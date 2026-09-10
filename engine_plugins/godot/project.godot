@@ -1,0 +1,19 @@
+[toolchain]
+
+[general]
+name="NRR"
+description="Neural Rendering Runtime for Godot"
+author="NRR Project"
+version="1.0.0"
+script_language="c++"
+
+[libs]
+system_libs=["dl", "pthread"]
+static_libs=["nrr"]
+
+[linking]
+mode="static"
+
+[build]
+target="release"
+pool="link"

@@ -1,0 +1,29 @@
+{
+    "name": "com.nrr.rendering",
+    "displayName": "NRR Neural Rendering",
+    "description": "Neural Rendering Runtime (NRR) integration for Unity",
+    "version": "1.0.0",
+    "unity": "2021.3",
+    "unityRelease": "0f",
+    "minEditorVersion": "2021.3.0f",
+    "dependencies": {
+        "com.unity.render-pipelines.core": "12.0.0"
+    },
+    "samples": {
+        "NRR Demo": "Samples~/NRRDemo"
+    },
+    "keywords": [
+        "neural rendering",
+        "NRR",
+        "upscaling",
+        "AI rendering",
+        "real-time rendering"
+    ],
+    "author": {
+        "name": "NRR Project",
+        "url": "https://github.com/nrr-project"
+    },
+    "documentationUrl": "https://nrr-project.github.io/docs/unity",
+    "licenseUrl": "https://github.com/nrr-project/nrr/blob/main/LICENSE",
+    "hideInEditor": false
+}

@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Temp/scratch files
+_*
+*.tmp
+*.log
