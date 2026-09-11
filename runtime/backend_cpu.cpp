@@ -1,7 +1,12 @@
 #include "backend_cpu.h"
 #include "nrr_device.h"
+#include "onnx_runtime.h"
+#include "nrr_inference.h"
 #include <cstring>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <sstream>
 
 namespace nrr {
 
@@ -250,21 +255,210 @@ NRRResult BackendCPU::execute_model(
     NRRFrameOutput& output,
     const NRRReferenceSet* references) {
 
-    (void)model;
     (void)references;
 
     if (!initialized_) {
         return NRR_ERROR_STATE_INVALID;
     }
 
+    auto fill_placeholder_stats = [&](const char* debug) {
+        output.temporal = input.temporal;
+        output.stats.render_time_ms = 0.0f;
+        output.stats.neural_inference_time_ms = 0.0f;
+        output.stats.backend_overhead_ms = 0.0f;
+        output.stats.memory_used_mb = 0;
+        output.stats.quality_metric = 0.5f;
+        output.stats.temporal_stability = 50;
+        copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), debug);
+    };
+
+    auto* model_onnx = dynamic_cast<ModelONNX*>(model);
+    ONNXRuntime* ort = model_onnx ? model_onnx->get_onnx_runtime() : nullptr;
+    if (!model_onnx || !ort || !ort->is_loaded()) {
+        /* No executable ONNX session (placeholder build without the SDK, or
+         * a model without a session): legacy passthrough behavior. */
+        fill_placeholder_stats("CPU Backend - Placeholder");
+        return NRR_SUCCESS;
+    }
+
+    const auto t_start = std::chrono::steady_clock::now();
+
+    // ---- Resolve frame textures --------------------------------------------
+    if (!input.color) {
+        set_last_error(NRR_ERROR_INVALID_ARGUMENT,
+                       "frame input has no color texture");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    auto* color_tex = reinterpret_cast<TextureImpl*>(input.color);
+    auto color_it = cpu_textures_.find(color_tex->backend_texture);
+    if (color_it == cpu_textures_.end()) {
+        set_last_error(NRR_ERROR_STATE_INVALID,
+                       "color texture is not registered with the backend");
+        return NRR_ERROR_STATE_INVALID;
+    }
+    const BackendCPU::CPUImage& color_img = color_it->second;
+
+    const BackendCPU::CPUImage* depth_img = nullptr;
+    const BackendCPU::CPUImage* motion_img = nullptr;
+    if (input.depth) {
+        auto* depth_tex = reinterpret_cast<TextureImpl*>(input.depth);
+        auto it = cpu_textures_.find(depth_tex->backend_texture);
+        if (it != cpu_textures_.end()) depth_img = &it->second;
+    }
+    if (input.motion_vectors) {
+        auto* motion_tex = reinterpret_cast<TextureImpl*>(input.motion_vectors);
+        auto it = cpu_textures_.find(motion_tex->backend_texture);
+        if (it != cpu_textures_.end()) motion_img = &it->second;
+    }
+
+    const uint32_t in_w = color_img.width;
+    const uint32_t in_h = color_img.height;
+
+    // ---- Build model input tensors (matched by role) ------------------------
+    std::vector<TensorInput> tensors;
+    tensors.reserve(static_cast<size_t>(ort->get_input_count()));
+    bool optional_zero_filled = false;
+
+    for (int i = 0; i < ort->get_input_count(); ++i) {
+        const char* name = ort->get_input_name(i);
+        if (!name) continue;
+        TensorRole role = classify_tensor_role(name);
+        if (ort->get_input_count() == 1 &&
+            role != TensorRole::Depth && role != TensorRole::Motion) {
+            role = TensorRole::Color; /* generic single-input models */
+        }
+        int channels = 0;
+        switch (role) {
+            case TensorRole::Depth:  channels = 1; break;
+            case TensorRole::Motion: channels = 2; break;
+            default:                 channels = 3; break;
+        }
+
+        const BackendCPU::CPUImage* src =
+            (role == TensorRole::Depth) ? depth_img
+            : (role == TensorRole::Motion) ? motion_img
+            : &color_img;
+        if (!src) {
+            /* Absent optional input (depth/motion): zero-filled tensor. */
+            optional_zero_filled = true;
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(ort->get_input_shape(i), channels,
+                                      in_w, in_h, shape)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("model input '") + name +
+                               "' shape conflicts with the frame resolution");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            t.data.assign(static_cast<size_t>(shape[1]) *
+                              static_cast<size_t>(shape[2]) *
+                              static_cast<size_t>(shape[3]),
+                          0.0f);
+            tensors.push_back(std::move(t));
+            continue;
+        }
+
+        std::vector<int64_t> shape;
+        if (!concrete_input_shape(ort->get_input_shape(i), channels,
+                                  src->width, src->height, shape)) {
+            std::ostringstream oss;
+            oss << "model input '" << name << "' resolution "
+                << src->width << "x" << src->height
+                << " conflicts with the model's static input shape";
+            set_last_error(NRR_ERROR_RENDER_FAILED, oss.str());
+            return NRR_ERROR_RENDER_FAILED;
+        }
+
+        TensorInput t;
+        t.name = name;
+        t.shape = shape;
+        if (!texture_to_nchw(src->pixels.data(), src->width, src->height,
+                             src->format, channels, t.data)) {
+            set_last_error(NRR_ERROR_RENDER_FAILED,
+                           std::string("unsupported texture format for input '") +
+                           name + "'");
+            return NRR_ERROR_RENDER_FAILED;
+        }
+        tensors.push_back(std::move(t));
+    }
+
+    const auto t_prepared = std::chrono::steady_clock::now();
+
+    // ---- Inference ----------------------------------------------------------
+    std::vector<float> out_data;
+    std::vector<int64_t> out_shape;
+    if (!ort->run_inference_multi(tensors, out_data, out_shape)) {
+        return NRR_ERROR_RENDER_FAILED;
+    }
+
+    const auto t_inferred = std::chrono::steady_clock::now();
+
+    // ---- Output tensor -> RGB8 texture --------------------------------------
+    uint32_t out_w = 0, out_h = 0;
+    std::vector<uint8_t> out_bytes;
+    if (!nchw_to_rgb8(out_data, out_shape, out_bytes, out_w, out_h)) {
+        set_last_error(NRR_ERROR_RENDER_FAILED,
+                       "model output tensor is not a 3+ channel NCHW image");
+        return NRR_ERROR_RENDER_FAILED;
+    }
+
+    TextureImpl* out_tex = nullptr;
+    NRRResult tex_result = model_onnx->get_or_create_output_texture(
+        out_w, out_h, NRR_TEXTURE_FORMAT_RGB8, &out_tex);
+    if (tex_result != NRR_SUCCESS || !out_tex) {
+        set_last_error(tex_result != NRR_SUCCESS ? tex_result
+                                                 : NRR_ERROR_OUT_OF_MEMORY,
+                       "failed to acquire the render output texture");
+        return tex_result != NRR_SUCCESS ? tex_result : NRR_ERROR_OUT_OF_MEMORY;
+    }
+    NRRResult upload_result = upload_texture(out_tex->backend_texture,
+                                             out_bytes.data(),
+                                             out_bytes.size());
+    if (upload_result != NRR_SUCCESS) {
+        set_last_error(NRR_ERROR_RENDER_FAILED,
+                       "failed to upload the inference output texture");
+        return NRR_ERROR_RENDER_FAILED;
+    }
+
+    const auto t_done = std::chrono::steady_clock::now();
+
+    // ---- Stats ---------------------------------------------------------------
+    const double prep_ms = std::chrono::duration<double, std::milli>(
+        t_prepared - t_start).count();
+    const double infer_ms = std::chrono::duration<double, std::milli>(
+        t_inferred - t_prepared).count();
+    const double post_ms = std::chrono::duration<double, std::milli>(
+        t_done - t_inferred).count();
+    const double total_ms = prep_ms + infer_ms + post_ms;
+
+    output.color = reinterpret_cast<NRRTexture*>(out_tex);
     output.temporal = input.temporal;
-    output.stats.render_time_ms = 0.0f;
-    output.stats.neural_inference_time_ms = 0.0f;
-    output.stats.backend_overhead_ms = 0.0f;
-    output.stats.memory_used_mb = 0;
-    output.stats.quality_metric = 0.5f;
-    output.stats.temporal_stability = 50;
-    copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), "CPU Backend - Placeholder");
+
+    const float motion_mag =
+        std::min(1.0f, std::max(0.0f, input.temporal.motion_magnitude));
+    output.stats.render_time_ms = static_cast<float>(total_ms);
+    output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
+    output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
+    output.stats.memory_used_mb = static_cast<uint32_t>(
+        (out_bytes.size() + color_img.pixels.size()) / (1024 * 1024));
+    output.stats.quality_metric = 0.75f;
+    output.stats.temporal_stability =
+        static_cast<uint32_t>(100.0f * (1.0f - motion_mag) + 0.5f);
+
+    {
+        char debug[256];
+        std::snprintf(debug, sizeof(debug),
+                      "ONNX CPU EP %ux%u -> %ux%u (prep %.3fms infer %.3fms)",
+                      in_w, in_h, out_w, out_h, prep_ms, infer_ms);
+        std::string info(debug);
+        if (optional_zero_filled) {
+            info += " [zero-filled optional inputs]";
+        }
+        copy_string(output.stats.debug_info,
+                    sizeof(output.stats.debug_info), info);
+    }
 
     return NRR_SUCCESS;
 }

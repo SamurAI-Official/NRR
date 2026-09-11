@@ -30,6 +30,10 @@ public:
 private:
     DeviceImpl* device_;
     std::string path_;
+
+protected:
+    /* Accessible to subclasses (ModelONNX surfaces real ONNX session
+     * metadata through this member). */
     std::string info_json_;
     void* model_data_;
     bool loaded_;

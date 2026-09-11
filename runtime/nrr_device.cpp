@@ -11,6 +11,7 @@
 #include "nrr_model.h"
 #include "nrr_reference.h"
 #include "nrr_backend.h"
+#include "onnx_runtime.h"
 #include <cstring>
 
 namespace nrr {
@@ -155,7 +156,10 @@ NRRResult DeviceImpl::load_model(const std::string& path, ModelImpl** out_model)
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
 
-    auto model = std::make_shared<ModelImpl>();
+    /* ModelONNX (subclass of ModelImpl) parses real ONNX sessions when the
+     * ONNX Runtime SDK is linked; it degrades to the placeholder path
+     * otherwise. */
+    auto model = std::make_shared<ModelONNX>();
     NRRResult result = model->load(this, path);
     if (result != NRR_SUCCESS) return result;
 

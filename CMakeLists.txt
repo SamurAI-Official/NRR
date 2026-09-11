@@ -16,6 +16,59 @@ option(NRR_ENABLE_AMD "Enable AMD backend" OFF)
 option(NRR_ENABLE_INTEL "Enable Intel backend" OFF)
 
 # ============================================================================
+# ONNX Runtime (optional; enables real neural inference - Phase 3)
+#
+# Point NRR_ONNXRUNTIME_ROOT at an extracted onnxruntime-win-x64 release
+# (see tools/fetch_ort.ps1) or rely on auto-detection of third_party/.
+# Without the SDK the build still succeeds using the placeholder path.
+# ============================================================================
+set(NRR_ONNXRUNTIME_ROOT "" CACHE PATH
+    "Path to the ONNX Runtime SDK root (contains include/ and lib/).")
+
+if(NOT NRR_ONNXRUNTIME_ROOT)
+    file(GLOB _NRR_ORT_CANDIDATES
+        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-win-x64*)
+    foreach(_cand ${_NRR_ORT_CANDIDATES})
+        if(EXISTS "${_cand}/include/onnxruntime_c_api.h")
+            set(NRR_ONNXRUNTIME_ROOT "${_cand}")
+            break()
+        endif()
+    endforeach()
+    unset(_NRR_ORT_CANDIDATES)
+endif()
+
+set(NRR_ORT_DLL "")
+if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h"
+   AND EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+    set(NRR_HAVE_ONNXRUNTIME ON)
+    set(NRR_ORT_INCLUDE_DIR "${NRR_ONNXRUNTIME_ROOT}/include")
+    set(NRR_ORT_LIB "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
+    set(NRR_ORT_DLL "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.dll")
+    message(STATUS "ONNX Runtime: ${NRR_ONNXRUNTIME_ROOT} (real inference)")
+else()
+    set(NRR_HAVE_ONNXRUNTIME OFF)
+    message(STATUS "ONNX Runtime: not found (placeholder inference path)")
+endif()
+
+function(nrr_link_ort target scope)
+    if(NRR_HAVE_ONNXRUNTIME)
+        target_include_directories(${target} ${scope} ${NRR_ORT_INCLUDE_DIR})
+        target_link_libraries(${target} ${scope} ${NRR_ORT_LIB})
+        target_compile_definitions(${target} ${scope} NRR_HAVE_ONNXRUNTIME)
+    endif()
+endfunction()
+
+function(nrr_copy_ort_dll target)
+    if(NRR_HAVE_ONNXRUNTIME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${NRR_ORT_DLL}" "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Copying onnxruntime.dll next to ${target}")
+    endif()
+endfunction()
+
+
+# ============================================================================
 # Include Directories
 # ============================================================================
 
@@ -36,6 +89,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference_impl.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_inference.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_registry.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_cpu.cpp
     ${CMAKE_SOURCE_DIR}/runtime/onnx_runtime.cpp
@@ -91,6 +145,8 @@ if(NRR_BUILD_SHARED)
     target_link_libraries(nrr PRIVATE
         Threads::Threads
     )
+    nrr_link_ort(nrr PRIVATE)
+    nrr_copy_ort_dll(nrr)
 
     if(NRR_ENABLE_VULKAN)
         target_link_libraries(nrr PRIVATE
@@ -116,6 +172,8 @@ find_package(Threads REQUIRED)
 target_link_libraries(nrr_static PUBLIC
     Threads::Threads
 )
+nrr_link_ort(nrr_static PRIVATE)
+nrr_copy_ort_dll(nrr_static)
 
 if(NRR_ENABLE_VULKAN)
     target_link_libraries(nrr_static PUBLIC
@@ -135,6 +193,14 @@ if(NRR_BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests
     )
     target_link_libraries(nrr_tests PRIVATE nrr_static nrr)
+    target_compile_definitions(nrr_tests PRIVATE
+        NRR_SAMPLE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_upscaler_v0.1.onnx"
+        NRR_PASSTHROUGH_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_passthrough_2x.onnx"
+    )
+    if(NRR_HAVE_ONNXRUNTIME)
+        target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_ONNXRUNTIME)
+    endif()
+    nrr_copy_ort_dll(nrr_tests)
 
     enable_testing()
     add_test(NAME NRRUnifiedTestSuite COMMAND nrr_tests)
@@ -145,18 +211,23 @@ if(NRR_BUILD_TESTS)
 
     add_executable(test_nrr_basic ${CMAKE_SOURCE_DIR}/tests/test_nrr_basic.cpp)
     target_link_libraries(test_nrr_basic PRIVATE nrr_static nrr)
+    nrr_copy_ort_dll(test_nrr_basic)
 
     add_executable(test_nrr_model ${CMAKE_SOURCE_DIR}/tests/test_nrr_model.cpp)
     target_link_libraries(test_nrr_model PRIVATE nrr_static nrr)
+    nrr_copy_ort_dll(test_nrr_model)
 
     add_executable(test_nrr_temporal ${CMAKE_SOURCE_DIR}/tests/test_nrr_temporal.cpp)
     target_link_libraries(test_nrr_temporal PRIVATE nrr_static nrr)
+    nrr_copy_ort_dll(test_nrr_temporal)
 
     add_executable(test_nrr_reference ${CMAKE_SOURCE_DIR}/tests/test_nrr_reference.cpp)
     target_link_libraries(test_nrr_reference PRIVATE nrr_static nrr)
+    nrr_copy_ort_dll(test_nrr_reference)
 
     add_executable(test_nrr_conditioning ${CMAKE_SOURCE_DIR}/tests/test_nrr_conditioning.cpp)
     target_link_libraries(test_nrr_conditioning PRIVATE nrr_static nrr)
+    nrr_copy_ort_dll(test_nrr_conditioning)
 
     add_test(NAME NRRBasicTest COMMAND test_nrr_basic)
     add_test(NAME NRRModelTest COMMAND test_nrr_model)

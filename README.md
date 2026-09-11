@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete; Phases 4-6 core implemented (model integration pending); Phase 12 Unity integration delivered; Phases 2/3/7-11 structural stubs  
+**Status:** Phase 0-1 complete; Phase 3 real ONNX inference + Phase 12 Unity delivered; Phases 4-6 core implemented (model integration pending); Phases 2/7-11 structural stubs  
 **Version:** 1.0.0-dev
 
 ---
@@ -50,9 +50,9 @@ nrr/
 │   ├── backend_amd.h             # Phase 8: AMD backend
 │   └── backend_intel.h           # Phase 9: Intel backend
 │
-├── models/                     # Phase 3: Neural models (architecture docs)
+├── models/                     # Phase 3: sample upscaler (.onnx) + architecture docs
 ├── engine_plugins/             # Phase 10-12: Engine integration (Unreal/Godot/Unity)
-├── tools/                      # Developer tools (future)
+├── tools/                      # gen_sample_model.py + fetch_ort.ps1
 ├── tests/                      # Phase 1: Tests
 │   ├── test_framework.h
 │   ├── main.cpp                # Unified test suite entry point
@@ -95,14 +95,14 @@ nrr/
 ### Phase 2 🔲 - Vulkan Backend
 - [ ] Full Vulkan implementation
 
-### Phase 3 🔲 - Neural Model Execution
-- [x] ONNX Runtime wrapper
-- [x] Model loading (ONNX + NRR package)
+### Phase 3 ✅ - Neural Model Execution
+- [x] ONNX Runtime wrapper (real OrtSession via the stable OrtApi C interface)
+- [x] Model loading (.onnx; .nrrmodel container is detected, payload parsing pending)
 - [x] Input/output tensor management
-- [x] Execution provider selection (CPU, CUDA, DirectML)
-- [ ] Full compute pipeline integration
-- [ ] Sample upscaling model
-- [x] Model execution test (placeholder ONNX wrapper exercise)
+- [x] Execution provider selection (CPU; CUDA/DirectML requests degrade gracefully with a reported note)
+- [x] Full compute pipeline integration (frame textures -> NCHW tensors -> inference -> RGB8 output texture)
+- [x] Sample upscaling model (models/nrr_upscaler_v0.1.onnx - generated, identity-preserving 2x upscaler)
+- [x] Model execution test (real end-to-end inference in the unified suite)
 
 ### Phase 4 🔲 - Temporal Neural Rendering
 - [x] Temporal history buffer (ring buffer)
@@ -197,6 +197,20 @@ nrr/
 - [x] URP/HDRP render feature
 - [x] Editor window for model management
 - [x] Sample scenes and scripts
+
+### ONNX Runtime (optional, enables real inference)
+
+```bash
+pwsh tools/fetch_ort.ps1          # downloads onnxruntime-win-x64 into third_party/ (gitignored)
+python tools/gen_sample_model.py  # regenerates models/*.onnx (needs: pip install onnx numpy)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+CMake auto-detects `third_party/onnxruntime-win-x64-*` (or pass
+`-DNRR_ONNXRUNTIME_ROOT=<path>`). When the SDK is present the CPU backend
+executes real neural inference; without it the build falls back to a
+placeholder path and everything still compiles and passes tests.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release

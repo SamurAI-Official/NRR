@@ -31,6 +31,11 @@ class BackendCPU;
 NRRResult to_result(bool success);
 const char* result_to_string(NRRResult result);
 
+/* Records the last error for retrieval via nrr_get_last_error(). Defined in
+ * nrr_c_api.cpp; runtime internals call this so failures surface through the
+ * public error API instead of being swallowed. */
+void set_last_error(NRRResult result, const std::string& message);
+
 /* Standard string helpers that avoid deprecated CRT functions. */
 inline std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),

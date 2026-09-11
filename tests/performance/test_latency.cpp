@@ -30,6 +30,9 @@ static bool        g_render_ok = false;
 
 static NRRModel* try_load_model(NRRDevice* dev) {
     const char* candidates[] = {
+#ifdef NRR_SAMPLE_MODEL
+        NRR_SAMPLE_MODEL, /* real ONNX upscaler when the sample model exists */
+#endif
         "test_model.onnx",
         "../../test_model.onnx",
         "../test_model.onnx",

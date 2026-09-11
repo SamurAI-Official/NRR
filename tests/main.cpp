@@ -4,6 +4,7 @@
 #include "unit/test_model.cpp"
 #include "unit/test_reference.cpp"
 #include "unit/test_backends/test_cpu.cpp"
+#include "unit/test_inference.cpp"
 #include "integration/test_frame_pipeline.cpp"
 #include "integration/test_multi_frame.cpp"
 #include "integration/test_reference_conditioning.cpp"
@@ -58,6 +59,17 @@ void run_all_tests() {
     NRR_RUN_TEST(test_cpu_backend_selection);
     NRR_RUN_TEST(test_cpu_texture_operations);
     NRR_RUN_TEST(test_cpu_buffer_operations);
+
+    std::cout << "\n--- Inference Tests ---\n";
+    NRR_RUN_TEST(test_inference_model_load);
+    NRR_RUN_TEST(test_inference_gray_upscale);
+    NRR_RUN_TEST(test_inference_gradient_smooth);
+    NRR_RUN_TEST(test_inference_single_input_model);
+    NRR_RUN_TEST(test_inference_output_texture_reuse);
+    NRR_RUN_TEST(test_inference_render_null_model);
+#ifdef NRR_HAVE_ONNXRUNTIME
+    NRR_RUN_TEST(test_inference_corrupt_model);
+#endif
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);

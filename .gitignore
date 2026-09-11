@@ -11,6 +11,9 @@ build/
 *.so
 *.dylib
 
+# Third-party SDKs (fetched via tools/fetch_ort.ps1)
+third_party/
+
 # CMake generated
 CMakeCache.txt
 CMakeFiles/
@@ -21,3 +24,4 @@ Makefile
 _*
 *.tmp
 *.log
+
