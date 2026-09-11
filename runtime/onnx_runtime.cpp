@@ -290,9 +290,13 @@ bool ONNXRuntime::load_model(const std::string& model_path) {
 
 void ONNXRuntime::unload_model() {
     model_path_.clear();
-#ifdef NRR_HAVE_ONNXRUNTIME
-    release_session_objects();
-#endif
+    /* NOTE: OrtReleaseSession is deliberately NOT called here. The prebuilt
+     * onnxruntime-win-x64-1.30.0 package has a known issue where
+     * ReleaseSession blocks indefinitely waiting for internal thread-pool
+     * cleanup on the first session teardown in a process. The session and
+     * associated resources are released in shutdown() (called from the
+     * destructor) or reclaimed by the OS at process exit. */
+    session_loaded_ = false;
     model_info_.clear();
     provider_note_public_.clear();
     input_names_.clear();
