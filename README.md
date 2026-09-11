@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 (Specification + C API)  
+**Status:** Phase 0-1 complete; Phases 4-6 core implemented (model integration pending); Phase 12 Unity integration delivered; Phases 2/3/7-11 structural stubs  
 **Version:** 1.0.0-dev
 
 ---
@@ -19,33 +19,51 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 ```
 nrr/
-├── specification/        # Phase 0: Specification documents
+├── specification/              # Phase 0: Specification documents
 │   ├── api.md
 │   ├── frame_contract.md
 │   ├── model_format.md
 │   ├── reference_format.md
 │   ├── capability_matrix.md
-│   └── backend_interface.md
+│   ├── backend_interface.md
+│   ├── temporal_rendering.md
+│   └── reference_conditioning.md
 │
-├── include/              # Phase 1: Public C API
+├── include/                    # Phase 1: Public C API
 │   └── nrr.h
 │
-├── runtime/              # Phase 1: C++ runtime
+├── runtime/                    # Phase 1: C++ runtime
 │   ├── nrr_runtime.h
 │   ├── nrr_device.h/cpp
 │   ├── nrr_model.h/cpp
 │   ├── nrr_reference.h/cpp
+│   ├── nrr_reference_impl.h/cpp  # Phase 5: .nrrref references + provenance
+│   ├── nrr_temporal.h/cpp        # Phase 4: Temporal rendering
+│   ├── nrr_conditioning.h/cpp    # Phase 6: Identity/material conditioning
 │   ├── nrr_backend.h
 │   ├── nrr_c_api.cpp
+│   ├── onnx_runtime.h/cpp        # Phase 3: ONNX Runtime wrapper
 │   ├── backend_cpu.cpp/h
 │   ├── backend_vulkan.cpp/h
-│   └── backend_registry.cpp
+│   ├── backend_registry.cpp
+│   ├── backend_nvidia.h          # Phase 7: NVIDIA backend
+│   ├── backend_amd.h             # Phase 8: AMD backend
+│   └── backend_intel.h           # Phase 9: Intel backend
 │
-├── backends/             # Phase 7-9: Vendor backends (future)
-├── models/               # Phase 3: Neural models (future)
-├── tools/                # Developer tools (future)
-├── tests/                # Phase 1: Tests
-│   └── test_nrr_basic.cpp
+├── models/                     # Phase 3: Neural models (architecture docs)
+├── engine_plugins/             # Phase 10-12: Engine integration (Unreal/Godot/Unity)
+├── tools/                      # Developer tools (future)
+├── tests/                      # Phase 1: Tests
+│   ├── test_framework.h
+│   ├── main.cpp                # Unified test suite entry point
+│   ├── test_nrr_basic.cpp
+│   ├── test_nrr_model.cpp
+│   ├── test_nrr_temporal.cpp
+│   ├── test_nrr_reference.cpp
+│   ├── test_nrr_conditioning.cpp
+│   ├── unit/                   # Unit tests (API, device, model, reference, backend)
+│   ├── integration/            # Integration tests (frame pipeline, multi-frame, conditioning)
+│   └── performance/            # Performance tests (render time, latency)
 │
 ├── CMakeLists.txt
 ├── Makefile
@@ -84,7 +102,7 @@ nrr/
 - [x] Execution provider selection (CPU, CUDA, DirectML)
 - [ ] Full compute pipeline integration
 - [ ] Sample upscaling model
-- [ ] Model execution test
+- [x] Model execution test (placeholder ONNX wrapper exercise)
 
 ### Phase 4 🔲 - Temporal Neural Rendering
 - [x] Temporal history buffer (ring buffer)
@@ -170,15 +188,15 @@ nrr/
 - [ ] GDNative bindings for full C API
 - [ ] Editor plugin UI
 
-### Phase 12 🔲 - Unity Integration
+### Phase 12 ✅ - Unity Integration
 - [x] Package.json descriptor
 - [x] Unity package structure
 - [x] Runtime/Scripts folder structure
 - [x] Native plugin structure
-- [ ] Full C# API bindings
-- [ ] URP/HDRP render feature
-- [ ] Editor window for model management
-- [ ] Sample scenes and scripts
+- [x] Full C# API bindings
+- [x] URP/HDRP render feature
+- [x] Editor window for model management
+- [x] Sample scenes and scripts
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release

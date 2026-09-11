@@ -67,12 +67,15 @@ var output = nrr.render_frame(color_img, depth_img, motion_img)
 
 ## Unity (Phase 12)
 
-**Status**: Package structure defined
+**Status**: Full C# bindings, URP render feature, editor tools, and demo sample
 
 The Unity package provides:
-- C# API wrapper for NRR
-- Native plugin support for platform-specific binaries
-- Scriptable render feature for URP/HDRP integration
+- Full C# P/Invoke bindings for the NRR C API (`Runtime/Scripts/`)
+- Native plugin support for platform-specific binaries (`Runtime/Plugins/`)
+- URP `ScriptableRendererFeature` + `ScriptableRenderPass` integration
+- `NRRRenderer` MonoBehaviour session driver
+- Editor settings asset + **Window > NRR > Model Manager** tool
+- Demo sample scene + controller (`Samples~/NRRDemo/`)
 
 ### Usage (Unity)
 

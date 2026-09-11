@@ -8,6 +8,7 @@
 #include "integration/test_multi_frame.cpp"
 #include "integration/test_reference_conditioning.cpp"
 #include "performance/test_render_time.cpp"
+#include "performance/test_latency.cpp"
 #include <iostream>
 #include <iomanip>
 
@@ -72,7 +73,19 @@ void run_all_tests() {
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);
     NRR_RUN_TEST(performance_texture_creation_time);
-    NRR_RUN_TEST(performance_buffer_creation_time);
+            NRR_RUN_TEST(performance_buffer_creation_time);
+
+
+    std::cout << "\n--- Latency Tests ---\n";
+    NRR_RUN_TEST(latency_single_frame);
+    NRR_RUN_TEST(latency_distribution_burst);
+    NRR_RUN_TEST(latency_temporal_accumulation);
+    NRR_RUN_TEST(latency_sustained_throughput);
+    NRR_RUN_TEST(latency_jitter);
+    NRR_RUN_TEST(latency_stats_consistency);
+    NRR_RUN_TEST(latency_no_model_budget);
+    NRR_RUN_TEST(latency_wait_idle);
+
     
     print_test_summary();
 }

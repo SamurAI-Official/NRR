@@ -134,7 +134,7 @@ if(NRR_BUILD_TESTS)
     target_include_directories(nrr_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/tests
     )
-    target_link_libraries(nrr_tests PRIVATE nrr_static)
+    target_link_libraries(nrr_tests PRIVATE nrr_static nrr)
 
     enable_testing()
     add_test(NAME NRRUnifiedTestSuite COMMAND nrr_tests)
@@ -144,19 +144,19 @@ if(NRR_BUILD_TESTS)
     # ==========================================================================
 
     add_executable(test_nrr_basic ${CMAKE_SOURCE_DIR}/tests/test_nrr_basic.cpp)
-    target_link_libraries(test_nrr_basic PRIVATE nrr_static)
+    target_link_libraries(test_nrr_basic PRIVATE nrr_static nrr)
 
     add_executable(test_nrr_model ${CMAKE_SOURCE_DIR}/tests/test_nrr_model.cpp)
-    target_link_libraries(test_nrr_model PRIVATE nrr_static)
+    target_link_libraries(test_nrr_model PRIVATE nrr_static nrr)
 
     add_executable(test_nrr_temporal ${CMAKE_SOURCE_DIR}/tests/test_nrr_temporal.cpp)
-    target_link_libraries(test_nrr_temporal PRIVATE nrr_static)
+    target_link_libraries(test_nrr_temporal PRIVATE nrr_static nrr)
 
     add_executable(test_nrr_reference ${CMAKE_SOURCE_DIR}/tests/test_nrr_reference.cpp)
-    target_link_libraries(test_nrr_reference PRIVATE nrr_static)
+    target_link_libraries(test_nrr_reference PRIVATE nrr_static nrr)
 
     add_executable(test_nrr_conditioning ${CMAKE_SOURCE_DIR}/tests/test_nrr_conditioning.cpp)
-    target_link_libraries(test_nrr_conditioning PRIVATE nrr_static)
+    target_link_libraries(test_nrr_conditioning PRIVATE nrr_static nrr)
 
     add_test(NAME NRRBasicTest COMMAND test_nrr_basic)
     add_test(NAME NRRModelTest COMMAND test_nrr_model)

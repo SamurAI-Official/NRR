@@ -1,0 +1,16 @@
+{
+    "name": "NRR.Demo",
+    "rootNamespace": "NRR.Demo",
+    "references": [
+        "NRR.Runtime"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
