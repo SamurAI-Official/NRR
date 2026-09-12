@@ -8,10 +8,9 @@
 #include "nrr_backend.h"
 #include "backend_cpu.h"
 #include "nrr_runtime.h"
-#ifdef NRR_ENABLE_VULKAN
 #include "mobile/backend_adreno.h"
 #include "mobile/backend_mali.h"
-#endif
+#include "mobile/backend_apple.h"
 #include <algorithm>
 
 namespace nrr {
@@ -46,6 +45,7 @@ static const BackendPriority backend_priorities[] = {
     {"Vulkan", 50},
     {"CPU", 10},
 };
+
 
 std::unique_ptr<Backend> select_best_backend(const NRRDeviceOptions& options) {
     auto& registry = get_backend_registry();
@@ -113,5 +113,18 @@ static struct CpuBackendRegistrar {
         });
     }
 } g_cpu_backend_registrar;
+
+#ifdef __APPLE__
+static struct AppleBackendRegistrar {
+    AppleBackendRegistrar() {
+        register_backend({
+            "Apple",
+            "1.0",
+            backend_apple_is_supported,
+            backend_apple_create
+        });
+    }
+} g_apple_backend_registrar;
+#endif
 
 } // namespace nrr

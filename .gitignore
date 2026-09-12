@@ -25,3 +25,6 @@ _*
 *.tmp
 *.log
 
+
+# Runtime-generated reference fixtures (written by test_nrr_reference)
+test_*.nrrref

@@ -1,12 +1,15 @@
-﻿/**
+/**
  * @file backend_adreno.cpp
  * @brief Qualcomm Adreno GPU Backend Implementation
  *
- * Mobile vendor backend for Qualcomm Adreno GPUs on Android.
+ * Real mobile ONNX execution: downloads the color RGBA8 texture, runs the
+ * frame through MobileExecutionKernel::execute_frame() (NNAPI / CPU EP) and
+ * uploads the inferred RGB8 result into the model-owned output texture.
  */
-
 #include "backend_adreno.h"
 #include "nrr_device.h"
+#include "mobile/mobile_kernel.h"
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -19,8 +22,12 @@ namespace nrr {
 
 BackendAdreno::BackendAdreno()
     : initialized_(false), is_adreno_(false), adreno_gpu_model_(0),
+#ifdef NRR_ENABLE_VULKAN
       instance_(VK_NULL_HANDLE), physical_device_(VK_NULL_HANDLE),
-      device_(VK_NULL_HANDLE), supports_astc_(false), supports_fsr_(false) {
+      device_(VK_NULL_HANDLE),
+#endif
+      supports_astc_(false), supports_etc2_(false),
+      supports_atc_(false), supports_tile_mode_(false) {
     name_ = "Adreno";
     std::memset(&capabilities_, 0, sizeof(capabilities_));
 }
@@ -35,14 +42,22 @@ NRRResult BackendAdreno::initialize(const NRRDeviceOptions& options) {
     result = query_adreno_capabilities();
     if (result != NRR_SUCCESS) return result;
     initialized_ = true;
+
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel && !kernel->is_initialized()) {
+        kernel->initialize(mobile_ep_for_vendor("Adreno"),
+                           256u * 1024u * 1024u, true, false, true);
+    }
     return NRR_SUCCESS;
 }
 
 void BackendAdreno::shutdown() {
     if (!initialized_) return;
+#ifdef NRR_ENABLE_VULKAN
     if (device_ != VK_NULL_HANDLE) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
     if (instance_ != VK_NULL_HANDLE) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
     physical_device_ = VK_NULL_HANDLE;
+#endif
     initialized_ = false;
     is_adreno_ = false;
 }
@@ -51,7 +66,11 @@ const NRRCapabilities& BackendAdreno::get_capabilities() const { return capabili
 const std::string& BackendAdreno::get_name() const { return name_; }
 
 bool BackendAdreno::is_supported(const NRRDeviceOptions&) const {
-    return true; // Placeholder - actual detection in initialize()
+#ifdef NRR_ENABLE_MOBILE_VENDOR
+    return true;
+#else
+    return false;
+#endif
 }
 
 NRRResult BackendAdreno::create_texture(const NRRTextureDesc& desc, void*& backend_texture) {
@@ -80,19 +99,33 @@ NRRResult BackendAdreno::download_buffer(void* backend_buffer, void* data, size_
     (void)backend_buffer; (void)data; (void)size; (void)offset;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
+
 NRRResult BackendAdreno::load_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel || !kernel->load_model(model)) return NRR_ERROR_MODEL_LOAD_FAILED;
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendAdreno::unload_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel) kernel->unload_model(model);
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendAdreno::execute_model(ModelImpl* model, const NRRFrameInput& input,
-                                      NRRFrameOutput& output, const NRRReferenceSet* references) {
-    (void)model; (void)input; (void)output; (void)references;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+                                       NRRFrameOutput& output, const NRRReferenceSet* references) {
+    (void)references;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel) return NRR_ERROR_STATE_INVALID;
+    if (!kernel->is_initialized())
+        kernel->initialize(mobile_ep_for_vendor("Adreno"), 256u * 1024u * 1024u, true, false, true);
+    return kernel->execute_frame(model, input, output,
+        [this](void* bt, void* data, size_t n) { return download_texture(bt, data, n); },
+        [this](void* bt, const void* data, size_t n) { return upload_texture(bt, data, n); });
 }
+
 NRRResult BackendAdreno::load_reference(ReferenceImpl* reference) {
     (void)reference;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
@@ -102,7 +135,9 @@ NRRResult BackendAdreno::unload_reference(ReferenceImpl* reference) {
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
 NRRResult BackendAdreno::wait_idle() {
+#ifdef NRR_ENABLE_VULKAN
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+#endif
     return NRR_SUCCESS;
 }
 
@@ -115,9 +150,8 @@ NRRResult BackendAdreno::detect_adreno_gpu() {
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
     VkInstance temp_instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS) {
+    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS)
         return NRR_ERROR_BACKEND_UNAVAILABLE;
-    }
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(temp_instance, &device_count, nullptr);
     if (device_count == 0) {
@@ -129,23 +163,21 @@ NRRResult BackendAdreno::detect_adreno_gpu() {
     for (uint32_t i = 0; i < device_count; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
-        // Qualcomm vendor ID is 0x5143 or device name contains "Adreno"
-        if (props.vendorID == 0x5143 || std::string(props.deviceName).find("Adreno") != std::string::npos) {
+        if (props.vendorID == 0x0EBD ||
+            std::string(props.deviceName).find("Adreno") != std::string::npos) {
             is_adreno_ = true;
             physical_device_ = devices[i];
             std::string name(props.deviceName);
             size_t pos = name.find("Adreno");
             if (pos != std::string::npos) {
-                // Parse Adreno model: 650, 730, etc.
                 std::string model_str = name.substr(pos + 7);
-                adreno_gpu_model_ = std::atoi(model_str.c_str());
+                adreno_gpu_model_ = static_cast<uint32_t>(atoi(model_str.c_str()));
             }
             break;
         }
     }
     vkDestroyInstance(temp_instance, nullptr);
-    if (!is_adreno_) return NRR_ERROR_BACKEND_UNAVAILABLE;
-    return NRR_SUCCESS;
+    return is_adreno_ ? NRR_SUCCESS : NRR_ERROR_BACKEND_UNAVAILABLE;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
@@ -168,7 +200,6 @@ NRRResult BackendAdreno::query_adreno_capabilities() {
 bool backend_adreno_is_supported(const NRRDeviceOptions& options) {
     return BackendAdreno().is_supported(options);
 }
-
 std::unique_ptr<Backend> backend_adreno_create(const NRRDeviceOptions&) {
     return std::make_unique<BackendAdreno>();
 }

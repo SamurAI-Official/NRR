@@ -209,6 +209,11 @@ nrr/
 - [x] Mobile-specific tests (Android, iOS, mobile backends)
 - [x] CMake mobile detection (ANDROID, IOS, NRR_PLATFORM_MOBILE)
 - [x] Mobile ONNX Runtime detection (onnxruntime-android, onnxruntime-mobile)
+- [x] Real mobile ONNX execution kernel (MobileExecutionKernel::execute_frame:
+      texture → NCHW → ONNX runtime (CPU/NNAPI/CoreML EP) → RGB8 → model output texture)
+- [x] All mobile vendor backends wired to the shared execution kernel
+      (Adreno, Mali, PowerVR, Apple, Android Vulkan, Xenos, Radeon Mobile)
+- [x] Mobile kernel unit test (real ONNX session through execute_frame)
 - [ ] Full Adreno GPU inference (Vulkan compute shaders)
 - [ ] Full Mali GPU inference (Vulkan compute shaders)
 - [ ] Mobile-optimized model format (.nrrmodel mobile variant)

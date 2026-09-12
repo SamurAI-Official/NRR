@@ -1,9 +1,13 @@
-﻿/**
+/**
  * @file backend_apple.cpp
- * @brief Apple GPU Backend Implementation
+ * @brief Apple GPU Backend Implementation (Metal + ANE)
+ *
+ * Real iOS ONNX execution via MobileExecutionKernel::execute_frame() with a
+ * Core ML / CPU EP preference.
  */
 #include "backend_apple.h"
 #include "nrr_device.h"
+#include "mobile/mobile_kernel.h"
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -35,6 +39,12 @@ NRRResult BackendApple::initialize(const NRRDeviceOptions& options) {
     result = query_apple_capabilities();
     if (result != NRR_SUCCESS) return result;
     initialized_ = true;
+
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel && !kernel->is_initialized()) {
+        kernel->initialize(mobile_ep_for_vendor("Apple"),
+                           256u * 1024u * 1024u, true, false, true);
+    }
     return NRR_SUCCESS;
 }
 
@@ -46,9 +56,10 @@ void BackendApple::shutdown() {
 
 const NRRCapabilities& BackendApple::get_capabilities() const { return capabilities_; }
 const std::string& BackendApple::get_name() const { return name_; }
+const AppleCapabilities& BackendApple::get_apple_capabilities() const { return apple_caps_; }
 
 bool BackendApple::is_supported(const NRRDeviceOptions&) const {
-#ifdef __APPLE__
+#ifdef NRR_ENABLE_MOBILE_VENDOR
     return true;
 #else
     return false;
@@ -81,19 +92,33 @@ NRRResult BackendApple::download_buffer(void* backend_buffer, void* data, size_t
     (void)backend_buffer; (void)data; (void)size; (void)offset;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
+
 NRRResult BackendApple::load_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel || !kernel->load_model(model)) return NRR_ERROR_MODEL_LOAD_FAILED;
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendApple::unload_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel) kernel->unload_model(model);
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendApple::execute_model(ModelImpl* model, const NRRFrameInput& input,
                                       NRRFrameOutput& output, const NRRReferenceSet* references) {
-    (void)model; (void)input; (void)output; (void)references;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    (void)references;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel) return NRR_ERROR_STATE_INVALID;
+    if (!kernel->is_initialized())
+        kernel->initialize(mobile_ep_for_vendor("Apple"), 256u * 1024u * 1024u, true, false, true);
+    return kernel->execute_frame(model, input, output,
+        [this](void* bt, void* data, size_t n) { return download_texture(bt, data, n); },
+        [this](void* bt, const void* data, size_t n) { return upload_texture(bt, data, n); });
 }
+
 NRRResult BackendApple::load_reference(ReferenceImpl* reference) {
     (void)reference;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
@@ -103,13 +128,12 @@ NRRResult BackendApple::unload_reference(ReferenceImpl* reference) {
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
 NRRResult BackendApple::wait_idle() { return NRR_SUCCESS; }
-const AppleCapabilities& BackendApple::get_apple_capabilities() const { return apple_caps_; }
 
 NRRResult BackendApple::detect_apple_gpu() {
 #ifdef __APPLE__
     supports_metal_ = true;
-    supports_ane_ = false; // Would need CoreML integration
-    gpu_family_ = 7; // Placeholder: A17 Pro / M4
+    supports_ane_ = true; // Apple Neural Engine on Apple Silicon
+    gpu_family_ = 7;      // Placeholder: A17 Pro / M4
     return NRR_SUCCESS;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -127,13 +151,15 @@ NRRResult BackendApple::query_apple_capabilities() {
     capabilities_.async_compute = NRR_CAPABILITY_FULL;
     std::strncpy(capabilities_.active_backend, "Apple", sizeof(capabilities_.active_backend) - 1);
     std::strncpy(capabilities_.backend_version, "1.0", sizeof(capabilities_.backend_version) - 1);
+    apple_caps_.supports_metal = supports_metal_;
+    apple_caps_.supports_ane = supports_ane_;
+    apple_caps_.gpu_family = gpu_family_;
     return NRR_SUCCESS;
 }
 
 bool backend_apple_is_supported(const NRRDeviceOptions& options) {
     return BackendApple().is_supported(options);
 }
-
 std::unique_ptr<Backend> backend_apple_create(const NRRDeviceOptions&) {
     return std::make_unique<BackendApple>();
 }

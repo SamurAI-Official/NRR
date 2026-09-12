@@ -1,10 +1,15 @@
-﻿/**
+/**
  * @file backend_mali.cpp
  * @brief ARM Mali GPU Backend Implementation
+ *
+ * Real mobile ONNX execution: downloads the color RGBA8 texture, runs the
+ * frame through MobileExecutionKernel::execute_frame() (NNAPI / CPU EP) and
+ * uploads the inferred RGB8 result into the model-owned output texture.
  */
-
 #include "backend_mali.h"
 #include "nrr_device.h"
+#include "mobile/mobile_kernel.h"
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <vector>
@@ -37,6 +42,12 @@ NRRResult BackendMali::initialize(const NRRDeviceOptions& options) {
     result = query_mali_capabilities();
     if (result != NRR_SUCCESS) return result;
     initialized_ = true;
+
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel && !kernel->is_initialized()) {
+        kernel->initialize(mobile_ep_for_vendor("Mali"),
+                           256u * 1024u * 1024u, true, false, true);
+    }
     return NRR_SUCCESS;
 }
 
@@ -55,7 +66,11 @@ const NRRCapabilities& BackendMali::get_capabilities() const { return capabiliti
 const std::string& BackendMali::get_name() const { return name_; }
 
 bool BackendMali::is_supported(const NRRDeviceOptions&) const {
-    return true; // Placeholder - actual detection in initialize()
+#ifdef NRR_ENABLE_MOBILE_VENDOR
+    return true;
+#else
+    return false;
+#endif
 }
 
 NRRResult BackendMali::create_texture(const NRRTextureDesc& desc, void*& backend_texture) {
@@ -84,19 +99,33 @@ NRRResult BackendMali::download_buffer(void* backend_buffer, void* data, size_t 
     (void)backend_buffer; (void)data; (void)size; (void)offset;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
+
 NRRResult BackendMali::load_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel || !kernel->load_model(model)) return NRR_ERROR_MODEL_LOAD_FAILED;
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendMali::unload_model(ModelImpl* model) {
-    (void)model;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (kernel) kernel->unload_model(model);
+    return NRR_SUCCESS;
 }
+
 NRRResult BackendMali::execute_model(ModelImpl* model, const NRRFrameInput& input,
                                      NRRFrameOutput& output, const NRRReferenceSet* references) {
-    (void)model; (void)input; (void)output; (void)references;
-    return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
+    (void)references;
+    if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    if (!kernel) return NRR_ERROR_STATE_INVALID;
+    if (!kernel->is_initialized())
+        kernel->initialize(mobile_ep_for_vendor("Mali"), 256u * 1024u * 1024u, true, false, true);
+    return kernel->execute_frame(model, input, output,
+        [this](void* bt, void* data, size_t n) { return download_texture(bt, data, n); },
+        [this](void* bt, const void* data, size_t n) { return upload_texture(bt, data, n); });
 }
+
 NRRResult BackendMali::load_reference(ReferenceImpl* reference) {
     (void)reference;
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
@@ -106,7 +135,9 @@ NRRResult BackendMali::unload_reference(ReferenceImpl* reference) {
     return initialized_ ? NRR_SUCCESS : NRR_ERROR_STATE_INVALID;
 }
 NRRResult BackendMali::wait_idle() {
+#ifdef NRR_ENABLE_VULKAN
     if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+#endif
     return NRR_SUCCESS;
 }
 
@@ -119,9 +150,8 @@ NRRResult BackendMali::detect_mali_gpu() {
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
     VkInstance temp_instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS) {
+    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS)
         return NRR_ERROR_BACKEND_UNAVAILABLE;
-    }
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(temp_instance, &device_count, nullptr);
     if (device_count == 0) {
@@ -133,23 +163,21 @@ NRRResult BackendMali::detect_mali_gpu() {
     for (uint32_t i = 0; i < device_count; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
-        // ARM vendor ID is 0x13B5 or device name contains "Mali"
-        if (props.vendorID == 0x13B5 || std::string(props.deviceName).find("Mali") != std::string::npos) {
+        if (props.vendorID == 0x13B5 ||
+            std::string(props.deviceName).find("Mali") != std::string::npos) {
             is_mali_ = true;
             physical_device_ = devices[i];
             std::string name(props.deviceName);
             size_t pos = name.find("Mali");
             if (pos != std::string::npos) {
-                // Parse Mali model: G77, G78, G710, etc.
                 std::string model_str = name.substr(pos + 5);
-                mali_gpu_model_ = std::atoi(model_str.c_str());
+                mali_gpu_model_ = static_cast<uint32_t>(atoi(model_str.c_str()));
             }
             break;
         }
     }
     vkDestroyInstance(temp_instance, nullptr);
-    if (!is_mali_) return NRR_ERROR_BACKEND_UNAVAILABLE;
-    return NRR_SUCCESS;
+    return is_mali_ ? NRR_SUCCESS : NRR_ERROR_BACKEND_UNAVAILABLE;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
@@ -172,7 +200,6 @@ NRRResult BackendMali::query_mali_capabilities() {
 bool backend_mali_is_supported(const NRRDeviceOptions& options) {
     return BackendMali().is_supported(options);
 }
-
 std::unique_ptr<Backend> backend_mali_create(const NRRDeviceOptions&) {
     return std::make_unique<BackendMali>();
 }

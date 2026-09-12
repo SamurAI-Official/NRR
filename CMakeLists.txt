@@ -42,6 +42,12 @@ else()
     option(NRR_ENABLE_AMD "Enable AMD backend" OFF)
     option(NRR_ENABLE_INTEL "Enable Intel backend" OFF)
 endif()
+# Mobile vendor backends are compiled unconditionally (NRR_RUNTIME_SOURCES) but
+# only *activate* (registration is_supported/EP selection) on mobile targets.
+# Propagate the option so the backend sources can gate their behavior.
+if(NRR_ENABLE_MOBILE_VENDOR)
+    add_compile_definitions(NRR_ENABLE_MOBILE_VENDOR=1)
+endif()
 
 # ============================================================================
 # ONNX Runtime (optional; enables real neural inference - Phase 3)
@@ -128,6 +134,14 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_inference.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/mobile_kernel.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_adreno.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_mali.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_pwrvr.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_apple.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_android_vulkan.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_xenos.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_radeon_mob.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_registry.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_cpu.cpp
     ${CMAKE_SOURCE_DIR}/runtime/onnx_runtime.cpp
@@ -161,13 +175,10 @@ if(NRR_ENABLE_INTEL AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/backend_intel.cpp)
     message(STATUS "Intel backend enabled")
 endif()
 
-if(NRR_ENABLE_MOBILE_VENDOR)
-    list(APPEND NRR_RUNTIME_SOURCES
-        ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_adreno.cpp
-        ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_mali.cpp
-    )
-    message(STATUS "Mobile vendor backends (Adreno/Mali) enabled")
-endif()
+# NOTE: mobile vendor backends are already compiled unconditionally via
+# NRR_RUNTIME_SOURCES (backend_adreno.cpp, backend_mali.cpp, etc.). The
+# NRR_ENABLE_MOBILE_VENDOR flag controls only feature-level behavior inside
+# those files (e.g. Vulkan-specific paths), not whether they are compiled.
 
 if(NRR_PLATFORM_ANDROID AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/platform/android/nrr_android.cpp)
     list(APPEND NRR_RUNTIME_SOURCES
@@ -287,6 +298,7 @@ if(NRR_BUILD_TESTS)
     )
     if(NRR_HAVE_ONNXRUNTIME)
         target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_ONNXRUNTIME)
+        target_include_directories(nrr_tests PRIVATE "${NRR_ORT_INCLUDE_DIR}")
     endif()
     nrr_copy_ort_dll(nrr_tests)
 

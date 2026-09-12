@@ -12,6 +12,8 @@
 #include "mobile/backend_adreno.h"
 #include "mobile/backend_mali.h"
 #endif
+#include "mobile/mobile_kernel.h"
+#include <vector>
 
 namespace nrr {
 namespace test {
@@ -85,6 +87,74 @@ NRR_TEST(test_mali_capabilities_structure) {
 }
 
 #endif // NRR_ENABLE_MOBILE_VENDOR
+
+NRR_TEST(test_mobile_kernel_execute_frame) {
+    // Real mobile execution path: drives the model's own ONNX session through
+    // MobileExecutionKernel::execute_frame() — the exact path every mobile
+    // vendor backend uses (NNAPI/CoreML on-device, CPU EP on the desktop).
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRRResult r = nrr_device_create(&options, &device);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "device for mobile kernel frame test");
+    if (!device) return;
+
+    NRRModel* model = nullptr;
+    r = nrr_model_load(device, NRR_PASSTHROUGH_MODEL, &model);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "load passthrough model for mobile kernel test");
+    if (!model) { nrr_device_destroy(device); return; }
+
+    NRRTextureDesc td = {};
+    td.width = 16;
+    td.height = 16;
+    td.format = NRR_TEXTURE_FORMAT_RGBA8;
+    td.usage = NRR_TEXTURE_USAGE_COLOR;
+    NRRTexture* color = nullptr;
+    r = nrr_texture_create(device, &td, &color);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "color texture for mobile kernel test");
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(16) * 16 * 4, 0);
+    for (uint32_t y = 0; y < 16; ++y) {
+        for (uint32_t x = 0; x < 16; ++x) {
+            const size_t i = (static_cast<size_t>(y) * 16 + x) * 4;
+            rgba[i]     = static_cast<uint8_t>((x * 255u) / 15u);
+            rgba[i + 1] = static_cast<uint8_t>((y * 255u) / 15u);
+            rgba[i + 2] = 128;
+            rgba[i + 3] = 255;
+        }
+    }
+    if (color)
+        nrr_texture_upload(device, color, rgba.data(), rgba.size());
+
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    NRR_EXPECT_TRUE(kernel != nullptr, "mobile kernel handle");
+    if (!kernel) {
+        if (color) nrr_texture_destroy(device, color);
+        nrr_model_unload(model);
+        nrr_device_destroy(device);
+        return;
+    }
+    if (!kernel->is_initialized())
+        kernel->initialize(MobileEP::CPU, 256u * 1024u * 1024u,
+                           true /* fp16 */, false /* quantized */,
+                           true /* cpu fallback */);
+    NRR_EXPECT_TRUE(kernel->is_initialized(), "mobile kernel initialized (CPU EP)");
+
+    NRRFrameInput input = {};
+    NRRFrameOutput output = {};
+    input.color = color;
+    input.camera.viewport_width = 16;
+    input.camera.viewport_height = 16;
+
+    const NRRResult er = kernel->execute_frame(
+        reinterpret_cast<ModelImpl*>(model), input, output,
+        nullptr, nullptr);
+    NRR_EXPECT_EQ(er, NRR_SUCCESS, "mobile kernel execute_frame real inference");
+    NRR_EXPECT_TRUE(output.color != nullptr, "mobile kernel produced output texture");
+
+    if (color) nrr_texture_destroy(device, color);
+    nrr_model_unload(model);
+    nrr_device_destroy(device);
+}
 
 // Platform-agnostic mobile constraint tests
 
