@@ -55,7 +55,7 @@ typedef struct NRRBuffer NRRBuffer;
 /* Number of public C entry points exported by the library. Used by the
  * implementation-testing hook nrr_test_entry_point_count(). Keep in sync
  * with the exported function table in nrr_c_api.cpp. */
-#define NRR_ENTRY_POINT_COUNT 29
+#define NRR_ENTRY_POINT_COUNT 43
 
 /* ============================================================================
  * Result Codes
@@ -333,6 +333,83 @@ NRR_API NRRResult nrr_buffer_create(NRRDevice* device, const NRRBufferDesc* desc
 NRR_API NRRResult nrr_buffer_destroy(NRRDevice* device, NRRBuffer* buffer);
 NRR_API NRRResult nrr_buffer_upload(NRRDevice* device, NRRBuffer* buffer, const void* data, size_t size, size_t offset);
 NRR_API NRRResult nrr_buffer_download(NRRDevice* device, NRRBuffer* buffer, void* data, size_t size, size_t offset);
+
+/* ============================================================================
+ * Mobile Platform Integration
+ * ============================================================================
+ *
+ * Platform-specific bridges for Android (NDK/Vulkan) and iOS (Metal/Vulkan).
+ * These functions provide native platform integration while maintaining
+ * portability - they degrade gracefully on non-mobile platforms.
+ *
+ * Android backends:
+ *   - Vulkan (portable baseline, all Android devices)
+ *   - Adreno (Qualcomm-specific optimizations)
+ *   - Mali (ARM-specific optimizations)
+ *   - NNAPI (Android Neural Networks API, Android 8.1+)
+ *
+ * iOS backends:
+ *   - Metal (Apple GPU, all iOS devices)
+ *   - ANE (Apple Neural Engine, A11 Bionic and later)
+ *   - MoltenVK (Vulkan portability layer)
+ */
+
+/* Mobile backend preference flags */
+typedef enum {
+    NRR_MOBILE_BACKEND_VULKAN    = 0,
+    NRR_MOBILE_BACKEND_ADRENO    = 1,
+    NRR_MOBILE_BACKEND_MALI      = 2,
+    NRR_MOBILE_BACKEND_NNAPI     = 3,
+    NRR_MOBILE_BACKEND_METAL     = 4,
+    NRR_MOBILE_BACKEND_ANE       = 5,
+    NRR_MOBILE_BACKEND_MOLTENVK  = 6,
+    NRR_MOBILE_BACKEND_MAX       = 7
+} NRRMobileBackend;
+
+/* Android-specific device configuration */
+typedef struct {
+    void* java_vm;              /* JavaVM* from JNI_OnLoad */
+    void* activity;             /* jobject for ANativeActivity */
+    void* asset_manager;        /* AAssetManager* for asset loading */
+    void* native_window;        /* ANativeWindow* for Vulkan surface */
+    bool enable_vulkan;
+    bool enable_adreno;
+    bool enable_mali;
+    bool enable_nnapi;
+    NRRMobileBackend preferred_backend;
+} NRRAndroidConfig;
+
+/* iOS-specific device configuration */
+typedef struct {
+    void* metal_device;         /* id<MTLDevice> in Objective-C */
+    void* command_queue;        /* id<MTLCommandQueue> in Objective-C */
+    bool enable_metal;
+    bool enable_moltenvk;
+    bool enable_ane;
+    NRRMobileBackend preferred_backend;
+} NRRiOSConfig;
+
+/* Android platform functions */
+NRR_API NRRResult nrr_android_init(const NRRAndroidConfig* config);
+NRR_API NRRResult nrr_android_shutdown(void);
+NRR_API NRRResult nrr_android_resolve_asset_path(const char* asset_path, char* resolved_path, size_t resolved_path_size);
+NRR_API NRRResult nrr_android_create_vulkan_surface(void* native_window, void** out_surface);
+NRR_API NRRResult nrr_android_create_texture_from_hardware_buffer(
+    NRRDevice* device, const NRRTextureDesc* desc, void* hardware_buffer, NRRTexture** out_texture);
+NRR_API NRRResult nrr_android_handle_memory_warning(NRRDevice* device);
+
+/* iOS platform functions */
+NRR_API NRRResult nrr_ios_init(const NRRiOSConfig* config);
+NRR_API NRRResult nrr_ios_shutdown(void);
+NRR_API NRRResult nrr_ios_create_texture_from_descriptor(
+    NRRDevice* device, const NRRTextureDesc* desc, void* descriptor, NRRTexture** out_texture);
+NRR_API NRRResult nrr_ios_export_texture_to_coreml(NRRDevice* device, NRRTexture* texture, void** out_coreml_texture);
+NRR_API NRRResult nrr_ios_handle_memory_warning(NRRDevice* device);
+NRR_API NRRResult nrr_ios_get_gpu_family(NRRDevice* device, int* out_gpu_family);
+
+/* Mobile utility functions */
+NRR_API bool nrr_is_mobile_platform(void);
+NRR_API NRRResult nrr_get_mobile_gpu_info(NRRDevice* device, char* buffer, size_t size);
 
 /* ============================================================================
  * Version Query

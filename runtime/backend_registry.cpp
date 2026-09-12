@@ -8,6 +8,10 @@
 #include "nrr_backend.h"
 #include "backend_cpu.h"
 #include "nrr_runtime.h"
+#ifdef NRR_ENABLE_VULKAN
+#include "mobile/backend_adreno.h"
+#include "mobile/backend_mali.h"
+#endif
 #include <algorithm>
 
 namespace nrr {
@@ -37,6 +41,8 @@ static const BackendPriority backend_priorities[] = {
     {"NVIDIA", 100},
     {"AMD", 90},
     {"Intel", 80},
+    {"Adreno", 60},
+    {"Mali", 55},
     {"Vulkan", 50},
     {"CPU", 10},
 };

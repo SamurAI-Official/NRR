@@ -10,6 +10,12 @@
 #include "integration/test_reference_conditioning.cpp"
 #include "performance/test_render_time.cpp"
 #include "performance/test_latency.cpp"
+#include "unit/test_mobile.cpp"
+#include "mobile/test_mobile_model.cpp"
+#ifndef _WIN32
+#include "mobile/test_android.cpp"
+#include "mobile/test_ios.cpp"
+#endif
 #include <iostream>
 #include <iomanip>
 
@@ -70,6 +76,38 @@ void run_all_tests() {
 #ifdef NRR_HAVE_ONNXRUNTIME
     NRR_RUN_TEST(test_inference_corrupt_model);
 #endif
+
+#ifdef NRR_ENABLE_MOBILE_VENDOR
+    std::cout << "\n--- Mobile Backend Tests ---\n";
+    NRR_RUN_TEST(test_adreno_backend_is_supported);
+    NRR_RUN_TEST(test_mali_backend_is_supported);
+    NRR_RUN_TEST(test_adreno_backend_name);
+    NRR_RUN_TEST(test_mali_backend_name);
+    NRR_RUN_TEST(test_adreno_capabilities_structure);
+    NRR_RUN_TEST(test_mali_capabilities_structure);
+#endif
+
+#ifndef _WIN32
+    std::cout << "\n--- Android Platform Tests ---\n";
+    NRR_RUN_TEST(test_android_power_manager_init);
+    NRR_RUN_TEST(test_android_power_status);
+    NRR_RUN_TEST(test_android_thermal_states);
+    NRR_RUN_TEST(test_android_power_profiles);
+    NRR_RUN_TEST(test_android_resolution_scaling);
+
+    std::cout << "\n--- iOS Platform Tests ---\n";
+    NRR_RUN_TEST(test_ios_power_manager_init);
+    NRR_RUN_TEST(test_ios_power_status);
+    NRR_RUN_TEST(test_ios_thermal_states);
+    NRR_RUN_TEST(test_ios_power_profiles);
+    NRR_RUN_TEST(test_ios_resolution_scaling);
+#endif
+
+    std::cout << "\n--- Mobile Constraint Tests ---\n";
+    NRR_RUN_TEST(test_device_options_zero_init);
+    NRR_RUN_TEST(test_capability_enum_values);
+    NRR_RUN_TEST(test_caps_name_buffer_size);
+    NRR_RUN_TEST(test_mobile_texture_format_support);
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);
@@ -85,7 +123,7 @@ void run_all_tests() {
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);
     NRR_RUN_TEST(performance_texture_creation_time);
-            NRR_RUN_TEST(performance_buffer_creation_time);
+    NRR_RUN_TEST(performance_buffer_creation_time);
 
 
     std::cout << "\n--- Latency Tests ---\n";

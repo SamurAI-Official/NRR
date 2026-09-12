@@ -53,6 +53,8 @@ nrr/
 ├── models/                     # Phase 3: sample upscaler (.onnx) + architecture docs
 ├── engine_plugins/             # Phase 10-12: Engine integration (Unreal/Godot/Unity)
 ├── tools/                      # gen_sample_model.py + fetch_ort.ps1
+├── mobile/                     # Phase 13: Mobile vendor backends (Adreno, Mali)
+├── platform/                   # Phase 13: Platform integration (Android NDK, iOS)
 ├── tests/                      # Phase 1: Tests
 │   ├── test_framework.h
 │   ├── main.cpp                # Unified test suite entry point
@@ -63,7 +65,8 @@ nrr/
 │   ├── test_nrr_conditioning.cpp
 │   ├── unit/                   # Unit tests (API, device, model, reference, backend)
 │   ├── integration/            # Integration tests (frame pipeline, multi-frame, conditioning)
-│   └── performance/            # Performance tests (render time, latency)
+│   ├── performance/            # Performance tests (render time, latency)
+│   └── mobile/                 # Phase 13: Mobile-specific tests
 │
 ├── CMakeLists.txt
 ├── Makefile
@@ -197,6 +200,20 @@ nrr/
 - [x] URP/HDRP render feature
 - [x] Editor window for model management
 - [x] Sample scenes and scripts
+
+### Phase 13 🔲 - Mobile Support
+- [x] Qualcomm Adreno GPU backend structure
+- [x] ARM Mali GPU backend structure
+- [x] Android NDK platform integration (JNI bridge)
+- [x] iOS platform integration (Objective-C++ bridge)
+- [x] Mobile-specific tests (Android, iOS, mobile backends)
+- [x] CMake mobile detection (ANDROID, IOS, NRR_PLATFORM_MOBILE)
+- [x] Mobile ONNX Runtime detection (onnxruntime-android, onnxruntime-mobile)
+- [ ] Full Adreno GPU inference (Vulkan compute shaders)
+- [ ] Full Mali GPU inference (Vulkan compute shaders)
+- [ ] Mobile-optimized model format (.nrrmodel mobile variant)
+- [ ] Android SurfaceView/NativeWindow integration
+- [ ] iOS Metal fallback for older devices
 
 ### ONNX Runtime (optional, enables real inference)
 

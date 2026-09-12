@@ -10,10 +10,38 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(NRR_BUILD_SHARED "Build as shared library" ON)
 option(NRR_BUILD_TESTS "Build tests" ON)
-option(NRR_ENABLE_VULKAN "Enable Vulkan backend" OFF)
-option(NRR_ENABLE_NVIDIA "Enable NVIDIA backend" OFF)
-option(NRR_ENABLE_AMD "Enable AMD backend" OFF)
-option(NRR_ENABLE_INTEL "Enable Intel backend" OFF)
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(NRR_PLATFORM_ANDROID ON)
+    set(NRR_PLATFORM_MOBILE ON)
+elseif(IOS OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(NRR_PLATFORM_IOS ON)
+    set(NRR_PLATFORM_MOBILE ON)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(NRR_PLATFORM_MACOS ON)
+else()
+    set(NRR_PLATFORM_DESKTOP ON)
+endif()
+
+# ---------------------------------------------------------------------------
+# Backend selection — desktop vendor backends disabled on mobile by default
+# ---------------------------------------------------------------------------
+if(NRR_PLATFORM_MOBILE)
+    option(NRR_ENABLE_VULKAN "Enable Vulkan backend (portable baseline for mobile)" ON)
+    option(NRR_ENABLE_MOBILE_VENDOR "Enable mobile vendor backends (Adreno, Mali)" ON)
+    option(NRR_ENABLE_NVIDIA "Enable NVIDIA backend" OFF)
+    option(NRR_ENABLE_AMD "Enable AMD backend" OFF)
+    option(NRR_ENABLE_INTEL "Enable Intel backend" OFF)
+else()
+    option(NRR_ENABLE_VULKAN "Enable Vulkan backend" OFF)
+    option(NRR_ENABLE_MOBILE_VENDOR "Enable mobile vendor backends" OFF)
+    option(NRR_ENABLE_NVIDIA "Enable NVIDIA backend" OFF)
+    option(NRR_ENABLE_AMD "Enable AMD backend" OFF)
+    option(NRR_ENABLE_INTEL "Enable Intel backend" OFF)
+endif()
 
 # ============================================================================
 # ONNX Runtime (optional; enables real neural inference - Phase 3)
@@ -26,8 +54,18 @@ set(NRR_ONNXRUNTIME_ROOT "" CACHE PATH
     "Path to the ONNX Runtime SDK root (contains include/ and lib/).")
 
 if(NOT NRR_ONNXRUNTIME_ROOT)
-    file(GLOB _NRR_ORT_CANDIDATES
-        ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-win-x64*)
+    if(NRR_PLATFORM_ANDROID)
+        file(GLOB _NRR_ORT_CANDIDATES
+            ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-android*
+            ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-mobile*)
+    elseif(NRR_PLATFORM_IOS)
+        file(GLOB _NRR_ORT_CANDIDATES
+            ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-ios*
+            ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-mobile*)
+    else()
+        file(GLOB _NRR_ORT_CANDIDATES
+            ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-win-x64*)
+    endif()
     foreach(_cand ${_NRR_ORT_CANDIDATES})
         if(EXISTS "${_cand}/include/onnxruntime_c_api.h")
             set(NRR_ONNXRUNTIME_ROOT "${_cand}")
@@ -123,6 +161,40 @@ if(NRR_ENABLE_INTEL AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/backend_intel.cpp)
     message(STATUS "Intel backend enabled")
 endif()
 
+if(NRR_ENABLE_MOBILE_VENDOR)
+    list(APPEND NRR_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_adreno.cpp
+        ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_mali.cpp
+    )
+    message(STATUS "Mobile vendor backends (Adreno/Mali) enabled")
+endif()
+
+if(NRR_PLATFORM_ANDROID AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/platform/android/nrr_android.cpp)
+    list(APPEND NRR_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/runtime/platform/android/nrr_android.cpp
+    )
+    message(STATUS "Android platform integration enabled")
+endif()
+
+if(NRR_PLATFORM_IOS AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/platform/ios/nrr_ios.mm)
+    list(APPEND NRR_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/runtime/platform/ios/nrr_ios.mm
+    )
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/runtime/platform/ios/nrr_ios.mm
+        PROPERTIES LANGUAGE CXX)
+    message(STATUS "iOS platform integration enabled")
+endif()
+
+# Power management (mobile)
+# The power manager is platform-agnostic (Android/iOS calls are guarded),
+# so compile it whenever tests are built — not just on mobile platforms.
+if(NRR_PLATFORM_MOBILE OR NRR_BUILD_TESTS)
+    list(APPEND NRR_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/runtime/mobile/nrr_power_manager.cpp
+    )
+    message(STATUS "Mobile power management enabled")
+endif()
+
 # ============================================================================
 # Library Target
 # ============================================================================
@@ -153,6 +225,13 @@ if(NRR_BUILD_SHARED)
             Vulkan::Vulkan
         )
     endif()
+
+    # Mobile platform/vendor headers live under runtime/ — add to include path
+    if(NRR_ENABLE_MOBILE_VENDOR OR NRR_PLATFORM_ANDROID OR NRR_PLATFORM_IOS)
+        target_include_directories(nrr PRIVATE
+            ${CMAKE_SOURCE_DIR}/runtime
+        )
+    endif()
 endif()
 
 # ----------------------------------------------------------------------------
@@ -181,6 +260,13 @@ if(NRR_ENABLE_VULKAN)
     )
 endif()
 
+# Mobile platform/vendor headers live under runtime/ — add to include path
+if(NRR_ENABLE_MOBILE_VENDOR OR NRR_PLATFORM_ANDROID OR NRR_PLATFORM_IOS)
+    target_include_directories(nrr_static PRIVATE
+        ${CMAKE_SOURCE_DIR}/runtime
+    )
+endif()
+
 # ============================================================================
 # Unified Test Suite (unit + integration + performance)
 # ============================================================================
@@ -191,6 +277,8 @@ if(NRR_BUILD_TESTS)
     )
     target_include_directories(nrr_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/tests
+        ${CMAKE_SOURCE_DIR}/runtime
+        ${CMAKE_SOURCE_DIR}/runtime/mobile
     )
     target_link_libraries(nrr_tests PRIVATE nrr_static nrr)
     target_compile_definitions(nrr_tests PRIVATE
@@ -234,6 +322,11 @@ if(NRR_BUILD_TESTS)
     add_test(NAME NRRTemporalTest COMMAND test_nrr_temporal)
     add_test(NAME NRRReferenceTest COMMAND test_nrr_reference)
     add_test(NAME NRRConditioningTest COMMAND test_nrr_conditioning)
+
+    # Mobile platform tests (test_android, test_ios, test_mobile_model) are
+    # integrated into the unified test suite via tests/main.cpp and run from
+    # nrr_tests.exe. They are NOT standalone executables because they use the
+    # unified test_framework.h (NRR_TEST macros, no main()).
 endif()
 
 # ============================================================================
