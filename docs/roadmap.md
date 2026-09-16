@@ -51,7 +51,7 @@ every claim becomes reproducible.
 - [ ] Promote the ASan CI job to blocking once it has a green history
 - [ ] Perf budget gate in CI (lands with M2, when there is something worth gating)
 
-### M0 status detail: CI run #1 (first run of this workflow)
+### M0 status detail: CI bring-up (runs #1 and #2)
 
 Run #1 (`35074715217`) failed in 20 seconds - both jobs died inside `tools/build.ps1`
 with:
@@ -65,12 +65,31 @@ automatic variable** (PowerShell variable names are case-insensitive). Local val
 had only ever used Windows PowerShell 5.1, which does not define that variable - so the
 bug existed only under `pwsh`, which is the shell CI uses.
 
-Fixes: rename to `$onWindows`; validate under pwsh locally from now on (the portable
-PowerShell 7 zip is enough - no install, no PATH change); and make `build.ps1` emit a
-GitHub `::error::` check annotation on failure, so a CI failure stays diagnosable via
-the public annotations API when job logs require authentication. The postmortem stays
-here because "it works on my machine" is precisely the class of claim this milestone
-exists to remove: the CI shell has to be reproducible on the development machine.
+Run #2 (`35075579918`) failed in 21 seconds for a second, unrelated reason:
+
+```
+tools/build.ps1 failed: The term 'C:\Program Files\CMake\bin\cmake.exe
+C:\Strawberry\c\bin\cmake.exe' is not recognized as a name of a cmdlet, function,
+script file, or executable program.
+```
+
+`Get-Command cmake -CommandType Application` returns **two** matches on the runner
+(CMake's and Strawberry Perl's, which is also on `PATH`), so `$cmd.Source` was an
+`System.Object[]` of paths that was then invoked as if it were a command name.
+`Find-CMake` now resolves exactly one path (verifying the array case locally with a
+duplicated `cmake.exe` on `PATH`), and the `vswhere` helpers were hardened the same way
+against multi-line native output.
+
+How these were diagnosed without job-log access (logs return HTTP 403 unauthenticated):
+`build.ps1` emits the failure as a GitHub `::error::` check annotation, and
+annotations are readable through the public API
+(`/repos/{owner}/{repo}/check-runs/{id}/annotations`). Keep that behaviour - it turned
+a blind 20-second failure into an exact one-line diagnosis.
+
+Lesson recorded here because "it works on my machine" is precisely the class of claim
+this milestone exists to remove: the CI shell *and* the CI toolchain layout have to be
+reproducible on the development machine. From now on, `tools/build.ps1` is validated
+under pwsh 7 (portable zip - no install required) as well as Windows PowerShell 5.1.
 
 ### M0 status detail: AddressSanitizer
 

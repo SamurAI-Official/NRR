@@ -73,8 +73,14 @@ if ($PSVersionTable.PSVersion.Major -ge 6) { $onWindows = $IsWindows }
 # ---------------------------------------------------------------------------
 
 function Find-CMake {
-    $cmd = Get-Command cmake -CommandType Application -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+    # Get-Command can return several matches - GitHub's windows-latest runners also
+    # expose Strawberry Perl's cmake.exe on PATH - so resolve to exactly one path
+    # (an array would be passed to the invocation as a single bogus command name).
+    $found = @(Get-Command cmake -CommandType Application -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Source } | Where-Object { $_ })
+    $preferred = @($found | Where-Object { $_ -like '*\CMake\bin\cmake.exe' })
+    if ($preferred.Count -gt 0) { return $preferred[0] }
+    if ($found.Count -gt 0) { return $found[0] }
 
     $roots = @('C:\Python313', 'C:\Python312', 'C:\Python311', 'C:\Python310',
                (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313'),
@@ -97,19 +103,23 @@ function Get-VsWhere {
 function Get-VsInstallPath {
     $vswhere = Get-VsWhere
     if (-not $vswhere) { return $null }
-    $path = & $vswhere -latest -products * -property installationPath 2>$null
+    # Take a single non-empty line: native output can be an array, and calling
+    # .Trim() on an array would throw.
+    $path = @(& $vswhere -latest -products * -property installationPath 2>$null |
+        Where-Object { $_ -and "$_".Trim() }) | Select-Object -First 1
     if (-not $path) { return $null }
-    return $path.Trim()
+    return "$path".Trim()
 }
 
 function Get-VisualStudioGenerator {
     $vswhere = Get-VsWhere
     if (-not $vswhere) { return $null }
-    $version = & $vswhere -latest -products * `
+    $version = @(& $vswhere -latest -products * `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property installationVersion 2>$null
+        -property installationVersion 2>$null |
+        Where-Object { $_ -and "$_".Trim() }) | Select-Object -First 1
     if (-not $version) { return $null }
-    switch (($version.Trim() -split '\.')[0]) {
+    switch (("$version".Trim() -split '\.')[0]) {
         '17' { return 'Visual Studio 17 2022' }
         '16' { return 'Visual Studio 16 2019' }
         default { return $null }
