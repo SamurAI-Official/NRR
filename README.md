@@ -73,7 +73,7 @@ nrr/
 │   ├── performance/            # render time, latency
 │   └── mobile/                 # Phase 13 mobile tests (guarded; not run on device)
 │
-├── .github/workflows/ci.yml    # build + full suite; advisory AddressSanitizer job
+├── .github/workflows/ci.yml    # build + full suite; blocking AddressSanitizer job
 ├── CMakeLists.txt
 ├── Makefile
 └── README.md

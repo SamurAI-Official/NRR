@@ -41,7 +41,7 @@ every claim becomes reproducible.
 - [x] Remove the developer-machine path (`g:/Program Prototype/NRR/...`) from
       `tests/performance/test_latency.cpp`; model paths now come from the build system
 - [x] CI: `.github/workflows/ci.yml` - Windows x64, cached ONNX Runtime SDK, full
-      suite plus phase tests; AddressSanitizer job (advisory until green on the runner)
+      suite plus phase tests; blocking AddressSanitizer job (green in run #6)
 - [x] `tools/build.ps1` - one entry point for configure/build/test that discovers
       CMake (PATH or pip install) and Visual Studio, so CI and local runs are identical
 - [x] `NRR_ENABLE_SANITIZERS` CMake option (MSVC AddressSanitizer; ASan+UBSan on GCC/Clang)
