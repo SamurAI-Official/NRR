@@ -506,6 +506,22 @@ NRRResult BackendCPU::execute_model(
         return NRR_ERROR_RENDER_FAILED;
     }
 
+    // ---- Scene-change handling ----------------------------------------------
+    /* A sequence that restarts (the frame index does not advance past the last one
+     * rendered) or a change of render resolution means the accumulated history
+     * belongs to a different scene or viewport. Reprojecting it would draw the old
+     * scene through the new one, so it is discarded. Detected here so a caller that
+     * forgets to announce a camera cut cannot ghost; nrr_device_reset_temporal_history()
+     * covers the case a caller must announce (a cut that keeps the frame indices
+     * and resolution, e.g. a camera switch). */
+    const bool scene_changed = temporal_scene_changed(
+        temporal_seen_frame_, temporal_last_frame_index_, input.temporal.frame_index,
+        temporal_last_width_, temporal_last_height_, out_w, out_h);
+    if (scene_changed) {
+        temporal_history_.clear();
+        temporal_state_.reset();
+    }
+
     // ---- Temporal accumulation ----------------------------------------------
     /* The previous displayed frame is reprojected through this frame's motion
      * field and blended in, weighted by the motion-adaptive alpha from the state
@@ -601,6 +617,12 @@ NRRResult BackendCPU::execute_model(
         temporal_state_.record_frame(input, displayed, temporal_history_);
     }
 
+    /* Remember what was rendered, for next-frame scene-change detection. */
+    temporal_seen_frame_ = true;
+    temporal_last_frame_index_ = input.temporal.frame_index;
+    temporal_last_width_ = out_w;
+    temporal_last_height_ = out_h;
+
     const auto t_done = std::chrono::steady_clock::now();
 
     // ---- Stats ---------------------------------------------------------------
@@ -679,6 +701,22 @@ NRRResult BackendCPU::unload_reference(ReferenceImpl* reference) {
 }
 
 NRRResult BackendCPU::wait_idle() {
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendCPU::reset_temporal_history() {
+    if (!initialized_) {
+        return NRR_ERROR_STATE_INVALID;
+    }
+    temporal_history_.clear();
+    temporal_state_.reset();
+    temporal_renderer_.reset();
+    /* The next frame begins a new sequence, so it must not be judged a
+     * continuation of the discarded one. */
+    temporal_seen_frame_ = false;
+    temporal_last_frame_index_ = 0;
+    temporal_last_width_ = 0;
+    temporal_last_height_ = 0;
     return NRR_SUCCESS;
 }
 

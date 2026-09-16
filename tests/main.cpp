@@ -151,6 +151,9 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_accumulation_applies_measured_blend);
     NRR_RUN_TEST(test_temporal_motion_above_threshold_bypasses_history);
     NRR_RUN_TEST(test_temporal_stability_reported_from_displayed_frames);
+    NRR_RUN_TEST(test_temporal_scene_change_discards_history);
+    NRR_RUN_TEST(test_temporal_reset_history_api);
+    NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
     
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);

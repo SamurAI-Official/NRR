@@ -54,6 +54,11 @@ public:
     // Synchronization
     virtual NRRResult wait_idle() = 0;
 
+    /* Discards any temporal history the backend has accumulated (scene changes,
+     * camera cuts, resolution changes). Backends without temporal accumulation
+     * keep this default and report NRR_ERROR_NOT_SUPPORTED. */
+    virtual NRRResult reset_temporal_history() { return NRR_ERROR_NOT_SUPPORTED; }
+
     // Backend information
     virtual bool is_supported(const NRRDeviceOptions& options) const = 0;
 };

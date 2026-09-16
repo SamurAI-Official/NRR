@@ -56,6 +56,12 @@ public:
     // Synchronization
     NRRResult wait_idle() override;
 
+    /* Discards the accumulated temporal history so the next frame starts a new
+     * sequence. Called by the device (nrr_device_reset_temporal_history) and also
+     * applied automatically when a restarted sequence or a resolution change is
+     * detected (see temporal_scene_changed()). */
+    NRRResult reset_temporal_history() override;
+
 private:
     bool initialized_;
     NRRCapabilities capabilities_;
@@ -87,6 +93,14 @@ private:
     TemporalHistory temporal_history_;
     TemporalStateManager temporal_state_;
     TemporalRenderer temporal_renderer_;
+
+    /* Tracks the last frame rendered, so a sequence that restarts (frame index
+     * does not advance) or changes resolution is detected as a scene change and
+     * handled without the caller having to announce it. */
+    bool temporal_seen_frame_ = false;
+    uint64_t temporal_last_frame_index_ = 0;
+    uint32_t temporal_last_width_ = 0;
+    uint32_t temporal_last_height_ = 0;
 };
 
 // Backend registration

@@ -369,6 +369,28 @@ NRRResult nrr_device_wait_idle(NRRDevice* device) {
     }
 }
 
+NRRResult nrr_device_reset_temporal_history(NRRDevice* device) {
+    if (!device) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "device is NULL");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        NRRResult result = impl->reset_temporal_history();
+        if (result == NRR_ERROR_NOT_SUPPORTED) {
+            nrr::set_last_error(result, "backend does not accumulate temporal history");
+        }
+        return result;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during reset_temporal_history");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
 // ============================================================================
 // Resource Management Helpers
 // ============================================================================

@@ -255,6 +255,97 @@ still assigns `output.temporal = input.temporal` and reports a hard-coded
 `temporal_stability = 50`. It is only reachable without the ORT SDK or with a non-ONNX
 model, but it is the same "fabricated state" pattern this milestone exists to remove.
 
+### M1.2 status detail: what the sanitizer gate runs, and what it cost
+
+The ASan job became a blocking gate at M0. The first M1 push (`202c924`) took **1096 s**
+(~18 minutes) for a gate that had taken ~100 s, because the 16 wall-clock benchmarks in
+`tests/performance/test_latency.cpp` were being executed under instrumentation. Measured
+cause, from the local suite log:
+
+```
+16 latency benchmarks: 71.4 s of the suite's 72.6 s wall clock   (98%)
+61 correctness tests:    96 ms combined
+```
+
+(The wall clock is a fresh measurement of `build-m1/Release/nrr_tests.exe`; the
+per-test totals are summed from the suite log, which prints a duration for each test.)
+
+Instrumentation multiplies that by ~15-30x, and the benchmarks' thresholds (`< 100 ms`
+per frame, `fps > 0`, jitter ratio `< 5`, `max < 100*avg`) become false regressions under
+it. They were therefore both the entire cost of the gate and a flake source in a job whose
+purpose is memory safety, not throughput.
+
+`NRR_SKIP_TIMING_TESTS` is now defined for `nrr_tests` when `NRR_ENABLE_SANITIZERS` is on
+(CMakeLists.txt). The render path those benchmarks cover stays instrumented through
+`test_inference`, `test_temporal_accumulation` and `test_frame_pipeline`, which assert on
+real inference output and real blending rather than on elapsed time. A skipped run is loud
+rather than silent: it prints a `--- Latency Tests: SKIPPED ---` banner and a
+`Timing benchmarks: SKIPPED` line in the summary.
+
+Measured effect (CI run for `c1b638d`, annotations quoted verbatim):
+
+```
+AddressSanitizer job:       1096 s -> 76 s      Total: 61, Passed: 61, Failed: 0
+default build + suite job:   172 s -> 144 s     Total: 77, Passed: 77, Failed: 0
+```
+
+The memory-safety gate is now the *cheaper* of the two jobs. Both jobs also carry
+`timeout-minutes: 30`: a hung process previously would have occupied a runner for GitHub's
+6-hour default instead of failing fast.
+
+**Known upstream noise:** every run emits a Node.js 20 deprecation warning for the pinned
+`actions/checkout@v4`, `actions/cache@v4` and `actions/upload-artifact@v4` (GitHub
+force-runs them on Node 24, so they work; the warning is cosmetic). Bumping the action
+majors is a separate, independently-verifiable change and is deliberately not bundled here.
+
+
+### M1.3 - Scene-reset handling
+
+**Problem.** `README.md` advertised "[x] Scene reset handling", but nothing
+implemented it: `TemporalRenderer::reset()` and `TemporalStateManager::reset()`
+existed and were never called, and no backend could tell the temporal system that
+the camera had cut. A cut makes every motion vector meaningless, so the next
+frame reprojects history from the previous scene and blends it in - visible
+ghosting for as long as the motion-adaptive alpha stays high.
+
+**Policy.** `temporal_scene_changed()` in `runtime/nrr_temporal.h` decides from
+the temporal state alone (no renderer state, so it is unit-testable):
+
+* the frame index moved backwards, or
+* the render resolution changed (history is stored per resolution),
+* otherwise the sequence is treated as a continuation.
+
+A *forward* frame-index jump is deliberately **not** a scene change; a dropped
+frame must keep accumulating. `SceneChangeTracker` wraps the policy: only an
+explicit change disables the shortcut, so a caller that recomputes the input
+state every frame (as `nrr_render` callers legitimately do) cannot reset the
+history by accident.
+
+**Wiring.**
+
+| Layer | Change |
+| --- | --- |
+| `runtime/nrr_temporal.h` | `temporal_scene_changed()` policy + `SceneChangeTracker` |
+| `runtime/nrr_backend.h` | `Backend::reset_temporal_history()` (default no-op) |
+| `runtime/backend_cpu.{h,cpp}` | applies the policy per frame, clears history + state on a change, implements the override |
+| `runtime/nrr_device.{h,cpp}` | `DeviceImpl::reset_temporal_history()` forwards to the backend |
+| `include/nrr.h`, `runtime/nrr_c_api.cpp` | `nrr_reset_temporal_history(device)` |
+
+The per-frame check happens *before* the blend, so the frame that detects the cut
+is already rendered without history: a cut frame reports `alpha=0` and a blend
+delta of exactly `0`, and the frame after it resumes the pre-cut alpha.
+
+**Tests.** `tests/integration/test_temporal_accumulation.cpp` (registered in
+`tests/main.cpp`):
+
+* the pure policy - regression, resolution change, continuation, forward jump;
+* the render path - a restart at frame 1 and a mid-sequence resolution change
+  both clear history (`history=0`) and reproduce the un-accumulated image
+  exactly (mean delta `0`), then re-accumulate on the following frame
+  (`alpha f3=0 -> f4=0.7`).
+
+Entry points: `NRR_ENTRY_POINT_COUNT` 43 -> 44 and `test_api_entry_point_count`
+updated with the new export.
 ## M2 - Real GPU execution
 
 Prerequisites: an ONNX Runtime build that ships the DirectML provider (runs on any

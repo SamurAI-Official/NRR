@@ -26,6 +26,21 @@ constexpr float TEMPORAL_MOTION_THRESHOLD = 0.3f; /* motion magnitude above whic
  * full [0,1] range, that is reported as zero stability (100 = frame unchanged). */
 constexpr float TEMPORAL_STABILITY_FULL_DELTA = 0.25f;
 
+/* A frame index that does not advance past the last recorded frame, or a change of
+ * render resolution, means the sequence restarted: whatever the history holds
+ * belongs to a different scene (or a different viewport), and reprojecting it would
+ * draw the old scene through the new one. Detected automatically so a caller that
+ * forgets to announce a camera cut cannot ghost, and defined here so the policy has
+ * a single definition that can be tested without a device. */
+inline bool temporal_scene_changed(bool has_history,
+                                   uint64_t last_frame_index, uint64_t frame_index,
+                                   uint32_t last_width, uint32_t last_height,
+                                   uint32_t width, uint32_t height) {
+    if (!has_history) return false;
+    if (frame_index <= last_frame_index) return true;
+    return last_width != width || last_height != height;
+}
+
 struct HistoryEntry {
     HistoryEntry() : frame_index(0), timestamp(0.0f) {}
     uint64_t frame_index;

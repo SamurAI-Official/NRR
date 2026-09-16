@@ -77,6 +77,13 @@ struct TemporalFixture {
     NRRTexture* color = nullptr;
     NRRTexture* depth = nullptr;
     NRRTexture* motion = nullptr;
+    /* Size of the frame textures currently held, and the output size the sample
+     * model produces from them (2x). make_textures() replaces them, which is how
+     * a test changes the render resolution mid-sequence. */
+    uint32_t in_w = kInW;
+    uint32_t in_h = kInH;
+    uint32_t out_w = kOutW;
+    uint32_t out_h = kOutH;
 
     ~TemporalFixture() {
         if (motion) nrr_texture_destroy(device, motion);
@@ -87,15 +94,24 @@ struct TemporalFixture {
     }
 };
 
-void make_fixture(TemporalFixture& fx) {
-    NRRDeviceOptions options = {};
-    NRR_EXPECT_EQ(nrr_device_create(&options, &fx.device), NRR_SUCCESS,
-                  "device creation");
-    NRR_EXPECT_TRUE(fx.device != nullptr, "device handle");
+/* Creates (or replaces) the frame textures at an input grid of tex_w x tex_h. */
+void make_textures(TemporalFixture& fx, uint32_t tex_w, uint32_t tex_h) {
+    if (fx.motion) {
+        nrr_texture_destroy(fx.device, fx.motion);
+        fx.motion = nullptr;
+    }
+    if (fx.depth) {
+        nrr_texture_destroy(fx.device, fx.depth);
+        fx.depth = nullptr;
+    }
+    if (fx.color) {
+        nrr_texture_destroy(fx.device, fx.color);
+        fx.color = nullptr;
+    }
 
     NRRTextureDesc td = {};
-    td.width = kInW;
-    td.height = kInH;
+    td.width = tex_w;
+    td.height = tex_h;
     td.format = NRR_TEXTURE_FORMAT_RGBA8;
     td.usage = NRR_TEXTURE_USAGE_COLOR;
     NRR_EXPECT_EQ(nrr_texture_create(fx.device, &td, &fx.color), NRR_SUCCESS,
@@ -109,6 +125,20 @@ void make_fixture(TemporalFixture& fx) {
     NRR_EXPECT_EQ(nrr_texture_create(fx.device, &td, &fx.motion), NRR_SUCCESS,
                   "motion texture");
 
+    fx.in_w = tex_w;
+    fx.in_h = tex_h;
+    fx.out_w = tex_w * 2;
+    fx.out_h = tex_h * 2;
+}
+
+void make_fixture(TemporalFixture& fx) {
+    NRRDeviceOptions options = {};
+    NRR_EXPECT_EQ(nrr_device_create(&options, &fx.device), NRR_SUCCESS,
+                  "device creation");
+    NRR_EXPECT_TRUE(fx.device != nullptr, "device handle");
+
+    make_textures(fx, kInW, kInH);
+
     NRR_EXPECT_EQ(nrr_model_load(fx.device, NRR_SAMPLE_MODEL, &fx.model),
                   NRR_SUCCESS, "sample model load");
     NRR_EXPECT_TRUE(fx.model != nullptr, "model handle");
@@ -116,10 +146,10 @@ void make_fixture(TemporalFixture& fx) {
 
 /* One gray level per input column (constant down each column). */
 void upload_color_columns(TemporalFixture& fx, const float* values) {
-    std::vector<uint8_t> rgba(static_cast<size_t>(kInW) * kInH * 4, 255);
-    for (uint32_t y = 0; y < kInH; ++y) {
-        for (uint32_t x = 0; x < kInW; ++x) {
-            const size_t i = (static_cast<size_t>(y) * kInW + x) * 4;
+    std::vector<uint8_t> rgba(static_cast<size_t>(fx.in_w) * fx.in_h * 4, 255);
+    for (uint32_t y = 0; y < fx.in_h; ++y) {
+        for (uint32_t x = 0; x < fx.in_w; ++x) {
+            const size_t i = (static_cast<size_t>(y) * fx.in_w + x) * 4;
             rgba[i] = rgba[i + 1] = rgba[i + 2] = quantize(values[x]);
         }
     }
@@ -130,19 +160,19 @@ void upload_color_columns(TemporalFixture& fx, const float* values) {
 
 /* Brightness ramp across the columns plus a constant offset. */
 void upload_ramp(TemporalFixture& fx, float offset) {
-    float values[kInW];
-    for (uint32_t x = 0; x < kInW; ++x) {
+    std::vector<float> values(fx.in_w);
+    for (uint32_t x = 0; x < fx.in_w; ++x) {
         values[x] = 0.1f * static_cast<float>(x) + offset;
     }
-    upload_color_columns(fx, values);
+    upload_color_columns(fx, values.data());
 }
 
 /* Uniform motion field, expressed in *input* texels. */
 void upload_constant_motion(TemporalFixture& fx, float dx, float dy) {
-    std::vector<uint8_t> data(static_cast<size_t>(kInW) * kInH * 4, 0);
+    std::vector<uint8_t> data(static_cast<size_t>(fx.in_w) * fx.in_h * 4, 0);
     const uint16_t hx = float_to_half(dx);
     const uint16_t hy = float_to_half(dy);
-    for (size_t p = 0; p < static_cast<size_t>(kInW) * kInH; ++p) {
+    for (size_t p = 0; p < static_cast<size_t>(fx.in_w) * fx.in_h; ++p) {
         std::memcpy(&data[p * 4], &hx, 2);
         std::memcpy(&data[p * 4 + 2], &hy, 2);
     }
@@ -157,13 +187,13 @@ NRRFrameOutput render_frame(TemporalFixture& fx, uint64_t frame_index,
     input.color = fx.color;
     input.depth = fx.depth;
     input.motion_vectors = fx.motion;
-    input.camera.viewport_width = kInW;
-    input.camera.viewport_height = kInH;
+    input.camera.viewport_width = fx.in_w;
+    input.camera.viewport_height = fx.in_h;
     input.camera.frame_time = 0.016f;
     input.temporal.frame_index = frame_index;
     input.temporal.delta_time = 0.016f;
-    input.temporal.resolution_x = kInW;
-    input.temporal.resolution_y = kInH;
+    input.temporal.resolution_x = fx.in_w;
+    input.temporal.resolution_y = fx.in_h;
     input.temporal.motion_magnitude = motion_magnitude;
     input.temporal.motion_vectors_scale = 1.0f;
     /* Deliberately wrong values: the pipeline must replace both with measured
@@ -184,7 +214,7 @@ NRRFrameOutput render_frame(TemporalFixture& fx, uint64_t frame_index,
 }
 
 std::vector<uint8_t> download_rgb(TemporalFixture& fx, NRRTexture* texture) {
-    std::vector<uint8_t> rgb(static_cast<size_t>(kOutW) * kOutH * 3, 0);
+    std::vector<uint8_t> rgb(static_cast<size_t>(fx.out_w) * fx.out_h * 3, 0);
     NRR_EXPECT_EQ(nrr_texture_download(fx.device, texture, rgb.data(), rgb.size()),
                   NRR_SUCCESS, "output download");
     return rgb;
@@ -206,9 +236,13 @@ double mean_abs_delta(const std::vector<uint8_t>& a, const std::vector<uint8_t>&
 /* The model output for a ramp scene with no accumulation at all: a fresh device
  * (empty history) rendering as its first frame, whose history weight is zero by
  * construction. This is the reference the accumulated frames are compared with. */
-std::vector<uint8_t> raw_ramp_render(float offset) {
+std::vector<uint8_t> raw_ramp_render(float offset, uint32_t tex_w = kInW,
+                                     uint32_t tex_h = kInH) {
     TemporalFixture fx;
     make_fixture(fx);
+    if (tex_w != kInW || tex_h != kInH) {
+        make_textures(fx, tex_w, tex_h);
+    }
     upload_constant_motion(fx, 0.0f, 0.0f);
     upload_ramp(fx, offset);
     const NRRFrameOutput out = render_frame(fx, 1, 0.0f);
@@ -411,6 +445,168 @@ NRR_TEST(test_temporal_stability_reported_from_displayed_frames) {
     NRR_EXPECT_TRUE(
         std::fabs(static_cast<float>(f3.stats.temporal_stability) - expected) <= 1.0f,
         "stability equals 100 * (1 - change / full delta) for the displayed frames");
+}
+
+// --- 5. A restarted sequence must not ghost --------------------------------
+//
+// A new sequence (scene load, resolution change) reaches the render path with
+// history still held from the old one. Reprojecting that history would draw the
+// previous scene through the new one, so it must be discarded. The policy is
+// checked directly first, then through the render path - the render-path part
+// fails if the history is merely retained and the expectations upstream are not
+// vacuous (the "continuing" frame is asserted to have really blended).
+NRR_TEST(test_temporal_scene_change_discards_history) {
+    NRR_EXPECT_FALSE(
+        nrr::temporal_scene_changed(false, 5, 1, kOutW, kOutH, kOutW, kOutH),
+        "without history there is nothing stale to discard");
+    NRR_EXPECT_FALSE(
+        nrr::temporal_scene_changed(true, 1, 2, kOutW, kOutH, kOutW, kOutH),
+        "an advancing frame index continues the sequence");
+    NRR_EXPECT_TRUE(
+        nrr::temporal_scene_changed(true, 2, 2, kOutW, kOutH, kOutW, kOutH),
+        "a repeated frame index restarts the sequence");
+    NRR_EXPECT_TRUE(
+        nrr::temporal_scene_changed(true, 9, 3, kOutW, kOutH, kOutW, kOutH),
+        "a rewound frame index restarts the sequence");
+    NRR_EXPECT_TRUE(
+        nrr::temporal_scene_changed(true, 1, 2, kOutW, kOutH, kOutW * 2, kOutH * 2),
+        "a change of render resolution discards the history");
+
+    TemporalFixture fx;
+    make_fixture(fx);
+    upload_constant_motion(fx, 0.0f, 0.0f);
+
+    upload_ramp(fx, kOffsetA);
+    render_frame(fx, 5, 0.0f);
+
+    upload_ramp(fx, kOffsetB);
+    const NRRFrameOutput f6 = render_frame(fx, 6, 0.0f);
+    NRR_EXPECT_NEAR(f6.temporal.temporal_alpha, nrr::TEMPORAL_BASE_ALPHA, 1e-6,
+                    "frame 6 is a continuation of frame 5 and accumulates against it");
+    const std::vector<uint8_t> continuing = download_rgb(fx, f6.color);
+    const std::vector<uint8_t> raw = raw_ramp_render(kOffsetB);
+    const double accumulated_delta = mean_abs_delta(continuing, raw, 0, raw.size());
+    NRR_EXPECT_TRUE(accumulated_delta > 0.01,
+                    "the continuing frame really was blended (guards the check below)");
+
+    /* The sequence restarts at index 1 while the history still holds frame 6. */
+    const NRRFrameOutput restart = render_frame(fx, 1, 0.0f);
+    NRR_EXPECT_EQ(restart.temporal.history_frames, 0u,
+                  "a restarted sequence sees an empty history");
+    NRR_EXPECT_NEAR(restart.temporal.temporal_alpha, 0.0f, 1e-6,
+                    "a restarted sequence does not blend");
+    const std::vector<uint8_t> restarted = download_rgb(fx, restart.color);
+    NRR_EXPECT_TRUE(mean_abs_delta(restarted, raw, 0, raw.size()) < 1e-6,
+                    "a restarted sequence displays the model output unmodified");
+
+    std::cout << "  continuing frame delta vs raw output: " << accumulated_delta
+              << " (blended) vs " << mean_abs_delta(restarted, raw, 0, raw.size())
+              << " (after restart)" << std::endl;
+}
+
+// --- 6. Explicit reset for cuts the automatic detection cannot see ---------
+//
+// A camera switch at the same resolution keeps both the frame index and the
+// output size, so only the caller can announce it. This is that path: it must
+// clear the history and the very next frame must be the un-accumulated model
+// output, verified against a reference render made on a fresh device.
+NRR_TEST(test_temporal_reset_history_api) {
+    TemporalFixture fx;
+    make_fixture(fx);
+    upload_constant_motion(fx, 0.0f, 0.0f);
+
+    NRR_EXPECT_EQ(nrr_device_reset_temporal_history(nullptr),
+                  NRR_ERROR_INVALID_ARGUMENT, "a NULL device is rejected");
+
+    upload_ramp(fx, kOffsetA);
+    render_frame(fx, 1, 0.0f);
+
+    upload_ramp(fx, kOffsetB);
+    const NRRFrameOutput f2 = render_frame(fx, 2, 0.0f);
+    NRR_EXPECT_NEAR(f2.temporal.temporal_alpha, nrr::TEMPORAL_BASE_ALPHA, 1e-6,
+                    "frame 2 accumulates against frame 1");
+    const std::vector<uint8_t> accumulated = download_rgb(fx, f2.color);
+
+    const std::vector<uint8_t> raw = raw_ramp_render(kOffsetB);
+    const double accumulated_delta = mean_abs_delta(accumulated, raw, 0, raw.size());
+    NRR_EXPECT_TRUE(accumulated_delta > 0.01,
+                    "the history was blended before the reset (guards the check below)");
+
+    NRR_EXPECT_EQ(nrr_device_reset_temporal_history(fx.device), NRR_SUCCESS,
+                  "an initialized device resets its temporal history");
+
+    /* The frame indices continue (3 follows 2), so nothing but the explicit call
+     * could have discarded the history. */
+    const NRRFrameOutput f3 = render_frame(fx, 3, 0.0f);
+    NRR_EXPECT_EQ(f3.temporal.history_frames, 0u,
+                  "the frame after a reset sees an empty history");
+    NRR_EXPECT_NEAR(f3.temporal.temporal_alpha, 0.0f, 1e-6,
+                    "the frame after a reset does not blend");
+    const std::vector<uint8_t> after_reset = download_rgb(fx, f3.color);
+    const double residual = mean_abs_delta(after_reset, raw, 0, raw.size());
+    NRR_EXPECT_TRUE(residual < 1e-6,
+                    "the frame after a reset is the model output, with no stale history");
+
+    /* The reset must not stop accumulation permanently: the next frame blends again. */
+    const NRRFrameOutput f4 = render_frame(fx, 4, 0.0f);
+    NRR_EXPECT_NEAR(f4.temporal.temporal_alpha, nrr::TEMPORAL_BASE_ALPHA, 1e-6,
+                    "accumulation resumes on the frame after a reset");
+
+    std::cout << "  blended=" << accumulated_delta << ", after reset=" << residual
+              << ", alpha f3=" << f3.temporal.temporal_alpha
+              << " -> f4=" << f4.temporal.temporal_alpha << std::endl;
+}
+
+// --- 7. A resolution change must discard history (automatic detection) ------
+//
+// The frame index keeps advancing, so nothing but the change of render size can
+// signal the restart. The history is 8x16 after frames 1-2 and the new frames
+// render 16x16: reprojecting the old history here would both ghost and read out
+// of bounds, so the very next frame must be the un-accumulated model output.
+NRR_TEST(test_temporal_resolution_change_discards_history) {
+    TemporalFixture fx;
+    make_fixture(fx);
+    upload_constant_motion(fx, 0.0f, 0.0f);
+
+    upload_ramp(fx, kOffsetA);
+    render_frame(fx, 1, 0.0f);
+
+    upload_ramp(fx, kOffsetB);
+    const NRRFrameOutput f2 = render_frame(fx, 2, 0.0f);
+    NRR_EXPECT_EQ(f2.temporal.history_frames, 1u,
+                  "frame 2 renders with frame 1 in history");
+    NRR_EXPECT_NEAR(f2.temporal.temporal_alpha, nrr::TEMPORAL_BASE_ALPHA, 1e-6,
+                    "frame 2 accumulates at the original resolution");
+
+    /* The frame textures are re-created at twice the size; the index continues. */
+    make_textures(fx, kInW * 2, kInH * 2);
+    upload_constant_motion(fx, 0.0f, 0.0f);
+    upload_ramp(fx, kOffsetC);
+
+    const NRRFrameOutput f3 = render_frame(fx, 3, 0.0f);
+    NRR_EXPECT_EQ(f3.temporal.history_frames, 0u,
+                  "the first frame at a new resolution sees an empty history");
+    NRR_EXPECT_NEAR(f3.temporal.temporal_alpha, 0.0f, 1e-6,
+                    "the first frame at a new resolution does not blend");
+
+    const std::vector<uint8_t> resized = download_rgb(fx, f3.color);
+    const std::vector<uint8_t> raw = raw_ramp_render(kOffsetC, kInW * 2, kInH * 2);
+    NRR_EXPECT_EQ(raw.size(), resized.size(),
+                  "the reference render used the new resolution");
+    const double resized_delta = mean_abs_delta(resized, raw, 0, raw.size());
+    NRR_EXPECT_TRUE(resized_delta < 1e-6,
+                    "the first frame at a new resolution is the model output, unmodified");
+
+    /* And accumulation resumes at the new resolution. */
+    upload_ramp(fx, kOffsetC + kFlicker);
+    const NRRFrameOutput f4 = render_frame(fx, 4, 0.0f);
+    NRR_EXPECT_NEAR(f4.temporal.temporal_alpha, nrr::TEMPORAL_BASE_ALPHA, 1e-6,
+                    "accumulation resumes at the new resolution");
+
+    std::cout << "  history after resize=" << f3.temporal.history_frames
+              << ", delta vs raw=" << resized_delta
+              << ", alpha f3=" << f3.temporal.temporal_alpha
+              << " -> f4=" << f4.temporal.temporal_alpha << std::endl;
 }
 
 } // namespace test

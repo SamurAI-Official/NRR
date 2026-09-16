@@ -55,7 +55,7 @@ typedef struct NRRBuffer NRRBuffer;
 /* Number of public C entry points exported by the library. Used by the
  * implementation-testing hook nrr_test_entry_point_count(). Keep in sync
  * with the exported function table in nrr_c_api.cpp. */
-#define NRR_ENTRY_POINT_COUNT 43
+#define NRR_ENTRY_POINT_COUNT 44
 
 /* ============================================================================
  * Result Codes
@@ -319,6 +319,17 @@ NRR_API NRRResult nrr_render(
     NRRFrameOutput* output
 );
 NRR_API NRRResult nrr_device_wait_idle(NRRDevice* device);
+
+/* Discards the temporal history accumulated by the render path, so the next
+ * frame does not blend against frames from the previous sequence. Call this on a
+ * scene change or camera cut. Render paths that accumulate history also detect a
+ * restarted frame sequence or a resolution change themselves, but an explicit
+ * call is required when the same frame indices continue across a cut (for
+ * example a camera switch at the same resolution).
+ *
+ * Returns NRR_ERROR_INVALID_ARGUMENT for a NULL device and
+ * NRR_ERROR_STATE_INVALID when the device is not initialized. */
+NRR_API NRRResult nrr_device_reset_temporal_history(NRRDevice* device);
 
 /* ============================================================================
  * Resource Management Helpers

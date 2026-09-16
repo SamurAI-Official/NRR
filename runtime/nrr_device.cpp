@@ -229,4 +229,10 @@ NRRResult DeviceImpl::wait_idle() {
     return backend_->wait_idle();
 }
 
+NRRResult DeviceImpl::reset_temporal_history() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    return backend_->reset_temporal_history();
+}
+
 } // namespace nrr

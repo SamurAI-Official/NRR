@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 77/77 tests green), with M1.1 temporal accumulation wired into the render path. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 80/80 tests green), with M1.1 temporal accumulation wired into the render path and M1.3 scene-reset handling. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -329,7 +329,7 @@ pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
 
 ## Testing
 
-`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 77 tests) plus the
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 80 tests) plus the
 five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
@@ -337,10 +337,12 @@ five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_tempo
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
-runs the full suite. A second, blocking job runs the same suite under MSVC
-AddressSanitizer (clean over that suite; last published run at M0 reported 61/61, and
-the M1 suite runs under the same job on every push), and a failing sanitizer run
-publishes the unresolved DLL dependencies of the built binaries as annotations.
+runs the full suite (80 tests). A second, **blocking** job runs the same correctness tests
+under MSVC AddressSanitizer; it excludes the 16 wall-clock benchmarks
+(`NRR_SKIP_TIMING_TESTS`, see [docs/roadmap.md](docs/roadmap.md) M1.2) because timings under
+instrumentation are not measurements, so the sanitizer job runs 64 of the 80 tests. A failing
+sanitizer run publishes the unresolved DLL dependencies of the built binaries as
+annotations.
 
 ## Roadmap
 

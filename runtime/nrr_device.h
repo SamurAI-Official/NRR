@@ -48,6 +48,9 @@ public:
     const std::string& get_backend_name() const { return backend_name_; }
 
     NRRResult wait_idle();
+    /* Discards the backend's accumulated temporal history (scene changes, camera
+     * cuts). */
+    NRRResult reset_temporal_history();
     bool is_initialized() const { return initialized_; }
 
 private:
