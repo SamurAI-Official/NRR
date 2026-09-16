@@ -13,6 +13,7 @@
 #include "nrr_device.h"
 #include "nrr_model.h"
 #include "nrr_reference.h"
+#include "accel_texture.h"
 
 #ifdef NRR_ENABLE_AMD
 #include <hip/hip_runtime.h>
@@ -92,7 +93,11 @@ private:
 
     // HIP handles
     int hip_device_;
+#ifdef NRR_ENABLE_AMD
     hipStream_t hip_stream_;
+#else
+    void* hip_stream_;
+#endif
 
     // Capabilities
     NRRCapabilities capabilities_;
@@ -103,12 +108,14 @@ private:
     int hip_precision_mode_;  // 0=FP32, 1=FP16, 2=FP32+FP16 mixed
 
     // Resource management
+    AccelResourceStore resources_;
     std::unordered_map<void*, TextureImpl*> textures_;
     std::unordered_map<void*, BufferImpl*> buffers_;
     std::vector<ModelImpl*> loaded_models_;
     std::vector<ReferenceImpl*> loaded_references_;
 
     // HIP-specific texture/buffer data
+#ifdef NRR_ENABLE_AMD
     struct HIPTexture {
         hipArray_t array;
         hipTextureObject_t texture_object;
@@ -116,6 +123,15 @@ private:
         uint32_t height;
         NRRTextureFormat format;
     };
+#else
+    struct HIPTexture {
+        void* array;
+        void* texture_object;
+        uint32_t width;
+        uint32_t height;
+        NRRTextureFormat format;
+    };
+#endif
 
     struct HIPBuffer {
         void* device_ptr;

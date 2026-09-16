@@ -12,6 +12,7 @@
 #include "performance/test_latency.cpp"
 #include "unit/test_mobile.cpp"
 #include "mobile/test_mobile_model.cpp"
+#include "unit/test_accel.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
 #include "mobile/test_ios.cpp"
@@ -109,6 +110,11 @@ void run_all_tests() {
     NRR_RUN_TEST(test_caps_name_buffer_size);
     NRR_RUN_TEST(test_mobile_texture_format_support);
     NRR_RUN_TEST(test_mobile_kernel_execute_frame);
+
+    std::cout << "\n--- Accelerator Vendor Tests ---\n";
+    NRR_RUN_TEST(test_accel_kernel_execute_frame);
+    NRR_RUN_TEST(test_accel_ep_routing);
+    NRR_RUN_TEST(test_accel_vendor_backends_structure);
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);

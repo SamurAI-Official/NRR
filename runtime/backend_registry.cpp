@@ -7,6 +7,18 @@
 
 #include "nrr_backend.h"
 #include "backend_cpu.h"
+#ifdef NRR_ENABLE_NVIDIA
+#include "backend_nvidia.h"
+#endif
+#ifdef NRR_ENABLE_AMD
+#include "backend_amd.h"
+#endif
+#ifdef NRR_ENABLE_INTEL
+#include "backend_intel.h"
+#endif
+#ifdef NRR_ENABLE_RISCV
+#include "backend_riscv.h"
+#endif
 #include "nrr_runtime.h"
 #include "mobile/backend_adreno.h"
 #include "mobile/backend_mali.h"
@@ -113,6 +125,58 @@ static struct CpuBackendRegistrar {
         });
     }
 } g_cpu_backend_registrar;
+
+#ifdef NRR_ENABLE_NVIDIA
+static struct NvidiaBackendRegistrar {
+    NvidiaBackendRegistrar() {
+        register_backend({
+            "NVIDIA",
+            "1.0",
+            backend_nvidia_is_supported,
+            backend_nvidia_create
+        });
+    }
+} g_nvidia_backend_registrar;
+#endif
+
+#ifdef NRR_ENABLE_AMD
+static struct AmdBackendRegistrar {
+    AmdBackendRegistrar() {
+        register_backend({
+            "AMD",
+            "1.0",
+            backend_amd_is_supported,
+            backend_amd_create
+        });
+    }
+} g_amd_backend_registrar;
+#endif
+
+#ifdef NRR_ENABLE_INTEL
+static struct IntelBackendRegistrar {
+    IntelBackendRegistrar() {
+        register_backend({
+            "Intel",
+            "1.0",
+            backend_intel_is_supported,
+            backend_intel_create
+        });
+    }
+} g_intel_backend_registrar;
+#endif
+
+#ifdef NRR_ENABLE_RISCV
+static struct RiscvBackendRegistrar {
+    RiscvBackendRegistrar() {
+        register_backend({
+            "RISC-V",
+            "1.0",
+            backend_riscv_is_supported,
+            backend_riscv_create
+        });
+    }
+} g_riscv_backend_registrar;
+#endif
 
 #ifdef __APPLE__
 static struct AppleBackendRegistrar {

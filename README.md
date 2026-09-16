@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete; Phase 3 real ONNX inference + Phase 12 Unity delivered; Phases 4-6 core implemented (model integration pending); Phases 2/7-11 structural stubs  
+**Status:** Phase 0-1 complete; 80 104 97 115 101 32 51 32 114 101 97 108 32 79 78 78 88 32 105 110 102 101 114 101 110 99 101 32 43 32 80 104 97 115 101 32 49 50 32 85 110 105 116 121 32 43 32 80 104 97 115 101 32 49 51 32 109 111 98 105 108 101 32 43 32 80 104 97 115 101 32 49 52 32 97 99 99 101 108 101 114 97 116 111 114 32 107 101 114 110 101 108 32 40 78 86 73 68 73 65 47 65 77 68 47 73 110 116 101 108 47 82 73 83 67 45 86 41 59 32 80 104 97 115 101 32 55 45 57 32 118 101 110 100 111 114 32 98 97 99 107 101 110 100 115 32 119 105 114 101 100 59 32 80 104 97 115 101 32 52 45 54 32 99 111 114 101 32 105 109 112 108 101 109 101 110 116 101 100 32 40 109 111 100 101 108 32 105 110 116 101 103 114 97 116 105 111 110 32 112 101 110 100 105 110 103 41 59 32 80 104 97 115 101 32 50 47 49 48 45 49 49 32 115 116 114 117 99 116 117 114 97 108 32 115 116 117 98 115  
 **Version:** 1.0.0-dev
 
 ---
@@ -76,6 +76,11 @@ nrr/
 ---
 
 ## Phase Status
+
+<details>
+<summary>Phase Status (click to expand full checklist)</summary>
+
+</details>
 
 ### Phase 0 ✅ - Specification
 - [x] API specification
@@ -171,6 +176,21 @@ nrr/
 - [ ] DirectML model execution
 - [ ] oneMKL math library integration
 
+### Phase 14 🔲 - Semiconductor Vendor Accelerator Kernels
+- [x] Shared AcceleratorExecutionKernel with unified ONNX Runtime session, texture→NCHW→ONNX→RGB8 frame path, and single-session EP routing
+- [x] AccelEP routing: CUDA, TensorRT, ROCm, DirectML, OpenVINO, Vulkan, RISC-V, CPU
+- [x] Capability reporting: FP16/FP8 tensor-core-style flags, max texture size, async compute, per-ep status, memory tracking
+- [x] Memory budgeting: per-frame byte accounting, peak/memory-limit, texture cache
+- [x] Vendor backends wired through the kernel: NVIDIA (CUDA + TensorRT EP prefer), AMD (ROCm EP), Intel (DirectML/OpenVINO EP), RISC-V (RVV 1.0 intrinsics + Vulkan/SPIR-V fallback + CPU EP)
+- [x] Compiler isolation: vendor SDK calls behind NRR_ENABLE_NVIDIA / NRR_ENABLE_AMD / NRR_ENABLE_INTEL / NRR_ENABLE_RISCV, inert stubs on desktop
+- [x] Real RVV 1.0 vector intrinsics: VLEN-aware vector clamping, expansion/packing via __riscv_vsetvl_e32m8, vector multiply-accumulate pixel pipelines
+- [x] Texture pool: backend-sourced color download via uploads
+- [ ] Full CUDA/TensorRT device kernels
+- [ ] Full HIP/ROCm device kernels
+- [ ] Full Intel XMX/DML kernels
+- [ ] Full RISC-V vector backend (RISC-V cross-compilation toolchain + RVV extension)
+- [ ] Vendor plugin isolation (Phase 15)
+
 ### Phase 10 🔲 - Unreal Integration
 - [x] Plugin Build.cs configuration
 - [x] NRRRuntimeModule (library loading)
@@ -220,7 +240,7 @@ nrr/
 - [ ] Android SurfaceView/NativeWindow integration
 - [ ] iOS Metal fallback for older devices
 
-### ONNX Runtime (optional, enables real inference)
+## License
 
 ```bash
 pwsh tools/fetch_ort.ps1          # downloads onnxruntime-win-x64 into third_party/ (gitignored)
@@ -241,8 +261,3 @@ cmake --build build
 
 ---
 
-## License
-
-Open standard. See specification documents for details.
-
-*Built as a portable neural-rendering platform, not as a DLSS clone.*

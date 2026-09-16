@@ -13,6 +13,7 @@
 #include "nrr_device.h"
 #include "nrr_model.h"
 #include "nrr_reference.h"
+#include "accel_texture.h"
 
 #ifdef NRR_ENABLE_INTEL
 #include <oneapi/dxoal.hpp>
@@ -111,6 +112,7 @@ private:
     bool use_directml_;
 
     // Resource management
+    AccelResourceStore resources_;
     std::unordered_map<void*, TextureImpl*> textures_;
     std::unordered_map<void*, BufferImpl*> buffers_;
     std::vector<ModelImpl*> loaded_models_;

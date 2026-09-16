@@ -19,10 +19,13 @@
 #include <NvInfer.h>
 #endif
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
+
+#include "accel_texture.h"
 
 namespace nrr {
 
@@ -71,18 +74,13 @@ private:
 
 class BackendNVIDIA : public Backend {
 public:
-    BackendNVIDIA() : initialized_(false), cuda_available_(false),
-        tensorrt_available_(false), name_("NVIDIA"), gpu_memory_mb_(0),
-        cuda_compute_capability_(0) {
-        std::memset(&capabilities_, 0, sizeof(capabilities_));
-    }
-
-    ~BackendNVIDIA() override { shutdown(); }
+    BackendNVIDIA();
+    ~BackendNVIDIA() override;
 
     NRRResult initialize(const NRRDeviceOptions& options) override;
     void shutdown() override;
-    const NRRCapabilities& get_capabilities() const override { return capabilities_; }
-    const std::string& get_name() const override { return name_; }
+    const NRRCapabilities& get_capabilities() const override;
+    const std::string& get_name() const override;
     bool is_supported(const NRRDeviceOptions&) const override;
 
     NRRResult create_texture(const NRRTextureDesc& desc, void*& backend_texture) override;
@@ -105,9 +103,11 @@ public:
     NRRResult unload_reference(ReferenceImpl* reference) override;
     NRRResult wait_idle() override;
 
+#ifdef NRR_ENABLE_NVIDIA
     void set_tensorrt_precision(bool fp16, bool int8, bool fp8) {
         if (tensorrt_engine_) tensorrt_engine_->set_precision(fp16, int8, fp8);
     }
+#endif
     bool is_tensorrt_available() const { return tensorrt_available_; }
     bool is_cuda_available() const { return cuda_available_; }
     const char* get_gpu_name() const { return gpu_name_.empty() ? "NVIDIA GPU" : gpu_name_.c_str(); }
@@ -122,12 +122,16 @@ private:
     std::string gpu_name_;
     std::string error_message_;
     int cuda_device_ = 0;
-    CUcontext cuda_context_ = nullptr;
-    CUstream cuda_stream_ = nullptr;
+    int cuda_device_count_ = 0;
+    void* cuda_context_ = nullptr; /* CUcontext without the CUDA toolkit */
+    void* cuda_stream_ = nullptr;  /* CUstream  without the CUDA toolkit */
     NRRCapabilities capabilities_;
     int gpu_memory_mb_;
     int cuda_compute_capability_;
+    AccelResourceStore resources_;
+#ifdef NRR_ENABLE_NVIDIA
     std::unique_ptr<TensorRTEngine> tensorrt_engine_;
+#endif
     std::unordered_map<void*, TextureImpl*> textures_;
     std::unordered_map<void*, BufferImpl*> buffers_;
     std::vector<ModelImpl*> loaded_models_;

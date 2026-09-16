@@ -49,6 +49,16 @@ if(NRR_ENABLE_MOBILE_VENDOR)
     add_compile_definitions(NRR_ENABLE_MOBILE_VENDOR=1)
 endif()
 
+# Desktop/embedded vendor backends: compiled unconditionally into the runtime
+# (inert stubs) and *activated* (registry registration, EP selection, HIP/CUDA
+# device paths) only when the corresponding option is enabled.
+option(NRR_ENABLE_RISCV "Enable RISC-V accelerator backend (RVV 1.0 + Vulkan fallback)" OFF)
+foreach(_vendor NVIDIA AMD INTEL RISCV)
+    if(NRR_ENABLE_${_vendor})
+        add_compile_definitions(NRR_ENABLE_${_vendor}=1)
+    endif()
+endforeach()
+
 # ============================================================================
 # ONNX Runtime (optional; enables real neural inference - Phase 3)
 #
@@ -144,6 +154,11 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_radeon_mob.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_registry.cpp
     ${CMAKE_SOURCE_DIR}/runtime/backend_cpu.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/backend_nvidia.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/backend_amd.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/backend_intel.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/backend_riscv.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/accel_kernel.cpp
     ${CMAKE_SOURCE_DIR}/runtime/onnx_runtime.cpp
 )
 
@@ -156,24 +171,14 @@ if(NRR_ENABLE_VULKAN)
     link_directories(${Vulkan_LIBRARY_DIRS})
 endif()
 
-if(NRR_ENABLE_NVIDIA)
-    # CUDA/TensorRT integration would go here
-    message(STATUS "NVIDIA backend enabled")
-endif()
-
-if(NRR_ENABLE_AMD AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/backend_amd.cpp)
-    list(APPEND NRR_RUNTIME_SOURCES
-        ${CMAKE_SOURCE_DIR}/runtime/backend_amd.cpp
-    )
-    message(STATUS "AMD backend enabled")
-endif()
-
-if(NRR_ENABLE_INTEL AND EXISTS ${CMAKE_SOURCE_DIR}/runtime/backend_intel.cpp)
-    list(APPEND NRR_RUNTIME_SOURCES
-        ${CMAKE_SOURCE_DIR}/runtime/backend_intel.cpp
-    )
-    message(STATUS "Intel backend enabled")
-endif()
+# Desktop/embedded vendor backends are compiled unconditionally (like the
+# mobile vendors); NRR_ENABLE_NVIDIA/AMD/INTEL/RISCV gate their *behavior*
+# (registry registration, device paths, EP selection), not compilation.
+foreach(_vendor NVIDIA AMD INTEL RISCV)
+    if(NRR_ENABLE_${_vendor})
+        message(STATUS "${_vendor} accelerator backend enabled")
+    endif()
+endforeach()
 
 # NOTE: mobile vendor backends are already compiled unconditionally via
 # NRR_RUNTIME_SOURCES (backend_adreno.cpp, backend_mali.cpp, etc.). The
