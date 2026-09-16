@@ -123,6 +123,14 @@ as the available machines allow:
   Microsoft.VisualStudio.Component.VC.ASAN`). `tools/build.ps1 -Sanitize -RunTests`
   detects the missing runtime and stops with that instruction instead of failing
   obscurely at link time.
+* CI run #4 failed with the same status even after the DLL copy, so the unresolved
+  dependency is something else - and `0xC0000135` does not name it. The job now runs
+  `tools/diagnose_pe.ps1` on failure: it reads the import table of the built executables
+  with `dumpbin /DEPENDENTS` and reports every dependency that cannot be resolved on the
+  runner as an `::error::` annotation, so the next failing run names the DLL instead of
+  only its status code. The helper treats `api-ms-win-*` / `ext-ms-*` names as resolved,
+  because API-set names are virtual and never exist as files (an early version of the
+  helper reported them as missing).
 * Because it has not yet produced a green run, the CI ASan job
   (`.github/workflows/ci.yml`, `windows-asan`) stays `continue-on-error: true`. It must
   be promoted to a blocking gate - and this note updated - once it runs green.

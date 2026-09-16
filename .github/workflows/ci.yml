@@ -86,6 +86,21 @@ jobs:
         shell: pwsh
         run: ./tools/build.ps1 -Config RelWithDebInfo -BuildDir build-asan -Sanitize -RunTests -Clean
 
+      # If the sanitizer tests could not start (0xC0000135 = STATUS_DLL_NOT_FOUND does
+      # not name the missing DLL), publish the resolved/ unresolved import list as
+      # annotations - readable through the public check-run API without log access.
+      - name: Diagnose unresolved runtime dependencies
+        if: failure()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build-asan -Recurse -Filter nrr_tests.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) { Write-Host "::warning::no nrr_tests.exe found to inspect"; exit 0 }
+          ./tools/diagnose_pe.ps1 -Binary $exe.FullName
+          $dll = Get-ChildItem build-asan -Recurse -Filter nrr.dll -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($dll) { ./tools/diagnose_pe.ps1 -Binary $dll.FullName -ExtraSearchDirs @($exe.DirectoryName) }
+
       - name: Upload ASan test logs
         if: always()
         uses: actions/upload-artifact@v4
