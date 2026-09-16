@@ -331,6 +331,15 @@ if(NRR_BUILD_TESTS)
         target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_ONNXRUNTIME)
         target_include_directories(nrr_tests PRIVATE "${NRR_ORT_INCLUDE_DIR}")
     endif()
+    if(NRR_ENABLE_SANITIZERS)
+        # Wall-clock benchmarks do not belong in a memory-safety gate:
+        # instrumentation makes their thresholds meaningless (~15x slower is
+        # expected, not a regression) and their ~255 renders dominate the run.
+        # The render path they exercise stays instrumented through the
+        # correctness tests (test_inference, test_temporal_accumulation,
+        # test_frame_pipeline), which assert on real inference and blending.
+        target_compile_definitions(nrr_tests PRIVATE NRR_SKIP_TIMING_TESTS=1)
+    endif()
     nrr_copy_ort_dll(nrr_tests)
 
     enable_testing()

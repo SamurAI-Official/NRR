@@ -161,8 +161,23 @@ void run_all_tests() {
     /* All latency tests via their own aggregator. The previous explicit list ran
      * only 8 of the 16 tests defined in test_latency.cpp; the other 8 (including
      * latency_motion_magnitude_alpha and latency_frame_index_continuity) were
-     * silently never executed. */
+     * silently never executed.
+     *
+     * NRR_SKIP_TIMING_TESTS is set for sanitizer builds (see CMakeLists.txt):
+     * those tests measure wall-clock time, so under instrumentation their
+     * thresholds (< 100ms per frame, fps > 0, jitter ratio < 5) would report
+     * regressions that do not exist, and their ~255 renders dominate the run.
+     * The banner below is deliberately explicit so an uninstrumented-timing run
+     * can never be mistaken for a green full suite. */
+#ifndef NRR_SKIP_TIMING_TESTS
     run_all_latency_tests();
+#else
+    std::cout << "\n--- Latency Tests: SKIPPED ---\n";
+    std::cout << "  16 wall-clock benchmarks in tests/performance/test_latency.cpp are not run\n";
+    std::cout << "  in this build (NRR_SKIP_TIMING_TESTS): timings under instrumentation are\n";
+    std::cout << "  not measurements. The render path they cover is still exercised by the\n";
+    std::cout << "  inference, temporal accumulation and frame pipeline tests above.\n";
+#endif
 
     
     print_test_summary();
@@ -182,6 +197,10 @@ void print_test_summary() {
     std::cout << "Passed: " << passed << std::endl;
     std::cout << "Failed: " << failed << std::endl;
     std::cout << "Success Rate: " << (total > 0 ? (100.0 * passed / total) : 0) << "%\n";
+#ifdef NRR_SKIP_TIMING_TESTS
+    std::cout << "Timing benchmarks: SKIPPED (NRR_SKIP_TIMING_TESTS: sanitizer build,\n";
+    std::cout << "                   16 latency benchmarks not run - see CMakeLists.txt)\n";
+#endif
     
     if (failed > 0) {
         std::cout << "\n--- Failed Tests ---\n";

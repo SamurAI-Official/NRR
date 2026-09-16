@@ -17,6 +17,10 @@ jobs:
   windows-build-test:
     name: Windows x64 - build + full test suite (ORT CPU EP)
     runs-on: windows-latest
+    # A hung NRR process would otherwise occupy a runner for GitHub's 6-hour
+    # default. The full suite is ~2 minutes on the runner; 30 is a fail-fast
+    # ceiling, not a budget.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +71,12 @@ jobs:
   windows-asan:
     name: Windows x64 - AddressSanitizer
     runs-on: windows-latest
+    # ~30x the uninstrumented suite was 18 minutes because the 16 wall-clock
+    # latency benchmarks (~255 renders at 256x256 -> 512x512) were being run
+    # under instrumentation; they are skipped in this build now
+    # (NRR_SKIP_TIMING_TESTS, see CMakeLists.txt). This ceiling still fails fast
+    # if an instrumented process hangs.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
