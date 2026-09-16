@@ -28,7 +28,7 @@ an ONNX Runtime session, and engine plugins that contained no executable code.
 | Godot plugin | Phase 11 items checked | **Not real**: `project.godot` + `plugin.cfg` only - zero `.gd`/`.gdextension` files in the repository. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
 | Performance | "GPU-ready" | 256x256 -> 512x512 single frame: ~59-74 ms, 16.7 fps sustained on the CPU EP. Specification target: <16 ms at 1080p -> 4K (~32x the pixels). No perf gate in CI. |
-| CI | none | Added in M0: `.github/workflows/ci.yml` (build + full suite, plus an advisory AddressSanitizer job). |
+| CI | none | `.github/workflows/ci.yml` added in M0: Windows x64 build + full suite against a real ONNX Runtime SDK, and a **blocking** AddressSanitizer job (61/61 tests clean under ASan, run #6). |
 
 ---
 
@@ -48,7 +48,7 @@ every claim becomes reproducible.
 - [x] README truth-up: false phase checkmarks, encoded status line, empty details
       block, broken build/licence section, stale project tree
 - [x] This document
-- [ ] Promote the ASan CI job to blocking once it has a green history
+- [x] Promote the ASan CI job to blocking once it has a green history (green in run #6)
 - [ ] Perf budget gate in CI (lands with M2, when there is something worth gating)
 
 ### M0 status detail: CI bring-up (runs #1 and #2)
@@ -123,17 +123,32 @@ as the available machines allow:
   Microsoft.VisualStudio.Component.VC.ASAN`). `tools/build.ps1 -Sanitize -RunTests`
   detects the missing runtime and stops with that instruction instead of failing
   obscurely at link time.
-* CI run #4 failed with the same status even after the DLL copy, so the unresolved
-  dependency is something else - and `0xC0000135` does not name it. The job now runs
-  `tools/diagnose_pe.ps1` on failure: it reads the import table of the built executables
-  with `dumpbin /DEPENDENTS` and reports every dependency that cannot be resolved on the
-  runner as an `::error::` annotation, so the next failing run names the DLL instead of
-  only its status code. The helper treats `api-ms-win-*` / `ext-ms-*` names as resolved,
-  because API-set names are virtual and never exist as files (an early version of the
-  helper reported them as missing).
-* Because it has not yet produced a green run, the CI ASan job
-  (`.github/workflows/ci.yml`, `windows-asan`) stays `continue-on-error: true`. It must
-  be promoted to a blocking gate - and this note updated - once it runs green.
+* CI run #4 still failed, and `tools/diagnose_pe.ps1` - added for exactly this class of
+  problem - then named the culprit:
+
+  ```
+  PE dependencies missing for nrr_tests.exe: clang_rt.asan_dynamic-x86_64.dll
+  PE dependencies missing for nrr.dll: clang_rt.asan_dynamic-x86_64.dll
+  ```
+
+  The deployment of the ASan runtime was gated on Visual Studio *generator* detection,
+  which returns nothing on the runner even though CMake builds with MSVC anyway (the
+  default Windows generator is Visual Studio). The DLL copy and the `PATH` entry were
+  therefore silently skipped. The deployment is now gated on Windows + sanitizers, and
+  generator detection has a second query as a fallback and reports itself in the notice.
+* Run #6 (2026-09-16) was the first fully green ASan run. The notice annotation reported
+
+  ```
+  NRR CI: 6 test executable(s) passed (AddressSanitizer build, generator: CMake default). Total:  61, Passed: 61, Failed: 0
+  ```
+
+  so the entire suite (61 tests across six executables) is clean under MSVC
+  AddressSanitizer. The job is now a **blocking** gate (`continue-on-error` removed).
+* Observation carried forward from that notice: on the runner the generator reads as
+  `CMake default` because `vswhere` reports no installation version there, so `build.ps1`
+  does not pass `-G`. CMake picks the newest Visual Studio generator regardless, so the
+  build is the same - and the fallback plus the notice mean this can no longer hide
+  silently, which is how the ASan deployment bug survived two runs.
 
 ### M0 status detail: verifiable CI results
 

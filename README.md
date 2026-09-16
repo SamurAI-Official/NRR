@@ -320,8 +320,9 @@ five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_tempo
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
-runs the full suite. A second, currently advisory job runs the suite under
-AddressSanitizer and is promoted to blocking once it has a green history.
+runs the full suite. A second, blocking job runs the same suite under MSVC
+AddressSanitizer (61/61 tests clean), and a failing sanitizer run publishes the
+unresolved DLL dependencies of the built binaries as annotations.
 
 ## Roadmap
 

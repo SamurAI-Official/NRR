@@ -56,16 +56,17 @@ jobs:
   # ---------------------------------------------------------------------------
   # Memory-safety gate: AddressSanitizer build of the runtime + test suite.
   #
-  # Advisory (continue-on-error) until it has been observed green on the runner
-  # for a few runs; promote to blocking by deleting continue-on-error once the
-  # ASan job has a stable history. See docs/roadmap.md (M0).
-  # Note: the ASan build intentionally runs the suite with the default model
-  # fixtures; it is a bug detector, not a performance gate.
+  # Blocking since run #6 (2026-09-16), which was the first green ASan run: the
+  # instrumented build links on the runner, the runtime DLL is deployed next to the
+  # executables, and all six test executables pass under ASan with no findings.
+  # Two failures had to be fixed first - see "M0 status detail: AddressSanitizer"
+  # in docs/roadmap.md.
+  #
+  # The ASan build is a bug detector, not a performance gate.
   # ---------------------------------------------------------------------------
   windows-asan:
     name: Windows x64 - AddressSanitizer
     runs-on: windows-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
