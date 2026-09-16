@@ -298,7 +298,6 @@ The memory-safety gate is now the *cheaper* of the two jobs. Both jobs also carr
 force-runs them on Node 24, so they work; the warning is cosmetic). Bumping the action
 majors is a separate, independently-verifiable change and is deliberately not bundled here.
 
-
 ### M1.3 - Scene-reset handling
 
 **Problem.** `README.md` advertised "[x] Scene reset handling", but nothing
