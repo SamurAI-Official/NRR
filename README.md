@@ -41,7 +41,7 @@ nrr/
 │   └── reference_conditioning.md
 │
 ├── include/
-│   └── nrr.h                   # Phase 1: public C API (~45 entry points)
+│   └── nrr.h                   # Phase 1: public C API (44 entry points)
 │
 ├── runtime/                    # Phase 1: C++ runtime
 │   ├── nrr_runtime.h

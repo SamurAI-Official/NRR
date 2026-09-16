@@ -329,7 +329,7 @@ history by accident.
 | `runtime/nrr_backend.h` | `Backend::reset_temporal_history()` (default no-op) |
 | `runtime/backend_cpu.{h,cpp}` | applies the policy per frame, clears history + state on a change, implements the override |
 | `runtime/nrr_device.{h,cpp}` | `DeviceImpl::reset_temporal_history()` forwards to the backend |
-| `include/nrr.h`, `runtime/nrr_c_api.cpp` | `nrr_reset_temporal_history(device)` |
+| `include/nrr.h`, `runtime/nrr_c_api.cpp` | `nrr_device_reset_temporal_history(device)` |
 
 The per-frame check happens *before* the blend, so the frame that detects the cut
 is already rendered without history: a cut frame reports `alpha=0` and a blend
@@ -346,6 +346,7 @@ delta of exactly `0`, and the frame after it resumes the pre-cut alpha.
 
 Entry points: `NRR_ENTRY_POINT_COUNT` 43 -> 44 and `test_api_entry_point_count`
 updated with the new export.
+
 ## M2 - Real GPU execution
 
 Prerequisites: an ONNX Runtime build that ships the DirectML provider (runs on any
