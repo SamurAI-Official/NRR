@@ -94,9 +94,15 @@ NRR_TEST(test_basic_frame_pipeline) {
     nrr_device_destroy(device);
 }
 
-NRR_TEST(test_temporal_state_update) {
-    NRRDevice* dummy_device = nullptr;
-    
+/* A render that cannot run (no model) must fail *and* leave the caller's frame
+ * state untouched. Previously this test asserted a temporal_alpha that the
+ * pipeline never computed; the pipeline now writes measured state only after a
+ * successful render, so a failed render can no longer look like a completed one. */
+NRR_TEST(test_temporal_state_not_fabricated_without_model) {
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRR_EXPECT_EQ(nrr_device_create(&options, &device), NRR_SUCCESS, "device creation");
+
     NRRFrameInput input = {};
     input.temporal.frame_index = 1;
     input.temporal.delta_time = 0.016f;
@@ -104,22 +110,26 @@ NRR_TEST(test_temporal_state_update) {
     input.temporal.resolution_y = 1080;
     input.temporal.motion_magnitude = 0.2f;
     input.temporal.temporal_alpha = 0.0f;
-    
+
     NRRFrameOutput output = {};
     output.temporal = input.temporal;
-    output.temporal.temporal_alpha = 0.7f;
-    
-    NRR_EXPECT_EQ(output.temporal.frame_index, 1, "Frame index should be 1");
-    NRR_EXPECT_TRUE(output.temporal.temporal_alpha > 0.0f, "Temporal alpha should be set");
-    
-    input.temporal.frame_index = 2;
-    input.temporal.motion_magnitude = 0.5f;
-    output.temporal = input.temporal;
-    output.temporal.temporal_alpha = 0.5f;
-    
-    NRR_EXPECT_EQ(output.temporal.frame_index, 2, "Frame index should be 2");
-    std::cout << "  Frame 2 motion: " << output.temporal.motion_magnitude 
-              << ", alpha: " << output.temporal.temporal_alpha << std::endl;
+    output.temporal.temporal_alpha = 0.55f;
+    output.temporal.history_frames = 7;
+
+    const NRRResult r = nrr_render(device, nullptr, nullptr, &input, &output);
+    NRR_EXPECT_EQ(r, NRR_ERROR_MODEL_LOAD_FAILED, "rendering without a model fails");
+
+    /* The pipeline reports temporal state only for frames it actually rendered,
+     * so the caller's values survive an unsuccessful render. */
+    NRR_EXPECT_EQ(output.temporal.frame_index, 1u, "frame index is not rewritten");
+    NRR_EXPECT_NEAR(output.temporal.temporal_alpha, 0.55f, 1e-6,
+                    "temporal alpha is not fabricated by a failed render");
+    NRR_EXPECT_EQ(output.temporal.history_frames, 7u,
+                  "history depth is not fabricated by a failed render");
+    NRR_EXPECT_TRUE(output.color == nullptr,
+                    "a failed render publishes no output texture");
+
+    nrr_device_destroy(device);
 }
 
 } // namespace test

@@ -7,6 +7,7 @@
 #include "unit/test_inference.cpp"
 #include "integration/test_frame_pipeline.cpp"
 #include "integration/test_multi_frame.cpp"
+#include "integration/test_temporal_accumulation.cpp"
 #include "integration/test_reference_conditioning.cpp"
 #include "performance/test_render_time.cpp"
 #include "performance/test_latency.cpp"
@@ -88,13 +89,24 @@ void run_all_tests() {
     NRR_RUN_TEST(test_mali_backend_name);
     NRR_RUN_TEST(test_adreno_capabilities_structure);
     NRR_RUN_TEST(test_mali_capabilities_structure);
+    /* test_mobile_model.cpp: previously defined but never registered, so these
+     * six never ran anywhere despite CMakeLists.txt documenting the file as
+     * "integrated into the unified test suite". They require the vendor backends
+     * to accept device creation, so they run under the same guard as the vendor
+     * tests above. */
+    NRR_RUN_TEST(test_adreno_backend_registration);
+    NRR_RUN_TEST(test_mali_backend_registration);
+    NRR_RUN_TEST(test_adreno_capabilities);
+    NRR_RUN_TEST(test_mali_capabilities);
+    NRR_RUN_TEST(test_mobile_texture_operations);
+    NRR_RUN_TEST(test_mobile_buffer_operations);
 #endif
 
 #ifndef _WIN32
     std::cout << "\n--- Android Platform Tests ---\n";
     NRR_RUN_TEST(test_android_power_manager_init);
     NRR_RUN_TEST(test_android_power_status);
-    NRR_RUN_TEST(test_android_thermal_states);
+    NRR_RUN_TEST(test_android_thermal_throttling);
     NRR_RUN_TEST(test_android_power_profiles);
     NRR_RUN_TEST(test_android_resolution_scaling);
 
@@ -104,6 +116,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_ios_thermal_states);
     NRR_RUN_TEST(test_ios_power_profiles);
     NRR_RUN_TEST(test_ios_resolution_scaling);
+    NRR_RUN_TEST(test_ios_low_power_mode);
 #endif
 
     std::cout << "\n--- Mobile Constraint Tests ---\n";
@@ -120,14 +133,24 @@ void run_all_tests() {
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);
-    NRR_RUN_TEST(test_temporal_state_update);
+    NRR_RUN_TEST(test_temporal_state_not_fabricated_without_model);
     NRR_RUN_TEST(test_temporal_history_buffer);
     NRR_RUN_TEST(test_motion_magnitude_calculation);
+    NRR_RUN_TEST(test_temporal_state_manager_policy);
+    NRR_RUN_TEST(test_temporal_record_frame);
+    NRR_RUN_TEST(test_temporal_blend_frame);
+    NRR_RUN_TEST(test_temporal_blend_reprojects_history);
     NRR_RUN_TEST(test_conditioning_weights_and_domains);
     NRR_RUN_TEST(test_conditioning_prepare_and_apply);
     NRR_RUN_TEST(test_provenance_permissions);
     NRR_RUN_TEST(test_identity_embedding_copy);
     NRR_RUN_TEST(test_reference_set_builder);
+
+    std::cout << "\n--- Temporal Accumulation Tests (render path) ---\n";
+    NRR_RUN_TEST(test_temporal_state_reported_from_pipeline);
+    NRR_RUN_TEST(test_temporal_accumulation_applies_measured_blend);
+    NRR_RUN_TEST(test_temporal_motion_above_threshold_bypasses_history);
+    NRR_RUN_TEST(test_temporal_stability_reported_from_displayed_frames);
     
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);
@@ -135,15 +158,11 @@ void run_all_tests() {
     NRR_RUN_TEST(performance_buffer_creation_time);
 
 
-    std::cout << "\n--- Latency Tests ---\n";
-    NRR_RUN_TEST(latency_single_frame);
-    NRR_RUN_TEST(latency_distribution_burst);
-    NRR_RUN_TEST(latency_temporal_accumulation);
-    NRR_RUN_TEST(latency_sustained_throughput);
-    NRR_RUN_TEST(latency_jitter);
-    NRR_RUN_TEST(latency_stats_consistency);
-    NRR_RUN_TEST(latency_no_model_budget);
-    NRR_RUN_TEST(latency_wait_idle);
+    /* All latency tests via their own aggregator. The previous explicit list ran
+     * only 8 of the 16 tests defined in test_latency.cpp; the other 8 (including
+     * latency_motion_magnitude_alpha and latency_frame_index_continuity) were
+     * silently never executed. */
+    run_all_latency_tests();
 
     
     print_test_summary();

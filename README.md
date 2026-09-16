@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 61/61 tests green). Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 77/77 tests green), with M1.1 temporal accumulation wired into the render path. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -13,13 +13,16 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
-> **Reality check (M0, verified by code inspection).** Real neural inference runs on
-> the CPU execution provider only: the execution-provider layer is a decision function
-> that never attaches a provider to an ONNX Runtime session, the shipped model is an
-> untrained identity fixture, the temporal and reference/conditioning paths do not yet
-> change the rendered image, `.nrrmodel` payloads are not parsed, and the Unreal and
-> Godot plugins contain no executable code. [docs/roadmap.md](docs/roadmap.md) lists
-> every gap together with the milestone that closes it.
+> **Reality check (M1 in progress, verified by code inspection).** Real neural inference
+> runs on the CPU execution provider only: the execution-provider layer is a decision
+> function that never attaches a provider to an ONNX Runtime session, the shipped model
+> is an untrained identity fixture, `.nrrmodel` payloads are not parsed, and the Unreal
+> and Godot plugins contain no executable code. The temporal path **is** now wired into
+> the render path (motion reprojection + blend, measured state), but it accumulates an
+> untrained model's output, so it reduces flicker without improving detail; the
+> reference/conditioning path still does not reach the model.
+> [docs/roadmap.md](docs/roadmap.md) lists every gap together with the milestone that
+> closes it.
 
 ---
 
@@ -127,15 +130,29 @@ neural inference today happens on one path only: the CPU backend.
 - [x] Model execution test (real end-to-end inference in the unified suite)
 - [ ] Trained model with a measured quality gate (PSNR/SSIM) - see M1
 
-### Phase 4 - Temporal Neural Rendering (partial: not wired into the render path)
-- [x] Temporal history buffer (ring buffer)
-- [x] Motion vector warping (backward mapping + bilinear)
-- [x] Temporal state manager (dynamic alpha)
-- [x] Temporal stability metrics
+### Phase 4 - Temporal Neural Rendering (wired into the render path; untrained model)
+- [x] Temporal history buffer (ring buffer; depth 2 - only the previous displayed frame
+      is ever reprojected)
+- [x] Motion vector warping (backward mapping + bilinear, in output texels)
+- [x] Temporal state manager (motion-adaptive alpha: 0.7 below the 0.3 motion threshold,
+      decaying to 0 at full motion)
+- [x] Temporal stability metric (measured frame-over-frame change of the displayed image,
+      reported in `NRRRenderStats::temporal_stability`)
 - [x] Scene reset handling
-- [ ] Full integration with neural renderer (today `output.temporal = input.temporal`
-      in runtime/backend_cpu.cpp - a passthrough)
-- [ ] Temporal blending (alpha compositing) into the output image
+- [x] Integration with the renderer: `runtime/backend_cpu.cpp` drives history, warping and
+      alpha from `execute_model`, reprojects the previous displayed frame through the
+      current motion field, blends it into the output image, and reports measured state in
+      `NRRFrameOutput::temporal` (the `output.temporal = input.temporal` passthrough is
+      gone from the ONNX path; the placeholder path without an ONNX session still echoes
+      the input and reports a hard-coded stability). Verified by
+      `tests/integration/test_temporal_accumulation.cpp`.
+- [x] Temporal blending (alpha compositing) into the output image
+- [ ] Temporal accumulation that improves detail: today it accumulates the *untrained*
+      fixture, so it only reduces flicker. Needs M1's trained model.
+- [ ] Disocclusion rejection and clamping (history is currently trusted wherever the
+      motion field says it reprojects)
+- [ ] Flicker regression gate in CI (the metric is reported and asserted in the suite,
+      but not yet compared against a committed quality baseline)
 
 ### Phase 5 - Reference-Conditioned Rendering (partial: nothing reaches the model)
 - [x] Reference file format (.nrrref) support
@@ -312,7 +329,7 @@ pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
 
 ## Testing
 
-`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 61 tests) plus the
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 77 tests) plus the
 five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
@@ -321,8 +338,9 @@ five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_tempo
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
 runs the full suite. A second, blocking job runs the same suite under MSVC
-AddressSanitizer (61/61 tests clean), and a failing sanitizer run publishes the
-unresolved DLL dependencies of the built binaries as annotations.
+AddressSanitizer (clean over that suite; last published run at M0 reported 61/61, and
+the M1 suite runs under the same job on every push), and a failing sanitizer run
+publishes the unresolved DLL dependencies of the built binaries as annotations.
 
 ## Roadmap
 

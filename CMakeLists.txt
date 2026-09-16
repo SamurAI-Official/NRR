@@ -367,9 +367,14 @@ if(NRR_BUILD_TESTS)
     add_test(NAME NRRConditioningTest COMMAND test_nrr_conditioning)
 
     # Mobile platform tests (test_android, test_ios, test_mobile_model) are
-    # integrated into the unified test suite via tests/main.cpp and run from
+    # compiled into the unified suite through tests/main.cpp and run from
     # nrr_tests.exe. They are NOT standalone executables because they use the
     # unified test_framework.h (NRR_TEST macros, no main()).
+    #
+    # test_android/test_ios are registered under `#ifndef _WIN32`, and the
+    # test_mobile_model vendor tests under `#ifdef NRR_ENABLE_MOBILE_VENDOR`
+    # (on by default for Android/iOS, off for desktop), so on a desktop build
+    # only the platform-independent mobile constraints tests run.
 endif()
 
 # ============================================================================

@@ -14,8 +14,8 @@
 
 namespace nrr {
 
-static const float BASE_TEMPORAL_ALPHA = 0.7f;
-static const float MOTION_THRESHOLD = 0.3f;
+static const float BASE_TEMPORAL_ALPHA = TEMPORAL_BASE_ALPHA;
+static const float MOTION_THRESHOLD = TEMPORAL_MOTION_THRESHOLD;
 
 // ============================================================================
 // TemporalHistory
@@ -49,7 +49,7 @@ void TemporalHistory::add_frame(uint64_t frame_index, float timestamp,
     entry.color_format = color_format;
     entry.depth_format = depth_format;
 
-    history_.push_back(entry);
+    history_.push_back(std::move(entry));
     if (history_.size() > max_frames_) {
         history_.erase(history_.begin());
     }
@@ -62,17 +62,30 @@ bool TemporalHistory::get_previous_frame(uint64_t current_frame_index,
                                          std::vector<float>& motion,
                                          uint32_t& width, uint32_t& height) const {
     std::lock_guard<std::mutex> lock(mutex_);
+    const int index = find_previous_index_locked(current_frame_index);
+    if (index < 0) {
+        return false;
+    }
+    color = history_[static_cast<size_t>(index)].color_data;
+    depth = history_[static_cast<size_t>(index)].depth_data;
+    motion = history_[static_cast<size_t>(index)].motion_data;
+    width = history_[static_cast<size_t>(index)].width;
+    height = history_[static_cast<size_t>(index)].height;
+    return true;
+}
+
+int TemporalHistory::find_previous_index_locked(uint64_t current_frame_index) const {
     for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
-        if (history_[i].frame_index < current_frame_index) {
-            color = history_[i].color_data;
-            depth = history_[i].depth_data;
-            motion = history_[i].motion_data;
-            width = history_[i].width;
-            height = history_[i].height;
-            return true;
+        if (history_[static_cast<size_t>(i)].frame_index < current_frame_index) {
+            return i;
         }
     }
-    return false;
+    return -1;
+}
+
+bool TemporalHistory::has_previous_frame(uint64_t current_frame_index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return find_previous_index_locked(current_frame_index) >= 0;
 }
 
 void TemporalHistory::clear() {
@@ -208,6 +221,53 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
     return true;
 }
 
+bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, uint32_t height,
+                                   const HistoryEntry& previous,
+                                   const std::vector<float>& current_motion,
+                                   float motion_vectors_scale, float alpha,
+                                   TemporalBlendStats* stats) {
+    if (stats) {
+        stats->mean_abs_delta = 0.0f;
+        stats->blended_pixels = 0;
+    }
+    if (!initialized_) return false;
+    if (current.empty() || width == 0 || height == 0) return false;
+    /* A history entry without an image (placeholder capture) cannot be reprojected. */
+    if (previous.color_data.empty()) return false;
+    if (previous.width != width || previous.height != height) return false;
+    if (previous.color_data.size() != current.size()) return false;
+    /* Backward warping needs the motion field of the frame being rendered. */
+    if (current_motion.size() < static_cast<size_t>(width) * height * 2) return false;
+    if (!(alpha > 0.0f && alpha < 1.0f)) return false;
+
+    /* warp_previous_output() reads the motion field from the history entry it is
+     * handed. Backward reprojection must use the *current* frame's motion, so the
+     * previous entry's color/depth are combined with this frame's motion. */
+    HistoryEntry warp_src = previous;
+    warp_src.motion_data = current_motion;
+
+    NRRFrameInput warp_input = {};
+    warp_input.temporal.motion_vectors_scale = motion_vectors_scale;
+
+    std::vector<float> warped_color, warped_depth;
+    if (!warp_previous_output(warp_input, warp_src, warped_color, warped_depth)) return false;
+    if (warped_color.size() != current.size()) return false;
+
+    double accumulated_delta = 0.0;
+    for (size_t i = 0; i < current.size(); ++i) {
+        const float blended = (1.0f - alpha) * current[i] + alpha * warped_color[i];
+        accumulated_delta += std::fabs(blended - current[i]);
+        current[i] = blended;
+    }
+
+    if (stats) {
+        stats->mean_abs_delta =
+            static_cast<float>(accumulated_delta / static_cast<double>(current.size()));
+        stats->blended_pixels = width * height;
+    }
+    return true;
+}
+
 bool TemporalRenderer::process_frame(const NRRFrameInput& input, NRRFrameOutput& output,
                                      const TemporalHistory& history) {
     output.temporal = input.temporal;
@@ -291,12 +351,8 @@ float TemporalStateManager::analyze_motion(const NRRFrameInput& input,
     return std::max(0.0f, std::min(input.temporal.motion_magnitude, 1.0f));
 }
 
-NRRTemporalState TemporalStateManager::update_state(NRRDevice* device,
-                                                    const NRRFrameInput& input,
-                                                    const NRRFrameOutput& output,
-                                                    TemporalHistory& history) {
-    (void)device;
-
+NRRTemporalState TemporalStateManager::compute_state(const NRRFrameInput& input,
+                                                    const TemporalHistory& history) {
     NRRTemporalState state = input.temporal;
     current_motion_magnitude_ = analyze_motion(input,
                                                input.temporal.resolution_x,
@@ -323,23 +379,44 @@ NRRTemporalState TemporalStateManager::update_state(NRRDevice* device,
     }
 
     state.temporal_alpha = temporal_alpha_;
+    /* History depth *available to this frame* (the frame is recorded afterwards,
+     * so a first frame reports zero history and an alpha of zero). */
     state.history_frames = history.get_frame_count();
     frame_index_ = input.temporal.frame_index;
+    return state;
+}
 
-    // Record the current frame in history so the next update has context.
-    uint32_t sw = input.temporal.resolution_x;
-    uint32_t sh = input.temporal.resolution_y;
-    if (sw > 0 && sh > 0) {
-        // Bounded placeholder capture (empty vectors); a real pipeline stores
-        // the rendered output textures here.
-        std::vector<float> empty_color;
-        std::vector<float> empty_depth;
-        std::vector<float> empty_motion;
-        history.add_frame(input.temporal.frame_index, input.temporal.delta_time,
-                          empty_color, empty_depth, empty_motion,
-                          sw, sh, NRR_TEXTURE_FORMAT_RGBA8, NRR_TEXTURE_FORMAT_R32F);
+void TemporalStateManager::record_frame(const NRRFrameInput& input,
+                                        const TemporalFrameData& frame,
+                                        TemporalHistory& history) {
+    uint32_t sw = frame.has_image() ? frame.width : input.temporal.resolution_x;
+    uint32_t sh = frame.has_image() ? frame.height : input.temporal.resolution_y;
+    if (sw == 0 || sh == 0) {
+        return;
     }
+    /* Without image data this records a bounded placeholder entry (the previous
+     * behaviour); such an entry is never warped because its color vector is empty. */
+    history.add_frame(input.temporal.frame_index, input.temporal.delta_time,
+                      frame.color, frame.depth, frame.motion,
+                      sw, sh, frame.color_format, frame.depth_format);
+}
 
+NRRTemporalState TemporalStateManager::update_state(NRRDevice* device,
+                                                    const NRRFrameInput& input,
+                                                    const NRRFrameOutput& output,
+                                                    TemporalHistory& history) {
+    return update_state(device, input, output, history, TemporalFrameData());
+}
+
+NRRTemporalState TemporalStateManager::update_state(NRRDevice* device,
+                                                    const NRRFrameInput& input,
+                                                    const NRRFrameOutput& output,
+                                                    TemporalHistory& history,
+                                                    const TemporalFrameData& frame) {
+    (void)device;
+    (void)output;
+    NRRTemporalState state = compute_state(input, history);
+    record_frame(input, frame, history);
     return state;
 }
 

@@ -9,6 +9,7 @@
 #define NRR_BACKEND_CPU_H
 
 #include "nrr_backend.h"
+#include "nrr_temporal.h"
 #include <vector>
 #include <unordered_map>
 
@@ -72,6 +73,20 @@ private:
         NRRTextureFormat format;
     };
     std::unordered_map<void*, CPUImage> cpu_textures_;
+
+    /* Temporal accumulation (see nrr_temporal.h).
+     *
+     * temporal_history_ holds the frames that were actually displayed, at the
+     * render output resolution; temporal_state_ derives the motion-adaptive
+     * history weight, and temporal_renderer_ performs the backward reprojection
+     * and blend. The history depth is 2 because only the immediately previous
+     * frame is ever reprojected - a deeper ring would only cost memory.
+     *
+     * Memory: 2 frames x 3 channels x W x H x 4 bytes (e.g. ~6 MB at 512x512,
+     * ~50 MB at 1920x1080). */
+    TemporalHistory temporal_history_;
+    TemporalStateManager temporal_state_;
+    TemporalRenderer temporal_renderer_;
 };
 
 // Backend registration
