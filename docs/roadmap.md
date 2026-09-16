@@ -51,6 +51,27 @@ every claim becomes reproducible.
 - [ ] Promote the ASan CI job to blocking once it has a green history
 - [ ] Perf budget gate in CI (lands with M2, when there is something worth gating)
 
+### M0 status detail: CI run #1 (first run of this workflow)
+
+Run #1 (`35074715217`) failed in 20 seconds - both jobs died inside `tools/build.ps1`
+with:
+
+```
+Cannot overwrite variable IsWindows because it is read-only or constant.
+```
+
+The script assigned `$isWindows`, and PowerShell 7 exposes `$IsWindows` as a **read-only
+automatic variable** (PowerShell variable names are case-insensitive). Local validation
+had only ever used Windows PowerShell 5.1, which does not define that variable - so the
+bug existed only under `pwsh`, which is the shell CI uses.
+
+Fixes: rename to `$onWindows`; validate under pwsh locally from now on (the portable
+PowerShell 7 zip is enough - no install, no PATH change); and make `build.ps1` emit a
+GitHub `::error::` check annotation on failure, so a CI failure stays diagnosable via
+the public annotations API when job logs require authentication. The postmortem stays
+here because "it works on my machine" is precisely the class of claim this milestone
+exists to remove: the CI shell has to be reproducible on the development machine.
+
 ### M0 status detail: AddressSanitizer
 
 `NRR_ENABLE_SANITIZERS=ON` + `tools/build.ps1 -Sanitize` are wired and verified as far

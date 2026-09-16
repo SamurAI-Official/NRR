@@ -41,6 +41,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Surface failures without needing the raw CI log: GitHub turns "::error::" into a
+# check annotation, which stays readable through the public API even when job logs
+# require authentication. (This is how the pwsh 7 "$IsWindows" bug was diagnosed.)
+trap {
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        Write-Host "::error::tools/build.ps1 failed: $($_.Exception.Message)"
+    }
+    Write-Host "--- failure detail ---"
+    Write-Host ($_ | Out-String)
+    exit 1
+}
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if ([System.IO.Path]::IsPathRooted($BuildDir)) {
@@ -49,8 +61,12 @@ if ([System.IO.Path]::IsPathRooted($BuildDir)) {
     $buildPath = Join-Path $repoRoot $BuildDir
 }
 
-$isWindows = $true
-if ($PSVersionTable.PSVersion.Major -ge 6) { $isWindows = $IsWindows }
+# NOTE: deliberately not named $isWindows - PowerShell 7 exposes a read-only
+# automatic variable $IsWindows, and PowerShell variable names are
+# case-insensitive, so assigning to $isWindows aborts the script under pwsh.
+# (This is exactly what broke CI run #1, where the shell is pwsh 7.x.)
+$onWindows = $true
+if ($PSVersionTable.PSVersion.Major -ge 6) { $onWindows = $IsWindows }
 
 # ---------------------------------------------------------------------------
 # Toolchain discovery
@@ -144,7 +160,7 @@ Write-Host "[build] repo:  $repoRoot"
 Write-Host "[build] cmake: $cmake"
 
 $generator = $null
-if ($isWindows) { $generator = Get-VisualStudioGenerator }
+if ($onWindows) { $generator = Get-VisualStudioGenerator }
 if ($generator) {
     Write-Host "[build] generator: $generator (x64)"
 } else {
