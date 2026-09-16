@@ -29,14 +29,22 @@ static uint32_t    g_tex_h     = 256;
 static bool        g_render_ok = false;
 
 static NRRModel* try_load_model(NRRDevice* dev) {
+    /* Model paths come from the build system as absolute paths (NRR_SAMPLE_MODEL,
+     * NRR_PASSTHROUGH_MODEL) so the benchmark measures a real model no matter
+     * which directory the test binary is launched from. Relative fallbacks
+     * cover a manual run from the repository root or the build directory.
+     * Do not add developer-machine paths here - a benchmark that silently picks
+     * up a stray file measures nothing. */
     const char* candidates[] = {
 #ifdef NRR_SAMPLE_MODEL
         NRR_SAMPLE_MODEL, /* real ONNX upscaler when the sample model exists */
 #endif
-        "test_model.onnx",
-        "../../test_model.onnx",
-        "../test_model.onnx",
-        "g:/Program Prototype/NRR/test_model.onnx"
+#ifdef NRR_PASSTHROUGH_MODEL
+        NRR_PASSTHROUGH_MODEL,
+#endif
+        "models/nrr_upscaler_v0.1.onnx",
+        "../models/nrr_upscaler_v0.1.onnx",
+        "../../models/nrr_upscaler_v0.1.onnx"
     };
     for (const char* p : candidates) {
         NRRModel* m = nullptr;

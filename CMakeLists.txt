@@ -12,6 +12,32 @@ option(NRR_BUILD_SHARED "Build as shared library" ON)
 option(NRR_BUILD_TESTS "Build tests" ON)
 
 # ---------------------------------------------------------------------------
+# Sanitizers - memory-safety instrumentation for CI and local hardening runs.
+#
+#   pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
+#
+# MSVC:  AddressSanitizer (/fsanitize=address). Requires the
+#        "C++ AddressSanitizer" component of the Visual Studio installer
+#        (otherwise clang_rt.asan_dynamic-x86_64.dll is missing and the
+#        binaries will not start - tools/build.ps1 detects this).
+# GCC/Clang: AddressSanitizer + UndefinedBehaviorSanitizer.
+# ---------------------------------------------------------------------------
+option(NRR_ENABLE_SANITIZERS "Build with AddressSanitizer (+UBSan on GCC/Clang)" OFF)
+if(NRR_ENABLE_SANITIZERS)
+    if(MSVC)
+        # MSVC: /fsanitize=address instruments at compile time and pulls the ASan
+        # runtime in automatically, so it must not be forwarded to link.exe
+        # (that only produces "LNK4044: unrecognized option" warnings).
+        add_compile_options(/fsanitize=address /Zi)
+        message(STATUS "Sanitizers: MSVC AddressSanitizer enabled")
+    else()
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=address,undefined)
+        message(STATUS "Sanitizers: AddressSanitizer + UndefinedBehaviorSanitizer enabled")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Platform detection
 # ---------------------------------------------------------------------------
 if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Android")
@@ -375,6 +401,7 @@ message(STATUS "Version:          ${PROJECT_VERSION}")
 message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "Shared Library:   ${NRR_BUILD_SHARED}")
 message(STATUS "Build Tests:      ${NRR_BUILD_TESTS}")
+message(STATUS "Sanitizers:       ${NRR_ENABLE_SANITIZERS}")
 message(STATUS "Vulkan Backend:   ${NRR_ENABLE_VULKAN}")
 message(STATUS "NVIDIA Backend:   ${NRR_ENABLE_NVIDIA}")
 message(STATUS "AMD Backend:      ${NRR_ENABLE_AMD}")

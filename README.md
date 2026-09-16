@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete; 80 104 97 115 101 32 51 32 114 101 97 108 32 79 78 78 88 32 105 110 102 101 114 101 110 99 101 32 43 32 80 104 97 115 101 32 49 50 32 85 110 105 116 121 32 43 32 80 104 97 115 101 32 49 51 32 109 111 98 105 108 101 32 43 32 80 104 97 115 101 32 49 52 32 97 99 99 101 108 101 114 97 116 111 114 32 107 101 114 110 101 108 32 40 78 86 73 68 73 65 47 65 77 68 47 73 110 116 101 108 47 82 73 83 67 45 86 41 59 32 80 104 97 115 101 32 55 45 57 32 118 101 110 100 111 114 32 98 97 99 107 101 110 100 115 32 119 105 114 101 100 59 32 80 104 97 115 101 32 52 45 54 32 99 111 114 101 32 105 109 112 108 101 109 101 110 116 101 100 32 40 109 111 100 101 108 32 105 110 116 101 103 114 97 116 105 111 110 32 112 101 110 100 105 110 103 41 59 32 80 104 97 115 101 32 50 47 49 48 45 49 49 32 115 116 114 117 99 116 117 114 97 108 32 115 116 117 98 115  
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 61/61 tests green). Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -13,13 +13,21 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
+> **Reality check (M0, verified by code inspection).** Real neural inference runs on
+> the CPU execution provider only: the execution-provider layer is a decision function
+> that never attaches a provider to an ONNX Runtime session, the shipped model is an
+> untrained identity fixture, the temporal and reference/conditioning paths do not yet
+> change the rendered image, `.nrrmodel` payloads are not parsed, and the Unreal and
+> Godot plugins contain no executable code. [docs/roadmap.md](docs/roadmap.md) lists
+> every gap together with the milestone that closes it.
+
 ---
 
 ## Project Structure
 
 ```
 nrr/
-├── specification/              # Phase 0: Specification documents
+├── specification/              # Phase 0: specification documents
 │   ├── api.md
 │   ├── frame_contract.md
 │   ├── model_format.md
@@ -29,8 +37,8 @@ nrr/
 │   ├── temporal_rendering.md
 │   └── reference_conditioning.md
 │
-├── include/                    # Phase 1: Public C API
-│   └── nrr.h
+├── include/
+│   └── nrr.h                   # Phase 1: public C API (~45 entry points)
 │
 ├── runtime/                    # Phase 1: C++ runtime
 │   ├── nrr_runtime.h
@@ -38,36 +46,34 @@ nrr/
 │   ├── nrr_model.h/cpp
 │   ├── nrr_reference.h/cpp
 │   ├── nrr_reference_impl.h/cpp  # Phase 5: .nrrref references + provenance
-│   ├── nrr_temporal.h/cpp        # Phase 4: Temporal rendering
-│   ├── nrr_conditioning.h/cpp    # Phase 6: Identity/material conditioning
+│   ├── nrr_temporal.h/cpp        # Phase 4: temporal rendering
+│   ├── nrr_conditioning.h/cpp    # Phase 6: identity/material conditioning
 │   ├── nrr_backend.h
 │   ├── nrr_c_api.cpp
+│   ├── nrr_inference.h/cpp
 │   ├── onnx_runtime.h/cpp        # Phase 3: ONNX Runtime wrapper
-│   ├── backend_cpu.cpp/h
-│   ├── backend_vulkan.cpp/h
+│   ├── backend_cpu.cpp/h         # the only backend that executes today
+│   ├── backend_vulkan.cpp/h      # Phase 2: placeholder
+│   ├── backend_nvidia.cpp/h      # Phase 7: structural (NRR_ENABLE_NVIDIA)
+│   ├── backend_amd.cpp/h         # Phase 8: structural (NRR_ENABLE_AMD)
+│   ├── backend_intel.cpp/h       # Phase 9: structural (NRR_ENABLE_INTEL)
+│   ├── backend_riscv.cpp/h       # Phase 14: structural (NRR_ENABLE_RISCV)
 │   ├── backend_registry.cpp
-│   ├── backend_nvidia.h          # Phase 7: NVIDIA backend
-│   ├── backend_amd.h             # Phase 8: AMD backend
-│   └── backend_intel.h           # Phase 9: Intel backend
+│   ├── accel_kernel.cpp/h        # Phase 14: shared accelerator execution kernel
+│   ├── mobile/                   # Phase 13: mobile kernel + vendor backends
+│   └── platform/                 # Phase 13: Android (NDK/JNI) + iOS (Obj-C++) bridges
 │
-├── models/                     # Phase 3: sample upscaler (.onnx) + architecture docs
-├── engine_plugins/             # Phase 10-12: Engine integration (Unreal/Godot/Unity)
-├── tools/                      # gen_sample_model.py + fetch_ort.ps1
-├── mobile/                     # Phase 13: Mobile vendor backends (Adreno, Mali)
-├── platform/                   # Phase 13: Platform integration (Android NDK, iOS)
-├── tests/                      # Phase 1: Tests
-│   ├── test_framework.h
-│   ├── main.cpp                # Unified test suite entry point
-│   ├── test_nrr_basic.cpp
-│   ├── test_nrr_model.cpp
-│   ├── test_nrr_temporal.cpp
-│   ├── test_nrr_reference.cpp
-│   ├── test_nrr_conditioning.cpp
-│   ├── unit/                   # Unit tests (API, device, model, reference, backend)
-│   ├── integration/            # Integration tests (frame pipeline, multi-frame, conditioning)
-│   ├── performance/            # Performance tests (render time, latency)
-│   └── mobile/                 # Phase 13: Mobile-specific tests
+├── models/                     # Phase 3: sample .onnx fixtures + architecture docs
+├── engine_plugins/             # Phase 10-12: Unreal (headers only), Godot (config only), Unity (code)
+├── tools/                      # gen_sample_model.py, fetch_ort.ps1, build.ps1
+├── docs/                       # roadmap.md (authoritative status + plan)
+├── tests/                      # unified suite (main.cpp) + standalone phase tests
+│   ├── unit/                   # API, device, model, reference, backend, inference, mobile
+│   ├── integration/            # frame pipeline, multi-frame, reference/conditioning
+│   ├── performance/            # render time, latency
+│   └── mobile/                 # Phase 13 mobile tests (guarded; not run on device)
 │
+├── .github/workflows/ci.yml    # build + full suite; advisory AddressSanitizer job
 ├── CMakeLists.txt
 ├── Makefile
 └── README.md
@@ -77,12 +83,14 @@ nrr/
 
 ## Phase Status
 
-<details>
-<summary>Phase Status (click to expand full checklist)</summary>
+Legend: `[x]` means the code exists in the repository and is exercised by the test
+suite that runs in CI. It does **not** mean the feature has been executed on the
+hardware it targets. Items are labelled `structural` when the code exists but has
+never run on the hardware it exists for, and `gated` when an SDK or device is
+required (see [docs/roadmap.md](docs/roadmap.md) for evidence and the plan). Real
+neural inference today happens on one path only: the CPU backend.
 
-</details>
-
-### Phase 0 ✅ - Specification
+### Phase 0 - Specification (complete)
 - [x] API specification
 - [x] Frame contract
 - [x] Model format
@@ -90,7 +98,7 @@ nrr/
 - [x] Capability matrix
 - [x] Backend interface
 
-### Phase 1 ✅ - C API
+### Phase 1 - C API (complete)
 - [x] Public C header (nrr.h)
 - [x] C++ runtime foundation
 - [x] Device/model/reference management
@@ -100,37 +108,46 @@ nrr/
 - [x] Backend selection
 - [x] Basic test
 
-### Phase 2 🔲 - Vulkan Backend
+### Phase 2 - Vulkan Backend (not implemented)
 - [ ] Full Vulkan implementation
 
-### Phase 3 ✅ - Neural Model Execution
+### Phase 3 - Neural Model Execution (CPU only)
 - [x] ONNX Runtime wrapper (real OrtSession via the stable OrtApi C interface)
-- [x] Model loading (.onnx; .nrrmodel container is detected, payload parsing pending)
+- [x] Model loading for `.onnx` files
+- [ ] `.nrrmodel` container: the extension is recognised but the payload is never
+      parsed and no capability negotiation happens (see M3 in docs/roadmap.md)
 - [x] Input/output tensor management
-- [x] Execution provider selection (CPU; CUDA/DirectML requests degrade gracefully with a reported note)
+- [ ] Execution provider selection: CUDA/DirectML requests only set a flag and a
+      note. No `SessionOptionsAppendExecutionProvider` call exists anywhere in the
+      codebase, so every provider setting runs on the CPU EP today (see M2)
 - [x] Full compute pipeline integration (frame textures -> NCHW tensors -> inference -> RGB8 output texture)
-- [x] Sample upscaling model (models/nrr_upscaler_v0.1.onnx - generated, identity-preserving 2x upscaler)
+- [x] Sample model fixture (models/nrr_upscaler_v0.1.onnx - ~45 KB untrained
+      identity 2x upscaler from tools/gen_sample_model.py; a test fixture, not the
+      network described in models/architecture.md)
 - [x] Model execution test (real end-to-end inference in the unified suite)
+- [ ] Trained model with a measured quality gate (PSNR/SSIM) - see M1
 
-### Phase 4 🔲 - Temporal Neural Rendering
+### Phase 4 - Temporal Neural Rendering (partial: not wired into the render path)
 - [x] Temporal history buffer (ring buffer)
 - [x] Motion vector warping (backward mapping + bilinear)
 - [x] Temporal state manager (dynamic alpha)
 - [x] Temporal stability metrics
 - [x] Scene reset handling
-- [ ] Full integration with neural renderer
-- [ ] Temporal blending (alpha compositing)
+- [ ] Full integration with neural renderer (today `output.temporal = input.temporal`
+      in runtime/backend_cpu.cpp - a passthrough)
+- [ ] Temporal blending (alpha compositing) into the output image
 
-### Phase 5 🔲 - Reference-Conditioned Rendering
+### Phase 5 - Reference-Conditioned Rendering (partial: nothing reaches the model)
 - [x] Reference file format (.nrrref) support
 - [x] Identity embedding system
 - [x] ReferenceSetBuilder for multiple references
 - [x] Provenance metadata (rights, permissions)
 - [x] Conditioning data preparation
-- [ ] Full neural model conditioning integration
+- [ ] Full neural model conditioning integration (no reference data is fed to
+      inference today, so outputs are unchanged by references - see M1)
 - [ ] Reference-conditioned model execution
 
-### Phase 6 🔲 - Identity/Material Conditioning
+### Phase 6 - Identity/Material Conditioning (partial: nothing reaches the model)
 - [x] Conditioning domain types (Identity, Skin, Hair, Fabric, Materials, Lighting)
 - [x] ConditioningWeights for per-domain control
 - [x] Domain-specific structs (IdentityConditioning, SkinConditioning, etc.)
@@ -139,7 +156,11 @@ nrr/
 - [x] Domain enable/disable control
 - [ ] Full neural model domain integration
 
-### Phase 7 🔲 - NVIDIA Backend
+### Phase 7 - NVIDIA Backend (structural: never executed on NVIDIA hardware)
+
+All items below are structural: the code is compiled but inert unless
+`NRR_ENABLE_NVIDIA` is set with the CUDA/TensorRT SDKs present, and no item has
+been run on an NVIDIA device. See M2/M7 in [docs/roadmap.md](docs/roadmap.md).
 - [x] CUDA device selection and initialization
 - [x] CUDA context and stream management
 - [x] CUDA memory management (device/host)
@@ -153,7 +174,9 @@ nrr/
 - [ ] CUDA kernel-based neural inference
 - [ ] FP8/Ampere+ optimizations
 
-### Phase 8 🔲 - AMD Backend
+### Phase 8 - AMD Backend (structural: never executed on AMD hardware)
+
+All items below are structural (as Phase 7, gated by `NRR_ENABLE_AMD` with HIP/ROCm).
 - [x] HIP device selection and initialization
 - [x] HIP context and stream management
 - [x] HIP memory management (device/host)
@@ -165,7 +188,9 @@ nrr/
 - [ ] Full HIP kernel-based neural inference
 - [ ] Matrix core utilization (RDNA2+)
 
-### Phase 9 🔲 - Intel Backend
+### Phase 9 - Intel Backend (structural: never executed on Intel hardware)
+
+All items below are structural (as Phase 7, gated by `NRR_ENABLE_INTEL`).
 - [x] oneAPI/XeML integration structure
 - [x] XMX AI acceleration detection
 - [x] DirectML backend option (Windows)
@@ -176,12 +201,21 @@ nrr/
 - [ ] DirectML model execution
 - [ ] oneMKL math library integration
 
-### Phase 14 🔲 - Semiconductor Vendor Accelerator Kernels
+### Phase 14 - Semiconductor Vendor Accelerator Kernels (structural)
+
+**Correction (M0):** the execution-provider layer is a decision function, not a
+working GPU path. `runtime/onnx_runtime.cpp` sets `use_cuda_ep_`/`use_directml_ep_`
+flags and a `provider_note_` string, but no `SessionOptionsAppendExecutionProvider`
+call exists anywhere in the repository. Every session is therefore created with the
+default CPU EP, and the note reports an intent rather than a fact. The bundled ONNX
+Runtime SDK is CPU-only as well. AccelEP routing and per-EP capability reporting are
+structural until M2 attaches providers for real
+(see [docs/roadmap.md](docs/roadmap.md)).
 - [x] Shared AcceleratorExecutionKernel with unified ONNX Runtime session, texture→NCHW→ONNX→RGB8 frame path, and single-session EP routing
-- [x] AccelEP routing: CUDA, TensorRT, ROCm, DirectML, OpenVINO, Vulkan, RISC-V, CPU
-- [x] Capability reporting: FP16/FP8 tensor-core-style flags, max texture size, async compute, per-ep status, memory tracking
+- [x] AccelEP routing *decision function*: CUDA, TensorRT, ROCm, DirectML, OpenVINO, Vulkan, RISC-V, CPU (a table lookup + vendor hint; it does not attach a provider)
+- [x] Capability reporting: FP16/FP8 tensor-core-style flags, max texture size, async compute, per-ep status, memory tracking (flags derived from the routing table, not measured on vendor hardware)
 - [x] Memory budgeting: per-frame byte accounting, peak/memory-limit, texture cache
-- [x] Vendor backends wired through the kernel: NVIDIA (CUDA + TensorRT EP prefer), AMD (ROCm EP), Intel (DirectML/OpenVINO EP), RISC-V (RVV 1.0 intrinsics + Vulkan/SPIR-V fallback + CPU EP)
+- [x] Vendor backends share the accelerator kernel: NVIDIA (CUDA + TensorRT preference), AMD (ROCm), Intel (DirectML/OpenVINO), RISC-V (RVV 1.0 intrinsics + Vulkan/SPIR-V fallback + CPU EP) - all of them execute through the CPU EP until M2 attaches real providers
 - [x] Compiler isolation: vendor SDK calls behind NRR_ENABLE_NVIDIA / NRR_ENABLE_AMD / NRR_ENABLE_INTEL / NRR_ENABLE_RISCV, inert stubs on desktop
 - [x] Real RVV 1.0 vector intrinsics: VLEN-aware vector clamping, expansion/packing via __riscv_vsetvl_e32m8, vector multiply-accumulate pixel pipelines
 - [x] Texture pool: backend-sourced color download via uploads
@@ -191,27 +225,34 @@ nrr/
 - [ ] Full RISC-V vector backend (RISC-V cross-compilation toolchain + RVV extension)
 - [ ] Vendor plugin isolation (Phase 15)
 
-### Phase 10 🔲 - Unreal Integration
-- [x] Plugin Build.cs configuration
-- [x] NRRRuntimeModule (library loading)
-- [x] UNRRComponent (actor component)
-- [x] Blueprint-exposed functions
-- [x] UObject wrappers for NRR types
+### Phase 10 - Unreal Integration (not implemented)
+- [x] Plugin Build.cs configuration (engine_plugins/unreal/Source/NRRPlugin/NRRPlugin.Build.cs)
+- [x] Public header declarations (NRRPlugin.h, UNRRComponent, NRRRuntimeModule)
+- [ ] NRRRuntimeModule library loading - the plugin contains no `.cpp` files at all,
+      so no module is implemented, nothing loads `nrr.dll`, and the plugin cannot link
+- [ ] UNRRComponent implementation (the declared UFUNCTIONs have no bodies)
+- [ ] Blueprint-exposed functions (declared only)
+- [ ] UObject wrappers for NRR types
 - [ ] Full C++ ↔ NRR binding
 - [ ] Editor UI for model/reference management
 - [ ] Render pass integration
 
-### Phase 11 🔲 - Godot Integration
-- [x] Plugin configuration files
-- [x] GDScript NRR class
-- [x] Initialize/Shutdown functions
-- [x] Model loading from res:// paths
-- [x] Reference loading from res:// paths
-- [x] Render frame function
-- [ ] GDNative bindings for full C API
+### Phase 11 - Godot Integration (not implemented)
+- [x] Plugin configuration files (engine_plugins/godot/project.godot, plugin.cfg)
+- [ ] GDScript NRR class - there are zero `.gd` files in the repository
+- [ ] Initialize/Shutdown functions
+- [ ] Model loading from res:// paths
+- [ ] Reference loading from res:// paths
+- [ ] Render frame function
+- [ ] GDExtension/GDNative bindings for the full C API
 - [ ] Editor plugin UI
 
-### Phase 12 ✅ - Unity Integration
+### Phase 12 - Unity Integration (code present, never run in an editor)
+
+The C# surface is real (`Runtime/Scripts/NRRNative.cs` declares the `DllImport`
+bindings), but the package has never been opened in a Unity editor, and no native
+binary is committed - `Runtime/Plugins/` contains a README describing where the
+build output goes.
 - [x] Package.json descriptor
 - [x] Unity package structure
 - [x] Runtime/Scripts folder structure
@@ -221,7 +262,11 @@ nrr/
 - [x] Editor window for model management
 - [x] Sample scenes and scripts
 
-### Phase 13 🔲 - Mobile Support
+### Phase 13 - Mobile Support (structural: never executed on a mobile device)
+
+The mobile kernel and vendor backends compile and pass guarded tests on Windows;
+the Android/iOS platform tests are compiled out on Windows and nothing has run on a
+device. See M8 in [docs/roadmap.md](docs/roadmap.md).
 - [x] Qualcomm Adreno GPU backend structure
 - [x] ARM Mali GPU backend structure
 - [x] Android NDK platform integration (JNI bridge)
@@ -231,33 +276,62 @@ nrr/
 - [x] Mobile ONNX Runtime detection (onnxruntime-android, onnxruntime-mobile)
 - [x] Real mobile ONNX execution kernel (MobileExecutionKernel::execute_frame:
       texture → NCHW → ONNX runtime (CPU/NNAPI/CoreML EP) → RGB8 → model output texture)
-- [x] All mobile vendor backends wired to the shared execution kernel
+- [x] Mobile kernel unit test (real ONNX session through execute_frame, Windows-guarded; never run on a device)
+- [x] All mobile vendor backends share the execution kernel
       (Adreno, Mali, PowerVR, Apple, Android Vulkan, Xenos, Radeon Mobile)
-- [x] Mobile kernel unit test (real ONNX session through execute_frame)
 - [ ] Full Adreno GPU inference (Vulkan compute shaders)
 - [ ] Full Mali GPU inference (Vulkan compute shaders)
 - [ ] Mobile-optimized model format (.nrrmodel mobile variant)
 - [ ] Android SurfaceView/NativeWindow integration
 - [ ] iOS Metal fallback for older devices
 
+## Building
+
+```powershell
+pwsh tools/fetch_ort.ps1                        # ONNX Runtime SDK (optional, but real inference needs it)
+python tools/gen_sample_model.py                # regenerate models/*.onnx (needs: pip install onnx numpy)
+pwsh tools/build.ps1 -Config Release -RunTests  # configure + build + full test suite
+```
+
+On Windows PowerShell 5.1 (no `pwsh` installed):
+`powershell -NoProfile -ExecutionPolicy Bypass -File tools/build.ps1 -Config Release -RunTests`
+
+`tools/build.ps1` locates CMake on PATH or in a Python site-packages install, selects
+the Visual Studio generator when Visual Studio is present (no `vcvars64` shell needed),
+and writes test logs to `<build>/test-results/`. CMake auto-detects
+`third_party/onnxruntime-*` (or accepts `-DNRR_ONNXRUNTIME_ROOT=<path>`). Without the
+SDK the build still compiles and the suite still passes on the placeholder inference
+path - that configuration is not the product.
+
+Memory-safety build (requires the "C++ AddressSanitizer" component in the Visual
+Studio installer):
+
+```powershell
+pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
+```
+
+## Testing
+
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 61 tests) plus the
+five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
+`test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
+`ctest --test-dir build -C Release --output-on-failure`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
+runs the full suite. A second, currently advisory job runs the suite under
+AddressSanitizer and is promoted to blocking once it has a green history.
+
+## Roadmap
+
+[docs/roadmap.md](docs/roadmap.md) is the authoritative status and plan (M0-M9),
+including what is blocked on hardware and SDKs, and the engineering rule that no
+capability is claimed without a test that measures it.
+
 ## License
 
-```bash
-pwsh tools/fetch_ort.ps1          # downloads onnxruntime-win-x64 into third_party/ (gitignored)
-python tools/gen_sample_model.py  # regenerates models/*.onnx (needs: pip install onnx numpy)
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-CMake auto-detects `third_party/onnxruntime-win-x64-*` (or pass
-`-DNRR_ONNXRUNTIME_ROOT=<path>`). When the SDK is present the CPU backend
-executes real neural inference; without it the build falls back to a
-placeholder path and everything still compiles and passes tests.
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
+See [LICENSE](LICENSE).
 
 ---
 

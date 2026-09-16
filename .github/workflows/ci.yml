@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ORT_VERSION: v1.30.0
+  ORT_DIR: third_party/onnxruntime-win-x64-1.30.0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Primary gate: real ONNX Runtime (CPU EP), full test suite, all phase tests.
+  # ---------------------------------------------------------------------------
+  windows-build-test:
+    name: Windows x64 - build + full test suite (ORT CPU EP)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ONNX Runtime SDK from cache
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ORT_DIR }}
+          key: ort-win-x64-${{ env.ORT_VERSION }}
+
+      - name: Fetch ONNX Runtime SDK
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ort.ps1 -Version $env:ORT_VERSION
+
+      - name: Verify ONNX Runtime SDK
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:ORT_DIR/include/onnxruntime_c_api.h")) {
+            throw "ONNX Runtime SDK missing - refusing to run the suite against the placeholder path."
+          }
+          Write-Host "ONNX Runtime SDK present at $env:ORT_DIR"
+
+      - name: Configure, build and test
+        shell: pwsh
+        run: ./tools/build.ps1 -Config Release -RunTests
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.run_number }}
+          path: build/test-results/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Memory-safety gate: AddressSanitizer build of the runtime + test suite.
+  #
+  # Advisory (continue-on-error) until it has been observed green on the runner
+  # for a few runs; promote to blocking by deleting continue-on-error once the
+  # ASan job has a stable history. See docs/roadmap.md (M0).
+  # Note: the ASan build intentionally runs the suite with the default model
+  # fixtures; it is a bug detector, not a performance gate.
+  # ---------------------------------------------------------------------------
+  windows-asan:
+    name: Windows x64 - AddressSanitizer
+    runs-on: windows-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ONNX Runtime SDK from cache
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ORT_DIR }}
+          key: ort-win-x64-${{ env.ORT_VERSION }}
+
+      - name: Fetch ONNX Runtime SDK
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ort.ps1 -Version $env:ORT_VERSION
+
+      - name: Configure, build and test with AddressSanitizer
+        shell: pwsh
+        run: ./tools/build.ps1 -Config RelWithDebInfo -BuildDir build-asan -Sanitize -RunTests -Clean
+
+      - name: Upload ASan test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-test-logs-${{ github.run_number }}
+          path: build-asan/test-results/
+          if-no-files-found: ignore
