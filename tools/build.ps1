@@ -114,12 +114,21 @@ function Get-VsInstallPath {
 function Get-VisualStudioGenerator {
     $vswhere = Get-VsWhere
     if (-not $vswhere) { return $null }
-    $version = @(& $vswhere -latest -products * `
+
+    # Prefer an instance that has the C++ toolset, but fall back to any instance:
+    # CMake's default generator is Visual Studio anyway, so a missing component must
+    # not silently disable generator reporting. Both queries return one line only.
+    $required = @(& $vswhere -latest -products * `
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
         -property installationVersion 2>$null |
         Where-Object { $_ -and "$_".Trim() }) | Select-Object -First 1
-    if (-not $version) { return $null }
-    switch (("$version".Trim() -split '\.')[0]) {
+    if (-not $required) {
+        $required = @(& $vswhere -latest -products * -property installationVersion 2>$null |
+            Where-Object { $_ -and "$_".Trim() }) | Select-Object -First 1
+    }
+    if (-not $required) { return $null }
+
+    switch (("$required".Trim() -split '\.')[0]) {
         '17' { return 'Visual Studio 17 2022' }
         '16' { return 'Visual Studio 16 2019' }
         default { return $null }
@@ -185,7 +194,11 @@ if ($ortDirs.Count -eq 0) {
     Write-Host "[build]       the placeholder path. Run 'pwsh tools/fetch_ort.ps1' for real inference." -ForegroundColor Yellow
 }
 
-$msvcAsan = ($Sanitize -and [bool]$generator)
+# ASan runtime deployment must not depend on Visual Studio *generator* detection:
+# CI run #5 showed that the generator can go undetected on a runner while CMake
+# still builds with MSVC by default, which silently skipped the runtime deployment
+# and made every instrumented executable fail with 0xC0000135 (STATUS_DLL_NOT_FOUND).
+$msvcAsan = ($Sanitize -and $onWindows)
 if ($msvcAsan) { Assert-MsvcAsanRuntime | Out-Null }
 
 if (-not $NoConfigure) {
@@ -296,7 +309,9 @@ if ($RunTests) {
         # PowerShell 7+ only and breaks Windows PowerShell 5.1.
         $mode = 'default'
         if ($msvcAsan) { $mode = 'AddressSanitizer' }
-        Write-Host "::notice::NRR CI: $ran test executable(s) passed ($mode build). $summary"
+        $genInfo = 'CMake default'
+        if ($generator) { $genInfo = $generator }
+        Write-Host "::notice::NRR CI: $ran test executable(s) passed ($mode build, generator: $genInfo). $summary"
     }
 }
 
