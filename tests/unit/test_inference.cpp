@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 #include "test_framework.h"
 #include "nrr.h"
+#include "onnx_runtime.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -293,6 +294,52 @@ NRR_TEST(test_inference_corrupt_model) {
                     "corrupt ONNX file must fail to load");
     NRR_EXPECT_TRUE(model == nullptr, "no model handle for corrupt file");
     std::remove(path);
+}
+#endif
+
+#ifdef NRR_HAVE_ONNXRUNTIME
+/* Regression test for the shared ONNX Runtime environment.
+ *
+ * Environments used to be created and released once per ONNXRuntime instance,
+ * so an env could be torn down while sessions created from it were still alive.
+ * ORT then handed recycled arena memory to live sessions, which surfaced as
+ * intermittent wrong output shapes/values in the other inference tests (a
+ * Concat axis mismatch when rendering 32x32, or a stale 128 fill value instead
+ * of the expected gray). Every instance must now share exactly one process-wide
+ * env that outlives all of them. */
+NRR_TEST(test_inference_shared_ort_env) {
+    ONNXRuntime first;
+    NRR_EXPECT_TRUE(first.initialize(), "first runtime initializes");
+    NRR_EXPECT_TRUE(first.load_model(NRR_PASSTHROUGH_MODEL),
+                    "first runtime loads a model");
+    OrtEnv* env = first.get_env();
+    NRR_EXPECT_TRUE(env != nullptr, "first runtime has an OrtEnv");
+
+    {
+        ONNXRuntime second;
+        NRR_EXPECT_TRUE(second.initialize(), "second runtime initializes");
+        NRR_EXPECT_TRUE(second.load_model(NRR_PASSTHROUGH_MODEL),
+                        "second runtime loads a model");
+        NRR_EXPECT_TRUE(second.get_env() == env,
+                        "both runtimes share one process-wide OrtEnv");
+    }   /* second shuts down: must NOT release the shared env */
+
+    NRR_EXPECT_TRUE(first.get_env() == env,
+                    "shared env survives a peer runtime's shutdown");
+    NRR_EXPECT_TRUE(first.is_loaded(),
+                    "first session stays loaded after peer shutdown");
+
+    /* The shared env can still create sessions after a peer was destroyed. */
+    ONNXRuntime third;
+    NRR_EXPECT_TRUE(third.initialize(), "third runtime initializes");
+    NRR_EXPECT_TRUE(third.load_model(NRR_PASSTHROUGH_MODEL),
+                    "shared env still creates sessions after peer shutdown");
+    NRR_EXPECT_TRUE(third.get_env() == env,
+                    "third runtime reuses the very same OrtEnv");
+
+    first.shutdown();
+    NRR_EXPECT_TRUE(first.get_env() == nullptr,
+                    "shutdown detaches the instance from the shared env");
 }
 #endif
 

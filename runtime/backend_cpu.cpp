@@ -114,16 +114,27 @@ NRRResult BackendCPU::create_texture(const NRRTextureDesc& desc, void*& backend_
     impl->format = desc.format;
     impl->array_layers = desc.array_layers;
 
+    /* The handle is this container's address and doubles as the key for
+     * textures_/cpu_textures_, so it must stay *unique for as long as the
+     * texture is alive*. Freeing the container here (as this used to do) let the
+     * allocator hand the very same address to a later texture: every
+     * std::vector header has the same size class, and the Windows
+     * low-fragmentation heap returns freed blocks in (pseudo)random order. That
+     * later create_texture() then silently overwrote this texture's map entry,
+     * so its pixel data *and* its width/height were replaced by the other
+     * texture's -- e.g. a lazily created 64x64 output texture aliasing the
+     * 32x32 color input, which produced intermittent "Concat axis mismatch
+     * 64 vs 32" and wrong pixel values. Keeping the (now empty) container alive
+     * keeps the address unique; it is released in destroy_texture(), mirroring
+     * create_buffer()/destroy_buffer(). */
     void* handle = reinterpret_cast<void*>(texture);
 
-    // Move pixel data into the CPUImage (canonical storage), then free the
-    // empty container. The handle stays a unique address for map lookups.
+    // Move pixel data into the CPUImage (canonical storage).
     CPUImage img;
     img.pixels.swap(*texture);
     img.width = desc.width;
     img.height = desc.height;
     img.format = desc.format;
-    delete texture;
 
     textures_[handle] = impl;
     cpu_textures_[handle] = img;
@@ -134,12 +145,19 @@ NRRResult BackendCPU::create_texture(const NRRTextureDesc& desc, void*& backend_
 
 void BackendCPU::destroy_texture(void* backend_texture) {
     if (!backend_texture) return;
+    bool known_handle = false;
     auto it = textures_.find(backend_texture);
     if (it != textures_.end()) {
         delete it->second;
         textures_.erase(it);
+        known_handle = true;
     }
-    cpu_textures_.erase(backend_texture);
+    if (cpu_textures_.erase(backend_texture) > 0) known_handle = true;
+    /* Release the token container that owns the handle address. Only for a
+     * handle we actually know, so an unknown/stale pointer is never freed. */
+    if (known_handle) {
+        delete reinterpret_cast<std::vector<uint8_t>*>(backend_texture);
+    }
 }
 
 NRRResult BackendCPU::upload_texture(void* backend_texture, const void* data, size_t size) {

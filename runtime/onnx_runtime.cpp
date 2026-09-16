@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <string>
 
 #ifdef NRR_HAVE_ONNXRUNTIME
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +25,35 @@ static std::wstring utf8_to_wide(const std::string& s) {
 #endif
 
 namespace nrr {
+
+#ifdef NRR_HAVE_ONNXRUNTIME
+namespace {
+
+/* Process-wide ONNX Runtime environment, shared by every ONNXRuntime instance.
+ *
+ * ORT requires an OrtEnv to outlive every OrtSession created from it, and each
+ * env owns its own allocator/thread-pool state. This wrapper used to create and
+ * release an env per instance (per model load/unload cycle); a session whose env
+ * had already been released could then be handed recycled arena memory, which
+ * showed up as intermittent wrong output shapes/values in the inference tests.
+ * One env per process removes that hazard.
+ *
+ * The env is deliberately never released: a function-local static's destructor
+ * can run before sessions that still reference the environment, and leaking a
+ * single env until process exit is the documented-safe ORT pattern. */
+struct SharedOrtEnv {
+    std::mutex mutex;
+    OrtEnv* env = nullptr;
+    std::string error;
+};
+
+SharedOrtEnv& shared_ort_env() {
+    static SharedOrtEnv state;
+    return state;
+}
+
+} /* namespace */
+#endif
 
 static std::string json_escape(const std::string& s) {
     std::string out;
@@ -84,7 +115,10 @@ void ONNXRuntime::shutdown() {
     release_session_objects();
     if (memory_info_) { api_->ReleaseMemoryInfo(memory_info_); memory_info_ = nullptr; }
     if (session_options_) { api_->ReleaseSessionOptions(session_options_); session_options_ = nullptr; }
-    if (env_) { api_->ReleaseEnv(env_); env_ = nullptr; }
+    /* The env is process-wide and shared: it is deliberately NOT released here
+     * so sessions owned by other instances (and any still in flight) keep a
+     * valid environment. It lives until process exit. */
+    env_ = nullptr;
     api_ = nullptr;
 #endif
     initialized_ = false;
@@ -92,6 +126,36 @@ void ONNXRuntime::shutdown() {
     model_info_.clear();
     provider_note_public_.clear();
 }
+
+#ifdef NRR_HAVE_ONNXRUNTIME
+OrtEnv* ONNXRuntime::acquire_shared_env(const OrtApi* api,
+                                        std::string* out_error) {
+    if (out_error) out_error->clear();
+    if (!api) {
+        if (out_error) *out_error = "no ONNX Runtime API table";
+        return nullptr;
+    }
+
+    SharedOrtEnv& shared = shared_ort_env();
+    std::lock_guard<std::mutex> lock(shared.mutex);
+    if (!shared.env) {
+        /* "NRR" is a string literal: ORT keeps the log id pointer for the
+         * lifetime of the env, which is process-lifetime here. */
+        OrtStatus* status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "NRR",
+                                           &shared.env);
+        if (status != nullptr) {
+            shared.error = std::string("CreateEnv: ") +
+                           api->GetErrorMessage(status);
+            api->ReleaseStatus(status);
+            shared.env = nullptr;
+        } else {
+            shared.error.clear();
+        }
+    }
+    if (!shared.env && out_error) *out_error = shared.error;
+    return shared.env;
+}
+#endif
 
 #ifdef NRR_HAVE_ONNXRUNTIME
 void ONNXRuntime::release_session_objects() {
@@ -139,8 +203,8 @@ bool ONNXRuntime::load_model(const std::string& model_path) {
         return false;
     };
 
-    if (!check(api_->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "NRR", &env_),
-               "CreateEnv")) return fail(ort_error_);
+    env_ = acquire_shared_env(api_, &ort_error_);
+    if (!env_) return fail(ort_error_);
     if (!check(api_->CreateSessionOptions(&session_options_),
                "CreateSessionOptions")) return fail(ort_error_);
     api_->SetIntraOpNumThreads(session_options_, 2);

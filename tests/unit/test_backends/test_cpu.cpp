@@ -1,6 +1,8 @@
 #include "test_framework.h"
 #include "nrr.h"
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace nrr {
 namespace test {
@@ -63,6 +65,83 @@ NRR_TEST(test_cpu_texture_operations) {
     nrr_texture_destroy(device, texture);
     nrr_device_destroy(device);
     std::cout << "  Texture create/upload/download/destroy OK" << std::endl;
+}
+
+NRR_TEST(test_cpu_texture_handle_stability) {
+    // Regression: BackendCPU used the address of a heap container it freed
+    // immediately as the texture handle *and* as the key of its texture maps.
+    // The Windows low-fragmentation heap can hand that same address to a later
+    // texture of the same size class, so creating a sibling texture silently
+    // replaced the still-alive texture's pixel data and dimensions -- the cause
+    // of intermittent wrong inference input shapes/values in this suite.
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRRResult result = nrr_device_create(&options, &device);
+    NRR_EXPECT_EQ(result, NRR_SUCCESS, "Device creation failed");
+    if (!device) return;
+
+    NRRTextureDesc desc = {};
+    desc.width = 16;
+    desc.height = 16;
+    desc.format = NRR_TEXTURE_FORMAT_RGBA8;
+    desc.usage = NRR_TEXTURE_USAGE_COLOR;
+    const size_t tex_size = 16 * 16 * 4;
+
+    NRRTexture* anchor = nullptr;
+    result = nrr_texture_create(device, &desc, &anchor);
+    NRR_EXPECT_EQ(result, NRR_SUCCESS, "Anchor texture creation failed");
+    if (!anchor) { nrr_device_destroy(device); return; }
+
+    std::vector<uint8_t> anchor_data(tex_size, 0xAB);
+    result = nrr_texture_upload(device, anchor, anchor_data.data(), tex_size);
+    NRR_EXPECT_EQ(result, NRR_SUCCESS, "Anchor texture upload failed");
+
+    // Churn textures of the same size class: pre-fix one of these reused the
+    // anchor's handle address and clobbered its stored pixels/dimensions.
+    std::vector<NRRTexture*> siblings;
+    std::vector<uint8_t> sibling_data(tex_size, 0x11);
+    for (int i = 0; i < 64; ++i) {
+        NRRTexture* sibling = nullptr;
+        if (nrr_texture_create(device, &desc, &sibling) != NRR_SUCCESS ||
+            !sibling) {
+            break;
+        }
+        nrr_texture_upload(device, sibling, sibling_data.data(), tex_size);
+        siblings.push_back(sibling);
+    }
+    NRR_EXPECT_TRUE(siblings.size() == 64,
+                    "All sibling textures were created");
+
+    std::vector<uint8_t> readback(tex_size, 0);
+    result = nrr_texture_download(device, anchor, readback.data(), tex_size);
+    NRR_EXPECT_EQ(result, NRR_SUCCESS, "Anchor download failed");
+    NRR_EXPECT_TRUE(readback == anchor_data,
+                    "Anchor texture data survives sibling creation");
+
+    // Each sibling must still own its own pixels too.
+    bool siblings_intact = true;
+    for (NRRTexture* sibling : siblings) {
+        std::fill(readback.begin(), readback.end(), 0);
+        if (nrr_texture_download(device, sibling, readback.data(), tex_size) !=
+                NRR_SUCCESS ||
+            readback != sibling_data) {
+            siblings_intact = false;
+            break;
+        }
+    }
+    NRR_EXPECT_TRUE(siblings_intact, "Sibling textures keep their own data");
+
+    for (NRRTexture* sibling : siblings) nrr_texture_destroy(device, sibling);
+    std::fill(readback.begin(), readback.end(), 0);
+    result = nrr_texture_download(device, anchor, readback.data(), tex_size);
+    NRR_EXPECT_EQ(result, NRR_SUCCESS, "Anchor download after teardown failed");
+    NRR_EXPECT_TRUE(readback == anchor_data,
+                    "Anchor texture data survives sibling destruction");
+
+    nrr_texture_destroy(device, anchor);
+    nrr_device_destroy(device);
+    std::cout << "  65 textures created: handles stay unique (no aliasing)"
+              << std::endl;
 }
 
 NRR_TEST(test_cpu_buffer_operations) {

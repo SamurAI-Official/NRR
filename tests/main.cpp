@@ -65,6 +65,7 @@ void run_all_tests() {
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);
     NRR_RUN_TEST(test_cpu_texture_operations);
+    NRR_RUN_TEST(test_cpu_texture_handle_stability);
     NRR_RUN_TEST(test_cpu_buffer_operations);
 
     std::cout << "\n--- Inference Tests ---\n";
@@ -76,6 +77,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_inference_render_null_model);
 #ifdef NRR_HAVE_ONNXRUNTIME
     NRR_RUN_TEST(test_inference_corrupt_model);
+    NRR_RUN_TEST(test_inference_shared_ort_env);
 #endif
 
 #ifdef NRR_ENABLE_MOBILE_VENDOR

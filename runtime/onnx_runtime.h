@@ -87,10 +87,29 @@ public:
 
     void set_execution_provider(const char* provider);
 
+#ifdef NRR_HAVE_ONNXRUNTIME
+    /* Process-wide OrtEnv shared by every ONNXRuntime instance.
+     *
+     * ONNX Runtime requires an OrtEnv to outlive every OrtSession created from
+     * it, and each env owns allocator/thread-pool state. Creating one env per
+     * instance meant env teardown interleaving with sessions that were still
+     * alive, which surfaced as intermittent wrong output shapes/values (see
+     * test_inference_shared_ort_env). The env is created on first use, shared by
+     * all instances and kept for the lifetime of the process; shutdown() never
+     * releases it. Thread safe. Returns nullptr on failure and optionally fills
+     * *out_error with the reason. */
+    static OrtEnv* acquire_shared_env(const OrtApi* api,
+                                      std::string* out_error = nullptr);
+
+    /* Env currently bound to this instance: the shared one, or nullptr before
+     * the first successful load_model() and after shutdown(). */
+    OrtEnv* get_env() const { return env_; }
+#endif
+
 private:
 #ifdef NRR_HAVE_ONNXRUNTIME
     const OrtApi* api_ = nullptr;
-    OrtEnv* env_ = nullptr;
+    OrtEnv* env_ = nullptr;   /* process-wide shared env; not owned here */
     OrtSessionOptions* session_options_ = nullptr;
     OrtSession* session_ = nullptr;
     OrtMemoryInfo* memory_info_ = nullptr;
