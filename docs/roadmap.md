@@ -94,25 +94,57 @@ under pwsh 7 (portable zip - no install required) as well as Windows PowerShell 
 ### M0 status detail: AddressSanitizer
 
 `NRR_ENABLE_SANITIZERS=ON` + `tools/build.ps1 -Sanitize` are wired and verified as far
-as this machine allows:
+as the available machines allow:
 
-* CMake configures and the compiler instruments the objects. The link step emits
-  `LNK4300: ignoring '/INCREMENTAL' because input module contains ASAN metadata`,
-  which is direct evidence the instrumentation is present.
-* The link then fails with
-  `LNK1104: cannot open file 'clang_rt.asan_dynamic_runtime_thunk-x86_64.lib'`
-  because the **x64** ASan runtime is not installed in the local Visual Studio -
-  only the i386 runtime is present under
-  `VC\Tools\MSVC\<ver>\bin\Hostx64\x86\`.
-* Fix for a local ASan run: add the `C++ AddressSanitizer` individual component in
-  the Visual Studio Installer (or
-  `vs_installer.exe modify --add Microsoft.VisualStudio.Component.VC.ASAN`).
-  `tools/build.ps1 -Sanitize -RunTests` detects the missing runtime and stops with
-  that instruction instead of failing obscurely.
-* Because it cannot be verified locally yet, the CI ASan job
-  (`.github/workflows/ci.yml`, `windows-asan`) is marked `continue-on-error: true`.
-  It must be promoted to a blocking gate - and this note updated - once it has run
-  green on the runner.
+* CI run #3 showed that the `windows-latest` runner **does** have the x64 ASan
+  component: the instrumented build configured, compiled and linked all six
+  executables (76 s step). The job then failed with
+
+  ```
+  Test failures: nrr_tests (exit -1073741515), ... (all six executables)
+  ```
+
+  `-1073741515` is `0xC0000135` `STATUS_DLL_NOT_FOUND` - the loader could not resolve
+  `clang_rt.asan_dynamic-x86_64.dll`, because putting the runtime directory on `PATH`
+  is not enough on the runner. `build.ps1` now also copies that DLL next to the test
+  executables before running them.
+* On the local machine the same instrumentation fails earlier, at link time
+
+  ```
+  LNK1104: cannot open file 'clang_rt.asan_dynamic_runtime_thunk-x86_64.lib'
+  ```
+
+  because the **x64** ASan runtime is not installed in the local Visual Studio - only
+  the i386 runtime is present under `VC\Tools\MSVC\<ver>\bin\Hostx64\x86\`. The link
+  step does emit `LNK4300: input module contains ASAN metadata`, which is direct
+  evidence that the instrumentation itself is applied.
+* Local fix: add the `C++ AddressSanitizer` individual component in the Visual Studio
+  Installer (or `vs_installer.exe modify --add
+  Microsoft.VisualStudio.Component.VC.ASAN`). `tools/build.ps1 -Sanitize -RunTests`
+  detects the missing runtime and stops with that instruction instead of failing
+  obscurely at link time.
+* Because it has not yet produced a green run, the CI ASan job
+  (`.github/workflows/ci.yml`, `windows-asan`) stays `continue-on-error: true`. It must
+  be promoted to a blocking gate - and this note updated - once it runs green.
+
+### M0 status detail: verifiable CI results
+
+`build.ps1` publishes a GitHub `::notice::` annotation with the measured outcome of the
+run, for example:
+
+```
+NRR CI: 6 test executable(s) passed (default build). Total:  61, Passed: 61, Failed: 0
+```
+
+Annotations are readable without authentication
+(`/repos/{owner}/{repo}/check-runs/{id}/annotations`), so a CI result can be verified
+from outside the GitHub UI without downloading the uploaded test logs. The same
+mechanism reports failures as `::error::`.
+
+Local validation must cover both shells the project supports, because each has caught a
+real bug: `pwsh` 7 (the CI shell; the portable PowerShell zip is enough) and Windows
+PowerShell 5.1 (the documented local fallback, where `if` used as an expression is a
+syntax error).
 
 ## M1 - Real inference value
 

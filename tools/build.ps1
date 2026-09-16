@@ -223,17 +223,27 @@ if (-not $NoBuild) {
 # ---------------------------------------------------------------------------
 
 if ($RunTests) {
-    if ($msvcAsan) {
-        $asanDir = Assert-MsvcAsanRuntime
-        Write-Host "[build] ASan runtime: $asanDir"
-        $env:PATH = "$asanDir;$env:PATH"
-    }
-
     # Multi-config generators (Visual Studio) emit into <build>/<Config>.
     $testDir = Join-Path $buildPath $Config
     if (-not (Test-Path (Join-Path $testDir 'nrr_tests.exe'))) { $testDir = $buildPath }
     if (-not (Test-Path (Join-Path $testDir 'nrr_tests.exe'))) {
         throw "nrr_tests.exe was not found under $buildPath - build first (drop -NoBuild)."
+    }
+
+    if ($msvcAsan) {
+        $asanDir = Assert-MsvcAsanRuntime
+        Write-Host "[build] ASan runtime: $asanDir"
+        $env:PATH = "$asanDir;$env:PATH"
+        # Copying the runtime next to the executables is more reliable than relying on
+        # PATH: CI run #3 failed with status 0xC0000135 (STATUS_DLL_NOT_FOUND) for all
+        # six executables because the loader could not resolve the ASan DLL.
+        $asanDll = Join-Path $asanDir 'clang_rt.asan_dynamic-x86_64.dll'
+        if (Test-Path $asanDll) {
+            Copy-Item $asanDll (Join-Path $testDir 'clang_rt.asan_dynamic-x86_64.dll') -Force
+            Write-Host "[build] copied ASan runtime next to the test executables"
+        } else {
+            Write-Warning "clang_rt.asan_dynamic-x86_64.dll not found in $asanDir"
+        }
     }
 
     $resultsDir = Join-Path $buildPath 'test-results'
@@ -269,6 +279,25 @@ if ($RunTests) {
         throw "Test failures: $($failed -join ', ')"
     }
     Write-Host "[test] passed: $ran executable(s), logs in $resultsDir" -ForegroundColor Green
+
+    # Publish the measured result as a GitHub notice annotation so the CI run can be
+    # verified from the public API (job logs need authentication). This is the M0
+    # principle in practice: a status claim must point at a measurement.
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $suiteLog = Join-Path $resultsDir 'nrr_tests.log'
+        $summary = 'summary unavailable'
+        if (Test-Path $suiteLog) {
+            $lines = @(Get-Content $suiteLog |
+                Select-String -Pattern '^(Total|Passed|Failed):' |
+                ForEach-Object { $_.Line.Trim() })
+            if ($lines.Count -gt 0) { $summary = $lines -join ', ' }
+        }
+        # NOTE: no "if" as an expression here - assignment from an if statement is
+        # PowerShell 7+ only and breaks Windows PowerShell 5.1.
+        $mode = 'default'
+        if ($msvcAsan) { $mode = 'AddressSanitizer' }
+        Write-Host "::notice::NRR CI: $ran test executable(s) passed ($mode build). $summary"
+    }
 }
 
 Write-Host "[build] done" -ForegroundColor Green
