@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 80/80 tests green), with M1.1 temporal accumulation wired into the render path and M1.3 scene-reset handling. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 80/80 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, and `M1.3` scene-reset and resolution-change handling. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -18,11 +18,12 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 > function that never attaches a provider to an ONNX Runtime session, the shipped model
 > is an untrained identity fixture, `.nrrmodel` payloads are not parsed, and the Unreal
 > and Godot plugins contain no executable code. The temporal path **is** now wired into
-> the render path (motion reprojection + blend, measured state), but it accumulates an
-> untrained model's output, so it reduces flicker without improving detail; the
-> reference/conditioning path still does not reach the model.
-> [docs/roadmap.md](docs/roadmap.md) lists every gap together with the milestone that
-> closes it.
+> the render path (motion reprojection + blend, measured state, scene-cut and
+> resolution-change handling), but it accumulates an untrained model's output, so it
+> reduces flicker without improving detail; the reference/conditioning path still does not
+> reach the model. [docs/roadmap.md](docs/roadmap.md) lists every gap together with the
+> milestone that closes it, and [CHANGELOG.md](CHANGELOG.md) records what changed recently
+> and how it was verified.
 
 ---
 
@@ -72,11 +73,12 @@ nrr/
 ├── docs/                       # roadmap.md (authoritative status + plan)
 ├── tests/                      # unified suite (main.cpp) + standalone phase tests
 │   ├── unit/                   # API, device, model, reference, backend, inference, mobile
-│   ├── integration/            # frame pipeline, multi-frame, reference/conditioning
+│   ├── integration/            # frame pipeline, multi-frame, temporal accumulation, reference/conditioning
 │   ├── performance/            # render time, latency
 │   └── mobile/                 # Phase 13 mobile tests (guarded; not run on device)
 │
 ├── .github/workflows/ci.yml    # build + full suite; blocking AddressSanitizer job
+├── CHANGELOG.md                # notable changes, with commit hashes and measured numbers
 ├── CMakeLists.txt
 ├── Makefile
 └── README.md
@@ -138,14 +140,22 @@ neural inference today happens on one path only: the CPU backend.
       decaying to 0 at full motion)
 - [x] Temporal stability metric (measured frame-over-frame change of the displayed image,
       reported in `NRRRenderStats::temporal_stability`)
-- [x] Scene reset handling
+- [x] Scene reset handling, in two halves. A sequence that restarts (frame index does not
+      advance past the last recorded frame) or changes render resolution is detected by
+      `temporal_scene_changed()` and discarded automatically, so a caller that forgets to
+      announce a cut cannot ghost the previous scene through the new one. A cut that keeps
+      the frame indices and resolution (a camera switch) is covered by the public
+      `nrr_device_reset_temporal_history()` entry point. A *forward* frame-index jump is
+      deliberately not a cut, so a dropped frame keeps accumulating.
 - [x] Integration with the renderer: `runtime/backend_cpu.cpp` drives history, warping and
       alpha from `execute_model`, reprojects the previous displayed frame through the
       current motion field, blends it into the output image, and reports measured state in
       `NRRFrameOutput::temporal` (the `output.temporal = input.temporal` passthrough is
       gone from the ONNX path; the placeholder path without an ONNX session still echoes
       the input and reports a hard-coded stability). Verified by
-      `tests/integration/test_temporal_accumulation.cpp`.
+      `tests/integration/test_temporal_accumulation.cpp` (7 tests, all driving `nrr_render`
+      with a real ONNX model) and `tests/integration/test_multi_frame.cpp` (6 tests on the
+      history/state/renderer classes).
 - [x] Temporal blending (alpha compositing) into the output image
 - [ ] Temporal accumulation that improves detail: today it accumulates the *untrained*
       fixture, so it only reduces flicker. Needs M1's trained model.
@@ -334,6 +344,13 @@ five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_tempo
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
 
+`nrr_tests` registers 87 tests. Of those, 23 are compiled out of a desktop build and stay
+in the count only as an explicit gap (12 under `NRR_ENABLE_MOBILE_VENDOR`, 11 under
+`#ifndef _WIN32`), and 2 need `NRR_HAVE_ONNXRUNTIME`; the 16 latency benchmarks are run by
+their own aggregator, which is what makes the executed total `62 + 2 + 16 = 80`. The mobile
+platform and vendor tests have never run on a device or in CI - see M8 in
+[docs/roadmap.md](docs/roadmap.md). `CHANGELOG.md` derives these counts per commit.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
@@ -342,13 +359,19 @@ under MSVC AddressSanitizer; it excludes the 16 wall-clock benchmarks
 (`NRR_SKIP_TIMING_TESTS`, see [docs/roadmap.md](docs/roadmap.md) M1.2) because timings under
 instrumentation are not measurements, so the sanitizer job runs 64 of the 80 tests. A failing
 sanitizer run publishes the unresolved DLL dependencies of the built binaries as
-annotations.
+annotations. Both jobs carry `timeout-minutes: 30`.
 
 ## Roadmap
 
 [docs/roadmap.md](docs/roadmap.md) is the authoritative status and plan (M0-M9),
 including what is blocked on hardware and SDKs, and the engineering rule that no
 capability is claimed without a test that measures it.
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) records notable changes with the commit hash of each one and
+the measured numbers behind it (test counts, suite timings, CI job durations), so a claim
+can be checked against the repository rather than taken on trust.
 
 ## License
 
