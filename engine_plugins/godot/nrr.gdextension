@@ -14,7 +14,13 @@
 [configuration]
 
 entry_symbol = "nrr_godot_library_init"
-compatibility_minimum = "4.2"
+; The binding is generated from one of godot-cpp's API dumps, so the library is
+; only loadable by a Godot at least that new. This value must track
+; NRR_GODOT_API_VERSION in src/CMakeLists.txt (default 4.7 - godot-cpp 10.x
+; ships extension_api-4-7.json). Lower it only together with a rebuild against
+; the matching godot-cpp API dump; Godot refuses to load a library whose
+; compatibility_minimum is newer than the engine.
+compatibility_minimum = "4.7"
 reloadable = true
 
 [libraries]

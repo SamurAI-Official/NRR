@@ -285,9 +285,54 @@ NRR_TEST(test_godot_addon_build_and_docs_wiring) {
                      "engine_plugins/godot/src/CMakeLists.txt");
 
     // Both READMEs must state the honest status rather than implying the addon
-    // has been run in an editor.
-    require_contains(plugin_readme, "never compiled", "godot README");
+    // has been run everywhere, and the addon README must carry the measured
+    // transcript rather than a claim.
+    require_contains(plugin_readme, "RESULT: PASS", "godot README transcript");
+    require_contains(plugin_readme, "4.7.2", "godot README must name the engine it ran on");
+    require_contains(plugin_readme, "The folder will be ignored",
+                     "godot README must warn about a nested project.godot");
     require_contains(plugins_readme, "GDExtension", "engine_plugins/README.md");
+}
+
+NRR_TEST(test_godot_addon_has_no_nested_project_file) {
+    using namespace plugin_files;
+
+    // Godot refuses to scan an addon folder that contains its own project.godot:
+    //   "Detected another project.godot at res://addons/nrr. The folder will be
+    //    ignored."
+    // The addon shipped one, so the whole folder was skipped: `class_name NRR`
+    // never registered and the GDExtension never loaded. Found by running the
+    // addon in Godot, not by reading it.
+    std::ifstream nested(std::string(NRR_PROJECT_SOURCE_DIR)
+                         + "/engine_plugins/godot/project.godot", std::ios::binary);
+    NRR_EXPECT_FALSE(nested.good(),
+                     "engine_plugins/godot/ must not contain project.godot "
+                     "(Godot ignores the whole addon folder)");
+
+    // The runnable project lives outside the addon instead.
+    std::ifstream verify(std::string(NRR_PROJECT_SOURCE_DIR)
+                         + "/engine_plugins/godot_verify/project.godot", std::ios::binary);
+    NRR_EXPECT_TRUE(verify.good(),
+                    "engine_plugins/godot_verify/project.godot must exist");
+
+    const std::string verify_project =
+        read("engine_plugins/godot_verify/project.godot");
+    require_contains(verify_project, "res://verify.tscn",
+                     "the verification project must name its main scene");
+    require_contains(read("engine_plugins/godot_verify/verify.tscn"),
+                     "res://verify.gd", "verify.tscn must attach verify.gd");
+
+    // The verification scene must drive the real C ABI surface and must be able
+    // to fail: a passthrough render is a failure, not a pass.
+    const std::string driver = read("engine_plugins/godot_verify/verify.gd");
+    for (const char* needle : {"ClassDB.class_exists(\"NRRNative\")",
+                               "render_frame(",
+                               "last_render_was_passthrough",
+                               "reset_temporal_history()",
+                               "RESULT: PASS",
+                               "RESULT: FAIL"}) {
+        require_contains(driver, needle, "verify.gd");
+    }
 }
 
 } // namespace test

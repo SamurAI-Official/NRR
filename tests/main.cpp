@@ -171,6 +171,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_godot_binding_exposes_temporal_history_reset);
     NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
     NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
+    NRR_RUN_TEST(test_godot_addon_has_no_nested_project_file);
 
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);

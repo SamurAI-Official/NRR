@@ -151,16 +151,34 @@ func last_render_time_ms() -> float:
 
 
 func native_entry_point_count() -> int:
-	if _native == null:
+	var native := _native_if_available()
+	if native == null:
 		return 0
-	return int(_native.call("get_entry_point_count"))
+	return int(native.call("get_entry_point_count"))
 
 
-## Compile-time library version string ("" when the binding is absent).
+## Compile-time library version string ("" only when the binding is genuinely
+## absent - this probes the class rather than reporting on initialize() state).
 func library_version() -> String:
-	if _native == null:
+	var native := _native_if_available()
+	if native == null:
 		return ""
-	return str(_native.call("get_library_version"))
+	return str(native.call("get_library_version"))
+
+
+## True when the GDExtension is loadable on this platform, independent of
+## whether initialize() has been called. Use this to tell "the binding is
+## missing" apart from "initialize() has not run yet".
+func is_binding_present() -> bool:
+	return _native_if_available() != null
+
+
+## The native handle, instantiating a probe instance when none exists yet.
+## Probing is safe: NRRNative allocates no device until initialize().
+func _native_if_available() -> Object:
+	if _native != null:
+		return _native
+	return _instantiate_native()
 
 
 func _instantiate_native() -> Object:

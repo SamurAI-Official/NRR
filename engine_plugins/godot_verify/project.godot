@@ -1,0 +1,23 @@
+; Verification project for the NRR Godot addon.
+;
+; This project exists to run the addon for real (headless is enough) and prove
+; that the GDExtension loads, registers NRRNative, creates a device, loads a
+; model and renders a frame. It lives OUTSIDE engine_plugins/godot/ on purpose:
+; Godot ignores any addon folder that contains its own project.godot
+; ("Detected another project.godot at res://addons/nrr. The folder will be
+; ignored."), and the old addon shipped one, so the addon was invisible.
+;
+; Setup + run: see README.md, or run ./setup.ps1 then the godot command it prints.
+
+config_version=5
+
+[application]
+
+config/name="NRR GDExtension verify"
+config/description="Runs the NRR Godot addon headless and asserts it really renders."
+run/main_scene="res://verify.tscn"
+config/features=PackedStringArray("4.7")
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

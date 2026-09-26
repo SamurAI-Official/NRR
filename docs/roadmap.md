@@ -25,7 +25,7 @@ an ONNX Runtime session, and engine plugins that contained no executable code.
 | `.nrrmodel` container | "detected, payload parsing pending" | **Not real**: the extension is sniffed and an info string written; the payload is never parsed, and the whole file is read into memory and discarded (`runtime/nrr_model.cpp`). No capability negotiation. |
 | Unity plugin | Phase 12 complete | Code present (`engine_plugins/unity/**`, real `DllImport` surface in `Runtime/Scripts/NRRNative.cs`) but never opened in a Unity editor. No native `.dll` committed (`Runtime/Plugins/` holds a README only - it is build output). |
 | Unreal plugin | Phase 10 items checked | **Not real**: headers plus `NRRPlugin.Build.cs` only - no `.cpp` anywhere and no `IMPLEMENT_MODULE`, so nothing builds or loads NRR. |
-| Godot plugin | Phase 11 items checked | Addon real, native binding uncompiled: `plugin.cfg` is now the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding to the C ABI. The binding has never been through a compiler (no godot-cpp checkout, no Godot install) and nothing has run in an editor. Wiring is measured by 8 drift guards in `tests/unit/test_engine_plugins.cpp`. |
+| Godot plugin | Phase 11 items checked | **Built and run.** `plugin.cfg` is the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding. Compiled against godot-cpp 10.0.0 and loaded by Godot 4.7.2-stable, which registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a non-passthrough frame (M1.5, `engine_plugins/godot_verify/`). Windows x86_64 **debug** variant only; the other `nrr.gdextension` entries are unbuilt. Wiring is measured by 9 drift guards in `tests/unit/test_engine_plugins.cpp`. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
 | Performance | "GPU-ready" | 256x256 -> 512x512 single frame: ~59-74 ms, 16.7 fps sustained on the CPU EP. Specification target: <16 ms at 1080p -> 4K (~32x the pixels). No perf gate in CI. |
 | CI | none | `.github/workflows/ci.yml` added in M0: Windows x64 build + full suite (77 tests after M1) against a real ONNX Runtime SDK, and a **blocking** AddressSanitizer job over the same suite (last published ASan result at M0: 61/61 clean; the M1 suite runs there on every push). |
@@ -386,9 +386,9 @@ so the patch series can be retired when ShugoCore re-pins.
 
 | Configuration | Command | Result |
 | --- | --- | --- |
-| Windows x64 Release, ORT SDK present | `tools/build.ps1 -Config Release -BuildDir build-ci -RunTests` | `nrr_tests` **91/91 pass**; 6/6 executables pass |
-| Windows x64 Release, ORT SDK absent | `cmake -DNRR_ONNXRUNTIME_ROOT=disabled` then build | Configures, compiles and links (it did **not** before fix 1); `nrr_tests` runs 89, 76 pass, 13 fail |
-| Godot GDExtension binding | n/a | Not compiled: no godot-cpp checkout, no Godot install |
+| Windows x64 Release, ORT SDK present | `tools/build.ps1 -Config Release -BuildDir build-ci -RunTests` | `nrr_tests` **92/92 pass**; 6/6 executables pass |
+| Windows x64 Release, ORT SDK absent | `cmake -DNRR_ONNXRUNTIME_ROOT=disabled` then build | Configures, compiles and links (it did **not** before fix 1); `nrr_tests` runs 90, 77 pass, 13 fail |
+| Godot GDExtension binding | `godot --headless --path engine_plugins/godot_verify` | Compiled and loaded; `RESULT: PASS` (see M1.5) |
 
 The 13 ORT-less failures are all rendering tests, and they are the placeholder path being
 honest about itself: it declares a fabricated `512x512` static input (`input_shapes_ = {{1,
@@ -400,6 +400,56 @@ build still compiles and the suite still passes"* - the second half was false.
 
 Entry points unchanged (`NRR_ENTRY_POINT_COUNT` 44); `NRR_ENTRY_POINT_COUNT` is asserted by
 `test_api_entry_point_count`.
+
+## M1.5 - Godot addon built and run in the engine
+
+The Godot addon was previously listed as "source written, never compiled". A Godot install
+(`G:\godot\Godot_v4.7.2-stable_win64.exe`, 4.7.2-stable) plus a godot-cpp checkout made the
+gated claim testable, and running it found two defects that reading the source could not.
+
+**Environment.** Godot 4.7.2-stable (official) on Windows x86_64, godot-cpp `master`
+(tag `10.0.0-stable`, which ships `gdextension/extension_api-4-7.json`), MSVC 17.14, ONNX
+Runtime CPU SDK present.
+
+| # | Defect | Why reading the source missed it | Fix |
+| --- | --- | --- | --- |
+| 1 | **The addon folder was invisible to Godot.** It contained its own `project.godot`, and Godot responds with `Detected another project.godot at res://addons/nrr. The folder will be ignored.` - skipping `class_name NRR` registration *and* `nrr.gdextension` entirely. | Nothing in the repository is wrong on its face; the file looks like a helpful "project config". | `project.godot` removed from the addon. The runnable project moved to `engine_plugins/godot_verify/`, and `test_godot_addon_has_no_nested_project_file` fails if one reappears. |
+| 2 | **The GDExtension link failed on an MSVC runtime mismatch.** godot-cpp defaults to the static runtime (`/MT`) and sets `CMAKE_MSVC_RUNTIME_LIBRARY` from inside its own `CMakeLists.txt` - i.e. *after* NRR's targets exist. CMake snapshots the runtime at target-creation time, so `nrr_static` kept `/MD` and the link produced `LNK2005 ... already defined in libcpmt.lib` plus unresolved `__imp__CrtDbgReport` / `__imp_ceilf`. | Only a linker sees it. | `src/CMakeLists.txt` adopts godot-cpp's resolved value onto `nrr_static`/`nrr`. |
+| 3 | **The build file targeted a godot-cpp API that no longer exists**: it linked `godot-cpp::template_debug` / `godot-cpp::template_release`, but godot-cpp 10.x exposes the single target `godot-cpp` (alias `godot::cpp`) and requires `GODOTCPP_API_VERSION` and `GODOTCPP_TARGET` at configure time. | The names were correct for earlier godot-cpp majors. | Rewritten against the current interface; the configure step now fails loudly if `GODOTCPP_API_VERSION` is unset rather than guessing. |
+| 4 | **`compatibility_minimum = "4.2"` was a false claim.** The library is generated from the 4.7 API, so it cannot be loaded by 4.2-4.6 at all. | Plausible-looking number. | Set to `"4.7"`, with the coupling to `NRR_GODOT_API_VERSION` documented in both files. |
+| 5 | **`NRR.library_version()` reported `""` for a present binding.** `_native` is only assigned inside `initialize()`, so probing before `initialize()` reported absence - the exact confusion the addon exists to avoid. | GDScript is not type-checked for this. | Added `_native_if_available()` (a stateless probe) plus `is_binding_present()`, so "missing" and "not initialized yet" are distinguishable. |
+
+**Measured evidence.** `engine_plugins/godot_verify/setup.ps1` copies the addon in, builds,
+and installs `nrr_godot.windows.debug.x86_64.dll` plus `onnxruntime.dll`; then
+
+```
+Godot_v4.7.2-stable_win64_console.exe --headless --import --path engine_plugins/godot_verify
+Godot_v4.7.2-stable_win64_console.exe --headless --path engine_plugins/godot_verify
+```
+
+prints, from a 64x48 RGBA8 input through `models/nrr_upscaler_v0.1.onnx`:
+
+```
+class_registered=true   binding_present=true   library_version=1.0.0
+entry_point_count_before_initialize=44   available=false -> available=true
+backend=CPU   caps.active_backend=CPU   caps.neural_acceleration=0   caps.fp16=1
+load_model=true   render_out=64x48 format=5   render_time_ms=2.926
+mean_abs_dr_vs_input=0.489112   reset_temporal_history=true
+available_after_shutdown=false   RESULT: PASS
+```
+
+(`render_time_ms` varied between 2.926 ms and 3.166 ms for the same input; it is a
+single-frame observation, not a benchmark. Everything else is reproducible.)
+
+`caps.neural_acceleration=0` (absent) is the honest capability report on a CPU-only ONNX
+Runtime, and `mean_abs_dr_vs_input` non-zero with `last_render_was_passthrough == false`
+is what proves a real neural pass ran rather than a passthrough. The magnitude of the
+difference is the untrained fixture, not evidence of quality.
+
+**Still open.** Only the Windows x86_64 **debug** variant is built; the other seven release
+and debug entries in `nrr.gdextension` are unbuilt names. `nrr_post_process.gd` drives the
+API but has not been rendered on screen. `--import` is required on a fresh clone because
+GDScript `class_name` registration lives in the imported class cache.
 
 ## M2 - Real GPU execution
 
@@ -456,23 +506,26 @@ none found on the current machine, and `NRR_ENABLE_VULKAN` is OFF on desktop.
 - [ ] Editor UI for model/reference management
 - [ ] `.uplugin` packaging rules and a sample map
 
-## M6 - Godot integration `gated: Godot install`
+## M6 - Godot integration
 
-The addon skeleton is in place and its wiring is measured by 8 drift guards
-(`tests/unit/test_engine_plugins.cpp`): INI descriptor + editor plugin, the GDScript `NRR`
-API surface, the per-platform `nrr.gdextension` table, the entry symbol, and the C ABI the
-GDExtension binding calls. What remains needs a Godot install and a godot-cpp checkout.
+Done: the addon is built and loaded in Godot 4.7.2 (M1.5). What remains needs the other
+platforms' toolchains and a rendered frame.
 
 - [x] `plugin.cfg` in the INI format Godot parses (the XML variant was never read)
 - [x] `@tool` EditorPlugin with a status menu item that reports real availability
 - [x] `NRR` class surface: initialize / shutdown / load_model / unload_model / render_frame
-      / reset_temporal_history / backend_name / capabilities
+      / reset_temporal_history / backend_name / capabilities / is_binding_present
 - [x] Per-platform library table: Windows x86_64, Linux x86_64+arm64, macOS universal,
       Android arm64+x86_64, iOS arm64, web wasm32
 - [x] Renderer-agnostic `NRRPostProcess` (CanvasLayer overdraw) + blit shader
 - [x] Honest unavailable path: passthrough + `last_error`, never fabricated output
-- [x] CMake target gated behind `NRR_BUILD_GODOT_PLUGIN` + `NRR_GODOT_CPP_PATH`
-- [ ] Compile the binding against godot-cpp for at least one platform and load it in Godot
+- [x] CMake target gated behind `NRR_BUILD_GODOT_PLUGIN` + `NRR_GODOT_CPP_PATH`, with MSVC
+      runtime alignment and the output file named exactly as `nrr.gdextension` expects
+- [x] Headless verification project (`engine_plugins/godot_verify/`) that fails on a
+      passthrough render
+- [x] **Compile and load in Godot** - Windows x86_64 debug, Godot 4.7.2
+- [ ] Build and load on any other platform (Linux/macOS/Android/iOS/web entries unbuilt)
+- [ ] Render `nrr_post_process.gd` on screen and confirm the composited output
 - [ ] `res://` reference loading (`.nrrref`) - the C API call has no call site yet
 - [ ] Capture depth and motion vectors (no portable depth buffer reaches GDScript; none of
       Forward+ motion vectors outside Forward+), without which NRR's depth/motion
@@ -532,7 +585,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | RISC-V toolchain + board | M7 RVV validation | Not present |
 | Vulkan SDK (headers + glslc) | M4 | Not present |
 | Unreal Engine install | M5 | Not present |
-| Godot install | M6 | Not present |
+| Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | Not present |
 | Model weights: train in-house vs license | M1 quality gate, M9 licensing | Undecided |
 | Performance bar for v1.0 | Whether <16 ms at 1080p->4K is the gate or a lower internal tier is acceptable | Undecided |
@@ -564,6 +617,14 @@ The build script picks the Visual Studio generator when Visual Studio is install
 and falls back to CMake's default generator otherwise, so no `vcvars64` shell is
 required. CMake auto-detects `third_party/onnxruntime-*` (or accepts
 `-DNRR_ONNXRUNTIME_ROOT=<path>`). Without the SDK the build now compiles (M1.4), but its
-suite does not pass - 89 run, 76 pass, 13 fail - because the placeholder session declares a
+suite does not pass - 90 run, 77 pass, 13 fail - because the placeholder session declares a
 fabricated `512x512` input and fabricated temporal stats. CI refuses to run in that
-configuration. With the SDK the suite is 91/91.
+configuration. With the SDK the suite is 92/92.
+
+The Godot addon is built separately and is not part of the test suite:
+
+```powershell
+pwsh engine_plugins/godot_verify/setup.ps1 -GodotCppPath <godot-cpp>
+<godot> --headless --import --path engine_plugins/godot_verify   # once, registers class_name
+<godot> --headless --path engine_plugins/godot_verify            # prints RESULT: PASS
+```

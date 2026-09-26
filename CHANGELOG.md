@@ -16,6 +16,36 @@ actually printed rather than estimates.
 
 ### Added
 
+- **The Godot addon is built and running in the engine** (`M1.5`, `engine_plugins/godot/`,
+  `engine_plugins/godot_verify/`). Compiled against godot-cpp `master` (tag `10.0.0-stable`,
+  which ships the Godot 4.7 API dump) and loaded by **Godot 4.7.2-stable**, the addon
+  registers `NRRNative`, creates a CPU device through the registry's deterministic
+  auto-selection, loads `models/nrr_upscaler_v0.1.onnx`, renders a 64x48 RGBA8 frame whose
+  output is measurably different from its input, reaches the `M1.3`
+  `nrr_device_reset_temporal_history` export, and shuts down cleanly. Measured transcript
+  (also in `engine_plugins/godot/README.md`): `class_registered=true`,
+  `library_version=1.0.0`, `entry_point_count=44`, `backend=CPU`,
+  `caps.neural_acceleration=0` (absent - honest on a CPU-only ONNX Runtime),
+  `render_out=64x48 format=5` (RGBA8), `render_time_ms=3.166`,
+  `mean_abs_dr_vs_input=0.489112`, `RESULT: PASS`. Only the Windows x86_64 **debug**
+  variant is built; the other `nrr.gdextension` entries are unbuilt names.
+  `render_time_ms` is not a benchmark - it varied between 2.926 ms and 3.166 ms across runs.
+- **`engine_plugins/godot_verify/`** (`M1.5`): a Godot 4 project that runs the addon headless
+  and prints `RESULT: PASS` / `RESULT: FAIL` with a non-zero exit, plus `setup.ps1` that
+  copies the addon into `addons/nrr/`, builds the GDExtension, and installs the library and
+  `onnxruntime.dll`. It asserts that a *passthrough* render is a failure, not a pass.
+- **`NRR.is_binding_present()` and the underlying `_native_if_available()` probe**
+  (`M1.5`, `engine_plugins/godot/NRR.gd`). Previously only `initialize()` assigned the native
+  handle, so `library_version()` returned `""` - reporting "binding absent" - for a binding
+  that was present but not yet initialized.
+- **A ninth engine-plugin drift guard**, `test_godot_addon_has_no_nested_project_file`
+  (`M1.5`, `tests/unit/test_engine_plugins.cpp`). It fails if `engine_plugins/godot/` ever
+  contains a `project.godot` again (Godot then ignores the whole addon folder), and checks
+  that the verification project exists, names its main scene, and contains a driver that can
+  actually fail.
+- **Godot's own `.uid` resource files** for the addon's scripts, shader and `.gdextension`
+  (`M1.5`), as Godot 4.4+ writes them, so installed copies keep stable resource ids.
+
 - **A real Godot 4.x addon** (`M1.4`, `engine_plugins/godot/`). The directory previously held
   a `project.godot` and an **XML** `plugin.cfg`; Godot 4 parses `plugin.cfg` as INI, so the
   descriptor was never read and the plugin never loaded. It now contains the INI descriptor, a
@@ -26,8 +56,9 @@ actually printed rather than estimates.
   macOS universal; Android arm64+x86_64; iOS arm64; web wasm32), and a GDExtension C++ binding
   (`src/nrr_godot.{h,cpp}`) over the public C ABI. Absence is reported, never faked:
   `render_frame()` returns the input image unchanged and records why in `last_error`.
-  **The C++ binding has never been compiled** - no godot-cpp checkout and no Godot install
-  exist in this environment - so it is shipped as source, not as a verified artifact.
+  **Compiled and loaded by Godot in the same commit** - see `M1.5` below, which found five
+  defects (including a nested `project.godot` that made Godot ignore the whole addon) that
+  reading the source could not have revealed.
 - **Eight engine-plugin drift guards** (`M1.4`, `tests/unit/test_engine_plugins.cpp`). They read
   the addon from the source tree and assert what can rot silently: the descriptor is INI with
   `name`/`version`/`description`/`author` and a `script=` that exists and `extends EditorPlugin`;
@@ -193,7 +224,7 @@ actually printed rather than estimates.
      `<windows.h>` and built a `std::wstring` path unconditionally, while `ORTCHAR_T` is `char`
      off Windows. A new `ort_path()` returns `std::wstring` under `_WIN32` and `std::string`
      elsewhere, with the `windows.h` include inside the `_WIN32` arm. **Verified**: the Windows
-     ORT build is still green at 91/91.
+     ORT build is still green at 92/92.
   3. **`backend_apple.h` declared neither `backend_apple_is_supported` nor
      `backend_apple_create`** although `backend_registry.cpp` references both under
      `#ifdef __APPLE__` (the macOS build failed on an undeclared identifier). Both are now
@@ -226,11 +257,39 @@ actually printed rather than estimates.
   H/W still conflicts as before. Covered by the three new tests above.
 - **Two documentation claims that no measurement supported**: the README's *"Without the SDK
   the build still compiles and the suite still passes on the placeholder inference path"* (the
-  compile half was also false before fix 1; the suite half is false - measured 89 run, 76 pass,
+  compile half was also false before fix 1; the suite half is false - measured 90 run, 77 pass,
   13 fail) and `docs/roadmap.md`'s *"Without the SDK the placeholder path is used and the suite
   still passes"*. Both now state the measured numbers, and M1.4 records why the 13 failures are
   rendering tests: the placeholder session declares a fabricated `512x512` static input and
   fabricated temporal stats. CI already refuses to run in that configuration.
+- **The Godot addon was invisible to Godot** (`M1.5`). `engine_plugins/godot/project.godot`
+  made Godot log `Detected another project.godot at res://addons/nrr. The folder will be
+  ignored.` and skip the whole folder - so `class_name NRR` never registered and
+  `nrr.gdextension` was never loaded. The file is gone; the runnable project lives in
+  `engine_plugins/godot_verify/`, and a drift guard fails if one reappears. No source-reading
+  check could have caught this - it took running the engine.
+- **The GDExtension link failed on an MSVC runtime mismatch** (`M1.5`,
+  `engine_plugins/godot/src/CMakeLists.txt`). godot-cpp defaults to the static runtime
+  (`GODOTCPP_USE_STATIC_CPP=ON` -> `/MT`) and sets `CMAKE_MSVC_RUNTIME_LIBRARY` as a cache
+  variable from inside its own `CMakeLists.txt` - after NRR's targets already exist. CMake
+  snapshots the runtime at target-creation time, so `nrr_static` kept `/MD` and the link
+  produced `LNK2005 ... already defined in libcpmt.lib`, `__imp__CrtDbgReport` and
+  `__imp_ceilf`. The runtime targets now adopt godot-cpp's resolved value, whatever a
+  consumer overrides it to.
+- **The Godot build file targeted a godot-cpp API that no longer exists** (`M1.5`). It linked
+  `godot-cpp::template_debug` / `godot-cpp::template_release`; godot-cpp 10.x exposes the
+  single target `godot-cpp` (alias `godot::cpp`) and requires `GODOTCPP_API_VERSION` and
+  `GODOTCPP_TARGET` to be set before it is added. The binding also links `nrr_static` only:
+  linking `nrr.dll` as well would have loaded two independent copies of the runtime's
+  process-wide state (the shared `OrtEnv`, the backend registry) into one process. Verified
+  by import inspection: the built library depends on `onnxruntime.dll` and neither `nrr.dll`
+  nor the dynamic CRT.
+- **`compatibility_minimum = "4.2"` was a false claim** (`M1.5`, `nrr.gdextension`). The
+  library is generated from the 4.7 API and cannot be loaded by 4.2-4.6 at all; the value is
+  now `"4.7"`, with its coupling to `NRR_GODOT_API_VERSION` documented in both files.
+- **The build now emits the file name `nrr.gdextension` lists** (`M1.5`) -
+  `nrr_godot.windows.debug.x86_64.dll` - instead of `nrr_godot.dll`, so an artifact can be
+  dropped into `addons/nrr/bin/<platform>/<variant>/` unchanged.
 
 ### Verification
 
@@ -255,7 +314,7 @@ were built and run on Windows x64 with the Visual Studio 17 2022 generator:
 
 ```
 ORT SDK present   (build-ci):   Total: 91, Passed: 91, Failed: 0    (6/6 executables)
-ORT SDK absent    (build-noort): Total: 89, Passed: 76, Failed: 13  <- placeholder path
+ORT SDK absent    (build-noort): Total: 90, Passed: 77, Failed: 13  <- placeholder path
 ```
 
 The ORT-present suite is the one CI gates on, and CI additionally fails the job when the SDK is
@@ -264,34 +323,53 @@ README previously claimed the opposite; the 13 failures are all rendering tests 
 is recorded under M1.4 in `docs/roadmap.md`. `build-noort` is a scratch directory, not a
 committed configuration.
 
-The Godot binding was **not** compiled - there is no godot-cpp checkout and no Godot install on
-this machine - so no build number is claimed for it. What is measured is the wiring
-(`tests/unit/test_engine_plugins.cpp`, 8 tests, all passing in both configurations).
+The Godot addon is **not** part of this suite: it is built and run separately (see `M1.5`
+above), and its measured result is the Godot transcript rather than a test count. The suite's
+9 engine-plugin drift guards cover the wiring and do not need Godot.
+
+**`M1.5` - measured in the engine, same commit.** Godot 4.7.2-stable, Windows x86_64,
+godot-cpp 10.0.0, ONNX Runtime CPU provider:
+
+```
+godot --headless --path engine_plugins/godot_verify
+  class_registered=true   library_version=1.0.0   entry_point_count=44
+  backend=CPU   render_out=64x48   render_time_ms=2.926
+  mean_abs_dr_vs_input=0.489112   RESULT: PASS
+
+GDExtension library imports: onnxruntime.dll (yes), nrr.dll (no), MSVCP140/VCRUNTIME140 (no)
+```
+
+(`render_time_ms` observed at both 2.926 ms and 3.166 ms across runs.)
+
+This is the first time any engine plugin in this repository has executed. The Unreal plugin
+still contains no executable code and the Unity package has still never been opened in an
+editor, so those remain unverified.
 
 Test counts are derived from `tests/main.cpp` per commit, so they can be re-derived with
 `git show <hash>:tests/main.cpp`:
 
 ```
-                              pre-work  M1.1  M1.2  M1.3  M1.4
-registrations in main.cpp          77    84    84    87    98
-  out: #ifndef _WIN32             -10   -11   -11   -11   -11   (android, ios)
-  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   -12   (adreno, mali)
-  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2    -2
+                              pre-work  M1.1  M1.2  M1.3  M1.4  M1.5
+registrations in main.cpp          77    84    84    87    98    99
+  out: #ifndef _WIN32             -10   -11   -11   -11   -11   -11   (android, ios)
+  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   -12   -12   (adreno, mali)
+  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2    -2    -2
   ------------------------------------------------
-  unconditional registrations       59    59    59    62    73
+  unconditional registrations       59    59    59    62    73    74
   + NRR_HAVE_ONNXRUNTIME (runs
-    wherever the SDK is present)    +2    +2    +2    +2    +2
+    wherever the SDK is present)    +2    +2    +2    +2    +2    +2
   + latency benchmarks run by
-    their own aggregator            +0   +16   +16   +16   +16
+    their own aggregator            +0   +16   +16   +16   +16   +16
   ------------------------------------------------
-  tests executed in the suite       61    77    77    80    91
+  tests executed in the suite       61    77    77    80    91    92
 ```
 
 Every column re-derives: `77 - 18 + 2 + 0 = 61`, `84 - 25 + 2 + 16 = 77`,
-`87 - 25 + 2 + 16 = 80`, `98 - 25 + 2 + 16 = 91`. The `M1.4` column adds 11 unconditional
-tests: 8 engine-plugin drift guards (`tests/unit/test_engine_plugins.cpp`) and 3
-`concrete_input_shape()` tests (`tests/unit/test_inference.cpp`). Every one of them runs in
-both the ORT-present and ORT-absent builds, which is what `89 = 91 - 2` reflects.
+`87 - 25 + 2 + 16 = 80`, `98 - 25 + 2 + 16 = 91`, `99 - 25 + 2 + 16 = 92`. The `M1.4` column
+adds 11 unconditional tests (8 engine-plugin drift guards + 3 `concrete_input_shape()`
+tests) and `M1.5` adds 1 more (`test_godot_addon_has_no_nested_project_file`). Every one of
+them runs in both the ORT-present and ORT-absent builds, which is what `90 = 92 - 2`
+reflects.
 
 Two rows carry the point of two of the entries above. `pre-work` registers 77 tests but
 executes 61: 18 are inside guards that are off on desktop, and although 8 latency tests ran,
@@ -303,8 +381,8 @@ and the registration total moved only 77 -> 84, while execution rose 61 -> 77 (t
 benchmarks now run through the aggregator, replacing the 8 that were listed by hand).
 
 Under `NRR_SKIP_TIMING_TESTS` (the ASan gate) the 16 benchmarks are excluded, so the gate
-runs 61 tests at M1.2, 64 at M1.3 and 75 at M1.4. Counts were reproduced locally with the same
-configuration CI uses (Windows x64, ONNX Runtime SDK present).
+runs 61 tests at M1.2, 64 at M1.3, 75 at M1.4 and 76 at M1.5. Counts were reproduced locally
+with the same configuration CI uses (Windows x64, ONNX Runtime SDK present).
 
 ---
 

@@ -1,0 +1,10 @@
+# engine_plugins/godot_verify - build output and the copied addon
+#
+# addons/ is a copy of ../godot (see setup.ps1), models/ is a copy of the
+# repository's model fixtures, and .godot is Godot's import cache. None of it is
+# source, and the GDExtension libraries are per-platform build output.
+addons/
+models/
+.godot/
+*.import
+export_presets.cfg

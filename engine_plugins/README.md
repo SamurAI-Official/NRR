@@ -13,7 +13,7 @@ engine_plugins/
 │   │       └── Private/      # Private implementation
 │   └── NRRPlugin.uplugin    # Plugin descriptor
 │
-├── godot/            # Godot 4.x addon
+├── godot/            # Godot 4.x addon (copy to <project>/addons/nrr/)
 │   ├── plugin.cfg            # Editor plugin descriptor (INI - Godot's format)
 │   ├── nrr_plugin.gd         # @tool EditorPlugin (the descriptor's script=)
 │   ├── NRR.gd                # GDScript runtime API
@@ -22,6 +22,12 @@ engine_plugins/
 │   ├── shaders/
 │   ├── src/                  # GDExtension C++ binding (nrr_godot.cpp/.h)
 │   └── README.md             # Build + install + known limits
+│
+├── godot_verify/     # Godot 4 project that runs the addon headless and asserts it renders
+│   ├── project.godot         # Must NOT live inside godot/ - see godot_verify/README.md
+│   ├── verify.gd / .tscn     # Prints RESULT: PASS / FAIL, exits accordingly
+│   ├── setup.ps1             # Copies the addon in, builds, installs the library
+│   └── README.md
 │
 └── unity/            # Unity package
     ├── package.json         # Package descriptor
@@ -53,10 +59,13 @@ bool RenderWithNRR(UTexture2D* InputColor, UTexture2D* InputDepth);
 
 ## Godot (Phase 11 / M6)
 
-**Status**: GDScript addon + editor plugin + post-process node are real source;
-the GDExtension C++ binding (`src/nrr_godot.cpp`) is written but has **never been
-compiled** in this repository (no godot-cpp checkout, no Godot install). Wiring
-is covered by `tests/unit/test_engine_plugins.cpp`.
+**Status**: **Built and run.** The GDExtension binding was compiled against
+godot-cpp 10.0.0 (Godot 4.7 API) and loaded by Godot **4.7.2-stable**, which
+registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a
+frame (`engine_plugins/godot_verify/`, transcript in `godot/README.md`). Only the
+Windows x86_64 **debug** variant has been built and loaded; the other platforms in
+`nrr.gdextension` are unbuilt entries. Wiring is also covered by 9 drift guards in
+`tests/unit/test_engine_plugins.cpp`.
 
 The Godot addon provides:
 - `plugin.cfg` - an **INI** descriptor. The XML variant that used to ship here is
