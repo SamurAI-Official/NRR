@@ -1,19 +1,28 @@
-[toolchain]
+; Engine configuration file.
+;
+; This is the plugin's own Godot 4 project, present so the addon can be opened
+; and verified without a host game project. To enable the plugin inside this
+; project (or any other), copy the contents of engine_plugins/godot/ into
+; <project>/addons/nrr/ and enable "NRR" under Project -> Project Settings ->
+; Plugins. Godot discovers addons only under res://addons/, which is why the
+; descriptor cannot enable itself from this directory in place.
+;
+; Honest status: no Godot binary has been run against this plugin in this
+; repository (docs/roadmap.md M6, `gated: Godot install`). The files here are
+; source-level verified by tests/unit/test_engine_plugins.cpp.
 
-[general]
-name="NRR"
-description="Neural Rendering Runtime for Godot"
-author="NRR Project"
-version="1.0.0"
-script_language="c++"
+config_version=5
 
-[libs]
-system_libs=["dl", "pthread"]
-static_libs=["nrr"]
+[application]
 
-[linking]
-mode="static"
+config/name="NRR (Neural Rendering Runtime) - Godot plugin"
+config/description="Local verification project for the NRR Godot addon."
+config/features=PackedStringArray("4.2")
+run/main_scene="res://scenes/nrr_main.tscn"
+config/icon="res://icon.svg"
 
-[build]
-target="release"
-pool="link"
+[rendering]
+
+renderer/rendering_method="forward_plus"
+; The NRR post-process node is a plain CanvasLayer overdraw, so it works
+; unchanged under "mobile" and "gl_compatibility" as well.

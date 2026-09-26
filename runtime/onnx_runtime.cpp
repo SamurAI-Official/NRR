@@ -10,6 +10,13 @@
 #include <string>
 
 #ifdef NRR_HAVE_ONNXRUNTIME
+/* OrtApi::CreateSession takes a path whose character type is ORTCHAR_T:
+ * wchar_t on Windows, char everywhere else. This block used to pull in
+ * <windows.h> and build a std::wstring unconditionally, so the ORT-enabled
+ * configuration only compiled on Windows - on Linux/macOS/Android either
+ * <windows.h> was missing or CreateSession() received a const wchar_t* where
+ * a const ORTCHAR_T* was required. (ShugoCore upstream bug report, item 2.) */
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -22,7 +29,14 @@ static std::wstring utf8_to_wide(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
     return w;
 }
+
+/* ORTCHAR_T is wchar_t here. */
+static std::wstring ort_path(const std::string& s) { return utf8_to_wide(s); }
+#else
+/* ORTCHAR_T is char here, so the UTF-8 path is already the right type. */
+static std::string ort_path(const std::string& s) { return s; }
 #endif
+#endif  /* NRR_HAVE_ONNXRUNTIME */
 
 namespace nrr {
 
@@ -213,8 +227,8 @@ bool ONNXRuntime::load_model(const std::string& model_path) {
 
     apply_provider(preferred_provider_);
 
-    std::wstring wpath = utf8_to_wide(model_path);
-    if (!check(api_->CreateSession(env_, wpath.c_str(), session_options_,
+    auto npath = ort_path(model_path);
+    if (!check(api_->CreateSession(env_, npath.c_str(), session_options_,
                                    &session_),
                "CreateSession")) return fail(ort_error_);
     if (!check(api_->GetAllocatorWithDefaultOptions(&allocator_),

@@ -31,8 +31,11 @@ enum class TensorRole {
 TensorRole classify_tensor_role(const std::string& name);
 
 /* Fills the dynamic dimensions (-1) of a model's 4-D NCHW input shape with
- * concrete values (1, channels, height, width). Returns false when the
- * static model dimensions conflict with the frame textures. */
+ * concrete values (1, channels, height, width). An EMPTY model_shape means the
+ * shape is unknown (no OrtSession metadata, or a fully dynamic input) and is
+ * treated as fully dynamic rather than as a conflict. Returns false only when
+ * a declared static dimension conflicts with the frame textures, the shape is
+ * not 4-D, or channels is not positive. */
 bool concrete_input_shape(const std::vector<int64_t>& model_shape,
                           int channels, uint32_t width, uint32_t height,
                           std::vector<int64_t>& out_shape);

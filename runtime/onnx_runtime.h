@@ -115,7 +115,6 @@ private:
     OrtMemoryInfo* memory_info_ = nullptr;
     OrtAllocator* allocator_ = nullptr;
     std::string ort_error_;           /* last ORT error message */
-    std::string provider_note_;       /* fallback explanation, if any */
     bool apply_provider(const std::string& preferred);
     void release_session_objects();
 #endif
@@ -127,7 +126,14 @@ private:
     // Model metadata
     std::string model_path_;
     std::string model_info_;
-    std::string provider_note_public_;
+    /* Provider note. Deliberately NOT inside #ifdef NRR_HAVE_ONNXRUNTIME:
+     * set_execution_provider() clears both of these unconditionally, so
+     * declaring them only for the ORT-enabled build made the ORT-less
+     * configuration fail to compile ("use of undeclared identifier
+     * 'provider_note_'"), contradicting the documented placeholder path.
+     * (ShugoCore upstream bug report, item 1.) */
+    std::string provider_note_;        /* fallback explanation, if any */
+    std::string provider_note_public_; /* copy surfaced through model info */
     std::vector<std::string> input_names_;
     std::vector<std::string> output_names_;
     std::vector<std::vector<int64_t>> input_shapes_;

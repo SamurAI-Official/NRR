@@ -14,6 +14,7 @@
 #include "unit/test_mobile.cpp"
 #include "mobile/test_mobile_model.cpp"
 #include "unit/test_accel.cpp"
+#include "unit/test_engine_plugins.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
 #include "mobile/test_ios.cpp"
@@ -76,6 +77,9 @@ void run_all_tests() {
     NRR_RUN_TEST(test_inference_single_input_model);
     NRR_RUN_TEST(test_inference_output_texture_reuse);
     NRR_RUN_TEST(test_inference_render_null_model);
+    NRR_RUN_TEST(test_concrete_input_shape_unknown_is_dynamic);
+    NRR_RUN_TEST(test_concrete_input_shape_fills_dynamic_dims);
+    NRR_RUN_TEST(test_concrete_input_shape_static_conflict_rejected);
 #ifdef NRR_HAVE_ONNXRUNTIME
     NRR_RUN_TEST(test_inference_corrupt_model);
     NRR_RUN_TEST(test_inference_shared_ort_env);
@@ -155,6 +159,19 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
     
+    std::cout << "\n--- Engine Plugin Tests ---\n";
+    /* Source-level drift guards for engine_plugins/. They read the addon files
+     * from the source tree (NRR_PROJECT_SOURCE_DIR) because nothing here can be
+     * executed without a Godot/godot-cpp install; see the file header. */
+    NRR_RUN_TEST(test_godot_plugin_descriptor_is_ini);
+    NRR_RUN_TEST(test_godot_gdscript_api_surface);
+    NRR_RUN_TEST(test_godot_gdextension_covers_platform_matrix);
+    NRR_RUN_TEST(test_godot_binding_entry_symbol_matches_descriptor);
+    NRR_RUN_TEST(test_godot_binding_references_only_declared_c_api_entry_points);
+    NRR_RUN_TEST(test_godot_binding_exposes_temporal_history_reset);
+    NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
+    NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
+
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);
     NRR_RUN_TEST(performance_texture_creation_time);

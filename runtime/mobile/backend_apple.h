@@ -59,5 +59,13 @@ private:
     std::string name_;
 };
 
+/* backend_registry.cpp references these two under #ifdef __APPLE__, and
+ * backend_apple.cpp defines them - but they were never declared here, so the
+ * macOS backend registration did not compile ("use of undeclared identifier
+ * 'backend_apple_is_supported'"). Declared the same way as
+ * backend_adreno.h / backend_mali.h. (ShugoCore upstream bug report, item 3.) */
+extern bool backend_apple_is_supported(const NRRDeviceOptions& options);
+extern std::unique_ptr<Backend> backend_apple_create(const NRRDeviceOptions& options);
+
 } // namespace nrr
-#endif
+#endif /* NRR_BACKEND_APPLE_H */

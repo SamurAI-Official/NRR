@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 80/80 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, and `M1.3` scene-reset and resolution-change handling. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. Unity plugin code is present but has never been run in an editor; Unreal and Godot plugins are not implemented. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 91/91 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, and `M1.4` the upstream defects an external consumer's Android port reported (ORT-less build, `ORTCHAR_T`, Apple declarations, power-manager C linkage, vendor auto-selection). Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon is real source guarded by 8 drift tests, but its GDExtension binding has never been compiled; Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -13,17 +13,18 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
-> **Reality check (M1 in progress, verified by code inspection).** Real neural inference
-> runs on the CPU execution provider only: the execution-provider layer is a decision
-> function that never attaches a provider to an ONNX Runtime session, the shipped model
-> is an untrained identity fixture, `.nrrmodel` payloads are not parsed, and the Unreal
-> and Godot plugins contain no executable code. The temporal path **is** now wired into
-> the render path (motion reprojection + blend, measured state, scene-cut and
-> resolution-change handling), but it accumulates an untrained model's output, so it
-> reduces flicker without improving detail; the reference/conditioning path still does not
-> reach the model. [docs/roadmap.md](docs/roadmap.md) lists every gap together with the
-> milestone that closes it, and [CHANGELOG.md](CHANGELOG.md) records what changed recently
-> and how it was verified.
+> **Reality check (M1 in progress, verified by code inspection and by the suite).** Real
+> neural inference runs on the CPU execution provider only: the execution-provider layer
+> is a decision function that never attaches a provider to an ONNX Runtime session, the
+> shipped model is an untrained identity fixture, and `.nrrmodel` payloads are not parsed.
+> The temporal path **is** wired into the render path (motion reprojection + blend,
+> measured state, scene-cut and resolution-change handling), but it accumulates an
+> untrained model's output, so it reduces flicker without improving detail; the
+> reference/conditioning path still does not reach the model. The Godot addon is real
+> source, but its GDExtension C++ binding has never been compiled and the Unreal plugin
+> contains no executable code. [docs/roadmap.md](docs/roadmap.md) lists every gap together
+> with the milestone that closes it, and [CHANGELOG.md](CHANGELOG.md) records what changed
+> recently and how it was verified.
 
 ---
 
@@ -68,7 +69,7 @@ nrr/
 │   └── platform/                 # Phase 13: Android (NDK/JNI) + iOS (Obj-C++) bridges
 │
 ├── models/                     # Phase 3: sample .onnx fixtures + architecture docs
-├── engine_plugins/             # Phase 10-12: Unreal (headers only), Godot (config only), Unity (code)
+├── engine_plugins/             # Phase 10-12: Unreal (headers only), Godot (addon + GDExtension binding), Unity (code)
 ├── tools/                      # gen_sample_model.py, fetch_ort.ps1, build.ps1
 ├── docs/                       # roadmap.md (authoritative status + plan)
 ├── tests/                      # unified suite (main.cpp) + standalone phase tests
@@ -264,15 +265,28 @@ structural until M2 attaches providers for real
 - [ ] Editor UI for model/reference management
 - [ ] Render pass integration
 
-### Phase 11 - Godot Integration (not implemented)
-- [x] Plugin configuration files (engine_plugins/godot/project.godot, plugin.cfg)
-- [ ] GDScript NRR class - there are zero `.gd` files in the repository
-- [ ] Initialize/Shutdown functions
-- [ ] Model loading from res:// paths
-- [ ] Reference loading from res:// paths
-- [ ] Render frame function
-- [ ] GDExtension/GDNative bindings for the full C API
-- [ ] Editor plugin UI
+### Phase 11 - Godot Integration (addon real, native binding never compiled)
+
+The addon is now real source: an **INI** `plugin.cfg` (the XML variant that used to
+be here is a Godot 3 format Godot 4 never parsed, so the plugin never loaded a
+single line), a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic
+`NRRPostProcess` node, a per-platform `nrr.gdextension` table, and a GDExtension
+C++ binding to the C ABI. The binding has **never been compiled** - no godot-cpp
+checkout and no Godot install exist in this environment - and nothing has been run
+in an editor or on a device (`gated: Godot install`, M6). What is measured is the
+wiring: 8 drift guards in `tests/unit/test_engine_plugins.cpp`.
+- [x] INI plugin descriptor (`engine_plugins/godot/plugin.cfg`)
+- [x] Editor plugin entry point (`nrr_plugin.gd`, `extends EditorPlugin`)
+- [x] GDScript `NRR` class - `initialize()` / `shutdown()`
+- [x] Model loading (res:// paths are globalized for the native filesystem layer)
+- [x] Render frame function with explicit passthrough reporting
+- [x] GDExtension binding for the C API surface a render path needs
+- [x] Per-platform library table (Windows/Linux/macOS/Android arm64+x86_64/iOS/web)
+- [x] Renderer-agnostic post-process node + blit shader
+- [ ] Reference loading from res:// paths (API exists, no call site yet)
+- [ ] Depth/motion capture - Godot exposes no portable depth buffer to GDScript
+- [ ] Editor UI beyond the status menu item
+- [ ] Compile the binding against godot-cpp and run it (gated: Godot install)
 
 ### Phase 12 - Unity Integration (code present, never run in an editor)
 
@@ -326,9 +340,25 @@ On Windows PowerShell 5.1 (no `pwsh` installed):
 `tools/build.ps1` locates CMake on PATH or in a Python site-packages install, selects
 the Visual Studio generator when Visual Studio is present (no `vcvars64` shell needed),
 and writes test logs to `<build>/test-results/`. CMake auto-detects
-`third_party/onnxruntime-*` (or accepts `-DNRR_ONNXRUNTIME_ROOT=<path>`). Without the
-SDK the build still compiles and the suite still passes on the placeholder inference
-path - that configuration is not the product.
+`third_party/onnxruntime-*` (or accepts `-DNRR_ONNXRUNTIME_ROOT=<path>`).
+
+**Without the SDK** the library and the tests now *compile* (they did not: `M1.4` fixed an
+undeclared `provider_note_`), but the suite does not go green on that path and CI refuses
+to pretend otherwise - `.github/workflows/ci.yml` fails the job if the SDK is missing.
+Measured on Windows x64 Release without ORT: `nrr_tests` runs 89 tests, 76 pass, 13 fail.
+Every failure is a rendering test, because the placeholder session declares a fabricated
+`512x512` static input and fabricated temporal stats, so it cannot honour a real frame.
+That configuration is not the product; see [docs/roadmap.md](docs/roadmap.md) M1.4.
+
+Godot plugin build (opt-in; needs a `godot-cpp` checkout and a Godot install, neither of
+which exists here):
+
+```powershell
+git clone --recursive https://github.com/godotengine/godot-cpp
+cmake -S . -B build-godot -DNRR_BUILD_GODOT_PLUGIN=ON `
+      -DNRR_GODOT_CPP_PATH=<abs path to godot-cpp> -DCMAKE_BUILD_TYPE=Release
+cmake --build build-godot --config Release --target nrr_godot
+```
 
 Memory-safety build (requires the "C++ AddressSanitizer" component in the Visual
 Studio installer):
@@ -339,25 +369,37 @@ pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
 
 ## Testing
 
-`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 80 tests) plus the
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 91 tests) plus the
 five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
 
-`nrr_tests` registers 87 tests. Of those, 23 are compiled out of a desktop build and stay
+`nrr_tests` registers 98 tests. Of those, 23 are compiled out of a desktop build and stay
 in the count only as an explicit gap (12 under `NRR_ENABLE_MOBILE_VENDOR`, 11 under
 `#ifndef _WIN32`), and 2 need `NRR_HAVE_ONNXRUNTIME`; the 16 latency benchmarks are run by
-their own aggregator, which is what makes the executed total `62 + 2 + 16 = 80`. The mobile
+their own aggregator, which is what makes the executed total `73 + 2 + 16 = 91`. The mobile
 platform and vendor tests have never run on a device or in CI - see M8 in
 [docs/roadmap.md](docs/roadmap.md). `CHANGELOG.md` derives these counts per commit.
+
+## Engine integrations
+
+| Consumer | What it uses | Verified how |
+| --- | --- | --- |
+| **ShugoCore** (`G:\Program Prototype\shugocore`) | Vendors this repository as a git submodule at `platforms/android/app/src/main/cpp/nrr` (pinned `6c977e2`) and consumes the **C ABI** from an ONNX Runtime extracted out of the Maven AAR. Its Python `nrr/` package mirrors `specification/frame_contract.md` at the descriptor level and stays binary-free. | `M1.4` fixes all six defects its Android port reported in `docs/nrr_upstream_bug_report.md`, plus the four Android power-manager hook declarations, so nothing ShugoCore patches is missing here any more. ShugoCore still carries `patches/nrr/000{1,2}-*.patch` because its pin predates this commit: re-pinning to this commit lets it retire both patches (they will not apply on top of it, and `scripts/apply_nrr_patches.sh` treats a patch that stops applying as a hard error). That re-pin is ShugoCore-side work and is **not** done here. |
+| **Shogunet** | Nothing. | `G:\Program Prototype\Shogunet` is an empty directory - there is no code to integrate with. NRR's transport-agnostic contract (`NRRFrameDescriptor` / `NRRRenderResult` as structured payloads) is what a Shogunet binding would carry; it does not exist yet. |
+
+The integration surface that matters in both directions is the export table: `include/nrr.h`
+declares 44 entry points (`NRR_ENTRY_POINT_COUNT`), `test_api_entry_point_count` asserts the
+linked library exports all of them, and the Godot GDExtension binding is checked against the
+same header by `test_godot_binding_references_only_declared_c_api_entry_points`.
 
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
-runs the full suite (80 tests). A second, **blocking** job runs the same correctness tests
+runs the full suite (91 tests). A second, **blocking** job runs the same correctness tests
 under MSVC AddressSanitizer; it excludes the 16 wall-clock benchmarks
 (`NRR_SKIP_TIMING_TESTS`, see [docs/roadmap.md](docs/roadmap.md) M1.2) because timings under
-instrumentation are not measurements, so the sanitizer job runs 64 of the 80 tests. A failing
+instrumentation are not measurements, so the sanitizer job runs 75 of the 91 tests. A failing
 sanitizer run publishes the unresolved DLL dependencies of the built binaries as
 annotations. Both jobs carry `timeout-minutes: 30`.
 

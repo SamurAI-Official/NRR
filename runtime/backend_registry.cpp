@@ -52,10 +52,27 @@ static const BackendPriority backend_priorities[] = {
     {"NVIDIA", 100},
     {"AMD", 90},
     {"Intel", 80},
-    {"Adreno", 60},
-    {"Mali", 55},
     {"Vulkan", 50},
     {"CPU", 10},
+    /* Mobile vendor backends rank BELOW the CPU backend on purpose.
+     *
+     * Their is_supported() returns true whenever NRR_ENABLE_MOBILE_VENDOR is
+     * set, without probing for that vendor's GPU, so an auto-selection that
+     * ranked them above CPU resolved to Adreno on *every* device; Adreno's
+     * initialize() then failed GPU detection on non-Qualcomm silicon and took
+     * nrr_device_create() down with it. Ranking them below CPU keeps
+     * auto-selection deterministic and initialisable. A caller that knows the
+     * hardware still selects the vendor explicitly through
+     * NRRDeviceOptions.preferred_backend, which is honoured before this table
+     * is consulted. (ShugoCore upstream bug report, item A.) Real
+     * vendor-GPU probing (Vulkan enumeration / ro.hardware) is the tracked
+     * follow-up - see docs/roadmap.md M7. */
+    {"Adreno", 5},
+    {"Mali", 4},
+    {"PowerVR", 3},
+    {"Apple", 3},
+    {"Xenos", 2},
+    {"Radeon", 2},
 };
 
 

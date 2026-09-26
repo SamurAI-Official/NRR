@@ -30,3 +30,9 @@ _*
 
 # Runtime-generated reference fixtures (written by test_nrr_reference)
 test_*.nrrref
+
+# Godot addon build output (see engine_plugins/godot/README.md): the GDExtension
+# libraries are built per platform/architecture and are never committed.
+engine_plugins/godot/bin/
+*.wasm
+

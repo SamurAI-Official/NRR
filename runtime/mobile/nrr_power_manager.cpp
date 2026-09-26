@@ -126,25 +126,37 @@ float power_manager_get_resolution_scale(NRRDevice* device) {
 }
 
 } // namespace mobile
+} // namespace nrr
 
-// C API wrappers
+/* C API wrappers.
+ *
+ * These are declared in nrr_power_manager.h inside a global `extern "C"`
+ * block, but they used to be *defined* inside `namespace nrr`, which gave them
+ * C++ linkage under a mangled name (`nrr::nrr_power_manager_init`). The
+ * repository's own tests linked only because they call the functions
+ * unqualified from `namespace nrr::test`, where enclosing-namespace lookup
+ * finds them; a plain-C consumer - the point of a C API - failed to link.
+ * The definitions now match their own header. (ShugoCore upstream bug report,
+ * item 6.) */
+extern "C" {
+
 NRRResult nrr_power_manager_init(NRRDevice* device, const NRRPowerSettings* settings) {
-    return mobile::power_manager_init(device, settings);
+    return nrr::mobile::power_manager_init(device, settings);
 }
 NRRResult nrr_power_manager_shutdown(NRRDevice* device) {
-    return mobile::power_manager_shutdown(device);
+    return nrr::mobile::power_manager_shutdown(device);
 }
 NRRResult nrr_power_manager_update(NRRDevice* device) {
-    return mobile::power_manager_update(device);
+    return nrr::mobile::power_manager_update(device);
 }
 NRRResult nrr_power_manager_get_status(NRRDevice* device, NRRPowerStatus* status) {
-    return mobile::power_manager_get_status(device, status);
+    return nrr::mobile::power_manager_get_status(device, status);
 }
 NRRResult nrr_power_manager_set_profile(NRRDevice* device, NRRPowerProfile profile) {
-    return mobile::power_manager_set_profile(device, profile);
+    return nrr::mobile::power_manager_set_profile(device, profile);
 }
 float nrr_power_manager_get_resolution_scale(NRRDevice* device) {
-    return mobile::power_manager_get_resolution_scale(device);
+    return nrr::mobile::power_manager_get_resolution_scale(device);
 }
 
-} // namespace nrr
+} // extern "C"

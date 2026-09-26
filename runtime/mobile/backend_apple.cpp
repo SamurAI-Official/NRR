@@ -12,7 +12,13 @@
 #include <algorithm>
 #include <vector>
 
-#ifdef __APPLE__
+/* The Metal/CoreML frameworks may only be included from an Objective-C++
+ * translation unit. This file is a .cpp and contains no Objective-C code of
+ * its own, so the guard tests the compile-time language as well as the OS:
+ * the previous `#ifdef __APPLE__` + TARGET_OS_* form pulled Objective-C
+ * headers into a C++ TU and failed to build on macOS. (ShugoCore upstream bug
+ * report, item 4.) */
+#if defined(__APPLE__) && defined(__OBJC__)
 #include <TargetConditionals.h>
 #if TARGET_OS_IOS || TARGET_OS_OSX
 #include <Metal/Metal.h>

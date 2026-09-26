@@ -35,4 +35,35 @@ size_t android_get_available_memory();
 } // namespace android
 } // namespace nrr
 
+// ---------------------------------------------------------------------------
+// Power-manager platform hooks.
+//
+// runtime/mobile/nrr_power_manager.cpp calls these four from inside
+// `namespace nrr::mobile`, guarded by __ANDROID__, but nothing declared or
+// defined them: the Android power-manager path could not compile. They are
+// declared in the namespace the call sites resolve in and must be implemented
+// by the consuming application (which owns the JNI/Context plumbing that reads
+// the battery and thermal sysfs nodes). ShugoCore supplies them in
+// platforms/android/app/src/main/cpp/nrr_android_platform.cpp.
+// (ShugoCore upstream bug report, item 5/declaration gap.)
+// ---------------------------------------------------------------------------
+namespace nrr {
+namespace mobile {
+
+// Battery charge 0.0..1.0, or -1 when the device exposes no battery supply.
+float android_get_battery_level();
+
+// 1 charging, 0 discharging, -1 unknown.
+int android_get_battery_status();
+
+// Thermal headroom 0.0 (critical) .. 1.0 (nominal). Reports 1.0 when no thermal
+// zone is readable, so an unknown reading never triggers throttling.
+float android_get_thermal_headroom();
+
+// 1 while the OS battery-saver is on, else 0.
+int android_is_low_power();
+
+} // namespace mobile
+} // namespace nrr
+
 #endif

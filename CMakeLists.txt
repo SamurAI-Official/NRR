@@ -12,6 +12,16 @@ option(NRR_BUILD_SHARED "Build as shared library" ON)
 option(NRR_BUILD_TESTS "Build tests" ON)
 
 # ---------------------------------------------------------------------------
+# Godot 4.x GDExtension binding (engine_plugins/godot/src).
+#
+# OFF by default: it needs a godot-cpp checkout and the Godot build toolchain
+# for the target platform, neither of which the runtime or its test suite
+# depends on. See engine_plugins/godot/README.md.
+# ---------------------------------------------------------------------------
+option(NRR_BUILD_GODOT_PLUGIN "Build the Godot 4.x GDExtension binding (needs godot-cpp)" OFF)
+set(NRR_GODOT_CPP_PATH "" CACHE PATH "Path to a godot-cpp checkout (used by NRR_BUILD_GODOT_PLUGIN)")
+
+# ---------------------------------------------------------------------------
 # Sanitizers - memory-safety instrumentation for CI and local hardening runs.
 #
 #   pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
@@ -326,6 +336,10 @@ if(NRR_BUILD_TESTS)
     target_compile_definitions(nrr_tests PRIVATE
         NRR_SAMPLE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_upscaler_v0.1.onnx"
         NRR_PASSTHROUGH_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_passthrough_2x.onnx"
+        # Source root, so the engine-plugin drift guards can read
+        # engine_plugins/**/*.cfg / *.gdextension / *.gd / src/*.cpp and check
+        # them against include/nrr.h at test time.
+        NRR_PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     )
     if(NRR_HAVE_ONNXRUNTIME)
         target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_ONNXRUNTIME)
@@ -387,6 +401,15 @@ if(NRR_BUILD_TESTS)
 endif()
 
 # ============================================================================
+# Godot GDExtension binding (optional; gated on a godot-cpp checkout)
+# ============================================================================
+
+if(NRR_BUILD_GODOT_PLUGIN)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/engine_plugins/godot/src
+                     ${CMAKE_BINARY_DIR}/nrr_godot)
+endif()
+
+# ============================================================================
 # Installation
 # ============================================================================
 
@@ -416,6 +439,7 @@ message(STATUS "Build Type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "Shared Library:   ${NRR_BUILD_SHARED}")
 message(STATUS "Build Tests:      ${NRR_BUILD_TESTS}")
 message(STATUS "Sanitizers:       ${NRR_ENABLE_SANITIZERS}")
+message(STATUS "Godot plugin:     ${NRR_BUILD_GODOT_PLUGIN}")
 message(STATUS "Vulkan Backend:   ${NRR_ENABLE_VULKAN}")
 message(STATUS "NVIDIA Backend:   ${NRR_ENABLE_NVIDIA}")
 message(STATUS "AMD Backend:      ${NRR_ENABLE_AMD}")

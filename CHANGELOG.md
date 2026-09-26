@@ -16,6 +16,39 @@ actually printed rather than estimates.
 
 ### Added
 
+- **A real Godot 4.x addon** (`M1.4`, `engine_plugins/godot/`). The directory previously held
+  a `project.godot` and an **XML** `plugin.cfg`; Godot 4 parses `plugin.cfg` as INI, so the
+  descriptor was never read and the plugin never loaded. It now contains the INI descriptor, a
+  `@tool` EditorPlugin (`nrr_plugin.gd`), the GDScript `NRR` API
+  (`initialize`/`shutdown`/`load_model`/`unload_model`/`render_frame`/`reset_temporal_history`/
+  `backend_name`/`capabilities`), a renderer-agnostic `NRRPostProcess` `CanvasLayer` node plus
+  its blit shader, a per-platform `nrr.gdextension` table (Windows x86_64; Linux x86_64+arm64;
+  macOS universal; Android arm64+x86_64; iOS arm64; web wasm32), and a GDExtension C++ binding
+  (`src/nrr_godot.{h,cpp}`) over the public C ABI. Absence is reported, never faked:
+  `render_frame()` returns the input image unchanged and records why in `last_error`.
+  **The C++ binding has never been compiled** - no godot-cpp checkout and no Godot install
+  exist in this environment - so it is shipped as source, not as a verified artifact.
+- **Eight engine-plugin drift guards** (`M1.4`, `tests/unit/test_engine_plugins.cpp`). They read
+  the addon from the source tree and assert what can rot silently: the descriptor is INI with
+  `name`/`version`/`description`/`author` and a `script=` that exists and `extends EditorPlugin`;
+  the GDScript API surface matches ShugoCore's Godot binding; `nrr.gdextension` declares an
+  `entry_symbol`, a `compatibility_minimum` and all eight release platform/arch entries; the
+  entry symbol is defined and `GDE_EXPORT`ed in the binding; the `distinct nrr_*` symbols the
+  binding calls (16 of them) are all declared in `include/nrr.h`; the `M1.3` reset export is
+  reachable from GDScript; the post-process node is a `CanvasLayer` with a `canvas_item` shader;
+  and `CMakeLists.txt` wires `NRR_BUILD_GODOT_PLUGIN`. Measured output:
+  `binding references 16 declared C entry points`, `descriptor script=nrr_plugin.gd`.
+- **Three `concrete_input_shape()` tests** (`M1.4`, `tests/unit/test_inference.cpp`): an unknown
+  (empty) model shape resolves from the frame, dynamic `-1` axes fill from the frame, and a
+  genuinely static `512x512` declaration is still refused.
+- **A `NRR_BUILD_GODOT_PLUGIN` CMake option and `NRR_GODOT_CPP_PATH` cache variable**
+  (`M1.4`). Off by default - it needs a godot-cpp checkout - so the runtime and its suite stay
+  buildable without one. The configuration summary prints `Godot plugin: OFF`.
+- **An "Engine integrations" section in the README** (`M1.4`) recording, with evidence, what
+  ShugoCore consumes (the C ABI plus the `frame_contract.md` descriptor shape, vendored as a
+  submodule) and that `G:\Program Prototype\Shogunet` is an empty directory with no code to
+  integrate with.
+
 - **Scene-cut detection and temporal history reset** (`M1.3`, `43d4224`).
   `temporal_scene_changed()` (`runtime/nrr_temporal.h`) treats a frame index that does not
   advance past the last recorded frame, or a change of render resolution, as a scene
@@ -144,6 +177,61 @@ actually printed rather than estimates.
   Runtime SDK or with a non-ONNX model - the same "fabricated state" pattern `M1` exists to
   remove, and it is recorded as a known gap in `docs/roadmap.md` rather than hidden.
 
+### Fixed
+
+- **Six upstream defects reported by ShugoCore's Android port** (`M1.4`). All six were reported
+  against `6c977e2` in `G:\Program Prototype\shugocore\docs\nrr_upstream_bug_report.md`, were
+  still present at `1b1f994`, and are now fixed here instead of being carried as a downstream
+  patch series:
+  1. **The ORT-less configuration did not compile.** `ONNXRuntime::set_execution_provider()`
+     clears `provider_note_`, but the member was declared only inside
+     `#ifdef NRR_HAVE_ONNXRUNTIME` (`runtime/onnx_runtime.h`), so a configure without the SDK
+     produced `use of undeclared identifier 'provider_note_'`. The member moved to the
+     unguarded metadata block. **Verified**: `cmake -DNRR_ONNXRUNTIME_ROOT=disabled` now
+     configures, compiles and links `nrr_static`, `nrr` and all six test executables.
+  2. **The ORT-enabled configuration was Windows-only.** `runtime/onnx_runtime.cpp` included
+     `<windows.h>` and built a `std::wstring` path unconditionally, while `ORTCHAR_T` is `char`
+     off Windows. A new `ort_path()` returns `std::wstring` under `_WIN32` and `std::string`
+     elsewhere, with the `windows.h` include inside the `_WIN32` arm. **Verified**: the Windows
+     ORT build is still green at 91/91.
+  3. **`backend_apple.h` declared neither `backend_apple_is_supported` nor
+     `backend_apple_create`** although `backend_registry.cpp` references both under
+     `#ifdef __APPLE__` (the macOS build failed on an undeclared identifier). Both are now
+     declared `extern`, matching `backend_adreno.h`/`backend_mali.h`.
+  4. **macOS could not build** because `runtime/mobile/backend_apple.cpp` - a C++ translation
+     unit with no Objective-C code in it - included `Metal/Metal.h` and `CoreML/CoreML.h` under
+     a `TARGET_OS_*` guard. The guard now also requires `defined(__OBJC__)`.
+  5. **Vendor auto-selection chose a backend that could not initialise.** Every vendor
+     `is_supported()` returns `true` when `NRR_ENABLE_MOBILE_VENDOR` is set without probing for
+     that GPU, and Adreno ranked 60 to CPU's 10, so `select_best_backend()` resolved to Adreno on
+     *every* device and `nrr_device_create()` failed on non-Qualcomm silicon. The six mobile
+     vendor priorities now rank below CPU; an explicit
+     `NRRDeviceOptions.preferred_backend` is still honoured first.
+  6. **The power-manager C API had C++ linkage.** `runtime/mobile/nrr_power_manager.cpp`
+     defined `nrr_power_manager_*` inside `namespace nrr` while `nrr_power_manager.h` declares
+     them in a global `extern "C"` block, so the symbols were mangled and a plain-C consumer
+     could not link. `namespace nrr` is now closed before the wrappers, which are wrapped in
+     `extern "C"` and call `nrr::mobile::*` qualified.
+  7. **The Android power-manager hooks had no declaration.** `runtime/mobile/nrr_power_manager.cpp`
+     calls `android_get_battery_level`, `android_get_battery_status`,
+     `android_get_thermal_headroom` and `android_is_low_power` under `__ANDROID__`, but
+     `runtime/platform/android/nrr_android.h` declared none of them, so the Android power path
+     had nothing to link against. They are now declared in `nrr::mobile` and stay implemented by
+     the consuming application (`android_get_*` reads the battery/thermal sysfs nodes and needs
+     the app's JNI/Context plumbing).
+- **`concrete_input_shape()` rejected an unknown model shape as a conflict**
+  (`M1.4`, `runtime/nrr_inference.cpp`). An empty `model_shape` means "no declared shape" - the
+  placeholder inference path has no `OrtSession` to query, and a fully dynamic model input has
+  none either - so it now resolves to `{1, channels, H, W}` from the frame. A declared static
+  H/W still conflicts as before. Covered by the three new tests above.
+- **Two documentation claims that no measurement supported**: the README's *"Without the SDK
+  the build still compiles and the suite still passes on the placeholder inference path"* (the
+  compile half was also false before fix 1; the suite half is false - measured 89 run, 76 pass,
+  13 fail) and `docs/roadmap.md`'s *"Without the SDK the placeholder path is used and the suite
+  still passes"*. Both now state the measured numbers, and M1.4 records why the 13 failures are
+  rendering tests: the placeholder session declares a fabricated `512x512` static input and
+  fabricated temporal stats. CI already refuses to run in that configuration.
+
 ### Verification
 
 `tools/build.ps1 -Config Release -RunTests` builds and runs six executables
@@ -162,27 +250,48 @@ The three commits at the head of this entry are documentation-only (`f90de61`, `
 the feature itself (`43d4224`), and no `.cpp`/`.h`/`CMakeLists.txt` file changed after the
 green local build, so the 80/80 result applies to the tree as committed.
 
+**`M1.4` (this changeset) - measured, before the commit that carries it.** Two configurations
+were built and run on Windows x64 with the Visual Studio 17 2022 generator:
+
+```
+ORT SDK present   (build-ci):   Total: 91, Passed: 91, Failed: 0    (6/6 executables)
+ORT SDK absent    (build-noort): Total: 89, Passed: 76, Failed: 13  <- placeholder path
+```
+
+The ORT-present suite is the one CI gates on, and CI additionally fails the job when the SDK is
+missing rather than running the placeholder path. The ORT-absent numbers are quoted because the
+README previously claimed the opposite; the 13 failures are all rendering tests and the reason
+is recorded under M1.4 in `docs/roadmap.md`. `build-noort` is a scratch directory, not a
+committed configuration.
+
+The Godot binding was **not** compiled - there is no godot-cpp checkout and no Godot install on
+this machine - so no build number is claimed for it. What is measured is the wiring
+(`tests/unit/test_engine_plugins.cpp`, 8 tests, all passing in both configurations).
+
 Test counts are derived from `tests/main.cpp` per commit, so they can be re-derived with
 `git show <hash>:tests/main.cpp`:
 
 ```
-                              pre-work  M1.1  M1.2  M1.3
-registrations in main.cpp          77    84    84    87
-  out: #ifndef _WIN32             -10   -11   -11   -11   (android, ios)
-  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   (adreno, mali)
-  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2
+                              pre-work  M1.1  M1.2  M1.3  M1.4
+registrations in main.cpp          77    84    84    87    98
+  out: #ifndef _WIN32             -10   -11   -11   -11   -11   (android, ios)
+  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   -12   (adreno, mali)
+  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2    -2
   ------------------------------------------------
-  unconditional registrations       59    59    59    62
+  unconditional registrations       59    59    59    62    73
   + NRR_HAVE_ONNXRUNTIME (runs
-    wherever the SDK is present)    +2    +2    +2    +2
+    wherever the SDK is present)    +2    +2    +2    +2    +2
   + latency benchmarks run by
-    their own aggregator            +0   +16   +16   +16
+    their own aggregator            +0   +16   +16   +16   +16
   ------------------------------------------------
-  tests executed in the suite       61    77    77    80
+  tests executed in the suite       61    77    77    80    91
 ```
 
 Every column re-derives: `77 - 18 + 2 + 0 = 61`, `84 - 25 + 2 + 16 = 77`,
-`87 - 25 + 2 + 16 = 80`.
+`87 - 25 + 2 + 16 = 80`, `98 - 25 + 2 + 16 = 91`. The `M1.4` column adds 11 unconditional
+tests: 8 engine-plugin drift guards (`tests/unit/test_engine_plugins.cpp`) and 3
+`concrete_input_shape()` tests (`tests/unit/test_inference.cpp`). Every one of them runs in
+both the ORT-present and ORT-absent builds, which is what `89 = 91 - 2` reflects.
 
 Two rows carry the point of two of the entries above. `pre-work` registers 77 tests but
 executes 61: 18 are inside guards that are off on desktop, and although 8 latency tests ran,
@@ -194,7 +303,7 @@ and the registration total moved only 77 -> 84, while execution rose 61 -> 77 (t
 benchmarks now run through the aggregator, replacing the 8 that were listed by hand).
 
 Under `NRR_SKIP_TIMING_TESTS` (the ASan gate) the 16 benchmarks are excluded, so the gate
-runs 61 tests at M1.2 and 64 at M1.3. Counts were reproduced locally with the same
+runs 61 tests at M1.2, 64 at M1.3 and 75 at M1.4. Counts were reproduced locally with the same
 configuration CI uses (Windows x64, ONNX Runtime SDK present).
 
 ---

@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 #include "test_framework.h"
 #include "nrr.h"
+#include "nrr_inference.h"
 #include "onnx_runtime.h"
 #include <cmath>
 #include <cstdio>
@@ -342,6 +343,50 @@ NRR_TEST(test_inference_shared_ort_env) {
                     "shutdown detaches the instance from the shared env");
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// concrete_input_shape() - the tensor-shape contract between a model's declared
+// input and the frame resolution.
+//
+// This used to reject an EMPTY model shape as a conflict. An empty shape means
+// "no declared shape" - true of the placeholder inference path (no OrtSession
+// to query) and of a fully dynamic model input - and rejecting it made every
+// render on the ORT-less path fail with "conflicts with the model's static input
+// shape".
+// ---------------------------------------------------------------------------
+
+NRR_TEST(test_concrete_input_shape_unknown_is_dynamic) {
+    std::vector<int64_t> shape;
+    NRR_EXPECT_TRUE(concrete_input_shape({}, 3, 64, 48, shape),
+                    "an unknown model shape is dynamic, not a conflict");
+    NRR_EXPECT_EQ(shape.size(), static_cast<size_t>(4), "shape is 4-D");
+    NRR_EXPECT_EQ(shape[0], static_cast<int64_t>(1), "batch");
+    NRR_EXPECT_EQ(shape[1], static_cast<int64_t>(3), "channels follow the role");
+    NRR_EXPECT_EQ(shape[2], static_cast<int64_t>(48), "height from the frame");
+    NRR_EXPECT_EQ(shape[3], static_cast<int64_t>(64), "width from the frame");
+}
+
+NRR_TEST(test_concrete_input_shape_fills_dynamic_dims) {
+    std::vector<int64_t> shape;
+    // The shipped fixture declares one dynamic axis pair (-1) and batch 1.
+    NRR_EXPECT_TRUE(concrete_input_shape({1, 3, -1, -1}, 3, 32, 16, shape),
+                    "dynamic H/W accepted");
+    NRR_EXPECT_EQ(shape[2], static_cast<int64_t>(16), "dynamic H resolved");
+    NRR_EXPECT_EQ(shape[3], static_cast<int64_t>(32), "dynamic W resolved");
+    NRR_EXPECT_EQ(shape[1], static_cast<int64_t>(3), "static channels kept");
+}
+
+NRR_TEST(test_concrete_input_shape_static_conflict_rejected) {
+    std::vector<int64_t> shape;
+    // A genuinely static model resolution must still be refused rather than
+    // silently reshaped - that rejection is what protects real inference.
+    NRR_EXPECT_FALSE(concrete_input_shape({1, 3, 512, 512}, 3, 64, 64, shape),
+                     "static 512x512 must conflict with a 64x64 frame");
+    NRR_EXPECT_FALSE(concrete_input_shape({1, 3, 1, 1, 1}, 3, 8, 8, shape),
+                     "a non-4-D shape is unsupported");
+    NRR_EXPECT_FALSE(concrete_input_shape({}, 0, 8, 8, shape),
+                     "an empty shape with no channel count cannot be built");
+}
 
 } // namespace test
 } // namespace nrr

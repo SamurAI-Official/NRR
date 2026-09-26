@@ -13,11 +13,15 @@ engine_plugins/
 │   │       └── Private/      # Private implementation
 │   └── NRRPlugin.uplugin    # Plugin descriptor
 │
-├── godot/            # Godot 4.x plugin
-│   ├── project.godot         # Project config
-│   ├── plugin.cfg            # Plugin descriptor
-│   └── gdscript/
-│       └── NRR.gd           # GDScript API
+├── godot/            # Godot 4.x addon
+│   ├── plugin.cfg            # Editor plugin descriptor (INI - Godot's format)
+│   ├── nrr_plugin.gd         # @tool EditorPlugin (the descriptor's script=)
+│   ├── NRR.gd                # GDScript runtime API
+│   ├── nrr_post_process.gd   # Renderer-agnostic CanvasLayer post-process node
+│   ├── nrr.gdextension       # Per-platform/architecture library table
+│   ├── shaders/
+│   ├── src/                  # GDExtension C++ binding (nrr_godot.cpp/.h)
+│   └── README.md             # Build + install + known limits
 │
 └── unity/            # Unity package
     ├── package.json         # Package descriptor
@@ -47,23 +51,38 @@ bool RenderWithNRR(UTexture2D* InputColor, UTexture2D* InputDepth);
 // NRR Component → Initialize NRR → Load Model → Render Frame
 ```
 
-## Godot (Phase 11)
+## Godot (Phase 11 / M6)
 
-**Status**: Structure defined
+**Status**: GDScript addon + editor plugin + post-process node are real source;
+the GDExtension C++ binding (`src/nrr_godot.cpp`) is written but has **never been
+compiled** in this repository (no godot-cpp checkout, no Godot install). Wiring
+is covered by `tests/unit/test_engine_plugins.cpp`.
 
-The Godot plugin provides:
-- `NRR` class - GDScript API for NRR
-- Texture/image handling via Godot's Image class
-- Model and reference loading from res:// paths
+The Godot addon provides:
+- `plugin.cfg` - an **INI** descriptor. The XML variant that used to ship here is
+  a Godot 3 format that Godot 4 never parsed, so the plugin never loaded.
+- `NRR` GDScript API (`initialize` / `load_model` / `render_frame` / `shutdown`)
+- `NRRPostProcess` - a `CanvasLayer` post-process node that works under
+  `forward_plus`, `mobile` **and** `gl_compatibility`, so one addon covers every
+  hardware pipeline Godot can present with
+- A GDExtension binding to the NRR C ABI with a library entry per platform and
+  architecture (`nrr.gdextension`): Windows/Linux/macOS desktop, Android
+  arm64 + x86_64, iOS arm64, web wasm32
+- Model and reference loading from `res://` paths
 
 ### Usage (Godot)
 
 ```gdscript
-var nrr = NRR.new()
+var nrr := NRR.new()
 nrr.initialize()
 nrr.load_model("res://models/character.nrrmodel")
-var output = nrr.render_frame(color_img, depth_img, motion_img)
+var output := nrr.render_frame(color_img, depth_img, motion_img)
+if nrr.last_render_was_passthrough:
+    push_warning(nrr.last_error)   # absence is reported, never faked
 ```
+
+See [godot/README.md](godot/README.md) for the build steps and the known limits
+(depth/motion capture, one-frame latency).
 
 ## Unity (Phase 12)
 

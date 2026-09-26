@@ -60,6 +60,21 @@ TensorRole classify_tensor_role(const std::string& name) {
 bool concrete_input_shape(const std::vector<int64_t>& model_shape,
                           int channels, uint32_t width, uint32_t height,
                           std::vector<int64_t>& out_shape) {
+    /* No declared shape at all. Two cases reach here:
+     *   - the placeholder inference path, which has no OrtSession to query, so
+     *     no metadata exists; and
+     *   - a model whose input is declared fully dynamic.
+     * Both mean "no static constraint", so the frame resolution supplies every
+     * dimension. Treating this as a conflict (the previous behaviour) made
+     * every render fail on the ORT-less path, so the documented
+     * "compiles and passes without the SDK" configuration compiled but could
+     * not render a single frame. */
+    if (model_shape.empty()) {
+        if (channels <= 0) return false;
+        out_shape = {1, channels, static_cast<int64_t>(height),
+                     static_cast<int64_t>(width)};
+        return true;
+    }
     if (model_shape.size() != 4) return false;
     int64_t n = model_shape[0] > 0 ? model_shape[0] : 1;
     int64_t c = model_shape[1] > 0 ? model_shape[1] : channels;
