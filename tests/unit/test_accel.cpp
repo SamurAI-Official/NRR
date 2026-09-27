@@ -229,10 +229,26 @@ NRR_TEST(test_accel_ep_routing) {
     NRR_EXPECT_TRUE(probe.is_initialized(), "probe kernel is initialized");
     NRR_EXPECT_TRUE(probe.get_active_ep_name().empty(),
                     "probe kernel reports no provider before a session exists");
-    NRR_EXPECT_FALSE(probe.get_capabilities().supports_cuda,
-                     "probe kernel does not turn a CUDA request into a capability");
-    NRR_EXPECT_FALSE(probe.get_capabilities().supports_tensorrt,
-                     "probe kernel does not turn a request into a TensorRT claim");
+    /* supports_* answers a different question from active_ep_name_: it reports what the
+     * LINKED ONNX Runtime offers, so it is populated at initialize() and must agree with
+     * OrtApi::GetAvailableProviders - never with the request above. (Asserting it was
+     * simply "false" was wrong in a way CI caught: on a build with the CUDA provider
+     * present, false contradicts the linked runtime.) */
+    {
+        const std::vector<std::string> provs = ONNXRuntime::available_providers();
+        auto linked = [&provs](const char* want) {
+            for (size_t i = 0; i < provs.size(); ++i) {
+                if (provs[i] == want) return true;
+            }
+            return false;
+        };
+        NRR_EXPECT_TRUE(probe.get_capabilities().supports_cuda ==
+                            linked("CUDAExecutionProvider"),
+                        "supports_cuda reflects the linked runtime, not the CUDA request");
+        NRR_EXPECT_TRUE(probe.get_capabilities().supports_tensorrt ==
+                            linked("TensorrtExecutionProvider"),
+                        "supports_tensorrt reflects the linked runtime, not the request");
+    }
     probe.shutdown();
     NRR_EXPECT_FALSE(probe.is_initialized(), "probe kernel shuts down cleanly");
 }

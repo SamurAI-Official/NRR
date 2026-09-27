@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 #include "test_framework.h"
 #include "onnx_runtime.h"
+#include "nrr_cuda_driver.h"
 
 #include <algorithm>
 #include <chrono>
@@ -131,6 +132,26 @@ NRR_TEST(test_ep_active_provider_is_measured) {
     } else {
         NRR_ASSERT(active == "CPUExecutionProvider",
                    "a session without CUDA reports the CPU provider");
+    }
+
+    /* Independent cross-check, because active_provider() is only as trustworthy as ONNX
+     * Runtime's willingness to report its own failure: some versions accept the CUDA
+     * provider at session-options time and only fall back while creating the session, so
+     * the attach call succeeds and nothing records why. probe_cuda_driver() asks the
+     * display driver directly (nvcuda.dll, no toolkit), so the two answers must agree -
+     * reporting CUDA on a host with no CUDA device is exactly the kind of claim this
+     * suite exists to prevent, and it is a claim that would otherwise survive on a
+     * GPU-less CI runner. */
+    {
+        const CudaDriverProbe& probe = probe_cuda_driver();
+        std::cout << "  driver probe: loaded=" << (probe.driver_loaded ? "yes" : "no")
+                  << " devices=" << probe.device_count
+                  << (probe.note.empty() ? std::string() : (" note: " + probe.note))
+                  << std::endl;
+        if (probe.device_count <= 0) {
+            NRR_EXPECT_TRUE(active != "CUDAExecutionProvider",
+                            "no CUDA device exists, so no session can be running on CUDA");
+        }
     }
     automatic.shutdown();
 }

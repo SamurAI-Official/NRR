@@ -117,9 +117,17 @@ public:
         const std::function<NRRResult(void*, void*, std::size_t)>& download,
         const std::function<NRRResult(void*, const void*, std::size_t)>& upload);
 
-    /* Measured facts about the accelerator runtime, not the request. Every
-     * supports_* flag is false until a session exists and ONNX Runtime has
-     * reported what it can actually attach (see refresh_provider_state()). */
+    /* Measured facts about the accelerator runtime, not the request.
+     *
+     * supports_* come from OrtApi::GetAvailableProviders, so they answer "what can
+     * this linked ONNX Runtime execute on" and are populated as soon as the kernel
+     * initializes - a caller does not have to load a model to find out whether the
+     * build has CUDA at all.
+     *
+     * active_ep_name_ and preferred_ep answer a different question - "where did THIS
+     * session land" - and are only knowable once a session exists, so they stay empty
+     * / CPU until then. Keeping those two questions apart is the point: reporting a
+     * request as an attachment is the defect this kernel used to have. */
     const AccelCapabilities& get_capabilities() const { return accel_caps_; }
 
     /* Discards the accumulated temporal history (camera cut / scene change). The
@@ -146,6 +154,12 @@ private:
      * the session that will actually run - never from a request. An empty name
      * means no session exists, and then nothing is claimed. */
     void apply_measured_provider(const std::string& measured);
+    /* Folds what the LINKED ONNX Runtime offers into supports_*. That is a build fact
+     * - OrtApi::GetAvailableProviders reports it whether or not a session exists - so
+     * it is measured at initialize() rather than deferred to the first model load,
+     * and it is deliberately NOT cleared when a session goes away: the libraries do
+     * not change. Where execution LANDED is active_ep_name_/preferred_ep. */
+    void refresh_available_providers();
     /* Folds the execution provider ONNX Runtime ACTUALLY attached into
      * active_ep_name_ and accel_caps_. select_best_execution_provider() records
      * only the request; the provider is not chosen until a session exists, so

@@ -162,10 +162,15 @@ jobs:
   # which is precisely how the accelerator frame path came to be handing one input
   # to a three-input model while reporting no timings at all.
   #
-  # GitHub-hosted runners have no GPU, so this is a compile/link and
-  # provider-availability gate rather than a performance gate: the CUDA speedup
-  # test records its own skip when the provider cannot be attached. Enforcing a
-  # GPU frame budget needs a self-hosted runner with a GPU.
+  # GitHub-hosted runners have no GPU, so even with the CUDA runtime present the
+  # provider cannot *attach* - the runtime means "loadable", the device means
+  # "usable", and this job has the first without the second. What it therefore gates:
+  # the CUDA configuration compiles and links, the provider and its runtime DLLs
+  # resolve, and the fallback to the CPU provider is reported truthfully rather than
+  # silently. A genuine attach (and the measured speedup) requires a self-hosted
+  # runner with a GPU; `test_ep_active_provider_is_measured` cross-checks the reported
+  # provider against probe_cuda_driver(), so a device-less host cannot claim CUDA even
+  # if ONNX Runtime defers its own failure to session creation.
   #
   # Only the CUDA package is fetched here, so CMake's `auto` flavour detection is
   # deterministic and the CUDA import library is the one linked.
@@ -202,6 +207,36 @@ jobs:
           }
           $mb = [math]::Round((Get-Item $provider).Length / 1MB)
           Write-Host "CUDA execution provider present: $provider ($mb MB)"
+
+      # The provider DLL alone is not enough: ORT loads it together with the CUDA
+      # runtime, and without that it fails with "Failed to load shared library" and the
+      # session silently lands on the CPU provider. Fetching the runtime is what makes
+      # this a gate on the configuration users actually install, rather than a gate on
+      # the fallback path. 2.3 GB, so it is cached.
+      - name: Restore CUDA runtime from cache
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/cuda-runtime-cu12
+          key: cuda-runtime-cu12-${{ env.ORT_VERSION }}
+
+      - name: Fetch the CUDA runtime
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_cuda_runtime.ps1
+
+      - name: Verify the CUDA runtime resolved
+        shell: pwsh
+        run: |
+          $bin = 'third_party/cuda-runtime-cu12/bin'
+          $dll = Join-Path $bin 'cudart64_12.dll'
+          if (-not (Test-Path $dll)) {
+            throw "CUDA runtime missing at $dll - the CUDA execution provider cannot attach without it, so this job would only be exercising the fallback path."
+          }
+          $count = @(Get-ChildItem $bin -Filter '*.dll').Count
+          $mb = [math]::Round((@(Get-ChildItem $bin -Filter '*.dll') |
+            Measure-Object -Property Length -Sum).Sum / 1MB)
+          Write-Host "CUDA runtime resolved: $count DLL(s), $mb MB, $dll present"
 
       - name: Configure, build and test against the CUDA provider
         shell: pwsh

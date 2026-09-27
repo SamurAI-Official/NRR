@@ -76,6 +76,9 @@ bool AcceleratorExecutionKernel::initialize(
     }
     accel_caps_.preferred_ep = preferred_ep_;
     apply_accel_optimizations();
+    /* What the linked ONNX Runtime offers is knowable now, without a session, so it is
+     * measured now rather than left false until the first model load. */
+    refresh_available_providers();
     select_best_execution_provider();
     /* Temporal accumulation is part of the render path, not an optional extra: the
      * CPU backend has always done it and this path must match it. */
@@ -470,26 +473,11 @@ bool AcceleratorExecutionKernel::select_best_execution_provider() {
     return true;
 }
 
-void AcceleratorExecutionKernel::apply_measured_provider(const std::string& measured) {
-    if (measured == active_ep_name_) return; /* unchanged: nothing to redo */
-    active_ep_name_ = measured;
-
-    if (measured.empty()) {
-        /* No session has been created, so nothing was attached and nothing is
-         * claimed. This is the state a freshly initialized kernel reports. */
-        accel_caps_.supports_cuda     = false;
-        accel_caps_.supports_tensorrt = false;
-        accel_caps_.supports_rocm     = false;
-        accel_caps_.supports_directml = false;
-        accel_caps_.supports_openvino = false;
-        accel_caps_.supports_riscv    = false;
-        accel_caps_.preferred_ep      = AccelEP::CPU;
-        return;
-    }
-
-    /* supports_* now describe the ONNX Runtime build that is actually linked, as
-     * reported by OrtApi::GetAvailableProviders - measured from the loaded
-     * libraries, not inferred from the request. */
+void AcceleratorExecutionKernel::refresh_available_providers() {
+    /* What the LINKED ONNX Runtime can execute on, read from OrtApi's own list of the
+     * loaded libraries. This is the number that used to be fabricated from the AccelEP
+     * enum, so it comes from ORT and nowhere else - and because it is a build fact it
+     * is meaningful before any session exists. */
     const std::vector<std::string> available = ONNXRuntime::available_providers();
     auto has = [&available](const char* want) {
         for (size_t i = 0; i < available.size(); ++i) {
@@ -502,9 +490,26 @@ void AcceleratorExecutionKernel::apply_measured_provider(const std::string& meas
     accel_caps_.supports_rocm     = has("ROCMExecutionProvider");
     accel_caps_.supports_directml = has("DmlExecutionProvider");
     accel_caps_.supports_openvino = has("OpenVINOExecutionProvider");
-    /* No ORT build exposes a RISC-V execution provider: a RISC-V host runs the
-     * CPU EP, so this is measured too rather than assumed from the vendor name. */
+    /* No ORT build exposes a RISC-V execution provider: a RISC-V host runs the CPU
+     * EP, so this is measured too rather than assumed from the vendor name. */
     accel_caps_.supports_riscv    = has("RiscvExecutionProvider");
+}
+
+void AcceleratorExecutionKernel::apply_measured_provider(const std::string& measured) {
+    if (measured == active_ep_name_) return; /* unchanged: nothing to redo */
+    active_ep_name_ = measured;
+
+    /* Keep the build facts correct even if a measurement is the first thing to call in. */
+    refresh_available_providers();
+
+    if (measured.empty()) {
+        /* No session exists, so nothing has landed anywhere. supports_* is deliberately
+         * NOT cleared: it reports what the build offers, and the linked libraries do not
+         * change just because a session went away. The session-dependent part is
+         * preferred_ep, which returns to CPU. */
+        accel_caps_.preferred_ep = AccelEP::CPU;
+        return;
+    }
 
     /* preferred_ep reports where execution LANDED, not where it was aimed. */
     if (measured == "CUDAExecutionProvider")           accel_caps_.preferred_ep = AccelEP::CUDA;

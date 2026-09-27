@@ -67,8 +67,19 @@ if (-not $NoDownload) {
     $pipArgs = @('-m', 'pip', 'download', '--only-binary=:all:', '--no-deps',
                  '--dest', $workDir) + ($packages | ForEach-Object { $_.Name })
     Write-Host "[cuda] $Python $($pipArgs -join ' ')"
-    & $Python @pipArgs
-    if ($LASTEXITCODE -ne 0) { throw "pip download failed (exit $LASTEXITCODE)" }
+    # pip writes download progress to stderr, and with $ErrorActionPreference = 'Stop'
+    # PowerShell promotes any native stderr line to a terminating error as soon as the
+    # output is captured - which is exactly what happens under CI. Judge pip by its exit
+    # code instead. Same defect as tools/build.ps1 and godot_verify/setup.ps1.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Python @pipArgs
+        $pipCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($pipCode -ne 0) { throw "pip download failed (exit $pipCode)" }
 }
 
 $wheels = @(Get-ChildItem -Path $workDir -Filter '*.whl')
