@@ -677,12 +677,15 @@ NRR_TEST(latency_frame_budget_breakdown) {
      * and the temporal blend are all CPU work. ONNX Runtime's own host<->device
      * transfers happen inside the inference figure, which is why the split is
      * published rather than a single number. */
-    struct Tier { const char* name; uint32_t w; uint32_t h; };
+    struct Tier { const char* name; uint32_t w; uint32_t h; double budget_ms; };
+    /* Budgets come from measurement, not invention. With the CUDA EP attached this
+     * host measures 32.7 / 136.6 / 257.6 / 989.6 ms for the four tiers (see the
+     * commit that added this test), and each ceiling is roughly 3.5x that. */
     const Tier tiers[] = {
-        {"256x256",   256,  256},
-        {"512x512",   512,  512},
-        {"960x540",   960,  540},
-        {"1920x1080", 1920, 1080},
+        {"256x256",   256,  256,  150.0},
+        {"512x512",   512,  512,  500.0},
+        {"960x540",   960,  540,  900.0},
+        {"1920x1080", 1920, 1080, 3500.0},
     };
 
     for (const Tier& tier : tiers) {
@@ -707,6 +710,7 @@ NRR_TEST(latency_frame_budget_breakdown) {
         double reported_total = 0.0;
         double infer_total = 0.0;
         double overhead_total = 0.0;
+        std::string last_debug;
         for (int i = 0; i < samples; ++i) {
             NRRFrameOutput out = {};
             const double wall = render_one(static_cast<uint64_t>(i + 100), out);
@@ -714,6 +718,7 @@ NRR_TEST(latency_frame_budget_breakdown) {
             reported_total += static_cast<double>(out.stats.render_time_ms);
             infer_total += static_cast<double>(out.stats.neural_inference_time_ms);
             overhead_total += static_cast<double>(out.stats.backend_overhead_ms);
+            last_debug.assign(out.stats.debug_info);
             if (i == 0) {
                 std::cout << "    " << tier.name << " path: "
                           << out.stats.debug_info << std::endl;
@@ -740,6 +745,23 @@ NRR_TEST(latency_frame_budget_breakdown) {
         NRR_EXPECT_TRUE(reported_avg * 4.0 + 1.0 >= wall_avg,
                         "reported render time is anchored to the measured wall time");
         NRR_EXPECT_TRUE(reported_avg > 0.0, "a real frame reports a non-zero time");
+
+        /* Tier budget. Enforced only where a device execution provider is actually
+         * attached: on a host running the CPU EP the same frame legitimately takes an
+         * order of magnitude longer, which is a property of the provider rather than
+         * a regression, so the skip is recorded instead of silently passing. A gate
+         * that runs on a GPU needs a self-hosted runner - GitHub-hosted runners have
+         * no GPU - so CI exercises the budgets only in this "no device EP" mode. */
+        const bool device_ep =
+            last_debug.find("CUDAExecutionProvider") != std::string::npos ||
+            last_debug.find("TensorrtExecutionProvider") != std::string::npos;
+        if (device_ep) {
+            NRR_EXPECT_TRUE(reported_avg < tier.budget_ms,
+                            "tier stays inside its measured frame budget");
+        } else {
+            std::cout << "    (budget " << tier.budget_ms << "ms not enforced: no device "
+                      << "execution provider attached on this host)" << std::endl;
+        }
     }
     latency_teardown();
 }

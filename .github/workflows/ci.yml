@@ -119,3 +119,68 @@ jobs:
           name: asan-test-logs-${{ github.run_number }}
           path: build-asan/test-results/
           if-no-files-found: ignore
+
+
+  # ---------------------------------------------------------------------------
+  # GPU linkage gate: build, link and test against the CUDA ONNX Runtime.
+  #
+  # None of the CUDA path is compiled by the CPU-flavour job above:
+  # SessionOptionsAppendExecutionProvider_CUDA, the provider-DLL-beside-
+  # onnxruntime.dll deployment, the toolkit-free driver probe (nrr_cuda_driver)
+  # and every #ifdef NRR_HAVE_CUDA_EP branch in the tests. Without a job that
+  # builds this configuration it can rot silently until someone does it by hand -
+  # which is precisely how the accelerator frame path came to be handing one input
+  # to a three-input model while reporting no timings at all.
+  #
+  # GitHub-hosted runners have no GPU, so this is a compile/link and
+  # provider-availability gate rather than a performance gate: the CUDA speedup
+  # test records its own skip when the provider cannot be attached. Enforcing a
+  # GPU frame budget needs a self-hosted runner with a GPU.
+  #
+  # Only the CUDA package is fetched here, so CMake's `auto` flavour detection is
+  # deterministic and the CUDA import library is the one linked.
+  # ---------------------------------------------------------------------------
+  windows-gpu-link:
+    name: Windows x64 - build + test against the CUDA ONNX Runtime
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    env:
+      ORT_GPU_DIR: third_party/onnxruntime-win-x64-gpu_cuda12-1.30.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore CUDA ONNX Runtime from cache
+        id: ort-gpu-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ORT_GPU_DIR }}
+          key: ort-win-x64-gpu_cuda12-${{ env.ORT_VERSION }}
+
+      - name: Fetch CUDA ONNX Runtime
+        if: steps.ort-gpu-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ort.ps1 -Flavor gpu_cuda12 -Version $env:ORT_VERSION
+
+      - name: Verify the CUDA execution provider shipped
+        shell: pwsh
+        run: |
+          $provider = Join-Path $env:ORT_GPU_DIR 'lib/onnxruntime_providers_cuda.dll'
+          if (-not (Test-Path $provider)) {
+            throw "CUDA provider missing from $env:ORT_GPU_DIR - refusing to report a GPU build."
+          }
+          $mb = [math]::Round((Get-Item $provider).Length / 1MB)
+          Write-Host "CUDA execution provider present: $provider ($mb MB)"
+
+      - name: Configure, build and test against the CUDA provider
+        shell: pwsh
+        run: ./tools/build.ps1 -Config Release -BuildDir build-gpu -RunTests
+
+      - name: Upload GPU-build test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-logs-${{ github.run_number }}
+          path: build-gpu/test-results/
+          if-no-files-found: ignore
