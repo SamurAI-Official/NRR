@@ -1,4 +1,5 @@
 #include "onnx_runtime.h"
+#include "nrr_cuda_driver.h"
 #include "nrr_device.h"
 #include <iostream>
 #include <fstream>
@@ -631,6 +632,25 @@ bool ONNXRuntime::append_cuda_provider() {
          * no session options exist yet. load_model() applies the provider again
          * once they do, so leave provider_note_ untouched here - a note written
          * now would shadow the real outcome. */
+        return false;
+    }
+
+    /* The attach call is necessary but NOT sufficient, and trusting it was a real bug:
+     * with the CUDA runtime installed and no CUDA device - a headless host, or the
+     * GPU-less runner this job runs on - ORT accepts the provider here and only fails
+     * when the session is created. NRR then recorded "CUDAExecutionProvider" and every
+     * model load failed with "model load failed" instead of falling back to the CPU
+     * provider as documented. probe_cuda_driver() asks the display driver directly
+     * (nvcuda.dll, no toolkit), so an attach with nowhere to run is reported as not
+     * attached, with the reason - CI run #28 found this the moment the CUDA runtime was
+     * actually installed rather than absent. */
+    const CudaDriverProbe& probe = probe_cuda_driver();
+    if (probe.device_count <= 0) {
+        provider_note_ =
+            std::string("CUDA execution provider not attached: no CUDA device is "
+                        "present (") +
+            (probe.note.empty() ? std::string("the driver reports none") : probe.note) +
+            ") (falls back to the CPU execution provider)";
         return false;
     }
 

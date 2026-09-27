@@ -176,6 +176,16 @@ NRR_TEST(test_ep_cuda_request_never_lies) {
                    "a silent fallback is not allowed: the reason must be recorded");
         std::cout << "  cuda requested, active=" << active
                   << ", note: " << ort.provider_note() << std::endl;
+
+        /* A provider that cannot run must not be able to stop a model from loading. With
+         * the CUDA runtime installed but no CUDA device, ORT accepts the provider at
+         * session-options time and only fails when the session is created - which made
+         * every model load fail instead of falling back (CI run #28). */
+        const CudaDriverProbe& probe = probe_cuda_driver();
+        if (probe.device_count <= 0) {
+            NRR_ASSERT(ort.is_loaded(),
+                       "a CUDA request with no CUDA device must fall back, not fail the load");
+        }
     }
     ort.shutdown();
 }
