@@ -209,15 +209,37 @@ NRRResult render_via_kernel(PathFixture& fx, const NRRFrameInput& in, NRRFrameOu
 
 /* Runs the same three-frame sequence through one path. Frame 1 has no history; frames 2 and
  * 3 blend against it through a uniform motion field, so the blend, the history bookkeeping
- * and the state reporting are all exercised. */
-bool run_sequence(PathFixture& fx, bool accelerator_path, std::vector<FrameResult>& out) {
+ * and the state reporting are all exercised.
+ *
+ * Returns an empty string on success, or the reason the sequence could not be rendered. The
+ * reason is carried back into the assertion, because "the accelerator path renders the
+ * sequence - expected true" is not a diagnosis: it was the first thing this harness reported
+ * in CI, and it took the kernel's source to turn it back into a cause. */
+std::string run_sequence(PathFixture& fx, bool accelerator_path, std::vector<FrameResult>& out) {
     ModelImpl* impl = reinterpret_cast<ModelImpl*>(fx.model);
     if (accelerator_path) {
+        /* Start from a kernel that is known to be cold, rather than inheriting whatever the rest
+         * of the suite left behind. Ownership of this singleton is uneven: a vendor backend
+         * brings it up as a side effect of loading a model (BackendNVIDIA::load_model ->
+         * kernel->initialize()), BackendCPU never touches it, and tests/unit/test_accel.cpp
+         * destroys it. The ambient state therefore depends on the platform and on which tests
+         * ran first, and this harness reported a working accelerator path on a CUDA host and a
+         * broken one in CI purely because of that - the exact defect class it exists to catch.
+         * Nothing caches the pointer (every caller goes through get_accel_kernel()), so
+         * replacing the instance is safe. */
+        destroy_accel_kernel();
         AcceleratorExecutionKernel* kernel = get_accel_kernel();
-        if (kernel == nullptr) return false;
-        if (!kernel->load_model(impl)) return false;
-        /* The kernel is a process-wide singleton, so start from a known state - another
-         * test's history must not leak into this comparison. */
+        if (kernel == nullptr) return "get_accel_kernel() returned null";
+        /* load_model() requires an initialized kernel and returns false otherwise
+         * (accel_kernel.cpp:113), which is what CI reported as "the accelerator path renders the
+         * three-frame sequence - expected true". Bring the kernel up deliberately; initialize()
+         * is idempotent for a kernel that is already running. */
+        if (!kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, false, false, true))
+            return "the shared accelerator kernel would not initialize";
+        if (!kernel->load_model(impl))
+            return "the accelerator kernel would not load the model";
+        /* Start from a known temporal state too - another test's history must not leak into this
+         * comparison. */
         kernel->reset_temporal_history();
     }
 
@@ -231,14 +253,21 @@ bool run_sequence(PathFixture& fx, bool accelerator_path, std::vector<FrameResul
         const NRRResult r = accelerator_path
             ? render_via_kernel(fx, in, rendered)
             : nrr_render(fx.device, fx.model, nullptr, &in, &rendered);
-        if (r != NRR_SUCCESS || rendered.color == nullptr) return false;
+        if (r != NRR_SUCCESS || rendered.color == nullptr) {
+            char err[256] = {};
+            nrr_get_last_error(err, sizeof(err));
+            return "frame " + std::to_string(i + 1) + ": rendering returned " +
+                   std::to_string(static_cast<int>(r)) + " (" +
+                   (err[0] != '\0' ? err : "no error message") + ")";
+        }
 
         FrameResult fr;
         TextureImpl* tex = reinterpret_cast<TextureImpl*>(rendered.color);
         fr.out_w = tex->width;
         fr.out_h = tex->height;
         if (!download_rgb8(fx.device, rendered.color, fr.out_w, fr.out_h, fr.rgb8)) {
-            return false;
+            return "frame " + std::to_string(i + 1) +
+                   ": the output texture could not be read back";
         }
         fr.alpha = rendered.temporal.temporal_alpha;
         fr.history_frames = rendered.temporal.history_frames;
@@ -256,7 +285,7 @@ bool run_sequence(PathFixture& fx, bool accelerator_path, std::vector<FrameResul
         AcceleratorExecutionKernel* kernel = get_accel_kernel();
         if (kernel) kernel->unload_model(impl);
     }
-    return true;
+    return std::string();
 }
 
 double max_abs_byte_difference(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
@@ -291,10 +320,13 @@ void compare_paths(const char* accel_backend, const std::string& what, bool requ
 
     std::vector<FrameResult> a;
     std::vector<FrameResult> b;
-    NRR_EXPECT_TRUE(run_sequence(cpu, false, a),
-                    what + ": the CPU path renders the three-frame sequence");
-    NRR_EXPECT_TRUE(run_sequence(accel, true, b),
-                    what + ": the accelerator path renders the three-frame sequence");
+    const std::string cpu_reason = run_sequence(cpu, false, a);
+    NRR_EXPECT_TRUE(cpu_reason.empty(),
+                    what + ": the CPU path renders the three-frame sequence: " + cpu_reason);
+    const std::string accel_reason = run_sequence(accel, true, b);
+    NRR_EXPECT_TRUE(accel_reason.empty(),
+                    what + ": the accelerator path renders the three-frame sequence: " +
+                        accel_reason);
     NRR_ASSERT(a.size() == 3u && b.size() == 3u,
                what + ": both paths rendered three frames");
 
@@ -392,14 +424,18 @@ NRR_TEST(test_execution_paths_produce_the_same_frames) {
      * one of the two, and before this test existed nothing compared them - which is how the
      * accelerator path came to have no temporal accumulation at all.
      *
-     * Two pairings, because no single environment has both shapes:
+     * Two pairings, because no single environment has both shapes. The CPU-forced one runs
+     * first on purpose: a vendor backend initializes the shared kernel as a side effect of
+     * loading a model and the CPU backend never does, so this pairing is the one that sees the
+     * kernel cold - which is what CI sees everywhere - and it is therefore the configuration in
+     * which a harness bug of that family shows up.
+     *   * a CPU-forced device for the kernel - the CI shape - so the accelerator path is
+     *     compared over BackendCPU's own primitives on a machine that does have an accelerator;
      *   * the automatic device, which is what an application gets: a vendor accelerator where
-     *     the machine has one, the CPU backend in CI, where no runner does;
-     *   * a CPU-forced device for the kernel - the CI shape - so the accelerator path is also
-     *     compared over BackendCPU's own primitives on a machine that does have an accelerator.
+     *     the machine has one, the CPU backend in CI, where no runner does.
      * Path A is always a CPU-forced device, so it is always BackendCPU::execute_model. */
-    path_parity::compare_paths(nullptr, "auto-selected device", true);
     path_parity::compare_paths("CPU", "CPU-forced device (the shape CI runs in)", false);
+    path_parity::compare_paths(nullptr, "auto-selected device", true);
 }
 
 } // namespace test

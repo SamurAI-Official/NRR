@@ -290,6 +290,24 @@ between two `quality_metric` values - between two constants - so it can only eve
 itself. The stability the render path reports *is* measured, from the frame-to-frame change of the
 displayed image, and that is what the new harness compares on both paths.
 
+**The harness's first CI run failed, and the defect was in the harness.** All three jobs reported
+one failing test - `FAILED: ... the accelerator path renders the three-frame sequence - expected
+true` - which is a symptom rather than a diagnosis, so `run_sequence()` now returns the *reason* it
+could not render instead of a bare `false`. The cause: the shared `AcceleratorExecutionKernel` is a
+process-wide singleton with uneven ownership. A *vendor* backend brings it up as a side effect of
+loading a model (`BackendNVIDIA::load_model()` calls `kernel->initialize()`), `BackendCPU` never
+touches it, and `load_model()` returns false for an uninitialized kernel
+(`accel_kernel.cpp:113`). On a CUDA host the automatic device is the NVIDIA backend, so loading the
+model initialized the kernel as a side effect and the harness passed; in CI automatic selection
+gives the CPU backend, nothing initializes the kernel, and `load_model()` returned false. **The
+harness was measuring its environment rather than the code it was written to test** - the same
+defect family it exists to catch. It now destroys the singleton and brings it up deliberately, so
+the accelerator path starts from a known-cold kernel everywhere, and the CPU-forced pairing runs
+first precisely because that is the ordering in which a cold kernel is observable. **Proved by
+disabling the deliberate bring-up again on a machine with a CUDA device: the suite failed with
+`...: the accelerator kernel would not load the model`, the same failure CI reported, and passed
+again with it restored (102/102).**
+
 **Configuration coverage, stated rather than implied.** Verified locally, Windows x64 Release:
 the CUDA-provider-present build, both pairings, 102/102. The CPU-provider CI runtime shape (no
 usable CUDA device) is covered by the CPU-forced pairing - the same code path with the same

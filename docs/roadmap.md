@@ -698,6 +698,24 @@ path's own stability *is* measured, from the frame-to-frame change of the displa
 (`quantify_stability(displayed_delta)`), and that is what the parity harness compares on both
 paths.
 
+**The harness's own first CI run found a defect in the harness, not in NRR.** All three jobs failed
+one test, with the message `FAILED: ... the accelerator path renders the three-frame sequence -
+expected true` - a symptom, so `run_sequence()` now returns the reason it could not render. The
+cause is an ownership hole worth recording on its own: the shared
+`AcceleratorExecutionKernel` singleton is initialized as a *side effect* of
+`BackendNVIDIA::load_model()` and by nothing else on the CPU path, while
+`AcceleratorExecutionKernel::load_model()` refuses an uninitialized kernel
+(`accel_kernel.cpp:113`). So the harness reported a working accelerator path on a CUDA host -
+where automatic selection happened to give the NVIDIA backend - and a broken one in CI, where it
+gives the CPU backend, without a line of NRR changing between the two. A test that depends on
+which backend some other component happened to select is not a test of either path. The harness
+now replaces the singleton and initializes it deliberately, and the CPU-forced pairing (the
+cold-kernel case) is ordered first. **Recorded follow-up, deliberately not fixed with it:**
+nothing *owns* that kernel's lifecycle - the device that uses it never initializes it - so the next
+caller that forgets `initialize()` fails the same way. Making `nrr_device_create` own it is a
+behaviour change for every vendor backend and is left explicit here rather than smuggled into a
+test fix.
+
 **Two configurations this machine still cannot check, recorded rather than implied:** the
 AddressSanitizer job cannot be built locally (the MSVC ASan runtime is not installed here, and
 `tools/build.ps1 -Sanitize` fails fast saying exactly that), so the harness is verified under

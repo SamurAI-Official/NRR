@@ -180,7 +180,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_scene_change_discards_history);
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
-NRR_RUN_TEST(test_execution_paths_produce_the_same_frames);
+    NRR_RUN_TEST(test_execution_paths_produce_the_same_frames);
     
     std::cout << "\n--- Engine Plugin Tests ---\n";
     /* Source-level drift guards for engine_plugins/. They read the addon files
