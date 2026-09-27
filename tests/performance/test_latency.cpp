@@ -661,6 +661,90 @@ NRR_TEST(latency_no_model_budget) {
 // Runner
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 18. Frame budget breakdown: where the per-frame time actually goes
+// ---------------------------------------------------------------------------
+
+NRR_TEST(latency_frame_budget_breakdown) {
+    /* C2. Before this existed the accelerator path published no render stats at all,
+     * so last_render_time_ms() read 0 while a frame really took milliseconds - a
+     * frame-budget tool saw a free render. Measure the reported split at the
+     * resolutions the M2 tiers are defined over, and cross-check it against the wall
+     * clock so the published budget cannot drift away from reality.
+     *
+     * The host overhead is where the data path lives: the engine boundary hands NRR
+     * host memory, so the texture download, the NCHW conversion, the RGB8 conversion
+     * and the temporal blend are all CPU work. ONNX Runtime's own host<->device
+     * transfers happen inside the inference figure, which is why the split is
+     * published rather than a single number. */
+    struct Tier { const char* name; uint32_t w; uint32_t h; };
+    const Tier tiers[] = {
+        {"256x256",   256,  256},
+        {"512x512",   512,  512},
+        {"960x540",   960,  540},
+        {"1920x1080", 1920, 1080},
+    };
+
+    for (const Tier& tier : tiers) {
+        latency_teardown();
+        g_tex_w = tier.w;
+        g_tex_h = tier.h;
+        latency_setup();
+        if (!g_render_ok) {
+            std::cout << "  " << tier.name << ": no model available, skipped"
+                      << std::endl;
+            continue;
+        }
+
+        /* Warm up first: the first frame carries one-time provider/session setup
+         * (measured at 571 ms against a 0.58 ms steady state), which is not a frame
+         * budget and would swamp the split. */
+        NRRFrameOutput warm = {};
+        for (int i = 0; i < 3; ++i) render_one(static_cast<uint64_t>(i + 1), warm);
+
+        const int samples = 5;
+        double wall_total = 0.0;
+        double reported_total = 0.0;
+        double infer_total = 0.0;
+        double overhead_total = 0.0;
+        for (int i = 0; i < samples; ++i) {
+            NRRFrameOutput out = {};
+            const double wall = render_one(static_cast<uint64_t>(i + 100), out);
+            wall_total += wall;
+            reported_total += static_cast<double>(out.stats.render_time_ms);
+            infer_total += static_cast<double>(out.stats.neural_inference_time_ms);
+            overhead_total += static_cast<double>(out.stats.backend_overhead_ms);
+            if (i == 0) {
+                std::cout << "    " << tier.name << " path: "
+                          << out.stats.debug_info << std::endl;
+            }
+        }
+        const double n = static_cast<double>(samples);
+        const double wall_avg = wall_total / n;
+        const double reported_avg = reported_total / n;
+        const double infer_avg = infer_total / n;
+        const double overhead_avg = overhead_total / n;
+
+        std::cout << "  " << tier.name << ": wall=" << wall_avg
+                  << "ms  reported=" << reported_avg
+                  << "ms  (inference=" << infer_avg
+                  << "ms, host overhead=" << overhead_avg << "ms)" << std::endl;
+
+        /* The split must add up to the total the render claims. */
+        NRR_EXPECT_NEAR(infer_avg + overhead_avg, reported_avg,
+                        std::max(0.05, reported_avg * 0.05),
+                        "inference + host overhead equals the reported total");
+        /* And that total must be anchored to the wall clock. Reporting a fraction of
+         * the frame is what made a 632 ms hitch look like the render cost, and 0 ms
+         * look like a free render; neither is a budget. */
+        NRR_EXPECT_TRUE(reported_avg * 4.0 + 1.0 >= wall_avg,
+                        "reported render time is anchored to the measured wall time");
+        NRR_EXPECT_TRUE(reported_avg > 0.0, "a real frame reports a non-zero time");
+    }
+    latency_teardown();
+}
+
+
 void run_all_latency_tests() {
     std::cout << "\n--- Latency Tests ---\n";
     NRR_RUN_TEST(latency_single_frame);
@@ -679,6 +763,8 @@ void run_all_latency_tests() {
     NRR_RUN_TEST(latency_jitter);
     NRR_RUN_TEST(latency_stats_consistency);
     NRR_RUN_TEST(latency_no_model_budget);
+    NRR_RUN_TEST(latency_frame_budget_breakdown);
+
 }
 
 } // namespace test

@@ -392,10 +392,10 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     {
         char debug[256];
         std::snprintf(debug, sizeof(debug),
-                      "ONNX %s via accel %ux%u -> %ux%u | temporal %s: "
-                      "alpha=%.3f hist=%u change=%.4f%s",
+                      "ONNX %s via accel %ux%u -> %ux%u | prep %.3fms infer %.3fms "
+                      "post %.3fms | temporal %s: alpha=%.3f hist=%u change=%.4f%s",
                       active_ep_name_.empty() ? "no-provider" : active_ep_name_.c_str(),
-                      w, h, out_w, out_h, temporal.note,
+                      w, h, out_w, out_h, prep_ms, infer_ms, post_ms, temporal.note,
                       static_cast<double>(temporal.state.temporal_alpha),
                       temporal.state.history_frames,
                       static_cast<double>(temporal.displayed_delta),
