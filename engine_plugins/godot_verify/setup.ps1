@@ -72,15 +72,27 @@ if (-not $NoBuild) {
     else { $cmakeExe = 'C:\Python310\Lib\site-packages\cmake\data\bin\cmake.exe' }
     if (-not (Test-Path $cmakeExe)) { throw "cmake not found (set PATH or pass a build yourself with -NoBuild)" }
 
-    & $cmakeExe -S $repo -B (Join-Path $repo $BuildDir) `
-        -DNRR_BUILD_GODOT_PLUGIN=ON `
-        -DNRR_GODOT_CPP_PATH="$GodotCppPath" `
-        -DGODOTCPP_TARGET="$Target" `
-        -DNRR_GODOT_API_VERSION="$ApiVersion"
-    if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+    # Native tools write progress and notes to stderr, and with
+    # $ErrorActionPreference = 'Stop' PowerShell promotes ANY stderr line to a
+    # terminating error - so cmake's harmless "Default build type is Debug" note
+    # aborted this script before a single file was compiled. Relax the preference
+    # for the native calls only, and judge them by their exit code, which is what
+    # actually distinguishes success from failure here.
+    $nativePreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $cmakeExe -S $repo -B (Join-Path $repo $BuildDir) `
+            -DNRR_BUILD_GODOT_PLUGIN=ON `
+            -DNRR_GODOT_CPP_PATH="$GodotCppPath" `
+            -DGODOTCPP_TARGET="$Target" `
+            -DNRR_GODOT_API_VERSION="$ApiVersion"
+        if ($LASTEXITCODE -ne 0) { throw "configure failed (cmake exit $LASTEXITCODE)" }
 
-    & $cmakeExe --build (Join-Path $repo $BuildDir) --config Release --target nrr_godot
-    if ($LASTEXITCODE -ne 0) { throw "build failed" }
+        & $cmakeExe --build (Join-Path $repo $BuildDir) --config Release --target nrr_godot
+        if ($LASTEXITCODE -ne 0) { throw "build failed (cmake exit $LASTEXITCODE)" }
+    } finally {
+        $ErrorActionPreference = $nativePreference
+    }
 }
 
 if (-not (Test-Path $builtPath)) {

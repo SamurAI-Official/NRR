@@ -120,6 +120,33 @@ func render_frame(color: Image, depth: Image = null, motion: Image = null) -> Im
 	return color
 
 
+## Renders `frames` throwaway frames and discards them, so the one-time cost of
+## bringing up the neural stack (CUDA/cuDNN context creation, kernel autotuning,
+## ONNX Runtime session warm-up) is paid before the first frame anyone sees.
+## Returns true when the warm-up produced a real render.
+##
+## HONESTY: a first frame measured without this is dominated by initialization,
+## not by per-frame cost. 632 ms cold against 11.7 ms steady state was measured
+## for a 512x512 model on a CUDA host (M2, docs/roadmap.md). Report the first
+## frame and the steady state separately; never present the cold number as the
+## render cost. `width`/`height` should match the size you will actually render
+## at, because providers do per-shape work (cuDNN algorithm selection) on first
+## use, so a 64x48 warm-up does not fully cover a 1920x1080 frame.
+func warmup(frames: int = 3, width: int = 64, height: int = 48) -> bool:
+	if not available or _native == null or loaded_model == "":
+		return false
+	if frames <= 0 or width < 1 or height < 1:
+		return false
+	var probe := Image.create_empty(width, height, false, Image.FORMAT_RGBA8)
+	probe.fill(Color(0.5, 0.5, 0.5, 1.0))
+	var rendered := false
+	for i in frames:
+		if render_frame(probe) == null:
+			return false
+		rendered = not last_render_was_passthrough
+	return rendered
+
+
 ## Discards accumulated temporal history (scene cut / camera switch).
 ## Mirrors nrr_device_reset_temporal_history() from the public C API.
 func reset_temporal_history() -> bool:
