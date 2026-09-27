@@ -626,6 +626,37 @@ model; and the kernels' internal `supports_fp16` / `use_fp16_decoupled` fields s
 caller's request rather than a measurement (internal, not part of the C ABI, and currently read by
 nothing - but the name reads like a measurement).
 
+### M2 follow-up: the CUDA gate, and the bug it found
+
+CI had been red since `windows-gpu-link` was added. Chasing it produced two things, and the
+second is the one that matters.
+
+**The gate now installs the CUDA runtime** (`tools/fetch_cuda_runtime.ps1`, 2.3 GB, cached, with
+a step that fails if `cudart64_12.dll` is missing), so it exercises the configuration users
+actually install rather than the fallback path. What it can and cannot claim is stated in the
+workflow: a GPU-less runner gives loadable-without-usable, so a *genuine* attach and the
+measured speedup still need a self-hosted runner. CI is green again - run 29 (`beb336a`), with
+the CPU-flavour, AddressSanitizer and CUDA jobs all passing.
+
+**Its first run with the runtime present found a real bug that no other job could see.**
+`append_cuda_provider()` trusted a successful `SessionOptionsAppendExecutionProvider_CUDA` as
+proof of attachment. With the CUDA runtime installed and **no CUDA device**, that call
+*successfully loads the library* and ONNX Runtime only fails later, when the session is created
+- so NRR recorded `CUDAExecutionProvider` and then failed **every model load** with "model load
+failed" instead of falling back to the CPU provider as its own contract promises. Nine tests
+failed with model-load errors and not one of them was a test bug. Any user who installs the GPU
+package on a machine without a usable NVIDIA device hits this. Fixed by consulting
+`probe_cuda_driver()` before appending the provider: an attach with nowhere to run is not an
+attach. `test_ep_active_provider_is_measured` cross-checks the reported provider against that
+probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its own failure.
+
+**Recorded follow-up, deliberately not fixed with it:** when a device *is* present but
+`CreateSession` still fails (driver/toolkit mismatch, out of memory), NRR reports ONNX Runtime's
+error rather than retrying on the CPU. Silently degrading a genuinely broken GPU is the worse
+failure mode for a rendering runtime, but the choice is a product decision rather than a bug
+fix and is left explicit here.
+
+
 ## M3 - Specification conformance
 
 No external prerequisites (the specification documents already exist).

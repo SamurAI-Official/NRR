@@ -154,6 +154,45 @@ needs a self-hosted runner, which is stated in the workflow instead of papered o
   the accelerator kernel's `active_model_` pointing at freed objects. Both are unregistered
   before release now, in `unload_model()` and in `shutdown()`.
 
+**Fixed: the CUDA provider was attached on machines with no CUDA device, which broke every model load**
+
+CI had been red since `windows-gpu-link` was added. The diagnostic step added while chasing it (both CI jobs now publish their FAILED lines as check-run **annotations**, because job logs need authentication and this was a failure nobody could reproduce locally) named it exactly:
+
+```
+test_accel_kernel_execute_frame ... FAILED:
+  supports_cuda reflects the linked runtime, not the request - expected true
+```
+
+That assertion, written in this same session, conflated two questions. In that job the device backend is the CPU backend, so the accelerator kernel is freshly initialized: `supports_cuda` was "false, nothing claimed yet" while `available_providers()` does list `CUDAExecutionProvider` (the GPU-flavour package ships the provider DLL). The fix belongs in the product, not the test - `available_providers()` is a **build fact** ORT reports whether or not a session exists, so `supports_*` now come from it at `initialize()` and are no longer cleared when a session goes away, while `active_ep_name_`/`preferred_ep` keep their own meaning (*where this session landed*). Two questions, two answers, each measured from its own source.
+
+**The gate then found a real bug, which is the reason to have it.** Fetching the CUDA runtime into the job made nine tests fail with model-load failures, and none of them was a test bug:
+
+```
+test_inference_model_load                  FAILED: sample model load - expected 0 but got 4
+test_inference_gray_upscale                FAILED: sample model load - expected 0 but got 4
+test_inference_gradient_smooth             FAILED: sample model load - expected 0 but got 4
+test_inference_single_input_model          FAILED: single-input model load - expected 0 but got 4
+test_inference_output_texture_reuse        FAILED: sample model load - expected 0 but got 4
+test_inference_shared_ort_env              FAILED: first runtime loads a model - expected true
+test_ep_active_provider_is_measured        FAILED: model loads with the default preference
+test_ep_cuda_request_never_lies            FAILED: model loads with cuda requested
+test_cuda_ep_is_measurably_faster_than_cpu FAILED: cuda session loads
+```
+
+`append_cuda_provider()` trusted a successful `SessionOptionsAppendExecutionProvider_CUDA` as proof of attachment, and ORT does not work that way: with the CUDA runtime present and **no CUDA device**, the library loads, *the attach call succeeds*, and the failure only surfaces when the session is created. NRR recorded `CUDAExecutionProvider` and then failed every model load outright, instead of falling back to the CPU provider as its own contract says.
+
+This is user-facing, not a CI artefact: install the GPU ONNX Runtime package and the CUDA runtime on a machine without a usable NVIDIA device and NRR becomes unusable, reporting "model load failed" rather than degrading to the CPU. It was invisible locally because this machine *has* a device, and invisible to the CPU-flavour job because there the provider is absent outright. **It took actually installing the CUDA runtime in CI to expose it.**
+
+Fixed by asking the driver rather than trusting the attach: `append_cuda_provider()` now consults `probe_cuda_driver()` (`nvcuda.dll`, no toolkit - the same probe the NVIDIA backend already used) before appending the provider, and records the reason when no device exists. An attach with nowhere to run is not an attach. `test_ep_cuda_request_never_lies` now asserts the consequence - with no CUDA device the load must still succeed - so a regression fails one test instead of nine, and `test_ep_active_provider_is_measured` cross-checks the reported provider against the driver probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its own failure.
+
+**Deliberately not done in the same change:** retrying `CreateSession` without the CUDA provider when a device *is* present but the session still fails (driver/toolkit mismatch, out of memory). That would silently degrade a genuinely broken GPU; today the failure is reported with ORT's own message, and the choice deserves to be made on its own rather than smuggled in with this fix.
+
+**The CUDA job now installs the CUDA runtime** (`tools/fetch_cuda_runtime.ps1`, 2.3 GB, cached, plus a step that fails if `cudart64_12.dll` is missing), so it tests the configuration users actually install rather than the fallback path. Its comment states the limit plainly: a GPU-less runner gives loadable-without-usable, so a *genuine* attach and the measured speedup still need a self-hosted runner.
+
+**Tooling: three scripts treated native stderr as fatal.** With `$ErrorActionPreference = 'Stop'`, PowerShell promotes any native stderr line to a terminating error as soon as the output is captured - and CI captures it. `godot_verify/setup.ps1` aborted on cmake's harmless "Default build type is Debug" note; `tools/build.ps1` aborted on the CUDA-runtime CMake *warning* while CI ran straight past it (the same script behaving two different ways, which means a local reproduction cannot be trusted); `tools/fetch_cuda_runtime.ps1` would have aborted on pip's download progress. All three now judge native tools by exit code.
+
+CI: **run 29 (`beb336a`) is green** - the CPU-flavour, AddressSanitizer and CUDA jobs all pass, the first green run since the CUDA job was added.
+
 **Fixed: `fp16` claimed what NRR cannot do, in fourteen places, and a platform build that cannot compile**
 
 The follow-up on `supports_fp16` found the defect was far wider than one line, and it led
