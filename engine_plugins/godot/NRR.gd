@@ -166,6 +166,15 @@ func library_version() -> String:
 	return str(native.call("get_library_version"))
 
 
+## The loaded model's session metadata as JSON, including the execution provider
+## ONNX Runtime actually attached ("CPUExecutionProvider" or
+## "CUDAExecutionProvider"). "" when no model is loaded.
+func model_info() -> String:
+	if _native == null:
+		return ""
+	return str(_native.call("get_model_info"))
+
+
 ## True when the GDExtension is loadable on this platform, independent of
 ## whether initialize() has been called. Use this to tell "the binding is
 ## missing" apart from "initialize() has not run yet".

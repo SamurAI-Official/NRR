@@ -17,9 +17,26 @@ this file and the runnable project is `../godot_verify/`.
 | `nrr_plugin.gd` editor plugin | **Source-level verified** (`extends EditorPlugin`, entry symbol matches the descriptor). The status menu item has not been clicked in the editor UI. |
 | `nrr_post_process.gd` | **Source-level verified.** Renderer-agnostic (CanvasLayer overdraw); not yet rendered on screen. |
 | `nrr.gdextension` | **Verified** in Godot 4.7.2 (debug variant, Windows x86_64). |
-| GDExtension binding (`src/`) | **Compiled and loaded**, Windows x86_64 debug variant only. Other platforms are still untested. |
+| GDExtension binding (`src/`) | **Compiled, loaded, and running on the GPU** (`"provider": "CUDAExecutionProvider"` in `model_info`). Windows x86_64 debug variant only. |
 | On-device / other-platform run | **Not performed.** |
 | Editor UI beyond the status menu item | **Not implemented.** |
+
+### Runtime footprint
+
+The addon links NRR statically, so the only native dependencies are ONNX Runtime's, and
+`setup.ps1` installs them next to the addon library:
+
+| File | Size |
+| --- | --- |
+| `nrr_godot.windows.debug.x86_64.dll` (the addon) | ~0.6 MB |
+| `onnxruntime.dll` | ~16 MB |
+| `onnxruntime_providers_cuda.dll` | ~336 MB |
+| 19 CUDA runtime DLLs (cudart/cuBLAS/cuDNN/cuFFT/NVRTC) | ~2,280 MB |
+
+`onnxruntime_providers_cuda.dll` **must** sit beside `onnxruntime.dll` - ONNX Runtime resolves
+its providers relative to its own module, not through `PATH`. Pass `-SkipCuda` to `setup.ps1`
+to install without the CUDA runtime and run on the CPU provider instead (the smallest usable
+install is then ~17 MB).
 
 `tests/unit/test_engine_plugins.cpp` additionally locks the wiring that rots
 silently: the descriptor format and keys, the GDScript API surface, the platform

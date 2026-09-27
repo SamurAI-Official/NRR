@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 92/92 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported (ORT-less build, `ORTCHAR_T`, Apple declarations, power-manager C linkage, vendor auto-selection), and `M1.5` the Godot addon built and loaded by Godot 4.7.2. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon is compiled and runs on Windows x86_64 (9 drift tests plus a headless engine run); Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 96/96 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output)**. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -13,20 +13,24 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
-> **Reality check (M1 in progress, verified by code inspection, by the suite, and by
-> running the engine).** Real neural inference runs on the CPU execution provider only:
-> the execution-provider layer is a decision function that never attaches a provider to
-> an ONNX Runtime session, the shipped model is an untrained identity fixture, and
-> `.nrrmodel` payloads are not parsed. The temporal path **is** wired into the render
-> path (motion reprojection + blend, measured state, scene-cut and resolution-change
-> handling), but it accumulates an untrained model's output, so it reduces flicker
-> without improving detail; the reference/conditioning path still does not reach the
-> model. The Godot GDExtension is compiled and loaded by Godot 4.7.2 on Windows x86_64
-> and its neural pass is confirmed non-passthrough; every other platform entry in
-> `nrr.gdextension` is unbuilt, and the Unreal plugin still contains no executable code.
-> [docs/roadmap.md](docs/roadmap.md) lists every gap together with the milestone that
-> closes it, and [CHANGELOG.md](CHANGELOG.md) records what changed recently and how it
-> was verified.
+> **Reality check (M1 complete for its scope, M2 in progress; verified by code inspection,
+> by the suite, and by running the engine).** Inference now runs on the **CUDA execution
+> provider by default** when the ONNX Runtime GPU package and the CUDA runtime are present
+> (measured: 22x faster than the CPU provider, bit-identical output), and falls back to the
+> CPU provider with ONNX Runtime's own reason recorded when they are not. The **NRR**
+> execution-provider routing layer (`use_cuda_ep_`/`use_directml_ep_`, AccelEP tables in
+> Phases 7-9) is still a decision function: only the ONNX Runtime provider is attached for
+> real, there is no DirectML path, and `nrr_get_backend_name()` still reports the NRR backend
+> (`CPU`) rather than the provider - the provider is reported through `nrr_model_get_info()`.
+> The shipped model is an untrained identity fixture and `.nrrmodel` payloads are not parsed.
+> The temporal path is wired into the render path (motion reprojection + blend, measured
+> state, scene-cut and resolution-change handling) but accumulates that untrained fixture, so
+> it reduces flicker without improving detail; the reference/conditioning path still does not
+> reach the model. The Godot GDExtension is compiled, loaded and GPU-accelerated on Windows
+> x86_64; every other platform entry in `nrr.gdextension` is unbuilt, and the Unreal plugin
+> still contains no executable code. [docs/roadmap.md](docs/roadmap.md) lists every gap
+> together with the milestone that closes it, and [CHANGELOG.md](CHANGELOG.md) records what
+> changed recently and how it was verified.
 
 ---
 
@@ -233,14 +237,14 @@ All items below are structural (as Phase 7, gated by `NRR_ENABLE_INTEL`).
 
 ### Phase 14 - Semiconductor Vendor Accelerator Kernels (structural)
 
-**Correction (M0):** the execution-provider layer is a decision function, not a
-working GPU path. `runtime/onnx_runtime.cpp` sets `use_cuda_ep_`/`use_directml_ep_`
-flags and a `provider_note_` string, but no `SessionOptionsAppendExecutionProvider`
-call exists anywhere in the repository. Every session is therefore created with the
-default CPU EP, and the note reports an intent rather than a fact. The bundled ONNX
-Runtime SDK is CPU-only as well. AccelEP routing and per-EP capability reporting are
-structural until M2 attaches providers for real
-(see [docs/roadmap.md](docs/roadmap.md)).
+**Correction (M0), partly closed by M2:** the *NRR* execution-provider layer is a decision
+function, not a working GPU path. `runtime/onnx_runtime.cpp` sets `use_cuda_ep_` flags and an
+AccelEP routing table, but the only function that changes how work is executed is
+`SessionOptionsAppendExecutionProvider_CUDA` (attached for real in M2). There is still no
+DirectML/ROCm/oneAPI/OpenVINO attachment, no `SessionOptionsAppendExecutionProvider_*` call for
+any of those, and the vendor backends are still `structural`. The bundled ONNX Runtime package
+is selected by `NRR_ONNXRUNTIME_FLAVOR`; the CPU package has no CUDA provider at all and the
+GPU one does. See [docs/roadmap.md](docs/roadmap.md) M2.
 - [x] Shared AcceleratorExecutionKernel with unified ONNX Runtime session, texture→NCHW→ONNX→RGB8 frame path, and single-session EP routing
 - [x] AccelEP routing *decision function*: CUDA, TensorRT, ROCm, DirectML, OpenVINO, Vulkan, RISC-V, CPU (a table lookup + vendor hint; it does not attach a provider)
 - [x] Capability reporting: FP16/FP8 tensor-core-style flags, max texture size, async compute, per-ep status, memory tracking (flags derived from the routing table, not measured on vendor hardware)
@@ -331,10 +335,21 @@ device. See M8 in [docs/roadmap.md](docs/roadmap.md).
 ## Building
 
 ```powershell
-pwsh tools/fetch_ort.ps1                        # ONNX Runtime SDK (optional, but real inference needs it)
-python tools/gen_sample_model.py                # regenerate models/*.onnx (needs: pip install onnx numpy)
-pwsh tools/build.ps1 -Config Release -RunTests  # configure + build + full test suite
+pwsh tools/fetch_ort.ps1 -Flavor gpu_cuda12              # ONNX Runtime + the CUDA provider (~362 MB)
+pwsh tools/fetch_cuda_runtime.ps1                        # CUDA runtime DLLs, no toolkit/admin (~1.5 GB)
+python tools/gen_sample_model.py                         # regenerate models/*.onnx
+pwsh tools/build.ps1 -Config Release -RunTests           # configure + build + full suite
 ```
+
+Use `-Flavor cpu` instead for a CPU-only build. CMake selects the package with
+`-DNRR_ONNXRUNTIME_FLAVOR=auto|cpu|gpu` (`auto`, the default, prefers a GPU package when one is
+present) and reports what it found: `ONNX Runtime: ... (real inference, CUDA EP present)` plus
+`CUDA runtime: ...`.
+
+Nothing needs an administrator install and `nvcc` is not used: ONNX Runtime only *loads* the
+CUDA runtime, it never compiles with it, so `fetch_cuda_runtime.ps1` takes the cudart/cuBLAS/
+cuDNN/cuFFT DLLs out of NVIDIA's PyPI wheels. `NRR_EXECUTION_PROVIDER=cpu` (or `cuda`) overrides
+the default `auto` preference at run time.
 
 On Windows PowerShell 5.1 (no `pwsh` installed):
 `powershell -NoProfile -ExecutionPolicy Bypass -File tools/build.ps1 -Config Release -RunTests`
@@ -378,24 +393,28 @@ pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
 
 ## Testing
 
-`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 92 tests) plus the
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 96 tests) plus the
 five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
 
-`nrr_tests` registers 99 tests. Of those, 23 are compiled out of a desktop build and stay
+`nrr_tests` registers 103 tests. Of those, 23 are compiled out of a desktop build and stay
 in the count only as an explicit gap (12 under `NRR_ENABLE_MOBILE_VENDOR`, 11 under
 `#ifndef _WIN32`), and 2 need `NRR_HAVE_ONNXRUNTIME`; the 16 latency benchmarks are run by
-their own aggregator, which is what makes the executed total `74 + 2 + 16 = 92`. The mobile
+their own aggregator, which is what makes the executed total `78 + 2 + 16 = 96`. The mobile
 platform and vendor tests have never run on a device or in CI - see M8 in
 [docs/roadmap.md](docs/roadmap.md). `CHANGELOG.md` derives these counts per commit.
+
+The 1 execution-provider test that needs `NRR_HAVE_CUDA_EP` (the CPU-vs-GPU comparison) runs
+only when the GPU ONNX Runtime package is selected; it **skips with a recorded reason**
+otherwise, and CI (no GPU runner) is in that group.
 
 ## Engine integrations
 
 | Consumer | What it uses | Verified how |
 | --- | --- | --- |
 | **ShugoCore** (`G:\Program Prototype\shugocore`) | Vendors this repository as a git submodule at `platforms/android/app/src/main/cpp/nrr` (pinned `6c977e2`) and consumes the **C ABI** from an ONNX Runtime extracted out of the Maven AAR. Its Python `nrr/` package mirrors `specification/frame_contract.md` at the descriptor level and stays binary-free. | `M1.4` fixes all six defects its Android port reported in `docs/nrr_upstream_bug_report.md`, plus the four Android power-manager hook declarations, so nothing ShugoCore patches is missing here any more. ShugoCore still carries `patches/nrr/000{1,2}-*.patch` because its pin predates this commit: re-pinning to this commit lets it retire both patches (they will not apply on top of it, and `scripts/apply_nrr_patches.sh` treats a patch that stops applying as a hard error). That re-pin is ShugoCore-side work and is **not** done here. |
-| **Godot 4.7.2** (engine) | The GDExtension binding in `engine_plugins/godot/src/` calls the C ABI directly; the GDScript layer in `engine_plugins/godot/NRR.gd` drives it. | **Run, not just compiled**: `engine_plugins/godot_verify/` loads the addon in the real engine headless and prints `RESULT: PASS` with `class_registered=true`, `entry_point_count=44`, `backend=CPU` and a non-passthrough render. Transcript in `engine_plugins/godot/README.md`. Windows x86_64 debug variant only. |
+| **Godot 4.7.2** (engine) | The GDExtension binding in `engine_plugins/godot/src/` calls the C ABI directly; the GDScript layer in `engine_plugins/godot/NRR.gd` drives it. | **Run, not just compiled, and GPU-accelerated**: `engine_plugins/godot_verify/` loads the addon in the real engine headless and prints `RESULT: PASS` with `class_registered=true`, `entry_point_count=44`, a non-passthrough render, and `model_info` reporting `"provider": "CUDAExecutionProvider"`. Transcript in `engine_plugins/godot/README.md`. Windows x86_64 debug variant only. |
 | **Shogunet** | Nothing. | `G:\Program Prototype\Shogunet` is an empty directory - there is no code to integrate with. NRR's transport-agnostic contract (`NRRFrameDescriptor` / `NRRRenderResult` as structured payloads) is what a Shogunet binding would carry; it does not exist yet. |
 
 The integration surface that matters in both directions is the export table: `include/nrr.h`
@@ -412,10 +431,10 @@ under `engine_plugins/godot/bin/`, which is `.gitignore`d.
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
-runs the full suite (92 tests). A second, **blocking** job runs the same correctness tests
+runs the full suite (96 tests). A second, **blocking** job runs the same correctness tests
 under MSVC AddressSanitizer; it excludes the 16 wall-clock benchmarks
 (`NRR_SKIP_TIMING_TESTS`, see [docs/roadmap.md](docs/roadmap.md) M1.2) because timings under
-instrumentation are not measurements, so the sanitizer job runs 76 of the 92 tests. A failing
+instrumentation are not measurements, so the sanitizer job runs 80 of the 96 tests. A failing
 sanitizer run publishes the unresolved DLL dependencies of the built binaries as
 annotations. Both jobs carry `timeout-minutes: 30`.
 

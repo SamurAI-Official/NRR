@@ -16,6 +16,42 @@ actually printed rather than estimates.
 
 ### Added
 
+- **GPU execution: the ONNX Runtime CUDA execution provider is attached for real** (`M2`).
+  `runtime/onnx_runtime.cpp` now calls `OrtApi::SessionOptionsAppendExecutionProvider_CUDA`,
+  and reports the provider the session actually ended up with rather than the one that was
+  requested. **Measured on an RTX 4070 Ti, 512x512 through `models/nrr_upscaler_v0.1.onnx`,
+  5 timed runs after 2 warm-ups: CPU 257.053 ms/frame, CUDA 11.684 ms/frame, 22.0x speedup,
+  and `mean |cpu - cuda| = 0` (bit-identical output).** The render-path benchmark that
+  previously ran at 11.1 fps reports **28.9 fps** on the same machine now that the default
+  provider is CUDA. The rule the milestone inherited ("no capability without a measurement")
+  is what makes this entry quotable: the numbers are from the suite, not from a table.
+- **`tools/fetch_cuda_runtime.ps1`** (`M2`): gets the CUDA runtime that ONNX Runtime's CUDA
+  provider needs out of NVIDIA's PyPI wheels - `cudart64_12`, `cublas64_12`, `cublasLt64_12`,
+  `cufft64_11`, `cudnn64_9` and cuDNN's nine `cudnn_*64_9` sublibraries, 19 DLLs / 2,280 MB.
+  **No CUDA Toolkit, no administrator rights and no `nvcc`:** ONNX Runtime only *loads* the
+  runtime, it never compiles with it, so the toolkit's compiler is irrelevant - which is why
+  the M2 prerequisite "CUDA toolkit matching the ORT build" was the wrong prerequisite.
+- **`fetch_ort.ps1 -Flavor cpu|gpu_cuda12|gpu_cuda13`** (`M2`), plus `NRR_ONNXRUNTIME_FLAVOR`
+  (`auto` prefers a GPU package when present), `NRR_CUDA_RUNTIME_DIR`, and `NRR_HAVE_CUDA_EP`
+  set only when `onnxruntime_providers_cuda.dll` is genuinely present.
+  `ONNX Runtime: ... (real inference, CUDA EP present)` / `CUDA runtime: ...` are printed at
+  configure time so the choice is visible rather than inferred.
+- **`NRR_EXECUTION_PROVIDER=auto|cpu|cuda`** (`M2`): the default is `auto`, which prefers CUDA
+  and falls back to the CPU provider with ONNX Runtime's own failure message recorded. It is an
+  environment variable rather than a new field on `NRRDeviceOptions` because growing a struct in
+  `include/nrr.h` would change the C ABI for every consumer; this is a preference, not a new
+  capability.
+- **`OrtApi::GetAvailableProviders`-backed capability reporting** (`M2`):
+  `ONNXRuntime::available_providers()` returns what the loaded libraries can actually execute
+  (on this machine: `TensorrtExecutionProvider CUDAExecutionProvider CPUExecutionProvider`), and
+  `active_provider()` / `provider_note()` report the session's real provider and the reason when
+  it is not the one requested.
+- **`tests/unit/test_gpu_ep.cpp`** (`M2`), 4 tests: the provider list is compared against how the
+  build was configured; an explicit `cpu` request must really be CPU (the opt-out); a `cuda`
+  request must never claim CUDA it did not get; and the CUDA half asserts correctness *and* a
+  measured speedup. The GPU test **skips with a recorded reason** when the provider cannot
+  attach, so a CPU-only machine (and CI, which has no GPU) reports why rather than failing.
+
 - **The Godot addon is built and running in the engine** (`M1.5`, `engine_plugins/godot/`,
   `engine_plugins/godot_verify/`). Compiled against godot-cpp `master` (tag `10.0.0-stable`,
   which ships the Godot 4.7 API dump) and loaded by **Godot 4.7.2-stable**, the addon
@@ -290,6 +326,27 @@ actually printed rather than estimates.
 - **The build now emits the file name `nrr.gdextension` lists** (`M1.5`) -
   `nrr_godot.windows.debug.x86_64.dll` - instead of `nrr_godot.dll`, so an artifact can be
   dropped into `addons/nrr/bin/<platform>/<variant>/` unchanged.
+- **The ONNX Runtime provider must be deployed next to `onnxruntime.dll`, not put on PATH**
+  (`M2`). ONNX Runtime resolves `onnxruntime_providers_*.dll` relative to its own module, so a
+  provider left in `third_party/` and exported through `PATH` is *listed* by
+  `GetAvailableProviders` but fails at attach time with `Failed to load shared library`.
+  `nrr_deploy_runtime_dlls` now copies `onnxruntime.dll` **and** the provider DLLs together;
+  only the CUDA runtime (2,280 MB) stays on PATH, because the provider finds those through the
+  normal search order. Found by running the code, not by reading it - the first GPU run
+  reported a `CUDAExecutionProvider` that could not be attached.
+- **A concurrent-copy race that intermittently broke the build** (`M2`). Six executables each
+  had a `POST_BUILD` step copying the same 16 MB `onnxruntime.dll` into one directory, and the
+  Visual Studio generator runs those steps in parallel, so builds failed with
+  `Error copying file ... Permission denied`. Deployment is one `nrr_deploy_runtime_dlls`
+  target that the executables depend on.
+- **`nrr_model_get_info()` hard-coded `"provider": "CPUExecutionProvider"`** (`M2`). It now
+  reports the measured provider, which is how the Godot verification shows
+  `"provider": "CUDAExecutionProvider"` - and how the previous text would have denied the GPU
+  was in use while it was.
+- **`nrr_tests` was not given `NRR_HAVE_CUDA_EP`** (`M2`), which would have compiled the GPU
+  half of `test_gpu_ep.cpp` - and its registration in `tests/main.cpp` - out of the suite
+  silently while the suite still reported success. That is the exact failure mode this
+  milestone exists to remove.
 
 ### Verification
 
@@ -345,31 +402,55 @@ This is the first time any engine plugin in this repository has executed. The Un
 still contains no executable code and the Unity package has still never been opened in an
 editor, so those remain unverified.
 
+**`M2` - the GPU path, measured on the same machine.** Windows x64 Release, ONNX Runtime
+1.30.0 `win-x64-gpu_cuda12` + CUDA 12.9.79 / cuDNN 9.26, RTX 4070 Ti:
+
+```
+tools/build.ps1 -Config Release -BuildDir build-ci -RunTests
+  available execution providers: TensorrtExecutionProvider CUDAExecutionProvider CPUExecutionProvider
+  default preference resolved to CUDAExecutionProvider
+  512x512 upscale: cpu 257.053 ms/frame, cuda 11.684 ms/frame, speedup 22.0x
+  mean |cpu - cuda| = 0
+  latency_throughput_fps: 28.9 fps
+  Total: 96, Passed: 96, Failed: 0   (6/6 executables)
+
+Godot 4.7.2 headless, same addon:
+  model_info ... "provider": "CUDAExecutionProvider" ...   RESULT: PASS
+```
+
+The `Renderer > GPU` claim therefore has three independent pieces of evidence: the provider list
+comes from ONNX Runtime, the attached provider comes from the attach call's return value, and the
+speedup is a wall-clock comparison whose outputs are bit-identical. What has **not** been done is
+a GPU-resident data path (the render path still round-trips through host memory each frame) and
+any GPU perf gate in CI, which has no GPU runner.
+
 Test counts are derived from `tests/main.cpp` per commit, so they can be re-derived with
 `git show <hash>:tests/main.cpp`:
 
 ```
-                              pre-work  M1.1  M1.2  M1.3  M1.4  M1.5
-registrations in main.cpp          77    84    84    87    98    99
-  out: #ifndef _WIN32             -10   -11   -11   -11   -11   -11   (android, ios)
-  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   -12   -12   (adreno, mali)
-  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2    -2    -2
+                              pre-work  M1.1  M1.2  M1.3  M1.4  M1.5  M2
+registrations in main.cpp          77    84    84    87    98    99   103
+  out: #ifndef _WIN32             -10   -11   -11   -11   -11   -11   -11   (android, ios)
+  out: NRR_ENABLE_MOBILE_VENDOR    -6   -12   -12   -12   -12   -12   -12   (adreno, mali)
+  out: NRR_HAVE_ONNXRUNTIME        -2    -2    -2    -2    -2    -2    -2
   ------------------------------------------------
-  unconditional registrations       59    59    59    62    73    74
+  unconditional registrations       59    59    59    62    73    74    78
   + NRR_HAVE_ONNXRUNTIME (runs
-    wherever the SDK is present)    +2    +2    +2    +2    +2    +2
+    wherever the SDK is present)    +2    +2    +2    +2    +2    +2    +2
   + latency benchmarks run by
-    their own aggregator            +0   +16   +16   +16   +16   +16
+    their own aggregator            +0   +16   +16   +16   +16   +16   +16
   ------------------------------------------------
-  tests executed in the suite       61    77    77    80    91    92
+  tests executed in the suite       61    77    77    80    91    92    96
 ```
 
 Every column re-derives: `77 - 18 + 2 + 0 = 61`, `84 - 25 + 2 + 16 = 77`,
-`87 - 25 + 2 + 16 = 80`, `98 - 25 + 2 + 16 = 91`, `99 - 25 + 2 + 16 = 92`. The `M1.4` column
-adds 11 unconditional tests (8 engine-plugin drift guards + 3 `concrete_input_shape()`
-tests) and `M1.5` adds 1 more (`test_godot_addon_has_no_nested_project_file`). Every one of
-them runs in both the ORT-present and ORT-absent builds, which is what `90 = 92 - 2`
-reflects.
+`87 - 25 + 2 + 16 = 80`, `99 - 25 + 2 + 16 = 92`, `103 - 25 + 2 + 16 = 96`. The `M1.4` column
+adds 11 unconditional tests (8 engine-plugin drift guards + 3 `concrete_input_shape()` tests),
+`M1.5` adds 1 more (`test_godot_addon_has_no_nested_project_file`) and `M2` adds 4
+(`tests/unit/test_gpu_ep.cpp`). Every one of them runs in both the ORT-present and ORT-absent
+builds, which is what `90 = 92 - 2` reflects. One of the four `M2` tests
+(`test_cuda_ep_is_measurably_faster_than_cpu`) is compiled only when `NRR_HAVE_CUDA_EP` is set;
+where it is compiled out, the M2 column is one lower and the other three still run.
 
 Two rows carry the point of two of the entries above. `pre-work` registers 77 tests but
 executes 61: 18 are inside guards that are off on desktop, and although 8 latency tests ran,
@@ -381,8 +462,8 @@ and the registration total moved only 77 -> 84, while execution rose 61 -> 77 (t
 benchmarks now run through the aggregator, replacing the 8 that were listed by hand).
 
 Under `NRR_SKIP_TIMING_TESTS` (the ASan gate) the 16 benchmarks are excluded, so the gate
-runs 61 tests at M1.2, 64 at M1.3, 75 at M1.4 and 76 at M1.5. Counts were reproduced locally
-with the same configuration CI uses (Windows x64, ONNX Runtime SDK present).
+runs 61 tests at M1.2, 64 at M1.3, 75 at M1.4, 76 at M1.5 and 80 at M2. Counts were reproduced
+locally with the same configuration CI uses (Windows x64, ONNX Runtime SDK present).
 
 ---
 

@@ -321,6 +321,15 @@ String NRRNative::get_last_error() const {
 	return last_error_;
 }
 
+String NRRNative::get_model_info() const {
+	if (model_ == nullptr) return String();
+	char buffer[1024] = {0};
+	if (nrr_model_get_info(model_, buffer, sizeof(buffer)) != NRR_SUCCESS) {
+		return String();
+	}
+	return fixed_string(buffer, sizeof(buffer));
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -424,6 +433,8 @@ void NRRNative::_bind_methods() {
 	                            &NRRNative::get_library_version);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_last_error"),
 	                            &NRRNative::get_last_error);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_model_info"),
+	                            &NRRNative::get_model_info);
 }
 
 void nrr_godot_initialize_module(godot::ModuleInitializationLevel p_level) {

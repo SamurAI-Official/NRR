@@ -15,6 +15,7 @@
 #include "mobile/test_mobile_model.cpp"
 #include "unit/test_accel.cpp"
 #include "unit/test_engine_plugins.cpp"
+#include "unit/test_gpu_ep.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
 #include "mobile/test_ios.cpp"
@@ -64,6 +65,16 @@ void run_all_tests() {
     NRR_RUN_TEST(test_reference_get_provenance_null);
     NRR_RUN_TEST(test_reference_unload_null);
     
+    std::cout << "\n--- Execution Provider Tests ---\n";
+    /* Nothing here is asserted from a flag: the provider list comes from ONNX
+     * Runtime, and the CUDA claim is a measured CPU-vs-GPU comparison. */
+    NRR_RUN_TEST(test_ep_available_providers_from_runtime);
+    NRR_RUN_TEST(test_ep_active_provider_is_measured);
+    NRR_RUN_TEST(test_ep_cuda_request_never_lies);
+#ifdef NRR_HAVE_CUDA_EP
+    NRR_RUN_TEST(test_cuda_ep_is_measurably_faster_than_cpu);
+#endif
+
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);
     NRR_RUN_TEST(test_cpu_texture_operations);

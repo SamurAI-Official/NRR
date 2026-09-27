@@ -41,6 +41,7 @@ func _ready() -> void:
 	if not loaded:
 		_fail("load_model failed: %s" % nrr.last_error)
 		return
+	print("model_info=%s" % nrr.model_info())
 
 	var source := Image.create_empty(W, H, false, Image.FORMAT_RGBA8)
 	for y in H:

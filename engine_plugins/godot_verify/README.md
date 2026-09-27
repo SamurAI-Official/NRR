@@ -60,8 +60,7 @@ pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild
 
 ## Recorded result
 
-Godot 4.7.2-stable, Windows x86_64, ONNX Runtime CPU provider, 64x48 RGBA8
-input, `models/nrr_upscaler_v0.1.onnx`:
+Godot 4.7.2-stable, Windows x86_64, 64x48 RGBA8 input, `models/nrr_upscaler_v0.1.onnx`:
 
 ```
 class_registered=true          binding_present=true
@@ -69,7 +68,20 @@ library_version=1.0.0          entry_point_count=44      (NRR_ENTRY_POINT_COUNT)
 available=false -> available=true
 backend=CPU                    caps.neural_acceleration=0 (absent, honestly)
 load_model=true                render_out=64x48 format=5 (RGBA8)
-render_time_ms=3.166           mean_abs_dr_vs_input=0.489112
+model_info ... "provider": "CUDAExecutionProvider" ...
+render_time_ms=632.088         mean_abs_dr_vs_input=0.489112
 reset_temporal_history=true    available_after_shutdown=false
 RESULT: PASS
 ```
+
+Two lines need reading carefully rather than taking at face value:
+
+* `backend=CPU` is the **NRR** backend, and `caps.neural_acceleration=0` is that backend's
+  honest view of itself. The **ONNX Runtime** execution provider is the one doing the neural
+  work, and it is reported separately in `model_info` - it says `CUDAExecutionProvider`, i.e.
+  the GPU. A first-class CUDA NRR backend (so `backend=NVIDIA`) is still open; see M2.
+* `render_time_ms=632.088` looks worse than the earlier 2.9 ms, and that is not a regression:
+  this driver renders **one** frame, so it absorbs the CUDA context creation, cuDNN engine
+  selection and kernel loading. Steady state on the same machine is 11.7 ms/frame at 512x512
+  (see the CPU-vs-GPU measurement in `tests/unit/test_gpu_ep.cpp`). Single-frame GPU timings
+  are warm-up measurements.

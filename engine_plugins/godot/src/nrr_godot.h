@@ -76,6 +76,9 @@ public:
 	int get_entry_point_count() const;
 	godot::String get_library_version() const;
 	godot::String get_last_error() const;
+	/** The model's real session metadata, including the execution provider
+	 *  ONNX Runtime actually attached (see nrr_model_get_info). */
+	godot::String get_model_info() const;
 
 protected:
 	static void _bind_methods();

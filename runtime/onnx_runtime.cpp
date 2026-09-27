@@ -5,6 +5,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -42,6 +43,20 @@ namespace nrr {
 
 #ifdef NRR_HAVE_ONNXRUNTIME
 namespace {
+
+/* Which execution provider to use when the caller has not chosen one.
+ *
+ * NRR_EXECUTION_PROVIDER is read instead of adding a field to the public
+ * NRRDeviceOptions struct: growing a struct in include/nrr.h would change the C
+ * ABI for every existing consumer, and this is a preference rather than a new
+ * capability. Accepted values are "auto" (the default: CUDA when this package
+ * and machine can provide it, otherwise CPU), "cpu" and "cuda". Anything else is
+ * passed through, so the normal fallback-and-explain path reports it. */
+std::string provider_preference_from_env() {
+    const char* value = std::getenv("NRR_EXECUTION_PROVIDER");
+    if (value == nullptr || *value == '\0') return "auto";
+    return to_lower(std::string(value));
+}
 
 /* Process-wide ONNX Runtime environment, shared by every ONNXRuntime instance.
  *
@@ -331,7 +346,10 @@ bool ONNXRuntime::load_model(const std::string& model_path) {
     // ---- Public info JSON (real session metadata) --------------------------
     std::ostringstream json;
     json << "{\"path\": \"" << json_escape(model_path)
-         << "\", \"type\": \"onnx\", \"provider\": \"CPUExecutionProvider\"";
+         << "\", \"type\": \"onnx\", \"provider\": \""
+         << json_escape(active_provider_.empty() ? std::string("CPUExecutionProvider")
+                                                 : active_provider_)
+         << "\"";
     if (!provider_note_.empty())
         json << ", \"provider_note\": \"" << json_escape(provider_note_) << "\"";
     json << ", \"input_count\": " << input_names_.size()
@@ -377,6 +395,7 @@ void ONNXRuntime::unload_model() {
     session_loaded_ = false;
     model_info_.clear();
     provider_note_public_.clear();
+    active_provider_.clear();
     input_names_.clear();
     output_names_.clear();
     input_shapes_.clear();
@@ -592,6 +611,7 @@ void ONNXRuntime::set_execution_provider(const char* provider) {
     apply_provider(preferred_provider_);
 #else
     use_cpu_ep_ = use_cuda_ep_ = use_directml_ep_ = false;
+    active_provider_.clear();
     if (preferred_provider_.empty()) {
         use_cpu_ep_ = true;
         return;
@@ -604,20 +624,125 @@ void ONNXRuntime::set_execution_provider(const char* provider) {
 }
 
 #ifdef NRR_HAVE_ONNXRUNTIME
+bool ONNXRuntime::append_cuda_provider() {
+#if defined(NRR_HAVE_CUDA_EP)
+    if (api_ == nullptr || session_options_ == nullptr) {
+        /* Not an error: set_execution_provider() runs before load_model(), when
+         * no session options exist yet. load_model() applies the provider again
+         * once they do, so leave provider_note_ untouched here - a note written
+         * now would shadow the real outcome. */
+        return false;
+    }
+
+    /* OrtCUDAProviderOptions' own defaults are the sane ones (device 0,
+     * exhaustive cuDNN convolution search, default stream). device_id is pinned
+     * so the GPU choice is explicit rather than incidental.
+     *
+     * The return value is the measurement that matters: per ORT's own
+     * documentation, "if the CUDA/cuDNN libraries are not installed, the CUDA
+     * provider will report an error when it is added to the session options".
+     * So a success here means the provider DLL and its CUDA runtime dependencies
+     * were actually loaded - not that a flag was set. */
+    OrtCUDAProviderOptions cuda_options;
+    cuda_options.device_id = 0;
+
+    OrtStatus* status = api_->SessionOptionsAppendExecutionProvider_CUDA(
+        session_options_, &cuda_options);
+    if (status != nullptr) {
+        provider_note_ =
+            std::string("CUDA execution provider could not be attached: ")
+            + api_->GetErrorMessage(status)
+            + " (falls back to the CPU execution provider)";
+        api_->ReleaseStatus(status);
+        return false;
+    }
+    return true;
+#else
+    /* This ONNX Runtime package has no CUDA provider at all. */
+    provider_note_ =
+        "requested 'cuda' execution provider, but this ONNX Runtime package has "
+        "no CUDA provider (fetch one with: pwsh tools/fetch_ort.ps1 -Flavor "
+        "gpu_cuda12) -> using CPU EP";
+    return false;
+#endif
+}
+
 bool ONNXRuntime::apply_provider(const std::string& preferred) {
     use_cpu_ep_ = use_cuda_ep_ = use_directml_ep_ = false;
+    active_provider_.clear();
+    /* Idempotent: load_model() applies the preferred provider again once the
+     * session options are real, so a note from an earlier, deferred attempt must
+     * not survive to misdescribe the session that actually gets created. */
+    provider_note_.clear();
+
     std::string pl = to_lower(preferred);
-    if (pl.empty() || pl == "cpu") {
+    if (pl.empty()) pl = provider_preference_from_env();
+
+    if (pl == "cpu") {
         use_cpu_ep_ = true;
+        active_provider_ = "CPUExecutionProvider";
         return true;
     }
-    /* The prebuilt package bundles only the CPU execution provider. A
-     * requested GPU provider degrades gracefully to CPU and the fallback is
-     * reported through model info / render debug output. */
+
+    if (pl == "auto" || pl == "cuda") {
+        /* "auto" is the default: take the best provider this package can offer,
+         * in the M2 order (CUDA, then CPU). This is safe to default to because
+         * the outcome is measured rather than assumed - if the provider cannot be
+         * created, append_cuda_provider() records ONNX Runtime's own reason and
+         * the session lands on the CPU provider with active_provider() saying so.
+         *
+         * "cuda" behaves identically except that it is an explicit request, so a
+         * failure is still worth the same honest note (there is no other GPU
+         * provider wired up yet - see docs/roadmap.md M2). */
+        if (append_cuda_provider()) {
+            use_cuda_ep_ = true;
+            active_provider_ = "CUDAExecutionProvider";
+            return true;
+        }
+        if (session_options_ == nullptr) {
+            /* Deferred: the provider will be attached for real in load_model().
+             * use_cuda_ep_ records the request; active_provider_ stays empty
+             * because nothing has been measured yet. */
+            use_cuda_ep_ = true;
+            return true;
+        }
+        /* The attach attempt failed for a real reason, which
+         * append_cuda_provider() recorded in provider_note_. */
+        use_cpu_ep_ = true;
+        active_provider_ = "CPUExecutionProvider";
+        return true;
+    }
+
     provider_note_ = "requested '" + pl +
-                     "' execution provider; CPU-only ONNX Runtime package -> using CPU EP";
+                     "' execution provider; no such provider is wired up in this "
+                     "build -> using CPU EP";
     use_cpu_ep_ = true;
+    active_provider_ = "CPUExecutionProvider";
     return true;
+}
+
+std::vector<std::string> ONNXRuntime::available_providers() {
+    std::vector<std::string> providers;
+    const OrtApi* api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (api == nullptr) return providers;
+
+    char** names = nullptr;
+    int count = 0;
+    OrtStatus* status = api->GetAvailableProviders(&names, &count);
+    if (status != nullptr) {
+        api->ReleaseStatus(status);
+        /* Report nothing rather than guessing what might have been available. */
+        return providers;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (names[i] != nullptr) providers.emplace_back(names[i]);
+    }
+    api->ReleaseAvailableProviders(names, count);
+    return providers;
+}
+#else
+std::vector<std::string> ONNXRuntime::available_providers() {
+    return {};   /* no SDK linked: there is nothing to measure */
 }
 #endif
 

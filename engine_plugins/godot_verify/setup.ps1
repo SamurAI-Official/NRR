@@ -27,6 +27,9 @@ param(
 
     [string]$BuildDir = 'build-godot',
 
+    # Skip the ~2.3 GB CUDA runtime copy (the addon then runs on the CPU provider)
+    [switch]$SkipCuda,
+
     [switch]$NoBuild
 )
 
@@ -84,21 +87,51 @@ if (-not (Test-Path $builtPath)) {
     throw "built library not found at $builtPath (build it, or pass -NoBuild after placing it by hand)"
 }
 
-# --- 3. install the library -------------------------------------------------
+# --- 3. install the library and its native dependencies ---------------------
 $binDst = Join-Path $addonDst "bin/windows/$variant"
 New-Item -ItemType Directory -Force $binDst | Out-Null
 Copy-Item $builtPath $binDst -Force
 Write-Host "[setup] installed $builtName"
 
-# The GDExtension links the NRR runtime statically, so the only runtime
-# dependency is ONNX Runtime's own DLL when the runtime was built with the SDK.
-$ortDll = Get-ChildItem -Path (Join-Path $repo 'third_party') -Recurse -Filter 'onnxruntime.dll' -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-if ($ortDll) {
-    Copy-Item $ortDll.FullName $binDst -Force
-    Write-Host "[setup] installed onnxruntime.dll (required because the runtime was built with the ORT SDK)"
+# The GDExtension links the NRR runtime statically, so its only native
+# dependencies are ONNX Runtime's, and ONNX Runtime resolves
+# onnxruntime_providers_*.dll RELATIVE TO onnxruntime.dll (not through PATH), so
+# the provider has to sit in this directory too.
+$ortRoots = @(Get-ChildItem -Path (Join-Path $repo 'third_party') -Directory -Filter 'onnxruntime-win-x64*' -ErrorAction SilentlyContinue |
+    Where-Object { Test-Path (Join-Path $_.FullName 'lib\onnxruntime.dll') } |
+    Sort-Object { if ($_.Name -like '*gpu*') { 0 } else { 1 } })
+if ($ortRoots.Count -eq 0) {
+    Write-Host "[setup] note: no ONNX Runtime package under third_party/ - the binding will fail to load" -ForegroundColor Yellow
 } else {
-    Write-Host "[setup] note: no onnxruntime.dll found under third_party/ - the binding will fail to load" -ForegroundColor Yellow
+    $ortRoot = $ortRoots[0]
+    Copy-Item (Join-Path $ortRoot.FullName 'lib\onnxruntime.dll') $binDst -Force
+    Write-Host "[setup] installed onnxruntime.dll from $($ortRoot.Name)"
+    foreach ($provider in 'onnxruntime_providers_shared.dll', 'onnxruntime_providers_cuda.dll') {
+        $src = Join-Path $ortRoot.FullName "lib\$provider"
+        if (Test-Path $src) {
+            Copy-Item $src $binDst -Force
+            Write-Host ("[setup] installed {0} ({1:N0} MB)" -f $provider, ((Get-Item $src).Length / 1MB))
+        }
+    }
+}
+
+# The CUDA runtime (cudart/cuBLAS/cuDNN/cuFFT) is what the CUDA provider loads
+# once it is attached. It is ~2.3 GB, so it is copied only when it is present and
+# only unless -SkipCuda is passed; without it the provider fails to attach and
+# NRR reports the CPU fallback rather than failing.
+if (-not $SkipCuda) {
+    $cudaDirs = @(Get-ChildItem -Path (Join-Path $repo 'third_party') -Directory -Filter 'cuda-runtime-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName 'bin' } | Where-Object { Test-Path (Join-Path $_ 'cudart64_12.dll') })
+    if ($cudaDirs.Count -eq 0) {
+        Write-Host "[setup] note: no CUDA runtime under third_party/ (run tools/fetch_cuda_runtime.ps1 to enable the GPU)" -ForegroundColor Yellow
+    } else {
+        $cudaDlls = @(Get-ChildItem -Path $cudaDirs[0] -Filter '*.dll')
+        foreach ($dll in $cudaDlls) { Copy-Item $dll.FullName $binDst -Force }
+        Write-Host ("[setup] installed {0} CUDA runtime DLL(s), {1:N0} MB" -f `
+            $cudaDlls.Count, (($cudaDlls | Measure-Object -Property Length -Sum).Sum / 1MB))
+    }
+} else {
+    Write-Host "[setup] -SkipCuda: installed without the CUDA runtime (GPU disabled, CPU fallback)"
 }
 
 # --- 4. the model the verify scene loads ------------------------------------

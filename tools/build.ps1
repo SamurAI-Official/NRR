@@ -243,6 +243,26 @@ if ($RunTests) {
         throw "nrr_tests.exe was not found under $buildPath - build first (drop -NoBuild)."
     }
 
+    # ONNX Runtime loads its execution providers by name, and
+    # onnxruntime_providers_cuda.dll in turn loads the CUDA runtime by name, so
+    # both directories have to be reachable at run time. They are taken from
+    # third_party/ rather than copied next to each executable: the CUDA set is
+    # ~2.3 GB and there are six executables. Running an executable by hand needs
+    # the same directories on PATH.
+    $runtimeDirs = @()
+    $thirdParty = Join-Path $repoRoot 'third_party'
+    if (Test-Path $thirdParty) {
+        $runtimeDirs += @(Get-ChildItem -Path $thirdParty -Directory -Filter 'onnxruntime-*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'lib' } | Where-Object { Test-Path $_ })
+        $runtimeDirs += @(Get-ChildItem -Path $thirdParty -Directory -Filter 'cuda-runtime-*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'bin' } | Where-Object { Test-Path $_ })
+    }
+    if ($runtimeDirs.Count -gt 0) {
+        $env:PATH = (($runtimeDirs -join ';') + ';' + $env:PATH)
+        Write-Host "[test] runtime DLL dirs on PATH:" -ForegroundColor Cyan
+        foreach ($dir in $runtimeDirs) { Write-Host "        $dir" }
+    }
+
     if ($msvcAsan) {
         $asanDir = Assert-MsvcAsanRuntime
         Write-Host "[build] ASan runtime: $asanDir"

@@ -453,24 +453,67 @@ GDScript `class_name` registration lives in the imported class cache.
 
 ## M2 - Real GPU execution
 
-Prerequisites: an ONNX Runtime build that ships the DirectML provider (runs on any
-D3D12 GPU, keeps the "vendor is a detail" promise) and, for the NVIDIA path, a
-CUDA-capable GPU plus a matching CUDA toolkit. **Both are absent on the current
-development machine** - the bundled SDK is CPU-only and no nvcc/CUDA toolkit is
-installed. This milestone cannot be completed or verified without them.
+**The CUDA half is done and measured.** The original prerequisite note said a "CUDA toolkit
+matching the ORT build" was required and absent; that was the wrong prerequisite. ONNX Runtime
+*loads* the CUDA runtime and never compiles with it, so `nvcc` and the toolkit are irrelevant -
+what is needed is the CUDA runtime DLLs, which NVIDIA publishes as PyPI wheels
+(`tools/fetch_cuda_runtime.ps1`), plus an ONNX Runtime package that ships the CUDA provider
+(`tools/fetch_ort.ps1 -Flavor gpu_cuda12`). Neither needs administrator rights.
 
-- [ ] `tools/fetch_ort.ps1 -Flavor cpu|gpu|directml`, CMake detection per flavour,
-      provider DLLs deployed next to `nrr.dll`
-- [ ] **Attach providers for real**: call `SessionOptionsAppendExecutionProvider_*`
-      in `runtime/onnx_runtime.cpp` (DirectML first, then CUDA, then TensorRT)
-- [ ] Report the *actual* provider, not the requested one: replace the cosmetic
-      `use_cuda_ep_`/`use_directml_ep_` flags and `provider_note_` with measured state
-- [ ] Replace `test_accel_ep_routing` (asserts a routing enum) with a test that
-      asserts the session's real provider
-- [ ] GPU-resident data path: keep textures/tensors on the device across frames
-      instead of download -> CPU -> upload
-- [ ] Perf gate: explicit budgets per tier (256->512, 540p->1080p, 1080p->4K) with
-      pass/fail thresholds in CI, plus published numbers
+Environment: NVIDIA GeForce RTX 4070 Ti (12 GB, sm_89), driver 610.88, Windows x86_64,
+ONNX Runtime 1.30.0 `win-x64-gpu_cuda12`, CUDA runtime 12.9.79 / cuDNN 9.26.
+
+- [x] `tools/fetch_ort.ps1 -Flavor cpu|gpu_cuda12|gpu_cuda13` + `NRR_ONNXRUNTIME_FLAVOR`
+      selection in CMake, with `NRR_HAVE_CUDA_EP` set only when the provider DLL is present
+- [x] `tools/fetch_cuda_runtime.ps1`: the CUDA runtime from PyPI wheels, no toolkit/admin
+- [x] **Attach the CUDA provider for real**: `SessionOptionsAppendExecutionProvider_CUDA` in
+      `runtime/onnx_runtime.cpp` (`append_cuda_provider()`)
+- [x] **Report the *actual* provider**: `active_provider()` is set from the attach call's result,
+      `provider_note()` carries ONNX Runtime's own failure message, and
+      `available_providers()` reports what `OrtApi::GetAvailableProviders` says the loaded
+      libraries can execute. `nrr_model_get_info()` no longer hard-codes `CPUExecutionProvider`.
+- [x] **Auto-selection with an opt-out**: the default preference is `auto` (CUDA, else CPU with
+      the reason recorded); `NRR_EXECUTION_PROVIDER=cpu|cuda` overrides it at run time.
+- [x] Tests that assert the session's real provider: `tests/unit/test_gpu_ep.cpp` (4 tests),
+      including a measured CPU-vs-GPU comparison.
+- [ ] Replace `test_accel_ep_routing` (asserts a routing *enum*) with an assertion about real
+      execution; the enum table is now covered by the provider tests instead
+- [ ] **A first-class CUDA NRR backend.** The CUDA execution provider runs inside the CPU
+      backend, so `nrr_get_backend_name()` still says `CPU` and `NRRCapabilities.active_backend`
+      still says `CPU`; the provider is only visible through `nrr_model_get_info()`. Once
+      `NRR_ENABLE_NVIDIA` is on by default the device should report `NVIDIA`/`CUDA` directly.
+- [ ] **DirectML** (runs on any D3D12 GPU, and is how the "vendor is a detail" promise holds for
+      non-NVIDIA hardware) - still absent; the ORT package for it has not been fetched and no
+      `SessionOptionsAppendExecutionProvider_DML` call exists
+- [ ] TensorRT provider (`onnxruntime_providers_tensorrt.dll` ships in the same package, but the
+      TensorRT libraries are a separate SDK and it is not installed)
+- [ ] GPU-resident data path: keep textures/tensors on the device across frames instead of
+      download -> CPU -> upload. Today the render path pays a full round trip per frame, which is
+      why the measured speedup at 512x512 is 22x rather than far more.
+- [ ] Perf gate: explicit budgets per tier (256->512, 540p->1080p, 1080p->4K) with pass/fail
+      thresholds. **It cannot live in CI as configured**: the GitHub runner has no GPU, so the
+      GPU test skips there with a recorded reason. The measured numbers so far are local only.
+
+**Measured evidence** (`nrr_tests`, Windows x64 Release, 2 warm-ups + 5 timed runs, 512x512
+through the untrained fixture, 3 inputs):
+
+```
+cpu   257.053 ms/frame
+cuda   11.684 ms/frame        speedup 22.0x
+mean |cpu - cuda| = 0         bit-identical output
+latency_throughput_fps: 28.9 fps   (was 11.1 fps before the default provider was CUDA)
+available execution providers: TensorrtExecutionProvider CUDAExecutionProvider CPUExecutionProvider
+```
+
+`mean |cpu - cuda| = 0` matters more than the speedup: a fast wrong answer is not a result, and
+bit-identical output on this fixture is the strongest correctness evidence available without a
+trained model and blind-reference metrics (M9).
+
+**Also worth recording:** the first CUDA frame is expensive. The Godot verification, which
+renders a single 64x48 frame, reports `render_time_ms=632` because it absorbs the CUDA context,
+cuDNN engine selection and kernel loading; steady state at 512x512 is 11.7 ms. Any single-frame
+GPU number is therefore a warm-up measurement, not a throughput measurement.
+
 
 ## M3 - Specification conformance
 

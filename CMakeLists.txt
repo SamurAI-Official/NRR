@@ -100,10 +100,20 @@ endforeach()
 #
 # Point NRR_ONNXRUNTIME_ROOT at an extracted onnxruntime-win-x64 release
 # (see tools/fetch_ort.ps1) or rely on auto-detection of third_party/.
-# Without the SDK the build still succeeds using the placeholder path.
+#
+# Flavour selection matters on a machine that has more than one package: the CPU
+# and GPU archives extract to `onnxruntime-win-x64-<ver>` and
+# `onnxruntime-win-x64-gpu_cuda12-<ver>`, and both match the `onnxruntime-win-x64*`
+# glob. NRR_ONNXRUNTIME_FLAVOR picks between them; `auto` prefers the GPU package
+# when one is present. A GPU package alone is not enough - the CUDA EP also needs
+# the CUDA runtime DLLs from tools/fetch_cuda_runtime.ps1 - and NRR_HAVE_CUDA_EP
+# is set only when onnxruntime_providers_cuda.dll is actually present.
 # ============================================================================
 set(NRR_ONNXRUNTIME_ROOT "" CACHE PATH
     "Path to the ONNX Runtime SDK root (contains include/ and lib/).")
+set(NRR_ONNXRUNTIME_FLAVOR "auto" CACHE STRING
+    "Which ONNX Runtime package to use: auto|cpu|gpu")
+set_property(CACHE NRR_ONNXRUNTIME_FLAVOR PROPERTY STRINGS auto cpu gpu)
 
 if(NOT NRR_ONNXRUNTIME_ROOT)
     if(NRR_PLATFORM_ANDROID)
@@ -118,23 +128,83 @@ if(NOT NRR_ONNXRUNTIME_ROOT)
         file(GLOB _NRR_ORT_CANDIDATES
             ${CMAKE_SOURCE_DIR}/third_party/onnxruntime-win-x64*)
     endif()
+
+    set(_NRR_ORT_CPU "")
+    set(_NRR_ORT_GPU "")
     foreach(_cand ${_NRR_ORT_CANDIDATES})
         if(EXISTS "${_cand}/include/onnxruntime_c_api.h")
-            set(NRR_ONNXRUNTIME_ROOT "${_cand}")
+            if(_cand MATCHES "gpu")
+                list(APPEND _NRR_ORT_GPU "${_cand}")
+            else()
+                list(APPEND _NRR_ORT_CPU "${_cand}")
+            endif()
+        endif()
+    endforeach()
+
+    if(NRR_ONNXRUNTIME_FLAVOR STREQUAL "gpu" AND NOT _NRR_ORT_GPU)
+        message(FATAL_ERROR
+            "NRR_ONNXRUNTIME_FLAVOR=gpu but no GPU ONNX Runtime package was found under "
+            "third_party/. Fetch one with: pwsh tools/fetch_ort.ps1 -Flavor gpu_cuda12")
+    endif()
+    if(NRR_ONNXRUNTIME_FLAVOR STREQUAL "cpu" AND NOT _NRR_ORT_CPU)
+        message(FATAL_ERROR
+            "NRR_ONNXRUNTIME_FLAVOR=cpu but no CPU package was found under third_party/. "
+            "Fetch one with: pwsh tools/fetch_ort.ps1 -Flavor cpu")
+    endif()
+
+    if(NRR_ONNXRUNTIME_FLAVOR STREQUAL "gpu")
+        list(GET _NRR_ORT_GPU 0 NRR_ONNXRUNTIME_ROOT)
+    elseif(NRR_ONNXRUNTIME_FLAVOR STREQUAL "cpu")
+        list(GET _NRR_ORT_CPU 0 NRR_ONNXRUNTIME_ROOT)
+    elseif(_NRR_ORT_GPU)
+        list(GET _NRR_ORT_GPU 0 NRR_ONNXRUNTIME_ROOT)
+    elseif(_NRR_ORT_CPU)
+        list(GET _NRR_ORT_CPU 0 NRR_ONNXRUNTIME_ROOT)
+    endif()
+    unset(_NRR_ORT_CANDIDATES)
+    unset(_NRR_ORT_CPU)
+    unset(_NRR_ORT_GPU)
+endif()
+
+# CUDA runtime DLLs (tools/fetch_cuda_runtime.ps1). Searched for, never copied
+# into the build tree: the set is ~2.3 GB and the provider loads them by name, so
+# they go on PATH instead (see NRR_RUNTIME_DLL_DIRS below).
+set(NRR_CUDA_RUNTIME_DIR "" CACHE PATH
+    "Directory holding the CUDA runtime DLLs the ONNX Runtime CUDA EP needs.")
+if(NOT NRR_CUDA_RUNTIME_DIR)
+    file(GLOB _NRR_CUDA_CANDIDATES ${CMAKE_SOURCE_DIR}/third_party/cuda-runtime-*/bin)
+    foreach(_cand ${_NRR_CUDA_CANDIDATES})
+        if(EXISTS "${_cand}/cudart64_12.dll")
+            set(NRR_CUDA_RUNTIME_DIR "${_cand}")
             break()
         endif()
     endforeach()
-    unset(_NRR_ORT_CANDIDATES)
+    unset(_NRR_CUDA_CANDIDATES)
 endif()
 
 set(NRR_ORT_DLL "")
+set(NRR_HAVE_CUDA_EP OFF)
 if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h"
    AND EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
     set(NRR_HAVE_ONNXRUNTIME ON)
     set(NRR_ORT_INCLUDE_DIR "${NRR_ONNXRUNTIME_ROOT}/include")
     set(NRR_ORT_LIB "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
     set(NRR_ORT_DLL "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.dll")
-    message(STATUS "ONNX Runtime: ${NRR_ONNXRUNTIME_ROOT} (real inference)")
+
+    if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll")
+        set(NRR_HAVE_CUDA_EP ON)
+        message(STATUS "ONNX Runtime: ${NRR_ONNXRUNTIME_ROOT} (real inference, CUDA EP present)")
+        if(NOT NRR_CUDA_RUNTIME_DIR)
+            message(WARNING
+                "The CUDA execution provider is present but no CUDA runtime was found, so it "
+                "will fail to load and NRR will report the CPU fallback. Run: "
+                "pwsh tools/fetch_cuda_runtime.ps1")
+        else()
+            message(STATUS "CUDA runtime: ${NRR_CUDA_RUNTIME_DIR}")
+        endif()
+    else()
+        message(STATUS "ONNX Runtime: ${NRR_ONNXRUNTIME_ROOT} (real inference, CPU EP only)")
+    endif()
 else()
     set(NRR_HAVE_ONNXRUNTIME OFF)
     message(STATUS "ONNX Runtime: not found (placeholder inference path)")
@@ -145,17 +215,68 @@ function(nrr_link_ort target scope)
         target_include_directories(${target} ${scope} ${NRR_ORT_INCLUDE_DIR})
         target_link_libraries(${target} ${scope} ${NRR_ORT_LIB})
         target_compile_definitions(${target} ${scope} NRR_HAVE_ONNXRUNTIME)
+        if(NRR_HAVE_CUDA_EP)
+            target_compile_definitions(${target} ${scope} NRR_HAVE_CUDA_EP)
+        endif()
     endif()
 endfunction()
 
+# onnxruntime.dll is deployed ONCE by this target, together with its provider
+# DLLs. Two reasons for the single target:
+#
+#  1. ONNX Runtime resolves onnxruntime_providers_*.dll RELATIVE TO
+#     onnxruntime.dll, not through PATH. Leaving the provider in third_party/ and
+#     putting it on PATH lists it in OrtApi::GetAvailableProviders but fails at
+#     attach time with "Failed to load shared library", so it has to sit next to
+#     onnxruntime.dll. Only the CUDA runtime (cudart/cuBLAS/cuDNN/cuFFT, ~2.3 GB)
+#     is left on PATH - the provider finds those through the normal search order.
+#  2. A POST_BUILD copy on every target makes six executables copy the same
+#     16 MB file into one directory concurrently, and the Visual Studio generator
+#     runs those steps in parallel, so the build intermittently fails with
+#     "Error copying file ... Permission denied".
+if(NRR_HAVE_ONNXRUNTIME)
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(_NRR_ORT_DEPLOY_DIR "${CMAKE_BINARY_DIR}/$<CONFIG>")
+    else()
+        set(_NRR_ORT_DEPLOY_DIR "${CMAKE_BINARY_DIR}")
+    endif()
+
+    set(_NRR_ORT_DEPLOY_FILES "${NRR_ORT_DLL}")
+    foreach(_provider onnxruntime_providers_shared.dll onnxruntime_providers_cuda.dll)
+        if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/${_provider}")
+            list(APPEND _NRR_ORT_DEPLOY_FILES "${NRR_ONNXRUNTIME_ROOT}/lib/${_provider}")
+        endif()
+    endforeach()
+    unset(_provider)
+
+    add_custom_target(nrr_deploy_runtime_dlls ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_NRR_ORT_DEPLOY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_NRR_ORT_DEPLOY_FILES} "${_NRR_ORT_DEPLOY_DIR}"
+        COMMENT "Deploying onnxruntime.dll and its provider DLLs"
+        VERBATIM)
+    unset(_NRR_ORT_DEPLOY_DIR)
+    unset(_NRR_ORT_DEPLOY_FILES)
+endif()
+
 function(nrr_copy_ort_dll target)
     if(NRR_HAVE_ONNXRUNTIME)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${NRR_ORT_DLL}" "$<TARGET_FILE_DIR:${target}>"
-            COMMENT "Copying onnxruntime.dll next to ${target}")
+        add_dependencies(${target} nrr_deploy_runtime_dlls)
     endif()
 endfunction()
+
+# Directories that must be on PATH for a test executable to find the provider
+# DLLs (onnxruntime_providers_cuda.dll) and their CUDA runtime dependencies.
+# tools/build.ps1 prepends these before running the suite. Deliberately not
+# copied next to each executable: the CUDA set is ~2.3 GB and there are six
+# executables.
+set(NRR_RUNTIME_DLL_DIRS "")
+if(NRR_HAVE_ONNXRUNTIME)
+    list(APPEND NRR_RUNTIME_DLL_DIRS "${NRR_ONNXRUNTIME_ROOT}/lib")
+endif()
+if(NRR_CUDA_RUNTIME_DIR)
+    list(APPEND NRR_RUNTIME_DLL_DIRS "${NRR_CUDA_RUNTIME_DIR}")
+endif()
 
 
 # ============================================================================
@@ -344,6 +465,14 @@ if(NRR_BUILD_TESTS)
     if(NRR_HAVE_ONNXRUNTIME)
         target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_ONNXRUNTIME)
         target_include_directories(nrr_tests PRIVATE "${NRR_ORT_INCLUDE_DIR}")
+        # The execution-provider tests are compiled in only when the CUDA
+        # provider is actually present. Without this the GPU half of
+        # tests/unit/test_gpu_ep.cpp - and its registration in main.cpp - would be
+        # dropped silently, which is precisely the failure mode the provider
+        # work exists to remove.
+        if(NRR_HAVE_CUDA_EP)
+            target_compile_definitions(nrr_tests PRIVATE NRR_HAVE_CUDA_EP)
+        endif()
     endif()
     if(NRR_ENABLE_SANITIZERS)
         # Wall-clock benchmarks do not belong in a memory-safety gate:

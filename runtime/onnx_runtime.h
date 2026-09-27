@@ -85,6 +85,21 @@ public:
     bool use_cuda() const { return use_cuda_ep_; }
     bool use_directml() const { return use_directml_ep_; }
 
+    /* The execution provider the session was actually created with. This is set
+     * from the RESULT of the ORT call that appends a provider, not from the
+     * request, so a machine without the CUDA runtime reports "CPUExecutionProvider"
+     * instead of claiming CUDA. Empty before a successful load_model(). */
+    const std::string& active_provider() const { return active_provider_; }
+
+    /* Why the active provider is what it is, in ORT's or NRR's words - e.g. the
+     * CUDA attach failure message. Empty when nothing needed explaining. */
+    const std::string& provider_note() const { return provider_note_; }
+
+    /* Providers this ONNX Runtime build can execute on, as reported by
+     * OrtApi::GetAvailableProviders - measured from the loaded libraries, not
+     * claimed. Empty when the SDK is absent. */
+    static std::vector<std::string> available_providers();
+
     void set_execution_provider(const char* provider);
 
 #ifdef NRR_HAVE_ONNXRUNTIME
@@ -116,6 +131,11 @@ private:
     OrtAllocator* allocator_ = nullptr;
     std::string ort_error_;           /* last ORT error message */
     bool apply_provider(const std::string& preferred);
+    /* Appends the CUDA execution provider to session_options_, for real.
+     * Returns false and fills provider_note_ with ORT's own message when the
+     * provider cannot be created - which is what happens when
+     * onnxruntime_providers_cuda.dll or the CUDA runtime DLLs are missing. */
+    bool append_cuda_provider();
     void release_session_objects();
 #endif
 
@@ -144,6 +164,9 @@ private:
     bool use_cuda_ep_ = false;
     bool use_directml_ep_ = false;
     std::string preferred_provider_;
+    /* Measured, not requested: set only after a provider was appended
+     * successfully. See active_provider(). */
+    std::string active_provider_;
 };
 
 // ============================================================================
