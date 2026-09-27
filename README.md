@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 96/96 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output)**. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 99/99 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output), and the NVIDIA backend is now first-class - probed through the driver ABI, so it needs no CUDA toolkit - and auto-selected**. M2 follow-up also made capability reporting honest (nothing is claimed that was not measured), added `NRR.warmup()` so a cold frame is no longer published as the frame cost, and moved the temporal pass into one `TemporalAccumulator` shared by every backend. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -14,14 +14,20 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
 > **Reality check (M1 complete for its scope, M2 in progress; verified by code inspection,
-> by the suite, and by running the engine).** Inference now runs on the **CUDA execution
+> by the suite, and by running the engine).** Inference runs on the **CUDA execution
 > provider by default** when the ONNX Runtime GPU package and the CUDA runtime are present
 > (measured: 22x faster than the CPU provider, bit-identical output), and falls back to the
-> CPU provider with ONNX Runtime's own reason recorded when they are not. The **NRR**
-> execution-provider routing layer (`use_cuda_ep_`/`use_directml_ep_`, AccelEP tables in
-> Phases 7-9) is still a decision function: only the ONNX Runtime provider is attached for
-> real, there is no DirectML path, and `nrr_get_backend_name()` still reports the NRR backend
-> (`CPU`) rather than the provider - the provider is reported through `nrr_model_get_info()`.
+> CPU provider with ONNX Runtime's own reason recorded when they are not. `nrr_device_create()`
+> with no preference selects the **NVIDIA backend** on NVIDIA hardware and says so:
+> `nrr_get_backend_name()` returns `NVIDIA`, and `NRRCapabilities.active_backend` names the
+> execution provider that actually attached (`CUDAExecutionProvider`) - only once a session
+> exists, because before that nothing has been measured and nothing is claimed. The backend
+> needs **no CUDA toolkit**: device name, VRAM and compute capability come from `nvcuda.dll`
+> through the driver ABI (`runtime/nrr_cuda_driver.cpp`). The other vendor backends
+> (AMD/Intel/RISC-V) are still structural, there is no DirectML path, and the compiled-in
+> routing tables are requests rather than capabilities. Measure a single frame with care: the
+> first one absorbs provider setup (measured `first_frame_ms=571.712` against
+> `steady_state_ms=0.578`), so warm up with `NRR.warmup()` and compare steady states.
 > The shipped model is an untrained identity fixture and `.nrrmodel` payloads are not parsed.
 > The temporal path is wired into the render path (motion reprojection + blend, measured
 > state, scene-cut and resolution-change handling) but accumulates that untrained fixture, so
@@ -57,15 +63,16 @@ nrr/
 │   ├── nrr_model.h/cpp
 │   ├── nrr_reference.h/cpp
 │   ├── nrr_reference_impl.h/cpp  # Phase 5: .nrrref references + provenance
-│   ├── nrr_temporal.h/cpp        # Phase 4: temporal rendering
+│   ├── nrr_temporal.h/cpp        # Phase 4: temporal rendering + TemporalAccumulator
+│   ├── nrr_cuda_driver.h/cpp     # driver-ABI CUDA probe (no CUDA toolkit needed)
 │   ├── nrr_conditioning.h/cpp    # Phase 6: identity/material conditioning
 │   ├── nrr_backend.h
 │   ├── nrr_c_api.cpp
 │   ├── nrr_inference.h/cpp
 │   ├── onnx_runtime.h/cpp        # Phase 3: ONNX Runtime wrapper
-│   ├── backend_cpu.cpp/h         # the only backend that executes today
+│   ├── backend_cpu.cpp/h         # reference backend: CPU provider + the temporal pass
 │   ├── backend_vulkan.cpp/h      # Phase 2: placeholder
-│   ├── backend_nvidia.cpp/h      # Phase 7: structural (NRR_ENABLE_NVIDIA)
+│   ├── backend_nvidia.cpp/h      # Phase 7: real, auto-selected via a driver-ABI probe
 │   ├── backend_amd.cpp/h         # Phase 8: structural (NRR_ENABLE_AMD)
 │   ├── backend_intel.cpp/h       # Phase 9: structural (NRR_ENABLE_INTEL)
 │   ├── backend_riscv.cpp/h       # Phase 14: structural (NRR_ENABLE_RISCV)
@@ -100,7 +107,12 @@ suite that runs in CI. It does **not** mean the feature has been executed on the
 hardware it targets. Items are labelled `structural` when the code exists but has
 never run on the hardware it exists for, and `gated` when an SDK or device is
 required (see [docs/roadmap.md](docs/roadmap.md) for evidence and the plan). Real
-neural inference today happens on one path only: the CPU backend.
+neural inference runs through one shared accelerator kernel: the CPU backend uses it directly,
+and the NVIDIA backend is selected automatically on NVIDIA hardware (AMD/Intel/RISC-V are
+compiled but not registered yet). Browsers, consoles and phones therefore have no working
+GPU path today, and the frame contract still hands NRR host memory, which is where the frame
+budget actually goes - measured at 85-88% host-side pixel work with the CUDA provider
+attached (see the M2 postmortem in `docs/roadmap.md`).
 
 ### Phase 0 - Specification (complete)
 - [x] API specification

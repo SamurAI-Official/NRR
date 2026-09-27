@@ -14,6 +14,147 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### M2 follow-up: honest reporting, a real warm-up, one shared temporal pass, and a first-class NVIDIA backend
+
+A pass over every claim the M2 work touched, on the same machine and under the same rule
+("no capability without a measurement"). Five defects of one family turned up - a capability
+reported from a *request* rather than from an *observation* - plus three caveats, three
+latent bugs that only became reachable once the accelerator path could actually be selected,
+and two tooling defects found by running it.
+
+**Fixed: capability claims that were never measured**
+
+- **The accelerator kernel advertised CUDA because CUDA was requested.**
+  `select_best_execution_provider()` set `active_ep_name_ = "cuda"` and
+  `accel_caps_.supports_cuda = true` from the `AccelEP` enum, with no ONNX Runtime call at
+  all, so a host with no CUDA runtime advertised CUDA - and `test_accel_ep_routing` blessed
+  it by asserting a non-empty provider name immediately after `initialize()`. The function
+  now records only the *request*; `apply_measured_provider()` derives `active_ep_name_`,
+  every `supports_*` flag and `preferred_ep` from `ONNXRuntime::active_provider()` and
+  `OrtApi::GetAvailableProviders()` - measured facts about the linked build.
+- **`nrr_get_capabilities()` could not report a provider even when it knew one.**
+  `DeviceImpl` cached `backend_name_`/`capabilities_` at `initialize()`, before any session
+  existed, then overwrote `active_backend` with the backend's own name. It now re-measures
+  after a model load/unload and whenever capabilities are read, so it reports nothing it has
+  not observed before a session and the provider verbatim afterwards. **Measured:
+  `caps_before_load.active_backend=CPU` with `neural_acceleration=0` (ABSENT), then
+  `active_backend=CUDAExecutionProvider` with `neural_acceleration=3` (FULL)** - agreeing
+  with `nrr_model_get_info()`.
+- **`BackendNVIDIA::is_supported()` returned true whenever `NRR_ENABLE_NVIDIA` was set**,
+  with no GPU probe - the M1.4 mobile-vendor trap in reverse. It is a real probe now.
+- **`supports_fp16` still mirrors a config flag** (`apply_accel_optimizations()` copies
+  `mem_config_.use_fp16` into it). Left alone deliberately: that is a configured policy
+  rather than a measured capability, and there is no measurement yet to replace it with.
+
+**Added: a warm-up, so the first frame stops being mistaken for the frame budget**
+
+`verify.gd` rendered a single frame and printed its time as the render cost. That frame
+absorbs CUDA context creation, cuDNN engine selection and kernel loading. **Measured:
+`first_frame_ms=571.712` against `steady_state_ms=0.578` on a CUDA host - a 990x
+difference** - which is how the alarming `632 ms` recorded under M2 came about.
+`NRR.warmup(frames, width, height)` renders throwaway frames at the size the caller will
+actually use (providers do per-shape work, so a 64x48 warm-up does not cover a 1080p
+frame), `NRRPostProcess._ready()` calls it, and `verify.gd` reports `first_frame_ms`,
+`steady_state_ms` and `frame_budget_ms` (the steady state) separately and asserts that the
+warm-up converged, instead of asserting on the cold frame.
+
+**Added: one temporal pass, shared by every backend (`TemporalAccumulator`)**
+
+The entire M1.1/M1.3 path - scene-change detection, history, `compute_state`,
+`blend_frame`, `record_frame` - lived inside `BackendCPU::execute_model`. Every other
+backend routes frames through `AcceleratorExecutionKernel::execute_frame`, which had no
+temporal accumulation of any kind: a camera cut was not detected, nothing was blended
+toward previous frames, and `NRRRenderStats::temporal_stability` was never populated.
+`TemporalAccumulator` (`runtime/nrr_temporal.{h,cpp}`) owns that behaviour now and both
+paths use it, so the rules exist once instead of once per backend. In the same family, no
+vendor backend implemented `reset_temporal_history`, so
+`nrr_device_reset_temporal_history()` returned `NRR_ERROR_NOT_SUPPORTED` on
+NVIDIA/AMD/Intel/RISC-V while working on the CPU backend, and a camera cut kept ghosting
+there; all four forward it now. The extraction is behaviour-preserving: the seven temporal
+tests and the measured-blend test stayed green, and the Godot verification's rendered
+output is unchanged at `mean_abs_dr_vs_input=0.489112`.
+
+**Added: a first-class NVIDIA backend, probed without the CUDA toolkit**
+
+The backend was unreachable in every default build - its registrar was gated behind
+`NRR_ENABLE_NVIDIA`, which is `OFF` - and it needed toolkit headers that are not installed
+here. `runtime/nrr_cuda_driver.{h,cpp}` resolves `nvcuda.dll` at run time (it ships with
+the *display* driver, not the toolkit) and reads device count, name, VRAM and compute
+capability through `cuInit`/`cuDeviceGet*`/`cuDeviceTotalMem_v2`, so no SDK, no `nvcc` and
+no include path are involved. The backend is registered unconditionally and
+`is_supported()` is that probe, so a host without NVIDIA hardware still lands on the CPU
+backend. **Measured: `nrr_device_create(NULL)` -> `nrr_get_backend_name()` = `NVIDIA`; the
+Godot addon reports `backend=NVIDIA` and `RESULT: PASS`.** The `TensorRTEngine` placeholder
+no longer reports success on its own: TensorRT is claimed only when the linked ONNX Runtime
+really offers the provider.
+
+
+**Fixed: three defects in the accelerator frame path, exposed by making the backend reachable**
+
+None of them was observable while no accelerator backend could ever be selected.
+
+- **It fed one input to a three-input model.** `execute_frame()` passed only input 0, so
+  `Run()` failed for every model in this project and the path silently degraded to
+  passthrough - the accelerator backends were returning the input image, not running neural
+  inference. It now builds every input the session declares, by role, zero-filling absent
+  optional depth/motion exactly as `BackendCPU` does. Surfaced by
+  `test_inference_gray_upscale` failing with `expected near 128.000000 but got 0.000000`.
+- **It published no render stats at all**, so `last_render_time_ms()` read 0 for every
+  accelerator frame and a budget tool saw a free render. It now reports the same
+  prep/infer/post split the CPU backend reports.
+- **`AccelResourceStore` silently truncated an oversized texture upload** while `BackendCPU`
+  rejects the same call. It rejects it too now, so the two agree.
+
+**Measured: the frame budget, and where it actually goes**
+
+New `latency_frame_budget_breakdown` warms up, samples five steady-state frames per M2 tier,
+asserts that the published split adds up to the published total and that the total is
+anchored to the wall clock, then checks the tier budget.
+
+| tier | wall | reported | inference | host overhead | overhead share |
+| --- | --- | --- | --- | --- | --- |
+| 256x256 -> 512x512 | 31.7 ms | 31.5 ms | 3.7 ms | 27.8 ms | 88% |
+| 512x512 -> 1024x1024 | 128.6 ms | 127.5 ms | 17.1 ms | 110.4 ms | 87% |
+| 960x540 -> 1920x1080 | 260.6 ms | 258.7 ms | 39.7 ms | 219.0 ms | 85% |
+| 1920x1080 -> 3840x2160 | 1031.3 ms | 1024.1 ms | 157.4 ms | 866.8 ms | 85% |
+
+**The GPU is not the bottleneck: 85-88% of every frame is host-side pixel work** (texture
+download, NCHW conversion, RGB8 conversion, temporal blend, upload), and the share grows
+with output resolution because that work scales with output pixels while inference does not.
+That result decides the next step rather than decorating it: ONNX Runtime I/O binding was
+the planned optimisation "if copies dominate", but it can only touch the inference figure,
+which is the *small* part, so doing it now would be optimising the wrong 15%. The dominant
+cost needs a path that never leaves device memory, and the host-memory engine boundary
+(`Image`/`NRRFrameInput`) plus the absent `nvcc` toolchain both block that today. Recorded
+in M2 of `docs/roadmap.md` with the numbers, rather than paid for with an unmeasured
+rewrite.
+
+**Added: tiered budgets, and a CI job that builds the CUDA configuration**
+
+Budgets per tier are derived from the measurements above (~3.5x headroom), enforced only
+where a device execution provider is actually attached, and skipped with a recorded reason
+otherwise - a CPU-only host is legitimately an order of magnitude slower, which is a
+property of the provider rather than a regression. The new `windows-gpu-link` CI job
+fetches the CUDA-flavoured ONNX Runtime (cached), asserts `onnxruntime_providers_cuda.dll`
+really shipped, then builds, links and runs the full suite against it, because none of the
+CUDA path is compiled by the CPU-flavour job: `SessionOptionsAppendExecutionProvider_CUDA`,
+the provider-DLL-beside-`onnxruntime.dll` deployment, the driver probe and every
+`#ifdef NRR_HAVE_CUDA_EP` branch in the tests. GitHub-hosted runners have no GPU, so it is a
+compile/link and provider-availability gate rather than a performance gate; a GPU budget
+needs a self-hosted runner, which is stated in the workflow instead of papered over.
+
+**Fixed: tooling defects found by running it**
+
+- `engine_plugins/godot_verify/setup.ps1` aborted before compiling anything:
+  with `$ErrorActionPreference = 'Stop'`, PowerShell promotes *any* native stderr line to a
+  terminating error, and cmake writes its harmless "Default build type is Debug" note there.
+  The preference is relaxed around the native calls, which are judged by exit code instead.
+- `DeviceImpl` dropped model/reference `shared_ptr`s without calling
+  `backend_->unload_model()`/`unload_reference()`, leaving `BackendCPU::loaded_models_` and
+  the accelerator kernel's `active_model_` pointing at freed objects. Both are unregistered
+  before release now, in `unload_model()` and in `shutdown()`.
+
+
 ### Added
 
 - **GPU execution: the ONNX Runtime CUDA execution provider is attached for real** (`M2`).
