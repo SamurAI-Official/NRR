@@ -154,9 +154,6 @@ needs a self-hosted runner, which is stated in the workflow instead of papered o
   the accelerator kernel's `active_model_` pointing at freed objects. Both are unregistered
   before release now, in `unload_model()` and in `shutdown()`.
 
-
-### Added
-
 **Fixed: `fp16` claimed what NRR cannot do, in fourteen places, and a platform build that cannot compile**
 
 The follow-up on `supports_fp16` found the defect was far wider than one line, and it led
