@@ -316,7 +316,10 @@ backend - rather than by a device-less host, which this machine cannot be. The O
 them requiring a real ONNX session; the new harness passes there in both pairings. The
 AddressSanitizer configuration could not be built locally at all (the MSVC ASan runtime is not
 installed here, and `tools/build.ps1 -Sanitize` fails fast saying exactly that), so CI owns that
-claim for this test.
+claim for this test. **Measured: CI run 32 (`b8c7bc2`) is green in all three jobs**, the
+AddressSanitizer one included, so the instrumentation claim is measured rather than delegated.
+The harness's first run (31, `d2aba69`) was red in all three, which is what exposed the defect
+below.
 
 
 ### Added

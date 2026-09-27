@@ -718,10 +718,11 @@ test fix.
 
 **Two configurations this machine still cannot check, recorded rather than implied:** the
 AddressSanitizer job cannot be built locally (the MSVC ASan runtime is not installed here, and
-`tools/build.ps1 -Sanitize` fails fast saying exactly that), so the harness is verified under
-instrumentation by CI alone. The no-ONNX-runtime flavour (`build-noort`, a local experiment that
-no CI job builds) shows 8 pre-existing failures, every one of them requiring a real ONNX session;
-the parity harness itself passes there, in both pairings.
+`tools/build.ps1 -Sanitize` fails fast saying exactly that), so that claim belongs to CI -
+**measured: CI run 32 (`b8c7bc2`) is green in all three jobs, the sanitizer one included**. The
+no-ONNX-runtime flavour (`build-noort`, a local experiment that no CI job builds) shows 8
+pre-existing failures, every one of them requiring a real ONNX session; the parity harness itself
+passes there, in both pairings.
 
 
 
