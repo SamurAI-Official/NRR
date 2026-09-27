@@ -390,6 +390,10 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     output.stats.render_time_ms = static_cast<float>(prep_ms + infer_ms + post_ms);
     output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
     output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
+    /* Reported through the same definition BackendCPU uses, so the field does not mean
+     * one thing on the CPU path and nothing at all on this one (it was left at zero). */
+    output.stats.memory_used_mb = reported_frame_memory_mb(
+        accel_texture_bytes(in_tex->width, in_tex->height, in_tex->format), rgb8.size());
     output.temporal = temporal.state;
     output.stats.temporal_stability = quantify_stability(temporal.displayed_delta);
     {

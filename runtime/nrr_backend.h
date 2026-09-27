@@ -77,6 +77,17 @@ public:
     virtual bool is_supported(const NRRDeviceOptions& options) const = 0;
 };
 
+/* NRRRenderStats::memory_used_mb, in whole MiB and by ONE definition.
+ *
+ * The field is published to callers (the Unity render pass shows it), so the CPU and the
+ * accelerator execution paths must not disagree about it - and they did: BackendCPU filled
+ * it in and every vendor backend, which routes through
+ * AcceleratorExecutionKernel::execute_frame, left it at zero. Both paths now call this, so
+ * "the memory this frame needed" means the same thing wherever the frame ran. */
+inline uint32_t reported_frame_memory_mb(size_t colour_bytes, size_t output_bytes) {
+    return static_cast<uint32_t>((colour_bytes + output_bytes) / (1024u * 1024u));
+}
+
 // Backend registration
 struct BackendInfo {
     const char* name;

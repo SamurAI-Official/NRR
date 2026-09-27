@@ -243,6 +243,64 @@ somewhere worse than the field itself.
 Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
 through the public API, and the two source guards above run on every build.
 
+### M2 follow-up: both execution paths, measured against each other
+
+`BackendCPU::execute_model()` and `AcceleratorExecutionKernel::execute_frame()` implement one
+contract and had never been compared. Every test used automatic device selection, so a CUDA host
+ran the accelerator path for the whole suite and CI ran the CPU path for the whole suite: **no
+environment ran both, and no assertion in the repository could tell that the two disagreed.**
+`tests/integration/test_path_parity.cpp` renders the same three frames through both paths and
+compares the results field by field. It needs no GPU, so all three CI jobs run it, and it drives
+the kernel through a device's own `download_texture`/`upload_texture` primitives.
+
+**Measured, Windows x64 Release, RTX 4070 Ti (CUDA provider present), 102 tests / 0 failures:**
+
+```
+auto-selected device: A BackendCPU::execute_model via 'CPU', B kernel::execute_frame via 'NVIDIA'
+  frame 1: max|byte delta|=0 alpha A/B=0/0     hist A/B=0/0 stability A/B=100/100 mem_mb A/B=4/4
+  frame 2: max|byte delta|=0 alpha A/B=0.7/0.7 hist A/B=1/1 stability A/B=76/76   mem_mb A/B=4/4
+  frame 3: max|byte delta|=0 alpha A/B=0.7/0.7 hist A/B=2/2 stability A/B=59/59   mem_mb A/B=4/4
+CPU-forced device (the shape CI runs in): A BackendCPU::execute_model via 'CPU',
+                                          B kernel::execute_frame via 'CPU'
+  frames 1..3: max|byte delta|=0, identical history weight, depth, stability and memory
+```
+
+Byte-identical displayed output on every frame, with the same measured history weight, history
+depth and reported stability, in two pairings: the automatic device (a real `NVIDIA` backend here;
+`CPU` in CI, where no runner has a device) and a CPU-forced device for the kernel, which is
+exactly the CI shape. The second pairing exists because no single environment has both.
+
+**Fixed: `NRRRenderStats::memory_used_mb` was published by one path only.** `BackendCPU` filled
+it; every accelerator frame - all three vendor backends, and the Godot binding that displays the
+field - reported `0`. Both paths now report it through one definition,
+`reported_frame_memory_mb()` in `runtime/nrr_backend.h`, and the harness asserts the two agree per
+frame. Measured: 4 MiB on **both** paths at 512x512 -> 1024x1024 with real inference, 1 MiB on
+both on the placeholder path.
+
+**Recorded, not fixed: `quality_metric` is fabricated, differently, on three paths.** `0.75f`
+(`BackendCPU`), `0` (every accelerator frame) and `0.5f`
+(`TemporalRenderer::compute_state`). There is no quality measurement in the tree - no PSNR/SSIM
+anywhere - so a caller cannot interpret the field, and the Unity package shows it. The harness
+prints every value and asserts nothing about them, so the divergence stays visible while the
+decision (measure it for real, or declare the field reserved and unset everywhere) remains open;
+it is in the roadmap's decision table. Related and likewise recorded:
+`TemporalRenderer::calculate_temporal_stability()` computes a "stability" from the difference
+between two `quality_metric` values - between two constants - so it can only ever return
+"perfectly stable"; nothing in the render path calls it, and its only test compares a frame with
+itself. The stability the render path reports *is* measured, from the frame-to-frame change of the
+displayed image, and that is what the new harness compares on both paths.
+
+**Configuration coverage, stated rather than implied.** Verified locally, Windows x64 Release:
+the CUDA-provider-present build, both pairings, 102/102. The CPU-provider CI runtime shape (no
+usable CUDA device) is covered by the CPU-forced pairing - the same code path with the same
+backend - rather than by a device-less host, which this machine cannot be. The ORT-less flavour
+(`build-noort`, a scratch directory no CI job builds) has 8 pre-existing failures, every one of
+them requiring a real ONNX session; the new harness passes there in both pairings. The
+AddressSanitizer configuration could not be built locally at all (the MSVC ASan runtime is not
+installed here, and `tools/build.ps1 -Sanitize` fails fast saying exactly that), so CI owns that
+claim for this test.
+
+
 ### Added
 
 - **GPU execution: the ONNX Runtime CUDA execution provider is attached for real** (`M2`).

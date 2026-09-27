@@ -8,6 +8,7 @@
 #include "integration/test_frame_pipeline.cpp"
 #include "integration/test_multi_frame.cpp"
 #include "integration/test_temporal_accumulation.cpp"
+#include "integration/test_path_parity.cpp"
 #include "integration/test_reference_conditioning.cpp"
 #include "performance/test_render_time.cpp"
 #include "performance/test_latency.cpp"
@@ -179,6 +180,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_scene_change_discards_history);
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
+NRR_RUN_TEST(test_execution_paths_produce_the_same_frames);
     
     std::cout << "\n--- Engine Plugin Tests ---\n";
     /* Source-level drift guards for engine_plugins/. They read the addon files

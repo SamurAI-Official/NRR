@@ -551,8 +551,8 @@ NRRResult BackendCPU::execute_model(
     output.stats.render_time_ms = static_cast<float>(total_ms);
     output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
     output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
-    output.stats.memory_used_mb = static_cast<uint32_t>(
-        (out_bytes.size() + color_img.pixels.size()) / (1024 * 1024));
+    output.stats.memory_used_mb =
+        reported_frame_memory_mb(color_img.pixels.size(), out_bytes.size());
     output.stats.quality_metric = 0.75f;
     /* temporal_stability is derived from the measured frame-to-frame change of the
      * displayed image, via the convention shared with every other backend (see

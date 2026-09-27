@@ -655,6 +655,57 @@ probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its o
 error rather than retrying on the CPU. Silently degrading a genuinely broken GPU is the worse
 failure mode for a rendering runtime, but the choice is a product decision rather than a bug
 fix and is left explicit here.
+### M2 follow-up: the two execution paths, compared frame by frame
+
+"Works for both execution paths" was an intention, not a measurement. NRR has two
+implementations of one contract - `BackendCPU::execute_model()` and
+`AcceleratorExecutionKernel::execute_frame()`, which every vendor backend routes through - and
+nothing compared them. Every test used automatic device selection, so on a CUDA host the suite
+ran the accelerator path and in CI it ran the CPU path: **no environment ran both.** That is the
+same "a configuration nothing ever builds" hole that let the accelerator path go without
+temporal accumulation, and `tests/integration/test_path_parity.cpp` closes it for the frame
+contract.
+
+**Measured in one process, on the same three frames:** path A (`BackendCPU::execute_model` on a
+CPU-forced device) and path B (`execute_frame`) produce **byte-identical RGB8 output** -
+`max|byte delta| = 0` on every frame - with the same measured history weight (`0 -> 0.7`), the
+same measured history depth (`0 -> 1 -> 2`), the same reported stability (`100 -> 76 -> 59`) and
+the same output resolution. Two pairings run, because no single environment has both shapes: the
+automatic device (a real `NVIDIA` backend on a CUDA host; `CPU` in CI, where no runner has one)
+and a CPU-forced device for the kernel, which is exactly the CI shape. The harness needs no GPU,
+so all three CI jobs run it.
+
+**Fixed because the harness named it:** `NRRRenderStats::memory_used_mb` was filled by
+`BackendCPU` only and published `0` for every accelerator frame - including the three vendor
+backends and the Godot binding that shows the field to users. Both paths now compute it through
+one definition (`reported_frame_memory_mb()` in `runtime/nrr_backend.h`), and the harness asserts
+the two agree per frame. **Measured: equal on both paths - 4 MiB at 512x512 -> 1024x1024 with
+real inference, 1 MiB on the placeholder path.**
+
+**Recorded, deliberately not fixed (product decision):** `NRRRenderStats::quality_metric` holds
+three different fabricated constants - `0.75f` on the CPU path, `0` on the accelerator path,
+`0.5f` in the legacy `TemporalRenderer::compute_state` path - and none of them is a measurement.
+NRR has no quality metric: there is no PSNR/SSIM anywhere in the tree, and the shipped model is
+an untrained fixture (M9). The harness prints every value and asserts nothing about them, so the
+divergence stays visible rather than being hidden behind an assertion that would need editing
+whichever way the decision goes. The decision itself is in the table below.
+
+**Same family, recorded:** `TemporalRenderer::calculate_temporal_stability()` derives a
+"stability" from `1 - |quality_metric(current) - quality_metric(previous)|` - the difference
+between two constants - so it can only ever report "perfectly stable". Nothing in the render path
+calls it, and its only test compares a frame with itself (`test_nrr_temporal.cpp:84`). The render
+path's own stability *is* measured, from the frame-to-frame change of the displayed image
+(`quantify_stability(displayed_delta)`), and that is what the parity harness compares on both
+paths.
+
+**Two configurations this machine still cannot check, recorded rather than implied:** the
+AddressSanitizer job cannot be built locally (the MSVC ASan runtime is not installed here, and
+`tools/build.ps1 -Sanitize` fails fast saying exactly that), so the harness is verified under
+instrumentation by CI alone. The no-ONNX-runtime flavour (`build-noort`, a local experiment that
+no CI job builds) shows 8 pre-existing failures, every one of them requiring a real ONNX session;
+the parity harness itself passes there, in both pairings.
+
+
 
 
 ## M3 - Specification conformance
@@ -773,6 +824,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | Not present |
 | Model weights: train in-house vs license | M1 quality gate, M9 licensing | Undecided |
+| `NRRRenderStats::quality_metric`: measure it for real, or declare the field reserved and unset on every path | The field is published to integrators and currently holds three different fabricated constants (0.75 CPU / 0 accelerator / 0.5 legacy), so no caller can interpret it | Undecided - the divergence is recorded and printed by `tests/integration/test_path_parity.cpp` |
 | Performance bar for v1.0 | Whether <16 ms at 1080p->4K is the gate or a lower internal tier is acceptable | Undecided |
 | Platform priority for v1.0 | Sequencing of M4-M8 | Undecided |
 
