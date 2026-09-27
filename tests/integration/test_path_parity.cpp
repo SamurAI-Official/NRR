@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -131,7 +132,18 @@ bool setup(PathFixture& fx, const char* preferred_backend) {
  * (see runtime/nrr_quality.h). Both paths get the same pattern, so their measurements are
  * measurements of the same thing. */
 bool install_quality_target(PathFixture& fx, uint32_t out_w, uint32_t out_h) {
-    if (nrr_reference_load(fx.device, "test_character.nrrref", &fx.reference) != NRR_SUCCESS ||
+    /* The reference file is written here rather than read from the tree: the .nrrref files at
+     * the repository root are produced by the standalone phase test, so on a fresh checkout -
+     * which is what CI has - they do not exist, and this harness passed locally only because
+     * something else had run first. */
+    const std::string ref_path = "test_parity_reference.nrrref";
+    {
+        std::ofstream out(ref_path);
+        if (!out.is_open()) return false;
+        out << "{\"reference_type\": \"character\", \"version\": 1}";
+        if (!out.good()) return false;
+    }
+    if (nrr_reference_load(fx.device, ref_path.c_str(), &fx.reference) != NRR_SUCCESS ||
         fx.reference == nullptr) {
         return false;
     }

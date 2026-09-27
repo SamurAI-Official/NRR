@@ -58,11 +58,25 @@ std::vector<float> floats_from_levels(uint32_t seed) {
     return out;
 }
 
+/* A reference file for these tests to load. Written here rather than read from the tree: the
+ * .nrrref files at the repository root are produced by the standalone phase test
+ * (tests/test_nrr_reference.cpp writes them), so on a fresh checkout - which is what CI has -
+ * they do not exist. A test that needs one has to make it, or it passes only on a machine where
+ * something else ran first. */
+bool write_minimal_reference(const std::string& path) {
+    std::ofstream out(path);
+    if (!out.is_open()) return false;
+    out << "{\"reference_type\": \"character\", \"version\": 1}";
+    return out.good();
+}
+
 /* A reference that carries `seed`'s pattern as its reference_frame image, of size w x h. Needs
  * a real device because references are owned by one. */
 NRRReference* load_reference_with_target(NRRDevice* device, uint32_t w, uint32_t h, uint32_t seed) {
+    const std::string path = "test_quality_reference.nrrref";
+    if (!write_minimal_reference(path)) return nullptr;
     NRRReference* ref = nullptr;
-    if (nrr_reference_load(device, "test_character.nrrref", &ref) != NRR_SUCCESS) return nullptr;
+    if (nrr_reference_load(device, path.c_str(), &ref) != NRR_SUCCESS) return nullptr;
     ReferenceData* data = dynamic_cast<ReferenceData*>(reinterpret_cast<ReferenceImpl*>(ref));
     if (data == nullptr) return nullptr;
     std::vector<float> target(static_cast<size_t>(w) * h * 3, 0.0f);

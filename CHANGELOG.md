@@ -287,6 +287,15 @@ harness blamed the metric for it. It now renders one frame per path to learn the
 resolution. **Measured in that flavour: `0.782637` on both paths at 512x512**, against
 `0.793177` at 1024x1024 with real inference - two different targets, both paths agreeing in each.
 
+**It also depended on a file another executable produces, and CI said so.** The tests loaded
+`test_character.nrrref`, which `tests/test_nrr_reference.cpp` writes into the repository root, so
+they passed locally - where the phase test had already run - and failed on a fresh checkout, which
+is what CI has: three tests failed there with "a reference carrying a ... reference_frame image".
+Each test now writes the reference file it needs (and the commit that fixes it was verified by
+deleting every `*.nrrref` first and re-running, which is the state CI is in). Two harness defects
+of one family in one workstream: **a test that passes only where something else has already run is
+not a test of the thing it names.**
+
 **Recorded, not fixed:** single-scale SSIM only (not multi-scale); the mobile kernel is a separate
 implementation that never receives references, so it still publishes an unmeasured metric; and
 PNG/EXR decoding is not implemented, so a product ships its ground-truth frame as raw RGB8.

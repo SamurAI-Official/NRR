@@ -718,6 +718,16 @@ the *metric* as broken. It renders one frame per path to learn the displayed res
 both flavours report agreement between the paths on a measured value: `0.793177` at 1024x1024 with
 real inference, `0.782637` at 512x512 on the placeholder path.
 
+**And the same harness read a file another executable produces.** The tests loaded
+`test_character.nrrref`, written into the repository root by the standalone
+`tests/test_nrr_reference.cpp`, so they passed on a machine where that had already run and failed
+on a fresh checkout - which is what CI has, and what CI reported ("a reference carrying a ...
+reference_frame image", three tests). The tests write the reference files they need now, and the
+fix was verified by deleting every `*.nrrref` and re-running, which is the state CI is in. Two
+harness defects of one family in one workstream: a test that passes only where something else has
+already run is not a test of the thing it names - the same rule the kernel-ownership finding above
+was about.
+
 ### M2 follow-up: the two execution paths, compared frame by frame
 
 "Works for both execution paths" was an intention, not a measurement. NRR has two
