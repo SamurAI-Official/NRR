@@ -59,6 +59,20 @@ public:
      * keep this default and report NRR_ERROR_NOT_SUPPORTED. */
     virtual NRRResult reset_temporal_history() { return NRR_ERROR_NOT_SUPPORTED; }
 
+    /* Re-reads state that is only knowable once work has actually run - most
+     * importantly the ONNX Runtime execution provider that ended up attached to
+     * a loaded model's session - and folds it into get_capabilities().
+     *
+     * A backend whose capabilities are fixed at construction keeps this default,
+     * which changes nothing. The device calls it after a model is loaded or
+     * unloaded and before it reports capabilities, so a caller never sees a
+     * claim where a measurement exists.
+     *
+     * Backends must NOT use this to assert a capability they have not observed:
+     * the execution provider is chosen by ONNX Runtime when the session is
+     * created, so before that there is nothing to report and nothing is claimed. */
+    virtual void refresh_measured_state() {}
+
     // Backend information
     virtual bool is_supported(const NRRDeviceOptions& options) const = 0;
 };

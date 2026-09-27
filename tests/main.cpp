@@ -145,6 +145,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_accel_kernel_execute_frame);
     NRR_RUN_TEST(test_accel_ep_routing);
     NRR_RUN_TEST(test_accel_vendor_backends_structure);
+    NRR_RUN_TEST(test_device_capabilities_track_measured_provider);
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);

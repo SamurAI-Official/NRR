@@ -54,6 +54,11 @@ public:
     bool is_initialized() const { return initialized_; }
 
 private:
+    /* Re-reads the backend's measured state (see nrr_backend.h) and folds it into
+     * backend_name_/capabilities_. Called after a model is loaded or unloaded and
+     * before capabilities are reported, so a caller never sees a stale claim. */
+    void refresh_measured_state();
+
     bool initialized_;
     NRRDeviceOptions options_;
     std::unique_ptr<Backend> backend_;

@@ -116,7 +116,13 @@ public:
         const std::function<NRRResult(void*, void*, std::size_t)>& download,
         const std::function<NRRResult(void*, const void*, std::size_t)>& upload);
 
+    /* Measured facts about the accelerator runtime, not the request. Every
+     * supports_* flag is false until a session exists and ONNX Runtime has
+     * reported what it can actually attach (see refresh_provider_state()). */
     const AccelCapabilities& get_capabilities() const { return accel_caps_; }
+    /* The execution provider the session is actually on, verbatim from
+     * ONNXRuntime::active_provider(). EMPTY until a model is loaded: before ORT
+     * has chosen a provider there is nothing truthful to report. */
     const std::string& get_active_ep_name() const { return active_ep_name_; }
     size_t get_current_memory_usage() const;
     size_t get_peak_memory_usage() const;
@@ -127,6 +133,18 @@ public:
 private:
     bool apply_accel_optimizations();
     bool select_best_execution_provider();
+
+    /* Folds a measured execution provider name into active_ep_name_ and
+     * accel_caps_. `measured` must come from ONNXRuntime::active_provider() of
+     * the session that will actually run - never from a request. An empty name
+     * means no session exists, and then nothing is claimed. */
+    void apply_measured_provider(const std::string& measured);
+    /* Folds the execution provider ONNX Runtime ACTUALLY attached into
+     * active_ep_name_ and accel_caps_. select_best_execution_provider() records
+     * only the request; the provider is not chosen until a session exists, so
+     * before a model is loaded there is nothing to measure and this reports
+     * nothing. Called after load_model() and at the top of execute_frame(). */
+    void refresh_provider_state();
 
     bool                 initialized_;
     AccelCapabilities    accel_caps_;

@@ -62,10 +62,21 @@ public:
      * detected (see temporal_scene_changed()). */
     NRRResult reset_temporal_history() override;
 
+    /* Folds the execution provider the loaded model's ONNX session ACTUALLY
+     * attached into the capability block (see nrr_backend.h for the contract).
+     * Nothing is claimed before a session exists: the provider is not chosen
+     * until ONNX Runtime creates one, so a pre-load query reports this backend's
+     * own name and no neural acceleration. */
+    void refresh_measured_state() override;
+
 private:
     bool initialized_;
     NRRCapabilities capabilities_;
     std::string name_;
+    /* Execution provider measured from the loaded model's ONNX session, as
+     * reported by ONNXRuntime::active_provider(). Empty before a model is loaded
+     * and in placeholder builds with no ONNX Runtime linked. */
+    std::string measured_provider_;
     std::unordered_map<void*, TextureImpl*> textures_;
     std::unordered_map<void*, BufferImpl*> buffers_;
     std::vector<ModelImpl*> loaded_models_;

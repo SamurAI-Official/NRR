@@ -107,6 +107,8 @@ bool AcceleratorExecutionKernel::load_model(ModelImpl* model) {
     if (!onnx_) return false;
     if (!onnx_->load_model(path)) return false;
     active_model_ = model;
+    /* The session exists, so the execution provider is finally measurable. */
+    refresh_provider_state();
     return true;
 }
 
@@ -123,6 +125,9 @@ bool AcceleratorExecutionKernel::execute_model(
     if (!initialized_ || !onnx_) return false;
     if (model && !load_model(model)) return false;
     if (!onnx_->is_loaded()) return false;
+    /* The caller may already have loaded the model, in which case load_model()
+     * did not run above; re-measure either way. */
+    refresh_provider_state();
 
     ++current_frame_;
     current_memory_usage_ = input_data.size() + output_data.size();
@@ -182,6 +187,7 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     /* ---- 3. Real ONNX inference ------------------------------------------ */
     bool ok = false;
     std::vector<float> out;
+    ONNXRuntime* used_rt = nullptr; /* the session that actually ran the frame */
     ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
 
     auto run_session = [&](ONNXRuntime* rt) -> bool {
@@ -195,6 +201,7 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         std::vector<float> o;
         std::vector<int64_t> os;
         if (!rt->run_inference_multi(tins, o, os)) return false;
+        used_rt = rt;
         out = std::move(o);
         out_shape = std::move(os);
         return true;
@@ -213,6 +220,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         out = nchw;
         out_shape = in_shape;
     }
+
+    /* Record the provider that executed the frame, measured from the session that
+     * actually ran it - a caller reading get_active_ep_name() after a render must
+     * not be told about a provider that was only requested. */
+    if (used_rt) apply_measured_provider(used_rt->active_provider());
 
     /* ---- 4. Convert back to RGB8 and publish the output texture --------- */
     std::vector<uint8_t> rgb8;
@@ -270,21 +282,87 @@ bool AcceleratorExecutionKernel::apply_accel_optimizations() {
 bool AcceleratorExecutionKernel::select_best_execution_provider() {
     const char* ep = "cpu";
     switch (preferred_ep_) {
-        case AccelEP::CUDA:      ep = "cuda";     accel_caps_.supports_cuda = true;     break;
-        case AccelEP::TENSORRT:  ep = "tensorrt"; accel_caps_.supports_tensorrt = true; break;
-        case AccelEP::ROCM:      ep = "rocm";     accel_caps_.supports_rocm = true;     break;
-        case AccelEP::DIRECTML:  ep = "directml"; accel_caps_.supports_directml = true; break;
-        case AccelEP::OPEN_VINO: ep = "openvino"; accel_caps_.supports_openvino = true; break;
+        case AccelEP::CUDA:      ep = "cuda";     break;
+        case AccelEP::TENSORRT:  ep = "tensorrt"; break;
+        case AccelEP::ROCM:      ep = "rocm";     break;
+        case AccelEP::DIRECTML:  ep = "directml"; break;
+        case AccelEP::OPEN_VINO: ep = "openvino"; break;
         case AccelEP::VULKAN:    ep = "vulkan";   break;
-        case AccelEP::RISCV:     ep = "cpu";      accel_caps_.supports_riscv = true;    break;
+        case AccelEP::RISCV:     ep = "cpu";      break;
         case AccelEP::CPU:
         default:                 ep = "cpu";      break;
     }
-    active_ep_name_ = ep;
-    /* Unavailable providers degrade gracefully to CPU inside the ORT
-     * wrapper; the fallback is reported via the provider note. */
+    /* This records the REQUEST only. The enum above is a preference, not a
+     * capability: ONNX Runtime decides what it can attach when the session is
+     * created, and that is measured in refresh_provider_state(). Deriving
+     * supports_cuda from "cuda was requested" is how a host with no CUDA runtime
+     * ends up advertising CUDA - the M1.4 mobile-vendor trap, mirrored. */
+    active_ep_name_.clear();
+    /* Unavailable providers degrade gracefully to CPU inside the ORT wrapper; the
+     * fallback is reported via the provider note. */
     onnx_->set_execution_provider(ep);
     return true;
+}
+
+void AcceleratorExecutionKernel::apply_measured_provider(const std::string& measured) {
+    if (measured == active_ep_name_) return; /* unchanged: nothing to redo */
+    active_ep_name_ = measured;
+
+    if (measured.empty()) {
+        /* No session has been created, so nothing was attached and nothing is
+         * claimed. This is the state a freshly initialized kernel reports. */
+        accel_caps_.supports_cuda     = false;
+        accel_caps_.supports_tensorrt = false;
+        accel_caps_.supports_rocm     = false;
+        accel_caps_.supports_directml = false;
+        accel_caps_.supports_openvino = false;
+        accel_caps_.supports_riscv    = false;
+        accel_caps_.preferred_ep      = AccelEP::CPU;
+        return;
+    }
+
+    /* supports_* now describe the ONNX Runtime build that is actually linked, as
+     * reported by OrtApi::GetAvailableProviders - measured from the loaded
+     * libraries, not inferred from the request. */
+    const std::vector<std::string> available = ONNXRuntime::available_providers();
+    auto has = [&available](const char* want) {
+        for (size_t i = 0; i < available.size(); ++i) {
+            if (available[i] == want) return true;
+        }
+        return false;
+    };
+    accel_caps_.supports_cuda     = has("CUDAExecutionProvider");
+    accel_caps_.supports_tensorrt = has("TensorrtExecutionProvider");
+    accel_caps_.supports_rocm     = has("ROCMExecutionProvider");
+    accel_caps_.supports_directml = has("DmlExecutionProvider");
+    accel_caps_.supports_openvino = has("OpenVINOExecutionProvider");
+    /* No ORT build exposes a RISC-V execution provider: a RISC-V host runs the
+     * CPU EP, so this is measured too rather than assumed from the vendor name. */
+    accel_caps_.supports_riscv    = has("RiscvExecutionProvider");
+
+    /* preferred_ep reports where execution LANDED, not where it was aimed. */
+    if (measured == "CUDAExecutionProvider")           accel_caps_.preferred_ep = AccelEP::CUDA;
+    else if (measured == "TensorrtExecutionProvider")  accel_caps_.preferred_ep = AccelEP::TENSORRT;
+    else if (measured == "ROCMExecutionProvider")      accel_caps_.preferred_ep = AccelEP::ROCM;
+    else if (measured == "DmlExecutionProvider")       accel_caps_.preferred_ep = AccelEP::DIRECTML;
+    else if (measured == "OpenVINOExecutionProvider")  accel_caps_.preferred_ep = AccelEP::OPEN_VINO;
+    else                                               accel_caps_.preferred_ep = AccelEP::CPU;
+}
+
+void AcceleratorExecutionKernel::refresh_provider_state() {
+    /* execute_frame() runs the model's OWN session when it has one, so that - not
+     * this kernel's fallback session - is the provider a caller cares about. */
+    if (active_model_) {
+        ModelONNX* monx = dynamic_cast<ModelONNX*>(active_model_);
+        if (monx) {
+            ONNXRuntime* rt = monx->get_onnx_runtime();
+            if (rt && rt->is_loaded()) {
+                apply_measured_provider(rt->active_provider());
+                return;
+            }
+        }
+    }
+    if (onnx_) apply_measured_provider(onnx_->active_provider());
 }
 
 AcceleratorExecutionKernel* get_accel_kernel() {

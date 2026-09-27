@@ -39,7 +39,12 @@ NRRResult DeviceImpl::initialize(const NRRDeviceOptions& options) {
 
     backend_name_ = backend_->get_name();
     capabilities_ = backend_->get_capabilities();
-    copy_string(capabilities_.active_backend, sizeof(capabilities_.active_backend), backend_name_);
+    /* A backend may name the thing that will execute the work. Before a session
+     * exists none of them can know it, so fall back to the backend's own name
+     * rather than leaving the field empty - or inventing a provider. */
+    if (capabilities_.active_backend[0] == '\0') {
+        copy_string(capabilities_.active_backend, sizeof(capabilities_.active_backend), backend_name_);
+    }
     copy_string(capabilities_.backend_version, sizeof(capabilities_.backend_version), "1.0");
 
     initialized_ = true;
@@ -50,13 +55,21 @@ void DeviceImpl::shutdown() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!initialized_ && !backend_) return;
 
-    // Unload all owned models and references first.
+    // Unload all owned models and references first. Each one is unregistered from
+    // the backend before its shared_ptr is dropped, so a backend never keeps a
+    // dangling raw pointer (see unload_model).
     for (auto& m : models_) {
-        if (m) m->unload();
+        if (m) {
+            if (backend_) backend_->unload_model(m.get());
+            m->unload();
+        }
     }
     models_.clear();
     for (auto& r : references_) {
-        if (r) r->unload();
+        if (r) {
+            if (backend_) backend_->unload_reference(r.get());
+            r->unload();
+        }
     }
     references_.clear();
 
@@ -171,6 +184,11 @@ NRRResult DeviceImpl::load_model(const std::string& path, ModelImpl** out_model)
 
     models_.push_back(model);
     if (out_model) *out_model = model.get();
+
+    /* The session exists now, so the execution provider is finally knowable.
+     * Re-measure before returning, so the first capability query after a load
+     * reports the provider that actually attached rather than the request. */
+    refresh_measured_state();
     return NRR_SUCCESS;
 }
 
@@ -179,8 +197,18 @@ NRRResult DeviceImpl::unload_model(ModelImpl* model) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (size_t i = 0; i < models_.size(); ++i) {
         if (models_[i].get() == model) {
+            /* The backend must forget the model BEFORE the shared_ptr is
+             * released: dropping it can destroy the model, and backends keep the
+             * raw pointer they were handed in load_model() (BackendCPU in
+             * loaded_models_, the accelerator kernel in active_model_). Releasing
+             * first left them holding a dangling pointer - which also meant the
+             * kernel kept claiming the execution provider of a dead session. */
+            if (backend_) backend_->unload_model(model);
             models_[i]->unload();
             models_.erase(models_.begin() + i);
+            /* With the session gone there is nothing left to measure, so the
+             * capability block must stop reporting the provider it was on. */
+            refresh_measured_state();
             return NRR_SUCCESS;
         }
     }
@@ -211,6 +239,8 @@ NRRResult DeviceImpl::unload_reference(ReferenceImpl* reference) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (size_t i = 0; i < references_.size(); ++i) {
         if (references_[i].get() == reference) {
+            /* Unregister before the shared_ptr goes away - see unload_model(). */
+            if (backend_) backend_->unload_reference(reference);
             references_[i]->unload();
             references_.erase(references_.begin() + i);
             return NRR_SUCCESS;
@@ -219,7 +249,29 @@ NRRResult DeviceImpl::unload_reference(ReferenceImpl* reference) {
     return NRR_ERROR_STATE_INVALID;
 }
 
+void DeviceImpl::refresh_measured_state() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!backend_) return;
+
+    /* A backend can only learn what it is really running after work has run, so
+     * let it re-measure before anything is read back. */
+    backend_->refresh_measured_state();
+
+    backend_name_ = backend_->get_name();
+    NRRCapabilities live = backend_->get_capabilities();
+    /* backend_version describes the ABI contract and belongs to the device, so it
+     * must survive a backend refresh. */
+    copy_string(live.backend_version, sizeof(live.backend_version),
+                capabilities_.backend_version);
+    if (live.active_backend[0] == '\0') {
+        copy_string(live.active_backend, sizeof(live.active_backend), backend_name_);
+    }
+    capabilities_ = live;
+}
+
 const NRRCapabilities& DeviceImpl::get_capabilities() {
+    /* Never hand back a cached claim when a measurement is available. */
+    refresh_measured_state();
     return capabilities_;
 }
 

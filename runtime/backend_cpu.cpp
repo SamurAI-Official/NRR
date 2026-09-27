@@ -80,6 +80,51 @@ bool BackendCPU::is_supported(const NRRDeviceOptions& options) const {
     return true;
 }
 
+void BackendCPU::refresh_measured_state() {
+    /* ONNX Runtime picks the execution provider when it creates the session, not
+     * when this backend is constructed, so the measurement only exists once a
+     * model has been loaded. Everything asked before that keeps the constructor's
+     * self-description, which claims nothing it has not observed. */
+    std::string provider;
+    for (ModelImpl* m : loaded_models_) {
+        ModelONNX* monx = dynamic_cast<ModelONNX*>(m);
+        if (monx == nullptr) continue;
+        ONNXRuntime* rt = monx->get_onnx_runtime();
+        if (rt == nullptr) continue;
+        /* Only a live session has a provider. A torn-down session reports empty,
+         * which is exactly what a caller should hear. */
+        if (!rt->is_loaded()) continue;
+        const std::string& active = rt->active_provider();
+        if (active.empty()) continue;
+        provider = active;
+        break;
+    }
+
+    /* Cheap early-out: capabilities are queried on every nrr_get_capabilities(). */
+    if (provider == measured_provider_) return;
+    measured_provider_ = provider;
+
+    /* active_backend names the thing that EXECUTES the work, verbatim from ORT,
+     * so a reader cannot mistake a request for an attachment. The NRR-side
+     * identity stays in device_name ("NRR CPU Backend"): this backend owns the
+     * textures and the temporal history, the provider does the math. The reason a
+     * provider was not attached is reported by nrr_model_get_info(), which already
+     * carries ONNXRuntime::provider_note(). */
+    copy_string(capabilities_.active_backend, sizeof(capabilities_.active_backend),
+                provider.empty() ? name_ : provider);
+
+    /* Only a provider that is not the CPU fallback means the model really runs on
+     * a device. Callers gate on neural_acceleration, so it must stay ABSENT when
+     * the CUDA EP failed to attach - otherwise this is the M2 defect all over
+     * again, in the capability block instead of the model info string.
+     * tensor_cores/fp16/vram_mb are deliberately NOT set here: they are not
+     * measured yet, so no claim is made. */
+    const bool on_device = !provider.empty() &&
+                           provider != "CPUExecutionProvider";
+    capabilities_.neural_acceleration =
+        on_device ? NRR_CAPABILITY_FULL : NRR_CAPABILITY_ABSENT;
+}
+
 // ============================================================================
 // Texture management
 // ============================================================================

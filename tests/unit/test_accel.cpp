@@ -98,14 +98,38 @@ NRR_TEST(test_accel_kernel_execute_frame) {
                         "accelerator kernel initializes from a vendor EP request");
         NRR_EXPECT_TRUE(kernel->is_initialized(),
                         "accelerator kernel is initialized");
-        NRR_EXPECT_FALSE(kernel->get_active_ep_name().empty(),
-                         "accelerator kernel reports an active execution provider");
+        /* D5 guard: the vendor EP request above is a preference, not a fact. No
+         * session exists yet, so ONNX Runtime has not chosen anything and the
+         * kernel must claim nothing. */
+        NRR_EXPECT_TRUE(kernel->get_active_ep_name().empty(),
+                        "accelerator kernel claims no provider before a session");
+        NRR_EXPECT_FALSE(kernel->get_capabilities().supports_cuda,
+                         "supports_cuda is not derived from a CUDA request");
 
         ModelImpl* impl = reinterpret_cast<ModelImpl*>(model);
         NRR_EXPECT_TRUE(kernel->load_model(impl),
                         "accelerator kernel loads the model's ONNX session");
         NRR_EXPECT_TRUE(kernel->is_loaded(),
                         "accelerator kernel reports a loaded session");
+        /* The session exists now and ONNX Runtime has attached its provider, so
+         * the kernel can report a measured fact instead of the request. */
+        NRR_EXPECT_FALSE(kernel->get_active_ep_name().empty(),
+                         "accelerator kernel reports the measured provider");
+        {
+            const std::vector<std::string> provs = ONNXRuntime::available_providers();
+            bool ep_known = false;
+            for (size_t pi = 0; pi < provs.size(); ++pi) {
+                if (provs[pi] == kernel->get_active_ep_name()) { ep_known = true; break; }
+            }
+            NRR_EXPECT_TRUE(ep_known,
+                            "measured provider comes from ONNX Runtime's provider list");
+            bool cuda_linked = false;
+            for (size_t pi = 0; pi < provs.size(); ++pi) {
+                if (provs[pi] == "CUDAExecutionProvider") { cuda_linked = true; break; }
+            }
+            NRR_EXPECT_TRUE(kernel->get_capabilities().supports_cuda == cuda_linked,
+                            "supports_cuda matches the linked ONNX Runtime build");
+        }
 
         DeviceImpl* dev = reinterpret_cast<DeviceImpl*>(device);
         Backend* backend = dev ? dev->get_backend() : nullptr;
@@ -178,14 +202,21 @@ NRR_TEST(test_accel_ep_routing) {
                     static_cast<int>(AccelEP::CPU),
                     "unknown vendor falls back to CPU EP");
 
-    // A freshly initialized kernel reports the EP name it actually selected.
+    // A freshly initialized kernel has no session, so it has measured nothing and
+    // must report nothing. This is the D5 contract: the vendor -> EP mapping above
+    // selects what to REQUEST, and separately from that the kernel only ever
+    // reports what ONNX Runtime actually attached.
     AcceleratorExecutionKernel probe;
     NRR_EXPECT_TRUE(probe.initialize(AccelEP::CUDA, 64u * 1024u * 1024u,
                                      true, false, true),
                     "accelerator kernel initializes with a vendor EP request");
     NRR_EXPECT_TRUE(probe.is_initialized(), "probe kernel is initialized");
-    NRR_EXPECT_FALSE(probe.get_active_ep_name().empty(),
-                     "probe kernel reports an active EP name");
+    NRR_EXPECT_TRUE(probe.get_active_ep_name().empty(),
+                    "probe kernel reports no provider before a session exists");
+    NRR_EXPECT_FALSE(probe.get_capabilities().supports_cuda,
+                     "probe kernel does not turn a CUDA request into a capability");
+    NRR_EXPECT_FALSE(probe.get_capabilities().supports_tensorrt,
+                     "probe kernel does not turn a request into a TensorRT claim");
     probe.shutdown();
     NRR_EXPECT_FALSE(probe.is_initialized(), "probe kernel shuts down cleanly");
 }
@@ -248,6 +279,64 @@ NRR_TEST(test_accel_vendor_backends_structure) {
         nrr_device_destroy(device);
     }
 }
+
+NRR_TEST(test_device_capabilities_track_measured_provider) {
+    // D6 guard: DeviceImpl caches backend_name_/capabilities_ at initialize(),
+    // before any model exists, so a provider that only becomes knowable when a
+    // session is created would never reach nrr_get_capabilities(). The device has
+    // to re-measure around model load/unload, and neural_acceleration has to
+    // follow where execution actually landed.
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRRResult r = nrr_device_create(&options, &device);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "device for the capabilities refresh test");
+    if (!device) return;
+
+    char backend_before[64] = {};
+    NRR_EXPECT_EQ(nrr_get_backend_name(device, backend_before, sizeof(backend_before)),
+                  NRR_SUCCESS, "backend name before a model is loaded");
+    NRR_EXPECT_TRUE(backend_before[0] != '\0', "backend name is reported");
+
+    NRRModel* model = nullptr;
+    r = nrr_model_load(device, NRR_PASSTHROUGH_MODEL, &model);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "load model for the capabilities refresh test");
+    if (model) {
+        NRRCapabilities caps = {};
+        NRR_EXPECT_EQ(nrr_get_capabilities(device, &caps), NRR_SUCCESS,
+                      "capabilities after a model load");
+        NRR_EXPECT_TRUE(caps.active_backend[0] != '\0',
+                        "active backend is reported after a model load");
+
+        // The reported backend must be either a provider ONNX Runtime really
+        // lists, or - in a placeholder build with no ORT linked - the backend's
+        // own name. It must never be a value cached at initialize() time that
+        // contradicts what the session is running on.
+        const std::vector<std::string> provs = ONNXRuntime::available_providers();
+        bool known = false;
+        for (size_t i = 0; i < provs.size(); ++i) {
+            if (provs[i] == caps.active_backend) { known = true; break; }
+        }
+        NRR_EXPECT_TRUE(known || std::strcmp(caps.active_backend, backend_before) == 0,
+                        "active_backend is measured, not a stale initialize() claim");
+
+        const bool on_device = known &&
+            std::strcmp(caps.active_backend, "CPUExecutionProvider") != 0;
+        NRR_EXPECT_TRUE(caps.neural_acceleration ==
+                            (on_device ? NRR_CAPABILITY_FULL
+                                       : NRR_CAPABILITY_ABSENT),
+                        "neural_acceleration follows the measured provider");
+
+        // Unloading the session leaves nothing to measure, so the claim must go.
+        nrr_model_unload(model);
+        NRRCapabilities after = {};
+        NRR_EXPECT_EQ(nrr_get_capabilities(device, &after), NRR_SUCCESS,
+                      "capabilities after the model is unloaded");
+        NRR_EXPECT_TRUE(after.neural_acceleration == NRR_CAPABILITY_ABSENT,
+                        "neural_acceleration is withdrawn once no session exists");
+    }
+    nrr_device_destroy(device);
+}
+
 
 } // namespace test
 } // namespace nrr
