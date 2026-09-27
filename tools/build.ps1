@@ -42,6 +42,32 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Native tools write progress and warnings to stderr. With $ErrorActionPreference =
+# 'Stop', PowerShell promotes ANY native stderr line to a terminating error *when the
+# output is captured or piped* - which made this script behave two different ways: CI
+# (which does not capture the stream) ran past a CMake warning, while a local run
+# aborted on it. The warning in question is a real and useful one (CMakeLists.txt:
+# "the CUDA execution provider is present but no CUDA runtime was found"), and
+# aborting the build is not the right response to it. Run native commands with the
+# preference relaxed and judge them by exit code, which is what actually reports
+# success. Same defect as engine_plugins/godot_verify/setup.ps1.
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Command,
+        [Parameter(Mandatory)][string]$What
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Command
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) { throw "$What failed with exit code $code" }
+    return $code
+}
+
 # Surface failures without needing the raw CI log: GitHub turns "::error::" into a
 # check annotation, which stays readable through the public API even when job logs
 # require authentication. (This is how the pwsh 7 "$IsWindows" bug was diagnosed.)
@@ -217,8 +243,7 @@ if (-not $NoConfigure) {
     if ($generator) { $configureArgs += @('-G', $generator, '-A', 'x64') }
 
     Write-Host "[build] configure: cmake $($configureArgs -join ' ')"
-    & $cmake @configureArgs
-    if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE" }
+    Invoke-NativeCommand { & $cmake @configureArgs } 'CMake configure' | Out-Null
 }
 
 # ---------------------------------------------------------------------------
@@ -227,8 +252,7 @@ if (-not $NoConfigure) {
 
 if (-not $NoBuild) {
     Write-Host "[build] building configuration '$Config'"
-    & $cmake --build $buildPath --config $Config --parallel
-    if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+    Invoke-NativeCommand { & $cmake --build $buildPath --config $Config --parallel } 'Build' | Out-Null
 }
 
 # ---------------------------------------------------------------------------
@@ -297,8 +321,16 @@ if ($RunTests) {
         Write-Host "[test] $target" -ForegroundColor Cyan
         Push-Location $testDir
         try {
-            $output = & $exe 2>&1
-            $code = $LASTEXITCODE
+            # A diagnostic a test writes to stderr must not abort the runner - capture
+            # both streams with the preference relaxed and judge the exit code.
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $output = & $exe 2>&1
+                $code = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previous
+            }
         } finally {
             Pop-Location
         }

@@ -49,6 +49,36 @@ jobs:
         shell: pwsh
         run: ./tools/build.ps1 -Config Release -RunTests
 
+      # Same reasoning as the CUDA job: a failing test name must be readable without
+      # access to the job log.
+      - name: Publish failing tests as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $logs = 'build/test-results'
+          if (-not (Test-Path $logs)) {
+            Write-Host "::warning::no test logs at $logs - the failure happened before the suite ran"
+            exit 0
+          }
+          $found = $false
+          Get-ChildItem $logs -Filter '*.log' | ForEach-Object {
+            $name = $_.BaseName
+            Select-String -Path $_.FullName -Pattern 'FAILED|FAILURE:|RESULT: FAIL' |
+              Select-Object -First 25 | ForEach-Object {
+                $found = $true
+                Write-Host "::error title=$name::$($_.Line.Trim())"
+              }
+          }
+          if (-not $found) {
+            Write-Host "::warning::no FAILED line in the logs; publishing the suite summary instead"
+            $suite = Join-Path $logs 'nrr_tests.log'
+            if (Test-Path $suite) {
+              Select-String -Path $suite -Pattern 'Total:|Passed:|Failed:|Success Rate' |
+                ForEach-Object { Write-Host "::error title=nrr_tests summary::$($_.Line.Trim())" }
+            }
+          }
+          exit 0
+
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -176,6 +206,38 @@ jobs:
       - name: Configure, build and test against the CUDA provider
         shell: pwsh
         run: ./tools/build.ps1 -Config Release -BuildDir build-gpu -RunTests
+
+      # Job logs need authentication, and the whole point of this job is to catch a
+      # configuration-specific failure nobody can reproduce locally. Publish the
+      # FAILED lines as annotations so they are readable through the public check-run
+      # API - the same pattern the dependency diagnosis below uses.
+      - name: Publish failing tests as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $logs = 'build-gpu/test-results'
+          if (-not (Test-Path $logs)) {
+            Write-Host "::warning::no test logs at $logs - the failure happened before the suite ran"
+            exit 0
+          }
+          $found = $false
+          Get-ChildItem $logs -Filter '*.log' | ForEach-Object {
+            $name = $_.BaseName
+            Select-String -Path $_.FullName -Pattern 'FAILED|FAILURE:|RESULT: FAIL' |
+              Select-Object -First 25 | ForEach-Object {
+                $found = $true
+                Write-Host "::error title=$name::$($_.Line.Trim())"
+              }
+          }
+          if (-not $found) {
+            Write-Host "::warning::no FAILED line in the logs; publishing the suite summary instead"
+            $suite = Join-Path $logs 'nrr_tests.log'
+            if (Test-Path $suite) {
+              Select-String -Path $suite -Pattern 'Total:|Passed:|Failed:|Success Rate' |
+                ForEach-Object { Write-Host "::error title=nrr_tests summary::$($_.Line.Trim())" }
+            }
+          }
+          exit 0
 
       - name: Upload GPU-build test logs
         if: always()
