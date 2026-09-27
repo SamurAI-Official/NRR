@@ -655,6 +655,69 @@ probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its o
 error rather than retrying on the CPU. Silently degrading a genuinely broken GPU is the worse
 failure mode for a rendering runtime, but the choice is a product decision rather than a bug
 fix and is left explicit here.
+### M2 follow-up: `quality_metric` is measured now, against a reference image
+
+The follow-up to the parity harness's first finding. `NRRRenderStats::quality_metric` held three
+different constants - `0.75f` on the CPU path, `0` on every accelerator frame, `0.5f` in the
+legacy `TemporalRenderer` - and the field is displayed by the Unity package, so no integrator
+could interpret it. It is a measurement now, produced by one definition both execution paths call
+(`runtime/nrr_quality.{h,cpp}`):
+
+```
+quality_metric = SSIM(displayed frame, ground-truth image)   in [0,1], 1.0 = identical
+```
+
+with the peak signal-to-noise ratio of the same two images in `debug_info`, so the published
+number can be checked against the report rather than trusted.
+
+**Where the ground truth comes from - a reference set, which no render path had ever read.**
+Every backend received `references` and immediately wrote `(void)references;`. A reference that
+carries an RGB8 image named `reference_frame` at the displayed resolution is now the target, and
+the reference *file* names it:
+
+```
+{"reference_type": "character", "version": 1,
+ "reference_frame": {"width": 1920, "height": 1080, "file": "target.rgb"}}
+```
+
+Any of the six reference roles may carry it, because a caller that has a ground-truth frame should
+not have to misdeclare it as a skin sample. `ReferenceData::load_textures()` decodes the entry
+from the raw RGB8 file it names, and `ReferenceData::set_texture()` lets a caller install one that
+is already in memory.
+
+**Nothing to measure against is reported as nothing measured.** No reference set, no
+`reference_frame` image, or one whose resolution does not match the displayed frame publishes
+`0.0` and says which in `debug_info` ("quality unmeasured: ..."). A "perfect" fallback would be
+the worst option available, because no caller could tell 1.0-by-default from 1.0-measured.
+
+**One more implementation had to be reachable first.** `DeviceImpl::load_reference()` constructed
+a plain `ReferenceImpl`, so the documented `ReferenceData` implementation - the one that parses
+`.nrrref`, decodes textures and carries the identity embedding, and the one `ReferenceSetBuilder`
+accepts - could not be reached through `nrr_reference_load()` at all. It constructs `ReferenceData`
+now.
+
+**Measured.** `test_path_parity` renders the same frames through both paths against the same
+ground-truth image and asserts the published value is identical: **both paths report `0.793177`**
+where they previously reported `0.75` and `0`, and both report `0.0` with "quality unmeasured"
+when no reference set is presented. `tests/unit/test_quality_metric.cpp` pins the arithmetic
+against values derived by hand rather than recorded from the implementation: identical images are
+exactly 1.0, a uniform +3 offset is exactly `10*log10(255^2/9)`, two uniform images reduce to the
+luminance term `(2*mu_a*mu_b + C1)/(mu_a^2 + mu_b^2 + C1)`, a target of the wrong resolution is
+not scored at all, and the loader decodes a `reference_frame` entry from a reference file.
+
+**Recorded, deliberately not fixed:** the metric is single-scale SSIM over non-overlapping 8x8
+windows (clamped to the image when it is smaller), not the multi-scale variant; the mobile
+execution path (`MobileExecutionKernel`) is a separate implementation that never receives
+references, so it still publishes an unmeasured metric; and compressed image decoding (PNG/EXR)
+is not implemented, so a product must ship its ground-truth frame as raw RGB8.
+
+**The metric then corrected the harness that verified it.** `test_path_parity` sized the ground
+truth 2x the input - true of the sample model, which upscales - while the ORT-less flavour's
+placeholder path displays at the input size, so the target did not match and the harness reported
+the *metric* as broken. It renders one frame per path to learn the displayed resolution now, and
+both flavours report agreement between the paths on a measured value: `0.793177` at 1024x1024 with
+real inference, `0.782637` at 512x512 on the placeholder path.
+
 ### M2 follow-up: the two execution paths, compared frame by frame
 
 "Works for both execution paths" was an intention, not a measurement. NRR has two
@@ -688,7 +751,8 @@ three different fabricated constants - `0.75f` on the CPU path, `0` on the accel
 NRR has no quality metric: there is no PSNR/SSIM anywhere in the tree, and the shipped model is
 an untrained fixture (M9). The harness prints every value and asserts nothing about them, so the
 divergence stays visible rather than being hidden behind an assertion that would need editing
-whichever way the decision goes. The decision itself is in the table below.
+whichever way the decision goes. The decision itself is in the table below. **Resolved in the
+follow-up above: it is measured now, and the harness asserts that both paths agree on it.**
 
 **Same family, recorded:** `TemporalRenderer::calculate_temporal_stability()` derives a
 "stability" from `1 - |quality_metric(current) - quality_metric(previous)|` - the difference
@@ -843,7 +907,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | Not present |
 | Model weights: train in-house vs license | M1 quality gate, M9 licensing | Undecided |
-| `NRRRenderStats::quality_metric`: measure it for real, or declare the field reserved and unset on every path | The field is published to integrators and currently holds three different fabricated constants (0.75 CPU / 0 accelerator / 0.5 legacy), so no caller can interpret it | Undecided - the divergence is recorded and printed by `tests/integration/test_path_parity.cpp` |
+| `NRRRenderStats::quality_metric`: measure it for real, or declare the field reserved and unset on every path | The field is published to integrators and held three different fabricated constants (0.75 CPU / 0 accelerator / 0.5 legacy), so no caller could interpret it | **Decided and implemented: measured** - SSIM against a `reference_frame` image from the reference set, `0.0` with the reason in `debug_info` when there is nothing to measure against |
 | Performance bar for v1.0 | Whether <16 ms at 1080p->4K is the gate or a lower internal tier is acceptable | Undecided |
 | Platform priority for v1.0 | Sequencing of M4-M8 | Undecided |
 

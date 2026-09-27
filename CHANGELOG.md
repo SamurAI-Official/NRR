@@ -243,6 +243,54 @@ somewhere worse than the field itself.
 Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
 through the public API, and the two source guards above run on every build.
 
+### M2 follow-up: `quality_metric` is measured, against a reference image
+
+`NRRRenderStats::quality_metric` held three different constants - `0.75f` on the CPU path, `0` on
+every accelerator frame, `0.5f` in the legacy `TemporalRenderer` - and the Unity package displays
+the field, so no integrator could interpret it. It is a measurement now, produced by one
+definition both paths call (`runtime/nrr_quality.{h,cpp}`): **SSIM of the displayed frame against a
+ground-truth image, in [0,1]**, with the PSNR of the same two images in `debug_info`.
+
+The ground truth comes from the reference set, which no render path had ever read (every backend
+wrote `(void)references;` within a line of receiving it): a reference carrying an RGB8 image named
+`reference_frame` at the displayed resolution, decoded from the raw file the reference names, or
+installed in memory by the caller. With nothing to measure against, the field publishes `0.0` and
+`debug_info` says why - a "perfect" fallback would be the worst option available, because no caller
+could tell 1.0-by-default from 1.0-measured.
+
+`DeviceImpl::load_reference()` also constructed a plain `ReferenceImpl`, so the documented
+`ReferenceData` implementation - the one that parses `.nrrref`, decodes textures, carries the
+identity embedding, and the one `ReferenceSetBuilder` accepts - was unreachable through
+`nrr_reference_load()` at all. It constructs `ReferenceData` now, which is what makes a decoded
+target reachable in the first place.
+
+**Measured, 110 tests / 0 failures, Windows x64 Release with the CUDA provider present:**
+
+```
+test_path_parity, both paths against the same ground-truth image:
+  quality_metric A/B = 0.793177/0.793177    (identical, measured)
+test_path_parity, no reference set presented:
+  quality_metric A/B = 0/0                  (unmeasured, with the reason in debug_info)
+latency_frame_budget_breakdown (real render, no reference set):
+  ... | quality unmeasured: no reference set presented
+```
+
+`tests/unit/test_quality_metric.cpp` pins the arithmetic against values derived by hand rather than
+recorded from the implementation: identical images are exactly 1.0, a uniform +3 offset is exactly
+`10*log10(255^2/9)`, two uniform images reduce to the luminance term, a target of the wrong
+resolution is not scored at all, and a `reference_frame` entry is decoded from a reference file.
+
+**The harness's own assumption was wrong, and a flavour no CI job builds said so.** It sized the
+ground truth 2x the input - true of the sample model, which upscales - while the placeholder path
+an ORT-less build falls back to displays at the input size, so the target did not match and the
+harness blamed the metric for it. It now renders one frame per path to learn the displayed
+resolution. **Measured in that flavour: `0.782637` on both paths at 512x512**, against
+`0.793177` at 1024x1024 with real inference - two different targets, both paths agreeing in each.
+
+**Recorded, not fixed:** single-scale SSIM only (not multi-scale); the mobile kernel is a separate
+implementation that never receives references, so it still publishes an unmeasured metric; and
+PNG/EXR decoding is not implemented, so a product ships its ground-truth frame as raw RGB8.
+
 ### M2 follow-up: both execution paths, measured against each other
 
 `BackendCPU::execute_model()` and `AcceleratorExecutionKernel::execute_frame()` implement one

@@ -18,6 +18,7 @@
 #include "unit/test_capability_claims.cpp"
 #include "unit/test_engine_plugins.cpp"
 #include "unit/test_gpu_ep.cpp"
+#include "unit/test_quality_metric.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
 #include "mobile/test_ios.cpp"
@@ -181,6 +182,19 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
     NRR_RUN_TEST(test_execution_paths_produce_the_same_frames);
+
+    std::cout << "\n--- Frame Quality Tests (measured, not assumed) ---\n";
+    /* NRRRenderStats::quality_metric was a constant on every path. It is the SSIM of the
+     * displayed frame against the ground-truth image the reference set carries, measured by
+     * the same definition on both execution paths. */
+    NRR_RUN_TEST(test_quality_ssim_of_identical_images_is_exactly_one);
+    NRR_RUN_TEST(test_quality_psnr_matches_the_equation_for_an_exact_offset);
+    NRR_RUN_TEST(test_quality_ssim_of_uniform_images_is_the_luminance_term);
+    NRR_RUN_TEST(test_quality_ssim_discriminates_between_frames);
+    NRR_RUN_TEST(test_quality_is_unmeasured_without_a_reference_set);
+    NRR_RUN_TEST(test_quality_is_unmeasured_when_the_target_resolution_differs);
+    NRR_RUN_TEST(test_quality_measures_the_target_the_reference_carries);
+    NRR_RUN_TEST(test_quality_reference_frame_is_decoded_from_the_reference_file);
     
     std::cout << "\n--- Engine Plugin Tests ---\n";
     /* Source-level drift guards for engine_plugins/. They read the addon files

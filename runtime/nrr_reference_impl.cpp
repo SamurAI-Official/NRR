@@ -12,10 +12,13 @@
 
 #include "nrr_reference_impl.h"
 #include "nrr_device.h"
+#include "nrr_quality.h"
 #include "nrr_reference.h"
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <cstdlib>
+#include <iterator>
 
 namespace nrr {
 
@@ -150,6 +153,29 @@ bool ReferenceData::has_texture(const std::string& name) const {
     return textures_.find(name) != textures_.end();
 }
 
+bool ReferenceData::set_texture(const std::string& name, uint32_t width, uint32_t height,
+                                NRRTextureFormat format, const std::vector<float>& cpu_data) {
+    if (name.empty() || width == 0 || height == 0) return false;
+
+    ReferenceTexture* tex = nullptr;
+    auto it = textures_.find(name);
+    if (it != textures_.end()) {
+        tex = it->second;
+    } else {
+        tex = new ReferenceTexture();
+        if (tex == nullptr) return false;
+        tex->name = name;
+        textures_[name] = tex;
+        texture_names_.push_back(name);
+    }
+
+    tex->width = width;
+    tex->height = height;
+    tex->format = format;
+    tex->cpu_data = cpu_data;
+    return true;
+}
+
 bool ReferenceData::prepare_conditioning(std::vector<float>& conditioning_data,
                                          size_t& total_size) const {
     conditioning_data.clear();
@@ -199,9 +225,99 @@ NRRResult ReferenceData::load_textures(DeviceImpl* device, const std::string& ba
     }
     textures_["facial_reference"] = tex;
     texture_names_.push_back("facial_reference");
+    /* Optional ground-truth frame. The placeholder note above says a real implementation would
+     * decode texture files from the archive; this is the first one that is really decoded. */
+    load_reference_frame(base_path);
     return NRR_SUCCESS;
 }
 
+namespace {
+
+/* Minimal scan for the flat metadata files NRR reads. The reference format is one small JSON
+ * object with a handful of scalar fields, so a general parser would be a dependency-sized
+ * change for no benefit - and this returns "absent" rather than guessing when something is
+ * malformed, which leaves the quality metric unmeasured instead of wrong. */
+bool find_json_object(const std::string& text, const char* key, std::string& body) {
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t at = text.find(needle);
+    if (at == std::string::npos) return false;
+    const size_t open = text.find('{', at + needle.size());
+    if (open == std::string::npos) return false;
+    const size_t close = text.find('}', open);
+    if (close == std::string::npos) return false;
+    body = text.substr(open + 1, close - open - 1);
+    return true;
+}
+
+bool json_int(const std::string& body, const char* key, long& value) {
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t at = body.find(needle);
+    if (at == std::string::npos) return false;
+    const size_t colon = body.find(':', at + needle.size());
+    if (colon == std::string::npos) return false;
+    value = std::strtol(body.c_str() + colon + 1, nullptr, 10);
+    return true;
+}
+
+bool json_string(const std::string& body, const char* key, std::string& value) {
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t at = body.find(needle);
+    if (at == std::string::npos) return false;
+    const size_t colon = body.find(':', at + needle.size());
+    if (colon == std::string::npos) return false;
+    const size_t open = body.find('"', colon + 1);
+    if (open == std::string::npos) return false;
+    const size_t close = body.find('"', open + 1);
+    if (close == std::string::npos) return false;
+    value = body.substr(open + 1, close - open - 1);
+    return true;
+}
+
+std::string directory_of(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return (slash == std::string::npos) ? std::string() : path.substr(0, slash + 1);
+}
+
+} /* namespace */
+
+NRRResult ReferenceData::load_reference_frame(const std::string& base_path) {
+    std::ifstream file(base_path);
+    if (!file.is_open()) return NRR_SUCCESS;
+    const std::string content((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+
+    std::string entry;
+    if (!find_json_object(content, kQualityReferenceTextureName, entry)) return NRR_SUCCESS;
+
+    /* The image is a raw RGB8 file next to the reference:
+     *   "reference_frame": {"width": 1920, "height": 1080, "file": "target.rgb"}
+     * Raw rather than compressed because nothing in the tree decodes PNG/EXR, and inventing an
+     * archive format here would be a feature of its own; see docs/roadmap.md. */
+    long width = 0;
+    long height = 0;
+    std::string raw_name;
+    if (!json_int(entry, "width", width) || !json_int(entry, "height", height) ||
+        !json_string(entry, "file", raw_name)) {
+        return NRR_SUCCESS;
+    }
+    if (width <= 0 || height <= 0 || raw_name.empty()) return NRR_SUCCESS;
+
+    std::ifstream image(directory_of(base_path) + raw_name, std::ios::binary);
+    if (!image.is_open()) return NRR_SUCCESS;
+
+    const size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+    std::vector<unsigned char> bytes(expected, 0);
+    image.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(expected));
+    if (static_cast<size_t>(image.gcount()) != expected) return NRR_SUCCESS; /* truncated */
+
+    std::vector<float> target(expected, 0.0f);
+    for (size_t i = 0; i < expected; ++i) {
+        target[i] = static_cast<float>(bytes[i]) / 255.0f;
+    }
+    set_texture(kQualityReferenceTextureName, static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height), NRR_TEXTURE_FORMAT_RGB8, target);
+    return NRR_SUCCESS;
+}
 NRRResult ReferenceData::load_embedding(const std::string& base_path) {
     (void)base_path;
     // Placeholder: 32-dim identity embedding.

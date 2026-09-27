@@ -16,6 +16,7 @@
 #include "onnx_runtime.h"
 #include "nrr_model.h"
 #include "nrr_inference.h"
+#include "nrr_quality.h"
 #include "nrr_runtime.h"
 
 #include <algorithm>
@@ -50,7 +51,7 @@ AccelEP accel_ep_for_vendor(const char* vendor) {
 
 AcceleratorExecutionKernel::AcceleratorExecutionKernel()
     : initialized_(false), preferred_ep_(AccelEP::CPU),
-      active_model_(nullptr), current_frame_(0),
+      active_model_(nullptr), frame_references_(nullptr), current_frame_(0),
       current_memory_usage_(0), peak_memory_usage_(0),
       current_memory_usage_bytes_(0), peak_memory_usage_bytes_(0) {
     std::memset(&accel_caps_, 0, sizeof(accel_caps_));
@@ -396,6 +397,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         accel_texture_bytes(in_tex->width, in_tex->height, in_tex->format), rgb8.size());
     output.temporal = temporal.state;
     output.stats.temporal_stability = quantify_stability(temporal.displayed_delta);
+    /* Measured through the same definition BackendCPU uses, so quality_metric means the same
+     * thing wherever the frame ran: the displayed frame - rgb8, blended in place above -
+     * against the ground-truth image the frame's reference set carries, if it carries one at
+     * this resolution. */
+    const QualityMeasurement quality =
+        measure_frame_quality(rgb8.data(), out_w, out_h, frame_references_);
+    output.stats.quality_metric = published_quality_metric(quality);
     {
         char debug[256];
         std::snprintf(debug, sizeof(debug),
@@ -407,8 +415,9 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                       temporal.state.history_frames,
                       static_cast<double>(temporal.displayed_delta),
                       zero_filled_optional ? " [zero-filled optional inputs]" : "");
-        copy_string(output.stats.debug_info, sizeof(output.stats.debug_info),
-                    std::string(debug));
+        std::string info(debug);
+        info += quality_debug_note(quality);
+        copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), info);
     }
     return NRR_SUCCESS;
 }

@@ -298,6 +298,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_model.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference_impl.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_quality.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_cuda_driver.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp

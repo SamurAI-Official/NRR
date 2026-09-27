@@ -10,6 +10,7 @@
 #include "nrr_device.h"
 #include "nrr_model.h"
 #include "nrr_reference.h"
+#include "nrr_reference_impl.h"
 #include "nrr_backend.h"
 #include "onnx_runtime.h"
 #include <cstring>
@@ -219,7 +220,7 @@ NRRResult DeviceImpl::load_reference(const std::string& path, ReferenceImpl** ou
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
 
-    auto reference = std::make_shared<ReferenceImpl>();
+    auto reference = std::make_shared<ReferenceData>();
     NRRResult result = reference->load(this, path);
     if (result != NRR_SUCCESS) return result;
 

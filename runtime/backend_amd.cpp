@@ -166,11 +166,13 @@ NRRResult BackendAMD::unload_model(ModelImpl* model) {
 NRRResult BackendAMD::execute_model(ModelImpl* model, const NRRFrameInput& input,
                                     NRRFrameOutput& output,
                                     const NRRReferenceSet* references) {
-    (void)references;
     if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
     AcceleratorExecutionKernel* kernel = get_accel_kernel();
     if (!kernel->is_initialized())
         kernel->initialize(AccelEP::ROCM, 1024ull * 1024ull * 1024ull, true, false, true);
+    /* The kernel measures quality against the ground-truth image this set carries, so the
+     * frame it is about to execute has to be told which references belong to it. */
+    kernel->set_frame_references(references);
     return kernel->execute_frame(
         model, input, output,
         [this](void* bt, void* d, size_t s) { return download_texture(bt, d, s); },

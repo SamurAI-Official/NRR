@@ -22,6 +22,9 @@
 #include "nrr.h"
 #include "nrr_device.h"
 #include "accel_kernel.h"
+#include "nrr_quality.h"
+#include "nrr_reference.h"
+#include "nrr_reference_impl.h"
 
 #include <cmath>
 #include <cstdint>
@@ -77,6 +80,8 @@ struct PathFixture {
     NRRTexture* color = nullptr;
     NRRTexture* depth = nullptr;
     NRRTexture* motion = nullptr;
+    NRRReference* reference = nullptr;
+    NRRReferenceSet references = {};
     std::string backend_name;
 
     ~PathFixture() {
@@ -84,6 +89,7 @@ struct PathFixture {
         if (motion) nrr_texture_destroy(device, motion);
         if (depth) nrr_texture_destroy(device, depth);
         if (color) nrr_texture_destroy(device, color);
+        if (reference) nrr_reference_unload(reference);
         if (model) nrr_model_unload(model);
         nrr_device_destroy(device);
     }
@@ -118,6 +124,40 @@ bool setup(PathFixture& fx, const char* preferred_backend) {
 
     return nrr_model_load(fx.device, NRR_SAMPLE_MODEL, &fx.model) == NRR_SUCCESS &&
            fx.model != nullptr;
+}
+
+/* Loads a reference into `fx` and gives it a ground-truth image the size of the frame the
+ * fixture renders - which is what NRRRenderStats::quality_metric is measured against
+ * (see runtime/nrr_quality.h). Both paths get the same pattern, so their measurements are
+ * measurements of the same thing. */
+bool install_quality_target(PathFixture& fx, uint32_t out_w, uint32_t out_h) {
+    if (nrr_reference_load(fx.device, "test_character.nrrref", &fx.reference) != NRR_SUCCESS ||
+        fx.reference == nullptr) {
+        return false;
+    }
+    ReferenceData* data =
+        dynamic_cast<ReferenceData*>(reinterpret_cast<ReferenceImpl*>(fx.reference));
+    if (data == nullptr) return false;
+
+    std::vector<float> target(static_cast<size_t>(out_w) * out_h * 3, 0.0f);
+    for (uint32_t y = 0; y < out_h; ++y) {
+        for (uint32_t x = 0; x < out_w; ++x) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                /* A smooth ramp: a target that is neither identical to the render nor
+                 * unrelated to it, so the score is a real measurement of similarity. */
+                const float ramp = static_cast<float>((x + 2 * y + 17 * c) % (out_w + out_h)) /
+                                   static_cast<float>(out_w + out_h);
+                target[(static_cast<size_t>(y) * out_w + x) * 3 + c] = 0.2f + 0.6f * ramp;
+            }
+        }
+    }
+    if (!data->set_texture(kQualityReferenceTextureName, out_w, out_h,
+                           NRR_TEXTURE_FORMAT_RGB8, target)) {
+        return false;
+    }
+    fx.references = {};
+    fx.references.facial_reference = fx.reference;
+    return true;
 }
 
 /* Brightness ramp across the columns plus a constant offset - the construction the
@@ -190,6 +230,65 @@ struct FrameResult {
     std::string debug;
 };
 
+/* Forward declaration: the probe below renders through this before its definition. */
+NRRResult render_via_kernel(PathFixture& fx, const NRRFrameInput& in, NRRFrameOutput& out);
+
+/* Brings the shared accelerator kernel up for `impl` and returns the reason it could not, or an
+ * empty string. `references` is the set the frame being rendered belongs to, which is what
+ * quality_metric is measured against.
+ *
+ * The kernel is a process-wide singleton with uneven ownership: a vendor backend brings it up as
+ * a side effect of loading a model (BackendNVIDIA::load_model -> kernel->initialize()),
+ * BackendCPU never touches it, and tests/unit/test_accel.cpp destroys it. The ambient state
+ * therefore depends on the platform and on which tests ran first, and this harness reported a
+ * working accelerator path on a CUDA host and a broken one in CI purely because of that - the
+ * defect class it exists to catch. It starts from a kernel that is known to be cold, and
+ * load_model() refuses an uninitialized kernel (accel_kernel.cpp:113), which is what CI actually
+ * reported. Nothing caches the pointer (every caller goes through get_accel_kernel()), so
+ * replacing the instance is safe. */
+std::string prepare_kernel(ModelImpl* impl, const NRRReferenceSet* references) {
+    destroy_accel_kernel();
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr) return "get_accel_kernel() returned null";
+    if (!kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, false, false, true))
+        return "the shared accelerator kernel would not initialize";
+    if (!kernel->load_model(impl)) return "the accelerator kernel would not load the model";
+    /* A known temporal state too: another test's history must not leak into the comparison. */
+    kernel->reset_temporal_history();
+    kernel->set_frame_references(references);
+    return std::string();
+}
+
+/* The size the model actually displays, learned from one rendered frame per path.
+ *
+ * It cannot be assumed from the input size: the sample model used here upscales 2x, while the
+ * placeholder path an ORT-less build falls back to passes the frame through at the input size. A
+ * target sized from the wrong assumption makes the metric unmeasured - which the first version of
+ * this harness reported as a failure of the metric rather than of its own assumption. */
+bool probe_displayed_size(PathFixture& fx, bool accelerator_path, uint32_t& out_w,
+                          uint32_t& out_h) {
+    ModelImpl* impl = reinterpret_cast<ModelImpl*>(fx.model);
+    upload_ramp(fx, kOffsetA);
+    upload_motion(fx, 0.0f);
+    NRRFrameInput in = frame_input(fx, 1);
+    NRRFrameOutput rendered = {};
+
+    if (accelerator_path) {
+        if (!prepare_kernel(impl, nullptr).empty()) return false;
+        if (render_via_kernel(fx, in, rendered) != NRR_SUCCESS) return false;
+    } else {
+        if (nrr_render(fx.device, fx.model, nullptr, &in, &rendered) != NRR_SUCCESS) return false;
+        /* The probe is not part of the sequence, so forget its history. The accumulator also
+         * detects a restarted frame sequence, but saying so explicitly is cheaper to read. */
+        nrr_device_reset_temporal_history(fx.device);
+    }
+    if (rendered.color == nullptr) return false;
+    TextureImpl* tex = reinterpret_cast<TextureImpl*>(rendered.color);
+    out_w = tex->width;
+    out_h = tex->height;
+    return out_w > 0 && out_h > 0;
+}
+
 /// One frame through the ACCELERATOR path, using `fx`'s own backend primitives.
 NRRResult render_via_kernel(PathFixture& fx, const NRRFrameInput& in, NRRFrameOutput& out) {
     AcceleratorExecutionKernel* kernel = get_accel_kernel();
@@ -215,32 +314,13 @@ NRRResult render_via_kernel(PathFixture& fx, const NRRFrameInput& in, NRRFrameOu
  * reason is carried back into the assertion, because "the accelerator path renders the
  * sequence - expected true" is not a diagnosis: it was the first thing this harness reported
  * in CI, and it took the kernel's source to turn it back into a cause. */
-std::string run_sequence(PathFixture& fx, bool accelerator_path, std::vector<FrameResult>& out) {
+std::string run_sequence(PathFixture& fx, bool accelerator_path, bool present_references,
+                         std::vector<FrameResult>& out) {
     ModelImpl* impl = reinterpret_cast<ModelImpl*>(fx.model);
     if (accelerator_path) {
-        /* Start from a kernel that is known to be cold, rather than inheriting whatever the rest
-         * of the suite left behind. Ownership of this singleton is uneven: a vendor backend
-         * brings it up as a side effect of loading a model (BackendNVIDIA::load_model ->
-         * kernel->initialize()), BackendCPU never touches it, and tests/unit/test_accel.cpp
-         * destroys it. The ambient state therefore depends on the platform and on which tests
-         * ran first, and this harness reported a working accelerator path on a CUDA host and a
-         * broken one in CI purely because of that - the exact defect class it exists to catch.
-         * Nothing caches the pointer (every caller goes through get_accel_kernel()), so
-         * replacing the instance is safe. */
-        destroy_accel_kernel();
-        AcceleratorExecutionKernel* kernel = get_accel_kernel();
-        if (kernel == nullptr) return "get_accel_kernel() returned null";
-        /* load_model() requires an initialized kernel and returns false otherwise
-         * (accel_kernel.cpp:113), which is what CI reported as "the accelerator path renders the
-         * three-frame sequence - expected true". Bring the kernel up deliberately; initialize()
-         * is idempotent for a kernel that is already running. */
-        if (!kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, false, false, true))
-            return "the shared accelerator kernel would not initialize";
-        if (!kernel->load_model(impl))
-            return "the accelerator kernel would not load the model";
-        /* Start from a known temporal state too - another test's history must not leak into this
-         * comparison. */
-        kernel->reset_temporal_history();
+        const std::string reason =
+            prepare_kernel(impl, present_references ? &fx.references : nullptr);
+        if (!reason.empty()) return reason;
     }
 
     const float offsets[3] = {kOffsetA, kOffsetB, kOffsetC};
@@ -252,7 +332,8 @@ std::string run_sequence(PathFixture& fx, bool accelerator_path, std::vector<Fra
         NRRFrameOutput rendered = {};
         const NRRResult r = accelerator_path
             ? render_via_kernel(fx, in, rendered)
-            : nrr_render(fx.device, fx.model, nullptr, &in, &rendered);
+            : nrr_render(fx.device, fx.model, present_references ? &fx.references : nullptr,
+                         &in, &rendered);
         if (r != NRR_SUCCESS || rendered.color == nullptr) {
             char err[256] = {};
             nrr_get_last_error(err, sizeof(err));
@@ -307,7 +388,8 @@ double max_abs_byte_difference(const std::vector<uint8_t>& a, const std::vector<
  *
  * `required` distinguishes "the automatic choice must exist" (it always does, and a silent
  * skip would be a lie) from "this forced pairing is a bonus where it is available". */
-void compare_paths(const char* accel_backend, const std::string& what, bool required) {
+void compare_paths(const char* accel_backend, const std::string& what, bool required,
+                   bool with_target) {
     PathFixture cpu;
     PathFixture accel;
     if (!setup(cpu, "CPU") || !setup(accel, accel_backend)) {
@@ -315,15 +397,29 @@ void compare_paths(const char* accel_backend, const std::string& what, bool requ
         std::cout << "  skipped (" << what << "): no device available" << std::endl;
         return;
     }
+    if (with_target) {
+        /* Learn the resolution the model actually displays rather than assuming it, then put the
+         * same ground truth on both devices so the two measurements are of the same thing. */
+        uint32_t target_w = 0;
+        uint32_t target_h = 0;
+        NRR_EXPECT_TRUE(probe_displayed_size(cpu, false, target_w, target_h) &&
+                            probe_displayed_size(accel, true, target_w, target_h),
+                        what + ": the displayed resolution can be learned by rendering");
+        NRR_EXPECT_TRUE(install_quality_target(cpu, target_w, target_h) &&
+                            install_quality_target(accel, target_w, target_h),
+                        what + ": a reference carrying a ground-truth frame");
+    }
     std::cout << "  " << what << ": A BackendCPU::execute_model via '" << cpu.backend_name
-              << "', B kernel::execute_frame via '" << accel.backend_name << "'" << std::endl;
+              << "', B kernel::execute_frame via '" << accel.backend_name << "'"
+              << (with_target ? " (with a ground-truth reference)" : " (no reference set)")
+              << std::endl;
 
     std::vector<FrameResult> a;
     std::vector<FrameResult> b;
-    const std::string cpu_reason = run_sequence(cpu, false, a);
+    const std::string cpu_reason = run_sequence(cpu, false, with_target, a);
     NRR_EXPECT_TRUE(cpu_reason.empty(),
                     what + ": the CPU path renders the three-frame sequence: " + cpu_reason);
-    const std::string accel_reason = run_sequence(accel, true, b);
+    const std::string accel_reason = run_sequence(accel, true, with_target, b);
     NRR_EXPECT_TRUE(accel_reason.empty(),
                     what + ": the accelerator path renders the three-frame sequence: " +
                         accel_reason);
@@ -351,6 +447,25 @@ void compare_paths(const char* accel_backend, const std::string& what, bool requ
                         frame + ": the same reported temporal stability");
         NRR_EXPECT_TRUE(a[i].memory_mb == b[i].memory_mb,
                         frame + ": the same reported memory use");
+        /* quality_metric used to be a constant per path (0.75 against 0), which is why it is
+         * asserted here rather than printed: a caller cannot tell a fabricated score from a
+         * measured one, and the two paths must not disagree about what the field means. */
+        NRR_EXPECT_TRUE(a[i].quality == b[i].quality,
+                        frame + ": the same reported quality");
+        NRR_EXPECT_TRUE(a[i].quality >= 0.0f && a[i].quality <= 1.0f,
+                        frame + ": quality_metric is a score in [0,1]");
+        if (with_target) {
+            NRR_EXPECT_TRUE(a[i].quality > 0.0f,
+                            frame + ": a ground-truth frame produces a measured quality");
+            NRR_EXPECT_TRUE(a[i].debug.find("quality ssim=") != std::string::npos &&
+                                b[i].debug.find("quality ssim=") != std::string::npos,
+                            frame + ": both paths report the measured score");
+        } else {
+            NRR_EXPECT_TRUE(a[i].quality == 0.0f &&
+                                a[i].debug.find("quality unmeasured") != std::string::npos &&
+                                b[i].debug.find("quality unmeasured") != std::string::npos,
+                            frame + ": without a target both paths report it unmeasured");
+        }
     }
 
 
@@ -400,14 +515,12 @@ void compare_paths(const char* accel_backend, const std::string& what, bool requ
     NRR_EXPECT_TRUE(b[1].alpha > 0.0f && b[2].alpha > 0.0f,
                     what + ": low motion leaves a usable history weight");
 
-    /* Recorded, not asserted: quality_metric is a hard-coded 0.75 on the CPU path and 0 on
-     * the accelerator path. Neither value is a measurement - NRR has no quality metric (the
-     * shipped model is an untrained fixture and there is no PSNR/SSIM gate) - so what the field
-     * should mean is a product decision, tracked in docs/roadmap.md. Printed here so the
-     * divergence stays visible instead of hidden behind an assertion that would need editing
-     * whichever way the decision goes. */
+    /* quality_metric is asserted per frame above; printing it keeps the measured number itself
+     * in the transcript rather than only its equality. */
     std::cout << "    " << what << ": quality_metric A/B = " << a[0].quality << "/"
-              << b[0].quality << " (not a measurement on either path; pending decision)"
+              << b[0].quality
+              << (with_target ? " (measured against the ground truth)"
+                              : " (unmeasured: no reference set)")
               << std::endl;
 }
 
@@ -434,8 +547,9 @@ NRR_TEST(test_execution_paths_produce_the_same_frames) {
      *   * the automatic device, which is what an application gets: a vendor accelerator where
      *     the machine has one, the CPU backend in CI, where no runner does.
      * Path A is always a CPU-forced device, so it is always BackendCPU::execute_model. */
-    path_parity::compare_paths("CPU", "CPU-forced device (the shape CI runs in)", false);
-    path_parity::compare_paths(nullptr, "auto-selected device", true);
+    path_parity::compare_paths("CPU", "CPU-forced device (the shape CI runs in)", false, false);
+    path_parity::compare_paths(nullptr, "auto-selected device with a ground-truth reference",
+                               true, true);
 }
 
 } // namespace test

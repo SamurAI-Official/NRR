@@ -100,6 +100,14 @@ public:
     ReferenceTexture* get_texture(const std::string& name);
     const ReferenceTexture* get_texture(const std::string& name) const;
 
+    /* Installs (or replaces) a named CPU-side texture. The loader uses this to attach the
+     * decoded images a reference file carries, and it is how a caller that already holds
+     * pixels can supply them without an archive decoder - including the ground-truth frame
+     * NRRRenderStats::quality_metric is measured against (see nrr_quality.h). `cpu_data`
+     * holds normalised channel values, like every other reference texture. */
+    bool set_texture(const std::string& name, uint32_t width, uint32_t height,
+                     NRRTextureFormat format, const std::vector<float>& cpu_data);
+
     // Access identity embedding
     const IdentityEmbedding& get_embedding() const { return embedding_; }
     IdentityEmbedding& get_embedding() { return embedding_; }
@@ -134,6 +142,10 @@ private:
     NRRResult parse_metadata(const std::string& content);
     NRRResult parse_provenance(const std::string& content);
     NRRResult load_textures(DeviceImpl* device, const std::string& base_path);
+    /* Decodes the optional ground-truth frame a reference file names, which is what
+     * NRRRenderStats::quality_metric is measured against (see nrr_quality.h). Absent or
+     * unusable entries leave the metric unmeasured; they are not an error. */
+    NRRResult load_reference_frame(const std::string& base_path);
     NRRResult load_embedding(const std::string& base_path);
     NRRResult load_provenance(const std::string& base_path);
 };

@@ -254,6 +254,16 @@ typedef struct {
     float neural_inference_time_ms;
     float backend_overhead_ms;
     uint32_t memory_used_mb;
+    /* Fidelity of the displayed frame against a ground-truth image supplied with the frame's
+     * reference set: a reference carrying an RGB8 image named "reference_frame" at the
+     * displayed resolution. It is the structural similarity of the two images, in [0,1], 1.0
+     * meaning identical, and the peak signal-to-noise ratio of the same two images is reported
+     * alongside it in debug_info (see runtime/nrr_quality.h).
+     *
+     * 0.0 means NOT MEASURED - no reference set, no "reference_frame" image, or one whose
+     * resolution does not match the displayed frame - and debug_info states which. It does not
+     * mean "the worst possible frame". Before this was measured the field was a constant that
+     * nothing produced (0.75 on the CPU path, unset on the accelerator path). */
     float quality_metric;
     uint32_t temporal_stability;
     char debug_info[256];

@@ -145,6 +145,17 @@ public:
     void   reset_peak_memory();
     void   cleanup_texture_cache();
 
+    /* The reference set that belongs to the frame being rendered, so execute_frame() can
+     * measure NRRRenderStats::quality_metric against the ground truth the caller supplied
+     * (see nrr_quality.h). The kernel does not own references - the device does - so the
+     * backend whose execute_model() forwards the frame says which set belongs to this frame.
+     * nullptr (the initial value, and what a caller that presents no references leaves it at)
+     * means there is nothing to measure against, which is reported as an unmeasured metric
+     * rather than as a placeholder score. */
+    void set_frame_references(const NRRReferenceSet* references) {
+        frame_references_ = references;
+    }
+
 private:
     bool apply_accel_optimizations();
     bool select_best_execution_provider();
@@ -184,6 +195,7 @@ private:
     TemporalAccumulator  temporal_;
 
     ModelImpl*           active_model_;
+    const NRRReferenceSet* frame_references_;
     size_t               current_frame_;
     size_t               current_memory_usage_;
     size_t               peak_memory_usage_;

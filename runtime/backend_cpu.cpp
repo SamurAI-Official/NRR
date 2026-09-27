@@ -2,6 +2,7 @@
 #include "nrr_device.h"
 #include "onnx_runtime.h"
 #include "nrr_inference.h"
+#include "nrr_quality.h"
 #include <cstring>
 #include <algorithm>
 #include <chrono>
@@ -336,9 +337,6 @@ NRRResult BackendCPU::execute_model(
     const NRRFrameInput& input,
     NRRFrameOutput& output,
     const NRRReferenceSet* references) {
-
-    (void)references;
-
     if (!initialized_) {
         return NRR_ERROR_STATE_INVALID;
     }
@@ -553,7 +551,13 @@ NRRResult BackendCPU::execute_model(
     output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
     output.stats.memory_used_mb =
         reported_frame_memory_mb(color_img.pixels.size(), out_bytes.size());
-    output.stats.quality_metric = 0.75f;
+    /* Measured, not assumed: the *displayed* frame - out_bytes, blended in place above -
+     * against the ground-truth image the caller's reference set carries, if it carries one at
+     * this resolution. An unmeasured metric is published as 0.0 with the reason in debug_info;
+     * see nrr_quality.h. */
+    const QualityMeasurement quality =
+        measure_frame_quality(out_bytes.data(), out_w, out_h, references);
+    output.stats.quality_metric = published_quality_metric(quality);
     /* temporal_stability is derived from the measured frame-to-frame change of the
      * displayed image, via the convention shared with every other backend (see
      * quantify_stability in nrr_temporal.h). */
@@ -577,6 +581,7 @@ NRRResult BackendCPU::execute_model(
                           static_cast<double>(blend_stats.mean_abs_delta));
             info += gain;
         }
+        info += quality_debug_note(quality);
         copy_string(output.stats.debug_info,
                     sizeof(output.stats.debug_info), info);
     }

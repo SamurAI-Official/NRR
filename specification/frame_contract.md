@@ -216,6 +216,15 @@ struct RenderStats {
 
 ---
 
+`quality_metric` is the fidelity of the displayed frame against a ground-truth image supplied with
+the frame's reference set (a reference carrying an RGB8 image named `reference_frame`, at the
+displayed resolution): the structural similarity of the two images, in `[0,1]`, with the peak
+signal-to-noise ratio reported alongside it in `debug_info`. `0.0` means the metric was **not
+measured** - there was no reference set, no ground-truth image, or one whose resolution did not
+match - and `debug_info` states which; it does not mean the worst possible frame.
+
+---
+
 ## 8. Frame Lifecycle
 
 ### 8.1 Normal Frame Flow
