@@ -28,7 +28,13 @@ NRR_TEST(test_cpu_backend_selection) {
 }
 
 NRR_TEST(test_cpu_texture_operations) {
+    // This file tests the CPU backend's own contract (the upload-size rejection
+    // below is one of them), so the backend is named explicitly. Auto-selection now
+    // probes for real accelerator hardware, and the accelerator backends stage
+    // textures through AccelResourceStore - a different implementation whose
+    // behaviour this test is not about.
     NRRDeviceOptions options = {};
+    options.preferred_backend = "CPU";
     NRRDevice* device = nullptr;
     NRRResult result = nrr_device_create(&options, &device);
     NRR_EXPECT_EQ(result, NRR_SUCCESS, "Device creation failed");

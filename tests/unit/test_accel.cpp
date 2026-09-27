@@ -98,13 +98,29 @@ NRR_TEST(test_accel_kernel_execute_frame) {
                         "accelerator kernel initializes from a vendor EP request");
         NRR_EXPECT_TRUE(kernel->is_initialized(),
                         "accelerator kernel is initialized");
-        /* D5 guard: the vendor EP request above is a preference, not a fact. No
-         * session exists yet, so ONNX Runtime has not chosen anything and the
-         * kernel must claim nothing. */
-        NRR_EXPECT_TRUE(kernel->get_active_ep_name().empty(),
-                        "accelerator kernel claims no provider before a session");
-        NRR_EXPECT_FALSE(kernel->get_capabilities().supports_cuda,
-                         "supports_cuda is not derived from a CUDA request");
+        /* D5 guard: the vendor EP request above is a preference, not a fact. Whatever
+         * the kernel reports must be empty, or a provider ONNX Runtime really lists -
+         * never the string derived from the AccelEP enum ("cuda"/"tensorrt"/...).
+         * The kernel is a process-wide singleton, so an earlier test may already have
+         * loaded a session through it; both states are honest, a fabricated one is
+         * not. */
+        {
+            const std::string reported = kernel->get_active_ep_name();
+            const std::vector<std::string> provs = ONNXRuntime::available_providers();
+            bool known = reported.empty();
+            for (size_t pi = 0; pi < provs.size(); ++pi) {
+                if (provs[pi] == reported) { known = true; break; }
+            }
+            NRR_EXPECT_TRUE(known,
+                            "reported provider is empty or one ONNX Runtime lists");
+
+            bool cuda_linked = false;
+            for (size_t pi = 0; pi < provs.size(); ++pi) {
+                if (provs[pi] == "CUDAExecutionProvider") { cuda_linked = true; break; }
+            }
+            NRR_EXPECT_TRUE(kernel->get_capabilities().supports_cuda == cuda_linked,
+                            "supports_cuda reflects the linked runtime, not the request");
+        }
 
         ModelImpl* impl = reinterpret_cast<ModelImpl*>(model);
         NRR_EXPECT_TRUE(kernel->load_model(impl),

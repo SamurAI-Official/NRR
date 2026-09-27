@@ -7,18 +7,14 @@
 
 #include "nrr_backend.h"
 #include "backend_cpu.h"
-#ifdef NRR_ENABLE_NVIDIA
+/* The desktop accelerator backends are registered unconditionally: their
+ * is_supported() probes for real hardware (NVIDIA through the driver ABI, see
+ * nrr_cuda_driver.h), so a machine without the vendor simply never selects them.
+ * NRR_ENABLE_* gates their toolkit-level extras instead of their existence. */
 #include "backend_nvidia.h"
-#endif
-#ifdef NRR_ENABLE_AMD
 #include "backend_amd.h"
-#endif
-#ifdef NRR_ENABLE_INTEL
 #include "backend_intel.h"
-#endif
-#ifdef NRR_ENABLE_RISCV
 #include "backend_riscv.h"
-#endif
 #include "nrr_runtime.h"
 #include "mobile/backend_adreno.h"
 #include "mobile/backend_mali.h"
@@ -54,7 +50,11 @@ static const BackendPriority backend_priorities[] = {
     {"Intel", 80},
     {"Vulkan", 50},
     {"CPU", 10},
-    /* Mobile vendor backends rank BELOW the CPU backend on purpose.
+    /* The desktop accelerator backends rank ABOVE CPU because their is_supported()
+     * now probes for real hardware: NVIDIA asks the CUDA driver whether a device
+     * exists, so a machine without one never reaches this priority at all.
+     *
+     * Mobile vendor backends rank BELOW the CPU backend on purpose.
      *
      * Their is_supported() returns true whenever NRR_ENABLE_MOBILE_VENDOR is
      * set, without probing for that vendor's GPU, so an auto-selection that
@@ -143,7 +143,11 @@ static struct CpuBackendRegistrar {
     }
 } g_cpu_backend_registrar;
 
-#ifdef NRR_ENABLE_NVIDIA
+/* Registered unconditionally. is_supported() probes for a real CUDA device through
+ * the driver ABI, so auto-selection still lands on the CPU backend on a machine
+ * without NVIDIA hardware - the registry does not have to know that at compile
+ * time. Previously this registrar existed only under NRR_ENABLE_NVIDIA, which is
+ * off by default, so the backend was unreachable in every default build (C1). */
 static struct NvidiaBackendRegistrar {
     NvidiaBackendRegistrar() {
         register_backend({
@@ -154,7 +158,6 @@ static struct NvidiaBackendRegistrar {
         });
     }
 } g_nvidia_backend_registrar;
-#endif
 
 #ifdef NRR_ENABLE_AMD
 static struct AmdBackendRegistrar {

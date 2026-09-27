@@ -19,6 +19,7 @@
 #include "nrr_runtime.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -121,6 +122,10 @@ bool AcceleratorExecutionKernel::load_model(ModelImpl* model) {
 void AcceleratorExecutionKernel::unload_model(ModelImpl* /*model*/) {
     if (onnx_) onnx_->unload_model();
     active_model_ = nullptr;
+    /* With the session gone there is nothing left to measure, so stop reporting the
+     * provider it used to be on - a stale claim is exactly the defect this class
+     * exists to avoid. */
+    refresh_provider_state();
 }
 
 bool AcceleratorExecutionKernel::execute_model(
@@ -171,39 +176,121 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     TextureImpl* in_tex = reinterpret_cast<TextureImpl*>(input.color);
     if (!in_tex || in_tex->width == 0 || in_tex->height == 0)
         return NRR_ERROR_INVALID_ARGUMENT;
+    TextureImpl* depth_tex = reinterpret_cast<TextureImpl*>(input.depth);
+    TextureImpl* motion_tex = reinterpret_cast<TextureImpl*>(input.motion_vectors);
     const uint32_t w = in_tex->width;
     const uint32_t h = in_tex->height;
 
-    /* ---- 1. Read the frame (download color texture) --------------------- */
-    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 128u);
-    if (in_tex->backend_texture && download) {
-        if (download(in_tex->backend_texture, rgba.data(), rgba.size())
-                != NRR_SUCCESS)
-            std::fill(rgba.begin(), rgba.end(), 128u);
+    ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
+
+    const auto t_start = std::chrono::steady_clock::now();
+
+    /* ---- 1. Convert the color frame to an NCHW tensor ------------------- */
+    /* Read through the backend's own primitives, so a vendor SDK that keeps data in
+     * device memory still works. */
+    std::vector<uint8_t> scratch;
+    std::vector<float> color_nchw;
+    {
+        auto download_nchw = [&](TextureImpl* tex, int channels,
+                                 std::vector<float>& data) -> bool {
+            if (!tex || !tex->backend_texture || !download) return false;
+            scratch.assign(accel_texture_bytes(tex->width, tex->height, tex->format), 0);
+            if (download(tex->backend_texture, scratch.data(), scratch.size())
+                    != NRR_SUCCESS)
+                return false;
+            return texture_to_nchw(scratch.data(), tex->width, tex->height,
+                                   tex->format, channels, data);
+        };
+        if (!download_nchw(in_tex, 3, color_nchw)) {
+            /* Unreadable color texture: fall back to a neutral frame rather than
+             * failing the whole render, matching the historical behaviour. */
+            std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 128u);
+            if (!texture_to_nchw(rgba.data(), w, h, NRR_TEXTURE_FORMAT_RGBA8, 3,
+                                 color_nchw))
+                return NRR_ERROR_RENDER_FAILED;
+        }
     }
 
-    /* ---- 2. Convert to NCHW float tensor -------------------------------- */
-    std::vector<float> nchw;
-    if (!texture_to_nchw(rgba.data(), w, h, in_tex->format, 3, nchw))
-        return NRR_ERROR_RENDER_FAILED;
-    std::vector<int64_t> in_shape = {1, 3, static_cast<int64_t>(h),
-                                     static_cast<int64_t>(w)};
-    std::vector<int64_t> out_shape = in_shape;
+    /* ---- 2. Build every input the session declares ---------------------- */
+    /* ONNX Runtime requires a value for each declared input, so a model with
+     * optional depth/motion inputs must still be fed them (zero-filled when the
+     * caller supplied none) - exactly as BackendCPU does for the same frame.
+     *
+     * Passing only input 0 made Run() fail for every multi-input model, and this
+     * path then silently degraded to passthrough: the accelerator backends were not
+     * actually running the project's own models, they were returning the input
+     * image. That went unnoticed while no accelerator backend was reachable. */
+    bool zero_filled_optional = false;
+    auto build_inputs = [&](ONNXRuntime* rt, std::vector<TensorInput>& tins) -> bool {
+        tins.clear();
+        const int count = rt->get_input_count();
+        if (count <= 0) return false;
+        for (int i = 0; i < count; ++i) {
+            const char* name = rt->get_input_name(i);
+            if (!name) continue;
+            TensorRole role = classify_tensor_role(name);
+            if (count == 1 && role != TensorRole::Depth &&
+                role != TensorRole::Motion) {
+                role = TensorRole::Color; /* generic single-input models */
+            }
+            const int channels = (role == TensorRole::Depth) ? 1
+                               : (role == TensorRole::Motion) ? 2 : 3;
+            TextureImpl* src = (role == TensorRole::Depth) ? depth_tex
+                             : (role == TensorRole::Motion) ? motion_tex : in_tex;
 
-    /* ---- 3. Real ONNX inference ------------------------------------------ */
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(rt->get_input_shape(i), channels,
+                                      src ? src->width : w, src ? src->height : h,
+                                      shape)) {
+                return false;
+            }
+
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            std::vector<float> data;
+            if (role == TensorRole::Color) {
+                /* Already converted above; its shape is the texture's own size. */
+                data = color_nchw;
+            } else {
+                bool loaded = false;
+                if (src && src->backend_texture && download) {
+                    scratch.assign(accel_texture_bytes(src->width, src->height,
+                                                       src->format), 0);
+                    if (download(src->backend_texture, scratch.data(),
+                                 scratch.size()) == NRR_SUCCESS) {
+                        loaded = texture_to_nchw(scratch.data(), src->width,
+                                                 src->height, src->format, channels,
+                                                 data);
+                    }
+                }
+                if (!loaded) {
+                    /* Absent optional input (depth/motion): zero-filled, which is what
+                     * BackendCPU feeds for the same frame. */
+                    zero_filled_optional = true;
+                    data.assign(static_cast<size_t>(shape[1]) *
+                                    static_cast<size_t>(shape[2]) *
+                                    static_cast<size_t>(shape[3]),
+                                0.0f);
+                }
+            }
+            t.data = std::move(data);
+            tins.push_back(std::move(t));
+        }
+        return !tins.empty();
+    };
+
+    /* ---- 3. Real ONNX inference ----------------------------------------- */
+    const auto t_prepared = std::chrono::steady_clock::now();
     bool ok = false;
     std::vector<float> out;
     ONNXRuntime* used_rt = nullptr; /* the session that actually ran the frame */
-    ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
+    std::vector<int64_t> out_shape = {1, 3, static_cast<int64_t>(h),
+                                      static_cast<int64_t>(w)};
 
     auto run_session = [&](ONNXRuntime* rt) -> bool {
         std::vector<TensorInput> tins;
-        TensorInput t;
-        const char* name0 = rt->get_input_name(0);
-        t.name = name0 ? name0 : "input";
-        t.shape = in_shape;
-        t.data = nchw;
-        tins.push_back(std::move(t));
+        if (!build_inputs(rt, tins)) return false;
         std::vector<float> o;
         std::vector<int64_t> os;
         if (!rt->run_inference_multi(tins, o, os)) return false;
@@ -223,9 +310,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     }
     if (!ok) {
         /* Lossless passthrough when no neural stack is available. */
-        out = nchw;
-        out_shape = in_shape;
+        out = color_nchw;
+        out_shape = {1, 3, static_cast<int64_t>(h), static_cast<int64_t>(w)};
     }
+
+    const auto t_inferred = std::chrono::steady_clock::now();
 
     /* Record the provider that executed the frame, measured from the session that
      * actually ran it - a caller reading get_active_ep_name() after a render must
@@ -282,19 +371,35 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     output.color = reinterpret_cast<NRRTexture*>(out_tex);
 
     /* ---- 7. Report measured state --------------------------------------- */
-    /* This path used to publish no render stats at all, so a caller could not tell
-     * whether temporal reuse was happening. Report what was measured. */
+    /* This path used to publish no render stats at all. Two consequences: a caller
+     * could not tell whether temporal reuse was happening, and
+     * last_render_time_ms() read 0 for every accelerator frame - so a tool that
+     * measures the frame budget would see a suspiciously free render. Report what
+     * was actually measured, split the same way BackendCPU splits it. */
+    const auto t_done = std::chrono::steady_clock::now();
+    const double prep_ms = std::chrono::duration<double, std::milli>(
+        t_prepared - t_start).count();
+    const double infer_ms = std::chrono::duration<double, std::milli>(
+        t_inferred - t_prepared).count();
+    const double post_ms = std::chrono::duration<double, std::milli>(
+        t_done - t_inferred).count();
+
+    output.stats.render_time_ms = static_cast<float>(prep_ms + infer_ms + post_ms);
+    output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
+    output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
     output.temporal = temporal.state;
     output.stats.temporal_stability = quantify_stability(temporal.displayed_delta);
     {
         char debug[256];
         std::snprintf(debug, sizeof(debug),
-                      "accel %s %ux%u | temporal %s: alpha=%.3f hist=%u change=%.4f",
+                      "ONNX %s via accel %ux%u -> %ux%u | temporal %s: "
+                      "alpha=%.3f hist=%u change=%.4f%s",
                       active_ep_name_.empty() ? "no-provider" : active_ep_name_.c_str(),
-                      out_w, out_h, temporal.note,
+                      w, h, out_w, out_h, temporal.note,
                       static_cast<double>(temporal.state.temporal_alpha),
                       temporal.state.history_frames,
-                      static_cast<double>(temporal.displayed_delta));
+                      static_cast<double>(temporal.displayed_delta),
+                      zero_filled_optional ? " [zero-filled optional inputs]" : "");
         copy_string(output.stats.debug_info, sizeof(output.stats.debug_info),
                     std::string(debug));
     }

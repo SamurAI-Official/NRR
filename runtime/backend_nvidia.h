@@ -13,12 +13,11 @@
 #include "nrr_model.h"
 #include "nrr_reference.h"
 
-#ifdef NRR_ENABLE_NVIDIA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <NvInfer.h>
-#endif
-
+/* No CUDA toolkit headers. The device facts this backend reports come from the
+ * driver ABI probe (nrr_cuda_driver.h), which needs no SDK, no nvcc and no include
+ * path - it resolves nvcuda.dll at runtime. NRR_ENABLE_NVIDIA now only gates
+ * toolkit-level extras (the TensorRT engine, device-side kernels); the backend
+ * itself compiles and can activate everywhere. */
 #include <cstring>
 #include <memory>
 #include <string>
@@ -29,7 +28,9 @@
 
 namespace nrr {
 
-#ifdef NRR_ENABLE_NVIDIA
+/* Placeholder engine describing the TensorRT path. It refers to no TensorRT types,
+ * so it compiles on every host; the TensorRT *runtime* stays gated because it
+ * cannot be obtained here (no Windows wheels on PyPI - see docs/roadmap.md). */
 class TensorRTEngine {
 public:
     TensorRTEngine() {}
@@ -70,7 +71,6 @@ private:
     int input_count_ = 3, output_count_ = 1;
     bool use_fp16_ = true, use_int8_ = false, use_fp8_ = false;
 };
-#endif
 
 class BackendNVIDIA : public Backend {
 public:
@@ -107,11 +107,14 @@ public:
      * reset has to reach it. */
     NRRResult reset_temporal_history() override;
 
-#ifdef NRR_ENABLE_NVIDIA
+    /* Folds the execution provider the loaded session actually attached into the
+     * capability block. neural_acceleration may only be claimed once the CUDA EP is
+     * really running, which is not knowable until a session exists. */
+    void refresh_measured_state() override;
+
     void set_tensorrt_precision(bool fp16, bool int8, bool fp8) {
         if (tensorrt_engine_) tensorrt_engine_->set_precision(fp16, int8, fp8);
     }
-#endif
     bool is_tensorrt_available() const { return tensorrt_available_; }
     bool is_cuda_available() const { return cuda_available_; }
     const char* get_gpu_name() const { return gpu_name_.empty() ? "NVIDIA GPU" : gpu_name_.c_str(); }
@@ -127,25 +130,18 @@ private:
     std::string error_message_;
     int cuda_device_ = 0;
     int cuda_device_count_ = 0;
-    void* cuda_context_ = nullptr; /* CUcontext without the CUDA toolkit */
-    void* cuda_stream_ = nullptr;  /* CUstream  without the CUDA toolkit */
     NRRCapabilities capabilities_;
     int gpu_memory_mb_;
     int cuda_compute_capability_;
     AccelResourceStore resources_;
-#ifdef NRR_ENABLE_NVIDIA
     std::unique_ptr<TensorRTEngine> tensorrt_engine_;
-#endif
+    /* True only once the CUDA (or TensorRT) execution provider has actually attached
+     * to a loaded session - measured, never inferred from a request. */
+    bool gpu_ep_attached_ = false;
     std::unordered_map<void*, TextureImpl*> textures_;
     std::unordered_map<void*, BufferImpl*> buffers_;
     std::vector<ModelImpl*> loaded_models_;
     std::vector<ReferenceImpl*> loaded_references_;
-
-    NRRResult initialize_cuda(const NRRDeviceOptions&);
-    void shutdown_cuda();
-    NRRResult select_cuda_device();
-    NRRResult query_capabilities_cuda();
-    NRRResult initialize_tensorrt();
 };
 
 extern bool backend_nvidia_is_supported(const NRRDeviceOptions&);

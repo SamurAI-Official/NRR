@@ -70,12 +70,16 @@ public:
 
     void destroy_texture(void* handle) { textures_.erase(handle); }
 
+    /* An upload larger than the texture is caller error, and silently truncating it
+     * hides the bug - it also made this store disagree with BackendCPU, which
+     * rejects the same call. A download asking for more than the texture holds is
+     * left clamped: "give me up to N bytes" is a legitimate idiom. */
     NRRResult upload_texture(void* handle, const void* data, size_t size) {
         auto it = textures_.find(handle);
         if (it == textures_.end()) return NRR_ERROR_INVALID_ARGUMENT;
-        if (!data || size == 0) return NRR_ERROR_INVALID_ARGUMENT;
-        const size_t n = std::min(size, it->second.bytes);
-        std::memcpy(it->second.data.data(), data, n);
+        if (!data || size == 0 || size > it->second.bytes)
+            return NRR_ERROR_INVALID_ARGUMENT;
+        std::memcpy(it->second.data.data(), data, size);
         return NRR_SUCCESS;
     }
 

@@ -299,6 +299,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference_impl.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_cuda_driver.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_inference.cpp
     ${CMAKE_SOURCE_DIR}/runtime/mobile/mobile_kernel.cpp
@@ -329,8 +330,11 @@ if(NRR_ENABLE_VULKAN)
 endif()
 
 # Desktop/embedded vendor backends are compiled unconditionally (like the
-# mobile vendors); NRR_ENABLE_NVIDIA/AMD/INTEL/RISCV gate their *behavior*
-# (registry registration, device paths, EP selection), not compilation.
+# mobile vendors) and, for NVIDIA, registered unconditionally too: its
+# is_supported() probes the CUDA driver for a real device, so auto-selection
+# stays correct on a host without the hardware. NRR_ENABLE_NVIDIA/AMD/INTEL/
+# RISCV gate toolkit-level *extras* (TensorRT, device-side kernels), not whether
+# the backend exists.
 foreach(_vendor NVIDIA AMD INTEL RISCV)
     if(NRR_ENABLE_${_vendor})
         message(STATUS "${_vendor} accelerator backend enabled")
