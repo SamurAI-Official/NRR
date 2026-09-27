@@ -18,7 +18,10 @@ NRRResult detect_android_device_capabilities(NRRCapabilities* capabilities) {
     capabilities->neural_acceleration = NRR_CAPABILITY_BASIC;
     capabilities->compute_shader = NRR_CAPABILITY_BASIC;
     capabilities->fp32 = NRR_CAPABILITY_FULL;
-    capabilities->fp16 = NRR_CAPABILITY_FULL;
+    /* fp16 is the EXECUTION claim and NRR has no fp16 path, so it is ABSENT. This
+     * platform helper probes no device, so the hardware fact is ABSENT as well. */
+    capabilities->fp16 = NRR_CAPABILITY_ABSENT;
+    capabilities->fp16_hardware = NRR_CAPABILITY_ABSENT;
     capabilities->int8 = NRR_CAPABILITY_BASIC;
     capabilities->tensor_cores = NRR_CAPABILITY_BASIC;
     capabilities->async_compute = NRR_CAPABILITY_BASIC;

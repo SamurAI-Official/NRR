@@ -51,6 +51,22 @@ inline void copy_string(char* dst, size_t dst_size, const std::string& src) {
     dst[n] = '\0';
 }
 
+/* Sets the half-precision capability pair from a MEASURED hardware fact.
+ *
+ * NRR has no fp16 execution path - the ONNX session is created in fp32 and nothing
+ * converts a tensor - so `fp16` (what the runtime can execute) is ABSENT for every
+ * backend. Stating that in one place stops a backend from quietly reintroducing a
+ * claim it cannot back with a measurement, which is exactly what had happened:
+ * seven backends hard-coded FULL, two claimed OPTIMIZED in their constructor before
+ * probing anything, and two derived a claim from a config flag that defaults to
+ * true. `fp16_hardware` carries the device fact, which is the only part a backend
+ * can legitimately know. */
+inline void set_fp16_capabilities(NRRCapabilities& caps,
+                                  NRRCapabilityState hardware) {
+    caps.fp16 = NRR_CAPABILITY_ABSENT;
+    caps.fp16_hardware = hardware;
+}
+
 struct TextureImpl {
     TextureImpl() : device(nullptr), backend_texture(nullptr), format(NRR_TEXTURE_FORMAT_RGB8) {}
     DeviceImpl* device;

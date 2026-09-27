@@ -61,14 +61,16 @@ NRRResult BackendNVIDIA::initialize(const NRRDeviceOptions& options) {
         /* 7.0 = Volta, the first generation whose tensor cores cuDNN actually uses. */
         capabilities_.tensor_cores = (cuda_compute_capability_ >= 70)
             ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_ABSENT;
-        capabilities_.fp16 = (cuda_compute_capability_ >= 70)
-            ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_BASIC;
+        /* The device fact, measured from the driver's compute capability. `fp16`
+         * itself stays ABSENT: NRR runs the session in fp32. */
+        set_fp16_capabilities(capabilities_, (cuda_compute_capability_ >= 70)
+            ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_BASIC);
         cuda_device_ = probe.device.index;
     } else {
         copy_string(capabilities_.device_name, sizeof(capabilities_.device_name),
                     "NVIDIA GPU (no CUDA device)");
         capabilities_.tensor_cores = NRR_CAPABILITY_ABSENT;
-        capabilities_.fp16 = NRR_CAPABILITY_ABSENT;
+        set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
         error_message_ = probe.note.empty() ? std::string("no CUDA device found")
                                             : probe.note;
     }

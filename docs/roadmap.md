@@ -577,6 +577,55 @@ it and the CPU path. None of the three was observable while no accelerator backe
 selected, which is the argument for the `windows-gpu-link` CI job.
 
 
+### M2 follow-up: `fp16`, and the platform configuration that was never compiled
+
+Reported as a footnote ("`supports_fp16` still mirrors a config flag"), then followed up on
+request because the shape of the defect looked familiar. It was wider than assumed, and it led
+somewhere worse.
+
+**`fp16` now means what the runtime can EXECUTE**, and is ABSENT for every backend: NRR creates
+its session in fp32 and converts no tensor. The device fact moved to a new appended field,
+`fp16_hardware`. Measured per backend (`tests/unit/test_capability_claims.cpp`):
+
+```
+CPU      fp16=0 ABSENT   fp16_hardware=0 ABSENT      nothing probed
+NVIDIA   fp16=0 ABSENT   fp16_hardware=2 OPTIMIZED   driver compute capability
+AMD      fp16=0 ABSENT   fp16_hardware=0 ABSENT      nothing probed
+Intel    fp16=0 ABSENT   fp16_hardware=0 ABSENT      nothing probed
+RISC-V   fp16=0 ABSENT   fp16_hardware=0 ABSENT      nothing probed
+```
+
+Fourteen sites in nine files claimed it, in four different ways: seven hard-coded `FULL`, two
+claimed `OPTIMIZED` in a constructor *before any probe*, two derived it from a config flag whose
+default is `true`, one was `BASIC` in the CPU backend, and one named an enum value that does not
+exist. Three public APIs gave three different answers for the same machine
+(`NRRCapabilities.fp16` through NVIDIA, through CPU, and `nrr_model_supports_capability()`).
+
+**The worse finding: `runtime/backend_vulkan.cpp` has never compiled.** It uses
+`NRR_CAPABILITY_STATE_AVAILABLE` / `_UNAVAILABLE` six times; those symbols are declared nowhere in
+the repository. Compiling one on its own gives `error C2065: 'NRR_CAPABILITY_STATE_AVAILABLE':
+undeclared identifier`, while `NRR_CAPABILITY_FULL` beside it compiles. The file's body is behind
+`NRR_ENABLE_VULKAN`, which is `OFF` on desktop and `ON` for `NRR_PLATFORM_MOBILE`, so the mobile
+configuration has been broken since the file was written and desktop CI never looked at it -
+which also means the M1.4 Android portability work has never been built here. Fixed to the
+documented enum values.
+
+Root cause, and why this is a milestone-level note rather than a bug: **no CI job builds any
+platform configuration other than windows-latest/desktop**, so code in the others is never
+type-checked. Two guards now cover the part of that class a source scan can see, from the build
+CI *does* run: every `NRR_CAPABILITY_*` identifier named in `runtime/**.{h,cpp}` must be declared
+in `include/nrr.h`, and no runtime source may assign a non-`ABSENT` value to the public `fp16`
+field. Measured: 60 sources scanned, 0 undeclared symbols, 0 unmeasured claims. A job that builds
+Android remains the real fix and is recorded under M7/M9 rather than pretended.
+
+**Still open in the same family**, recorded rather than silently blessed: the Vulkan
+placeholder's other capability fields (`neural_acceleration`, `compute_shader`, `int8`,
+`async_compute`, `fp32`) are unmeasured; `nrr_model_supports_capability()` returns constants for
+`fp32` / `compute_shader` / `reference_conditioning` / `temporal_coherence` without inspecting the
+model; and the kernels' internal `supports_fp16` / `use_fp16_decoupled` fields still echo the
+caller's request rather than a measurement (internal, not part of the C ABI, and currently read by
+nothing - but the name reads like a measurement).
+
 ## M3 - Specification conformance
 
 No external prerequisites (the specification documents already exist).

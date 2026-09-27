@@ -44,8 +44,14 @@ NRR_TEST(test_adreno_capabilities) {
     result = nrr_get_capabilities(device, &caps);
     NRR_EXPECT_EQ(result, NRR_SUCCESS, "get Adreno capabilities");
 
-    // Adreno should support FP16
-    NRR_EXPECT_EQ(caps.fp16, NRR_CAPABILITY_FULL, "Adreno FP16 support");
+    /* NRR has no fp16 EXECUTION path (the session runs fp32), so no backend may claim
+     * one. This used to assert NRR_CAPABILITY_FULL and passed only because
+     * BackendAdreno::query_capabilities() hard-coded it. The device fact lives in
+     * caps.fp16_hardware, which this backend does not probe, so it is ABSENT too. */
+    NRR_EXPECT_EQ(caps.fp16, NRR_CAPABILITY_ABSENT,
+                  "Adreno does not claim an fp16 execution path NRR does not have");
+    NRR_EXPECT_EQ(caps.fp16_hardware, NRR_CAPABILITY_ABSENT,
+                  "Adreno reports no measured fp16 hardware support");
 
     nrr_device_destroy(device);
 }
@@ -62,8 +68,11 @@ NRR_TEST(test_mali_capabilities) {
     result = nrr_get_capabilities(device, &caps);
     NRR_EXPECT_EQ(result, NRR_SUCCESS, "get Mali capabilities");
 
-    // Mali should support FP16
-    NRR_EXPECT_EQ(caps.fp16, NRR_CAPABILITY_FULL, "Mali FP16 support");
+    /* See test_adreno_capabilities: fp16 is the execution claim, and NRR has none. */
+    NRR_EXPECT_EQ(caps.fp16, NRR_CAPABILITY_ABSENT,
+                  "Mali does not claim an fp16 execution path NRR does not have");
+    NRR_EXPECT_EQ(caps.fp16_hardware, NRR_CAPABILITY_ABSENT,
+                  "Mali reports no measured fp16 hardware support");
 
     nrr_device_destroy(device);
 }

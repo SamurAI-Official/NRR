@@ -145,6 +145,11 @@ namespace NRR
         public float model_execution_score;
         public uint recommended_input_resolution;
         public uint recommended_output_resolution;
+        // Device half-precision support. `fp16` above is the EXECUTION claim and is
+        // ABSENT today. This field is appended in nrr.h so existing offsets are
+        // unchanged, but it MUST be mirrored here: nrr_get_capabilities marshals the
+        // whole native struct, so a shorter C# copy would be written past its end.
+        public NRRCapabilityState fp16_hardware;
     }
 
     // =========================================================================

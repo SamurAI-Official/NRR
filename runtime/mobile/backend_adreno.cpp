@@ -188,7 +188,9 @@ NRRResult BackendAdreno::query_adreno_capabilities() {
     capabilities_.neural_acceleration = NRR_CAPABILITY_FULL;
     capabilities_.compute_shader = NRR_CAPABILITY_FULL;
     capabilities_.fp32 = NRR_CAPABILITY_FULL;
-    capabilities_.fp16 = NRR_CAPABILITY_FULL;
+    /* fp16 (execution) is ABSENT: NRR runs fp32. The device fact is not probed here,
+     * so it is ABSENT too - this used to hard-code FULL from the vendor name. */
+    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
     capabilities_.int8 = NRR_CAPABILITY_FULL;
     capabilities_.tensor_cores = NRR_CAPABILITY_ABSENT;
     capabilities_.async_compute = NRR_CAPABILITY_FULL;

@@ -157,6 +157,58 @@ needs a self-hosted runner, which is stated in the workflow instead of papered o
 
 ### Added
 
+**Fixed: `fp16` claimed what NRR cannot do, in fourteen places, and a platform build that cannot compile**
+
+The follow-up on `supports_fp16` found the defect was far wider than one line, and it led
+somewhere worse than the field itself.
+
+- **`NRRCapabilities::fp16` now means what the runtime can EXECUTE**, which is the only thing a
+  capability block can honestly answer. NRR creates its ONNX session in fp32 and converts no
+  tensor, so it is **ABSENT for every backend**. The device fact moved to a new appended field,
+  **`fp16_hardware`**, filled only from something a backend can actually measure. Measured on an
+  RTX 4070 Ti: `fp16=0` (ABSENT) with `fp16_hardware=2` (OPTIMIZED, from the driver's compute
+  capability) - the two questions are now visibly different numbers instead of one guessed one.
+- **Fourteen claim sites across nine backend files were made honest, and they were not all the
+  same kind of wrong.** Seven hard-coded `FULL` (Adreno, Mali, PowerVR, Apple, Android-Vulkan,
+  Xenos, the Android platform helper); two claimed `OPTIMIZED` in their *constructor, before any
+  probe* (AMD, Intel); two derived the claim from a config flag that defaults to `true` (the
+  accelerator and mobile kernels); one was `BASIC` (CPU); one came from compute capability
+  (NVIDIA, now the hardware field); and one named an enum value that does not exist (Vulkan).
+  `set_fp16_capabilities()` in `nrr_runtime.h` now states the execution claim once so a backend
+  cannot re-derive it, and `nrr_model_supports_capability(model, "fp16")` no longer answers
+  `BASIC` for every model while the capability block said something else.
+- **Three public answers to one question became one.** On a single machine `NRRCapabilities.fp16`
+  read `OPTIMIZED` through the NVIDIA backend, `BASIC` through the CPU backend, and `BASIC` from
+  the model-level API. All three now report ABSENT.
+- **`runtime/backend_vulkan.cpp` cannot compile, and had never been compiled.** It referenced
+  `NRR_CAPABILITY_STATE_AVAILABLE` / `_UNAVAILABLE` (six times), which are declared nowhere in
+  the repository - the documented enum is `ABSENT/BASIC/OPTIMIZED/FULL/EXPERIMENTAL`. Proof:
+  compiling the expression on its own gives
+  `error C2065: 'NRR_CAPABILITY_STATE_AVAILABLE': undeclared identifier`, while
+  `NRR_CAPABILITY_FULL` next to it compiles. It went unnoticed because the whole file sits behind
+  `NRR_ENABLE_VULKAN`, which is `OFF` on desktop and `ON` for `NRR_PLATFORM_MOBILE` (Android/iOS):
+  the mobile configuration has therefore been broken since that file was written, and desktop CI
+  never compiled it. Fixed to the documented enum values (AVAILABLE -> BASIC, keeping the
+  original intent), and the remaining unmeasured claims in that placeholder are recorded in
+  `docs/roadmap.md` rather than quietly blessed.
+- **A source-level guard, because the platform CI builds is not the platform that broke.** The
+  complete answer is a CI job that builds Android; that needs an NDK and a Vulkan toolchain, so
+  `tests/unit/test_capability_claims.cpp` checks from the build CI *does* run that (a) every
+  `NRR_CAPABILITY_*` identifier named by any runtime source is declared in `include/nrr.h`, and
+  (b) no runtime source assigns a non-`ABSENT` value to the public `fp16` field. Measured: 60
+  runtime sources scanned, 0 undeclared symbols, 0 unmeasured claims. Comments are stripped
+  first, because prose legitimately names these values.
+- **ABI:** `fp16_hardware` is *appended* to `NRRCapabilities`, so every existing field keeps its
+  offset and a consumer reading only the prefix still works. A consumer that MIRRORS the struct
+  must add the field, because `nrr_get_capabilities` marshals the whole native struct and a
+  shorter copy would be written past its end; the in-repo mirrors were updated accordingly
+  (`NRRTypes.cs`, `NRRComponent.h`, `specification/capability_matrix.md`).
+
+Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
+through the public API, and the two source guards above run on every build.
+
+### Added
+
 - **GPU execution: the ONNX Runtime CUDA execution provider is attached for real** (`M2`).
   `runtime/onnx_runtime.cpp` now calls `OrtApi::SessionOptionsAppendExecutionProvider_CUDA`,
   and reports the provider the session actually ended up with rather than the one that was

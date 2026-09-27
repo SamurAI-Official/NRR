@@ -14,6 +14,7 @@
 #include "unit/test_mobile.cpp"
 #include "mobile/test_mobile_model.cpp"
 #include "unit/test_accel.cpp"
+#include "unit/test_capability_claims.cpp"
 #include "unit/test_engine_plugins.cpp"
 #include "unit/test_gpu_ep.cpp"
 #ifndef _WIN32
@@ -147,6 +148,13 @@ void run_all_tests() {
     NRR_RUN_TEST(test_accel_vendor_backends_structure);
     NRR_RUN_TEST(test_device_capabilities_track_measured_provider);
     NRR_RUN_TEST(test_accel_kernel_accumulates_temporal_history);
+
+    std::cout << "\n--- Capability Claim Tests ---\n";
+    /* Nothing here is asserted from a flag: fp16 is the EXECUTION claim and must be
+     * ABSENT, and the source guards make an unmeasured claim fail the build's own
+     * suite rather than ship. */
+    NRR_RUN_TEST(test_fp16_execution_claim_is_absent_for_every_backend);
+    NRR_RUN_TEST(test_runtime_never_claims_fp16_without_a_measurement);
     
     std::cout << "\n--- Integration Tests ---\n";
     NRR_RUN_TEST(test_basic_frame_pipeline);

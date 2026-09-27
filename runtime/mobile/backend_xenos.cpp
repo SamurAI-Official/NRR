@@ -31,7 +31,8 @@ NRRResult BackendPVR::initialize(const NRRDeviceOptions&) {
     caps_.neural_acceleration = NRR_CAPABILITY_FULL;
     caps_.compute_shader = NRR_CAPABILITY_FULL;
     caps_.fp32 = NRR_CAPABILITY_FULL;
-    caps_.fp16 = NRR_CAPABILITY_FULL;
+    /* fp16 (execution) is ABSENT: NRR runs fp32, and nothing here probes the device. */
+    set_fp16_capabilities(caps_, NRR_CAPABILITY_ABSENT);
     caps_.int8 = NRR_CAPABILITY_ABSENT;
     std::strncpy(caps_.active_backend, "PowerVR", sizeof(caps_.active_backend) - 1);
     initialized_ = true;

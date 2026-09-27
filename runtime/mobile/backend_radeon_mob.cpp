@@ -31,7 +31,9 @@ NRRResult BackendRadeonMob::initialize(const NRRDeviceOptions&) {
     caps_.neural_acceleration = NRR_CAPABILITY_ABSENT;
     caps_.compute_shader = NRR_CAPABILITY_ABSENT;
     caps_.fp32 = NRR_CAPABILITY_FULL;
-    caps_.fp16 = NRR_CAPABILITY_ABSENT;
+    /* Already the honest value, now stated through the shared helper so the pair is
+     * always set together. */
+    set_fp16_capabilities(caps_, NRR_CAPABILITY_ABSENT);
     caps_.int8 = NRR_CAPABILITY_ABSENT;
     std::strncpy(caps_.active_backend, "RadeonMobile", sizeof(caps_.active_backend) - 1);
     initialized_ = true;

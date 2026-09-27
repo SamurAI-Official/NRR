@@ -52,6 +52,7 @@ func _ready() -> void:
 	print("caps.active_backend=%s" % str(caps.get("active_backend", "")))
 	print("caps.neural_acceleration=%s" % str(caps.get("neural_acceleration", -1)))
 	print("caps.fp16=%s" % str(caps.get("fp16", -1)))
+	print("caps.fp16_hardware=%s" % str(caps.get("fp16_hardware", -1)))
 
 	var source := Image.create_empty(W, H, false, Image.FORMAT_RGBA8)
 	for y in H:

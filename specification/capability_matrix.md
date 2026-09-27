@@ -104,6 +104,12 @@ typedef struct NRRCapabilities {
     float model_execution_score;
     uint32_t recommended_input_resolution;
     uint32_t recommended_output_resolution;
+
+    /* The DEVICE's half-precision support. `fp16` above is the EXECUTION claim -
+     * what the runtime can run a model in - and is ABSENT for every backend today,
+     * because NRR creates its session in fp32. Appended so existing field offsets
+     * are unchanged. */
+    NRRCapabilityState fp16_hardware;
 } NRRCapabilities;
 ```
 

@@ -62,7 +62,12 @@ NRRCapabilityState ModelImpl::supports_capability(const char* capability) const 
     if (!capability || !loaded_) return NRR_CAPABILITY_ABSENT;
     std::string cap(capability);
     if (cap == "fp32") return NRR_CAPABILITY_FULL;
-    if (cap == "fp16") return NRR_CAPABILITY_BASIC;
+    /* Consistent with NRRCapabilities::fp16, which is the EXECUTION claim: NRR has no
+     * fp16 execution path, so no model can be said to support one. This returned BASIC
+     * for every model, which made this public API disagree with the capability block
+     * on the same machine. (The rest of this function is a stub too - it never
+     * inspects the graph - and is recorded in docs/roadmap.md, M2 follow-up.) */
+    if (cap == "fp16") return NRR_CAPABILITY_ABSENT;
     if (cap == "compute_shader") return NRR_CAPABILITY_FULL;
     if (cap == "reference_conditioning") return NRR_CAPABILITY_BASIC;
     if (cap == "temporal_coherence") return NRR_CAPABILITY_BASIC;

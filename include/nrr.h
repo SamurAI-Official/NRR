@@ -158,6 +158,13 @@ typedef struct {
     NRRCapabilityState tensor_cores;
     NRRCapabilityState matrix_cores;
     NRRCapabilityState fp32;
+    /* Half-precision EXECUTION: what the runtime can actually run a model in.
+     * This is ABSENT today and must stay that way until an fp16 execution path
+     * exists - NRR creates its ONNX session in fp32 and converts no tensors, so
+     * "the hardware has fp16" is not what this field means. The device fact is
+     * fp16_hardware below. (M2 follow-up: this used to be claimed from a config
+     * flag, a compute capability or a hard-coded constant, depending on the
+     * backend, and no consumer could tell which.) */
     NRRCapabilityState fp16;
     NRRCapabilityState bf16;
     NRRCapabilityState fp8;
@@ -178,6 +185,16 @@ typedef struct {
     float model_execution_score;
     uint32_t recommended_input_resolution;
     uint32_t recommended_output_resolution;
+
+    /* The DEVICE's half-precision support, as measured by the backend from whatever
+     * it can actually query (for NVIDIA, compute capability from the driver). It says
+     * nothing about what NRR executes - that is `fp16` above.
+     *
+     * ABI note: appended rather than inserted, so every existing field keeps its
+     * offset and a consumer reading only the prefix keeps working. A consumer that
+     * MIRRORS this struct must add the field too, or the library will write past the
+     * end of its copy - see engine_plugins/unity/Runtime/Scripts/NRRTypes.cs. */
+    NRRCapabilityState fp16_hardware;
 } NRRCapabilities;
 
 /* ============================================================================

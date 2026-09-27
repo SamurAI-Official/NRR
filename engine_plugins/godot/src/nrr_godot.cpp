@@ -294,6 +294,8 @@ Dictionary NRRNative::get_capabilities() const {
 	caps["tensor_cores"] = static_cast<int>(native.tensor_cores);
 	caps["fp32"] = static_cast<int>(native.fp32);
 	caps["fp16"] = static_cast<int>(native.fp16);
+	// The device fact, which is a different question from the execution claim above.
+	caps["fp16_hardware"] = static_cast<int>(native.fp16_hardware);
 	caps["int8"] = static_cast<int>(native.int8);
 	caps["compute_shader"] = static_cast<int>(native.compute_shader);
 	caps["temporal_coherence"] = static_cast<int>(native.temporal_coherence);

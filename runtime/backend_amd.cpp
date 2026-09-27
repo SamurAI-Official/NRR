@@ -36,7 +36,9 @@ NRRResult BackendAMD::initialize(const NRRDeviceOptions& options) {
     std::strncpy(capabilities_.device_type, "discrete_gpu",
                  sizeof(capabilities_.device_type) - 1);
     capabilities_.max_texture_size = 16384;
-    capabilities_.fp16 = NRR_CAPABILITY_OPTIMIZED;
+    /* No fp16 claim here: this ran in the constructor, before any probe, so it was a
+     * claim about hardware nobody had looked at. query_capabilities_hip() fills the
+     * measured pair when a device is actually found. */
     capabilities_.neural_acceleration = NRR_CAPABILITY_FULL;
 #ifdef NRR_ENABLE_AMD
     hip_available_ = (initialize_hip(options) == NRR_SUCCESS);
@@ -98,8 +100,8 @@ NRRResult BackendAMD::select_hip_device() {
 
 NRRResult BackendAMD::query_capabilities_hip() {
     capabilities_.max_texture_size = 16384;
-    capabilities_.fp16 = (hip_compute_capability_ >= 90)
-        ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_BASIC; /* gfx90+ */
+    set_fp16_capabilities(capabilities_, (hip_compute_capability_ >= 90)
+        ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_BASIC); /* gfx90+ device fact */
     capabilities_.matrix_cores = (hip_compute_capability_ >= 90)
         ? NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
     capabilities_.neural_acceleration = NRR_CAPABILITY_FULL;

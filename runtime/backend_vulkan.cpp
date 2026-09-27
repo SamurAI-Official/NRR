@@ -217,16 +217,26 @@ NRRResult BackendVulkan::query_capabilities() {
     VkPhysicalDeviceFeatures features;
     vkGetPhysicalDeviceFeatures(physical_device_, &features);
 
+    /* The documented enum is ABSENT/BASIC/OPTIMIZED/FULL/EXPERIMENTAL. This block used
+     * NRR_CAPABILITY_STATE_AVAILABLE/_UNAVAILABLE, which exist nowhere in the
+     * repository - it compiled only because the whole file sits behind
+     * NRR_ENABLE_VULKAN, which is OFF on desktop and ON for Android/iOS, so every
+     * mobile build failed on six undeclared identifiers while desktop CI never
+     * compiled the file at all. AVAILABLE maps to BASIC to keep the original intent.
+     * These fields are still claims this placeholder does not measure. */
     capabilities_.neural_acceleration = features.computeShader ?
-        NRR_CAPABILITY_STATE_AVAILABLE : NRR_CAPABILITY_STATE_UNAVAILABLE;
+        NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
     capabilities_.compute_shader = features.computeShader ?
-        NRR_CAPABILITY_STATE_AVAILABLE : NRR_CAPABILITY_STATE_UNAVAILABLE;
-    capabilities_.tensor_cores = NRR_CAPABILITY_STATE_UNAVAILABLE;
-    capabilities_.fp32 = NRR_CAPABILITY_STATE_AVAILABLE;
-    capabilities_.fp16 = NRR_CAPABILITY_STATE_AVAILABLE;
-    capabilities_.int8 = NRR_CAPABILITY_STATE_AVAILABLE;
+        NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
+    capabilities_.tensor_cores = NRR_CAPABILITY_ABSENT;
+    capabilities_.fp32 = NRR_CAPABILITY_BASIC;
+    /* fp16 is the EXECUTION claim and NRR has no fp16 path. Vulkan can expose
+     * shaderFloat16, but this backend neither enables nor uses it, so the hardware
+     * fact is not claimed either. */
+    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
+    capabilities_.int8 = NRR_CAPABILITY_BASIC;
     capabilities_.max_texture_size = props.limits.maxImageDimension2D;
-    capabilities_.async_compute = NRR_CAPABILITY_STATE_AVAILABLE;
+    capabilities_.async_compute = NRR_CAPABILITY_BASIC;
     std::strncpy(capabilities_.active_backend, "Vulkan",
                  sizeof(capabilities_.active_backend) - 1);
     std::strncpy(capabilities_.backend_version, "1.0",

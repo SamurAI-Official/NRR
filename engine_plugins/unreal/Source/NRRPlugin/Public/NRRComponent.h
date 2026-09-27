@@ -104,6 +104,8 @@ protected:
         FString DeviceVendor;
         NRRCapabilityState NeuralAcceleration;
         NRRCapabilityState FP16;
+        /** Device half-precision support; FP16 above is the execution claim. */
+        NRRCapabilityState FP16Hardware;
         NRRCapabilityState ReferenceConditioning;
         NRRCapabilityState TemporalCoherence;
         int32 VRAMBudgetMB;

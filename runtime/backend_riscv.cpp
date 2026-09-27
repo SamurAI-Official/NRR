@@ -69,7 +69,9 @@ NRRResult BackendRISCV::select_riscv_device() {
 
 NRRResult BackendRISCV::query_rvv_capabilities() {
     capabilities_.max_texture_size = rvv_width_bits_ >= 256 ? 8192 : 4096;
-    capabilities_.fp16 = NRR_CAPABILITY_ABSENT; /* RVV FP16 needs Zvfh; conservative */
+    /* RVV FP16 needs Zvfh, which nothing here probes, so both the device fact and the
+     * execution claim are ABSENT. */
+    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
     capabilities_.int8 = NRR_CAPABILITY_OPTIMIZED; /* RVV 1.0 vector integer ops */
     capabilities_.neural_acceleration = rvv_intrinsic_available_
         ? NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;

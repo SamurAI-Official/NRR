@@ -19,7 +19,9 @@ BackendCPU::BackendCPU()
     copy_string(capabilities_.device_vendor, sizeof(capabilities_.device_vendor), "NRR");
     copy_string(capabilities_.device_type, sizeof(capabilities_.device_type), "cpu");
     capabilities_.fp32 = NRR_CAPABILITY_FULL;
-    capabilities_.fp16 = NRR_CAPABILITY_BASIC;
+    /* fp16 (execution) is ABSENT - NRR runs fp32 - and the CPU backend can measure no
+     * hardware half-precision support, so both facts are stated together. */
+    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
     capabilities_.compute_shader = NRR_CAPABILITY_BASIC;
     capabilities_.reference_conditioning = NRR_CAPABILITY_BASIC;
     capabilities_.temporal_coherence = NRR_CAPABILITY_BASIC;

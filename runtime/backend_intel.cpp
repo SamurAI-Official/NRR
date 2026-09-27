@@ -36,7 +36,9 @@ NRRResult BackendIntel::initialize(const NRRDeviceOptions& options) {
     std::strncpy(capabilities_.device_type, "discrete_gpu",
                  sizeof(capabilities_.device_type) - 1);
     capabilities_.max_texture_size = 16384;
-    capabilities_.fp16 = NRR_CAPABILITY_OPTIMIZED;
+    /* No fp16 claim here: this ran in the constructor, before any probe, so it was a
+     * claim about hardware nobody had looked at. query_capabilities_intel() fills the
+     * measured pair when a device is actually found. */
     capabilities_.neural_acceleration = NRR_CAPABILITY_FULL;
     if (initialize_device(options) == NRR_SUCCESS) {
         query_capabilities_intel();
@@ -102,7 +104,9 @@ NRRResult BackendIntel::select_execution_path() {
 
 NRRResult BackendIntel::query_capabilities_intel() {
     capabilities_.max_texture_size = 16384;
-    capabilities_.fp16 = NRR_CAPABILITY_OPTIMIZED;
+    /* Intel Xe supports fp16, but nothing here probes for it, so the device fact is
+     * reported as ABSENT rather than assumed from the vendor name. */
+    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
     capabilities_.compute_shader = NRR_CAPABILITY_OPTIMIZED;
     capabilities_.matrix_cores = xmx_available_
         ? NRR_CAPABILITY_OPTIMIZED : NRR_CAPABILITY_ABSENT; /* XMX engines */
