@@ -57,6 +57,11 @@ public:
     NRRResult unload_reference(ReferenceImpl* reference) override;
     NRRResult wait_idle() override;
 
+    /* Frames are accumulated in the shared accelerator kernel, so the documented
+     * reset has to reach it. */
+    NRRResult reset_temporal_history() override;
+
+
     // -- RISC-V specific --------------------------------------------------
     /** Runtime RVV feature probe (vector extension width in bits, 0 if none). */
     int detect_rvv_width() const;

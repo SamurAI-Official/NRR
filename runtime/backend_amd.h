@@ -71,6 +71,11 @@ public:
     // Synchronization
     NRRResult wait_idle() override;
 
+    /* Frames are accumulated in the shared accelerator kernel, so the documented
+     * reset has to reach it. */
+    NRRResult reset_temporal_history() override;
+
+
     // AMD-specific features
     bool is_hip_available() const { return hip_available_; }
     bool is_rocm_available() const { return hip_available_; }  // HIP = ROCm runtime

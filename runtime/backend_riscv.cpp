@@ -180,6 +180,17 @@ NRRResult BackendRISCV::execute_model(ModelImpl* model, const NRRFrameInput& inp
         [this](void* bt, const void* d, size_t s) { return upload_texture(bt, d, s); });
 }
 
+NRRResult BackendRISCV::reset_temporal_history() {
+    /* The temporal history lives in the shared accelerator kernel, so the reset must
+     * be forwarded: otherwise nrr_device_reset_temporal_history() reports
+     * NRR_ERROR_NOT_SUPPORTED here while the CPU backend honours it. */
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (!kernel || !kernel->is_initialized()) return NRR_ERROR_STATE_INVALID;
+    kernel->reset_temporal_history();
+    return NRR_SUCCESS;
+}
+
+
 NRRResult BackendRISCV::load_reference(ReferenceImpl* r) {
     if (!initialized_ || !r) return NRR_ERROR_STATE_INVALID;
     if (std::find(loaded_references_.begin(), loaded_references_.end(), r) == loaded_references_.end())

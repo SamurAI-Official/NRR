@@ -12,12 +12,14 @@
  */
 
 #include "accel_kernel.h"
+#include "accel_texture.h"
 #include "onnx_runtime.h"
 #include "nrr_model.h"
 #include "nrr_inference.h"
 #include "nrr_runtime.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace nrr {
@@ -74,6 +76,9 @@ bool AcceleratorExecutionKernel::initialize(
     accel_caps_.preferred_ep = preferred_ep_;
     apply_accel_optimizations();
     select_best_execution_provider();
+    /* Temporal accumulation is part of the render path, not an optional extra: the
+     * CPU backend has always done it and this path must match it. */
+    temporal_.initialize();
     initialized_ = true;
     return true;
 }
@@ -85,6 +90,7 @@ void AcceleratorExecutionKernel::shutdown() {
         onnx_->shutdown();
         onnx_.reset();
     }
+    temporal_.shutdown();
     active_model_ = nullptr;
     current_frame_ = 0;
     current_memory_usage_ = 0;
@@ -226,12 +232,42 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
      * not be told about a provider that was only requested. */
     if (used_rt) apply_measured_provider(used_rt->active_provider());
 
-    /* ---- 4. Convert back to RGB8 and publish the output texture --------- */
+    /* ---- 4. Convert back to RGB8 ---------------------------------------- */
     std::vector<uint8_t> rgb8;
     uint32_t out_w = 0, out_h = 0;
     if (!nchw_to_rgb8(out, out_shape, rgb8, out_w, out_h))
         return NRR_ERROR_RENDER_FAILED;
 
+    /* ---- 5. Temporal accumulation --------------------------------------- */
+    /* The same TemporalAccumulator BackendCPU uses, so a vendor backend obeys
+     * M1.1/M1.3 instead of rendering without history. `rgb8` is updated in place
+     * when a blend happens, so the upload below publishes what was displayed.
+     *
+     * The motion field is fetched through the backend's own download primitive
+     * and only when a blend is actually possible, so a frame without history does
+     * not pay for copying a field it cannot use. */
+    std::vector<uint8_t> motion_pixels;
+    auto motion_source = [&]() -> TemporalAccumulator::MotionImage {
+        TemporalAccumulator::MotionImage field;
+        TextureImpl* tex = reinterpret_cast<TextureImpl*>(input.motion_vectors);
+        if (!tex || !tex->backend_texture || !download) return field;
+        if (tex->width == 0 || tex->height == 0) return field;
+        const size_t bytes = accel_texture_bytes(tex->width, tex->height, tex->format);
+        if (bytes == 0) return field;
+        motion_pixels.assign(bytes, 0);
+        if (download(tex->backend_texture, motion_pixels.data(), bytes) != NRR_SUCCESS)
+            return field;
+        field.pixels = motion_pixels.data();
+        field.width = tex->width;
+        field.height = tex->height;
+        field.format = tex->format;
+        return field;
+    };
+
+    const TemporalAccumulator::Result temporal =
+        temporal_.apply(input, rgb8, out_w, out_h, motion_source);
+
+    /* ---- 6. Publish the output texture ---------------------------------- */
     TextureImpl* out_tex = nullptr;
     if (monx) {
         if (monx->get_or_create_output_texture(out_w, out_h,
@@ -244,6 +280,24 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     if (out_tex->backend_texture && upload)
         upload(out_tex->backend_texture, rgb8.data(), rgb8.size());
     output.color = reinterpret_cast<NRRTexture*>(out_tex);
+
+    /* ---- 7. Report measured state --------------------------------------- */
+    /* This path used to publish no render stats at all, so a caller could not tell
+     * whether temporal reuse was happening. Report what was measured. */
+    output.temporal = temporal.state;
+    output.stats.temporal_stability = quantify_stability(temporal.displayed_delta);
+    {
+        char debug[256];
+        std::snprintf(debug, sizeof(debug),
+                      "accel %s %ux%u | temporal %s: alpha=%.3f hist=%u change=%.4f",
+                      active_ep_name_.empty() ? "no-provider" : active_ep_name_.c_str(),
+                      out_w, out_h, temporal.note,
+                      static_cast<double>(temporal.state.temporal_alpha),
+                      temporal.state.history_frames,
+                      static_cast<double>(temporal.displayed_delta));
+        copy_string(output.stats.debug_info, sizeof(output.stats.debug_info),
+                    std::string(debug));
+    }
     return NRR_SUCCESS;
 }
 
@@ -254,6 +308,13 @@ size_t AcceleratorExecutionKernel::get_current_memory_usage() const {
 void AcceleratorExecutionKernel::cleanup_texture_cache() {
     current_memory_usage_ = 0;
     current_memory_usage_bytes_ = 0;
+}
+
+void AcceleratorExecutionKernel::reset_temporal_history() {
+    /* Delegated to the accumulator, which also forgets that a frame was seen, so
+     * the next frame starts a new sequence instead of being judged a continuation
+     * of the discarded one. */
+    temporal_.reset();
 }
 
 void AcceleratorExecutionKernel::set_memory_limit(size_t bytes) {

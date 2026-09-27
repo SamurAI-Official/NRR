@@ -103,6 +103,10 @@ public:
     NRRResult unload_reference(ReferenceImpl* reference) override;
     NRRResult wait_idle() override;
 
+    /* Frames are accumulated in the shared accelerator kernel, so the documented
+     * reset has to reach it. */
+    NRRResult reset_temporal_history() override;
+
 #ifdef NRR_ENABLE_NVIDIA
     void set_tensorrt_precision(bool fp16, bool int8, bool fp8) {
         if (tensorrt_engine_) tensorrt_engine_->set_precision(fp16, int8, fp8);

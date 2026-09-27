@@ -72,6 +72,11 @@ public:
     // Synchronization
     NRRResult wait_idle() override;
 
+    /* Frames are accumulated in the shared accelerator kernel, so the documented
+     * reset has to reach it. */
+    NRRResult reset_temporal_history() override;
+
+
     // Intel-specific features
     bool is_xmx_available() const { return xmx_available_; }
     bool is_onemkl_available() const { return onemkl_available_; }

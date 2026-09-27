@@ -24,6 +24,7 @@
 #include "onnx_runtime.h"
 #include "nrr_backend.h"
 #include "nrr_model.h"
+#include "nrr_temporal.h"
 
 #include <cstdint>
 #include <functional>
@@ -120,6 +121,12 @@ public:
      * supports_* flag is false until a session exists and ONNX Runtime has
      * reported what it can actually attach (see refresh_provider_state()). */
     const AccelCapabilities& get_capabilities() const { return accel_caps_; }
+
+    /* Discards the accumulated temporal history (camera cut / scene change). The
+     * same operation BackendCPU performs, so that
+     * nrr_device_reset_temporal_history() means the same thing whichever backend is
+     * active - before this existed the accelerator path simply ignored the call. */
+    void reset_temporal_history();
     /* The execution provider the session is actually on, verbatim from
      * ONNXRuntime::active_provider(). EMPTY until a model is loaded: before ORT
      * has chosen a provider there is nothing truthful to report. */
@@ -152,6 +159,15 @@ private:
     AccelEP              preferred_ep_;
     std::string          active_ep_name_;
     std::unique_ptr<ONNXRuntime> onnx_;
+
+    /* Temporal accumulation, shared with BackendCPU (see nrr_temporal.h).
+     *
+     * Before this existed the accelerator path rendered every frame with no
+     * history at all: a camera cut was not detected, nothing was blended toward
+     * previous frames, and NRRRenderStats::temporal_stability was never populated
+     * - so routing frames through a vendor backend silently lost the M1.1/M1.3
+     * behaviour the CPU path is tested for. */
+    TemporalAccumulator  temporal_;
 
     ModelImpl*           active_model_;
     size_t               current_frame_;

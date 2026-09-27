@@ -9,6 +9,8 @@
 #define NRR_TEMPORAL_H
 
 #include "nrr.h"
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -25,6 +27,15 @@ constexpr float TEMPORAL_MOTION_THRESHOLD = 0.3f; /* motion magnitude above whic
  * per-channel change between consecutive displayed frames, as a fraction of the
  * full [0,1] range, that is reported as zero stability (100 = frame unchanged). */
 constexpr float TEMPORAL_STABILITY_FULL_DELTA = 0.25f;
+
+/* Converts a measured frame-to-frame change into that convention. Shared, so the
+ * CPU path and the accelerator path cannot drift into reporting the same number
+ * with different meanings. */
+inline uint32_t quantify_stability(float displayed_delta) {
+    float change = displayed_delta / TEMPORAL_STABILITY_FULL_DELTA;
+    change = change < 0.0f ? 0.0f : (change > 1.0f ? 1.0f : change);
+    return static_cast<uint32_t>(100.0f * (1.0f - change) + 0.5f);
+}
 
 /* A frame index that does not advance past the last recorded frame, or a change of
  * render resolution, means the sequence restarted: whatever the history holds
@@ -207,6 +218,89 @@ private:
     float current_motion_magnitude_;
     bool first_frame_;
     float analyze_motion(const NRRFrameInput& input, uint32_t width, uint32_t height) const;
+};
+
+/* ============================================================================
+ * TemporalAccumulator - the whole temporal pass, shared by every backend
+ * ============================================================================
+ *
+ * Scene-change detection, history, motion-adaptive blending and frame recording
+ * are one behaviour, not one-per-backend: M1.1/M1.3 define them for the render
+ * path, so a second copy of the rules is a second set of rules - and the
+ * accelerator path had no copy at all (any backend routing frames through
+ * AcceleratorExecutionKernel::execute_frame silently rendered without history,
+ * being neither reset by a camera cut nor blended toward previous frames).
+ *
+ * The caller owns rendering and the texture upload; this class owns everything
+ * that depends on frame-to-frame history. History lives in system memory because
+ * that is where the blend inputs already are.
+ */
+class TemporalAccumulator {
+public:
+    TemporalAccumulator();
+    ~TemporalAccumulator();
+
+    /* History depth 2: only the immediately previous displayed frame is ever
+     * reprojected, so a deeper ring would only cost memory. */
+    void initialize();
+    void shutdown();
+    /* Discards history and per-sequence state (scene cut, camera switch). */
+    void reset();
+
+    /* The caller's motion field for this frame, or a default-constructed instance
+     * when it has none. Returned by value, so no ownership crosses the boundary. */
+    struct MotionImage {
+        const uint8_t* pixels = nullptr;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        NRRTextureFormat format = NRR_TEXTURE_FORMAT_RG16F;
+        bool valid() const {
+            return pixels != nullptr && width > 0 && height > 0;
+        }
+    };
+    using MotionProvider = std::function<MotionImage()>;
+
+    /* Measured outcome of one frame's temporal pass. */
+    struct Result {
+        NRRTemporalState state;         /* measured, never an echo of the input */
+        float displayed_delta = 0.0f;   /* frame-to-frame change of what was displayed */
+        bool blended = false;
+        TemporalBlendStats blend_stats;
+        /* Why the blend did or did not happen: "no previous frame",
+         * "accumulated", "no motion field to reproject with", or
+         * "alpha=0 (motion above threshold)".*/
+        const char* note = "no previous frame";
+    };
+
+    /* Applies temporal accumulation to a frame that has already been rendered.
+     *
+     * `rgb8` is the frame in packed RGB8 at width x height. It is converted to
+     * interleaved floats, blended against the previous frame reprojected through
+     * this frame's motion field, and converted back in place when a blend actually
+     * happened. `motion` is called at most once per frame and only when a blend is
+     * possible, so a caller never pays for a field it will not use.
+     *
+     * A scene change (frame index not advancing past the last one recorded, or a
+     * change of resolution) discards the history first, so a caller that forgets to
+     * announce a camera cut cannot ghost. */
+    Result apply(const NRRFrameInput& input,
+                 std::vector<uint8_t>& rgb8,
+                 uint32_t width, uint32_t height,
+                 const MotionProvider& motion);
+
+    uint32_t history_frames() const { return history_.get_frame_count(); }
+    bool has_history() const { return seen_frame_; }
+
+private:
+    TemporalHistory history_;
+    TemporalStateManager state_;
+    TemporalRenderer renderer_;
+
+    /* Last frame rendered, for automatic scene-change detection. */
+    bool seen_frame_;
+    uint64_t last_frame_index_;
+    uint32_t last_width_;
+    uint32_t last_height_;
 };
 
 } // namespace nrr

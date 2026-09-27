@@ -91,27 +91,16 @@ private:
     };
     std::unordered_map<void*, CPUImage> cpu_textures_;
 
-    /* Temporal accumulation (see nrr_temporal.h).
-     *
-     * temporal_history_ holds the frames that were actually displayed, at the
-     * render output resolution; temporal_state_ derives the motion-adaptive
-     * history weight, and temporal_renderer_ performs the backward reprojection
-     * and blend. The history depth is 2 because only the immediately previous
-     * frame is ever reprojected - a deeper ring would only cost memory.
+    /* Temporal accumulation, shared with every other backend (see
+     * TemporalAccumulator in nrr_temporal.h). It owns the history of displayed
+     * frames at the render output resolution, the motion-adaptive history weight,
+     * backward reprojection, and the automatic scene-change detection - including
+     * the "did this sequence restart or change resolution" bookkeeping, so the
+     * rules exist in one place instead of once per backend.
      *
      * Memory: 2 frames x 3 channels x W x H x 4 bytes (e.g. ~6 MB at 512x512,
      * ~50 MB at 1920x1080). */
-    TemporalHistory temporal_history_;
-    TemporalStateManager temporal_state_;
-    TemporalRenderer temporal_renderer_;
-
-    /* Tracks the last frame rendered, so a sequence that restarts (frame index
-     * does not advance) or changes resolution is detected as a scene change and
-     * handled without the caller having to announce it. */
-    bool temporal_seen_frame_ = false;
-    uint64_t temporal_last_frame_index_ = 0;
-    uint32_t temporal_last_width_ = 0;
-    uint32_t temporal_last_height_ = 0;
+    TemporalAccumulator temporal_;
 };
 
 // Backend registration

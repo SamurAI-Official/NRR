@@ -9,6 +9,7 @@
  */
 
 #include "nrr_temporal.h"
+#include "nrr_inference.h"
 #include <cmath>
 #include <algorithm>
 
@@ -426,5 +427,217 @@ void TemporalStateManager::reset() {
     current_motion_magnitude_ = 0.0f;
     first_frame_ = true;
 }
+
+// ============================================================================
+// TemporalAccumulator helpers
+// ============================================================================
+
+/* Interleaved RGB floats in [0,1] for a packed RGB8 image. The temporal history
+ * keeps displayed frames as floats so the blend can interpolate them. */
+static void rgb8_to_interleaved_float(const std::vector<uint8_t>& rgb8,
+                                      std::vector<float>& out) {
+    out.resize(rgb8.size());
+    for (size_t i = 0; i < rgb8.size(); ++i) {
+        out[i] = static_cast<float>(rgb8[i]) * (1.0f / 255.0f);
+    }
+}
+
+/* Inverse of rgb8_to_interleaved_float(), clamping to the representable range. */
+static void interleaved_float_to_rgb8(const std::vector<float>& in,
+                                      std::vector<uint8_t>& out) {
+    out.resize(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        float v = in[i];
+        v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        out[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+    }
+}
+
+/* Nearest-neighbour resampling of a motion field from the frame *input*
+ * resolution to the render *output* resolution, expressed in destination texels.
+ *
+ * Motion vectors are screen-space displacements supplied with the input frame.
+ * The temporal history holds frames at the output resolution, so an upscaled
+ * frame (e.g. the 2x models) needs the field converted before it can be used for
+ * backward reprojection: the nearest input vector is taken and scaled by the
+ * resolution ratio so that a given screen displacement covers the same fraction
+ * of the image at either resolution. `src_nchw` is planar (2 x src_h x src_w). */
+static void resample_motion_field_nchw(const std::vector<float>& src_nchw,
+                                       uint32_t src_w, uint32_t src_h,
+                                       uint32_t dst_w, uint32_t dst_h,
+                                       std::vector<float>& dst_interleaved) {
+    dst_interleaved.assign(static_cast<size_t>(dst_w) * dst_h * 2, 0.0f);
+    const size_t src_pixels = static_cast<size_t>(src_w) * src_h;
+    if (src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) return;
+    if (src_nchw.size() < src_pixels * 2) return;
+
+    const float ratio_x = static_cast<float>(dst_w) / static_cast<float>(src_w);
+    const float ratio_y = static_cast<float>(dst_h) / static_cast<float>(src_h);
+
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        uint32_t sy = static_cast<uint32_t>(static_cast<float>(y) / ratio_y);
+        if (sy >= src_h) sy = src_h - 1;
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            uint32_t sx = static_cast<uint32_t>(static_cast<float>(x) / ratio_x);
+            if (sx >= src_w) sx = src_w - 1;
+            const size_t s = static_cast<size_t>(sy) * src_w + sx;
+            const size_t d = (static_cast<size_t>(y) * dst_w + x) * 2;
+            dst_interleaved[d]     = src_nchw[s] * ratio_x;
+            dst_interleaved[d + 1] = src_nchw[src_pixels + s] * ratio_y;
+        }
+    }
+}
+
+/* Mean absolute per-channel difference between two equal-length images. */
+static float mean_abs_difference(const std::vector<float>& a,
+                                 const std::vector<float>& b) {
+    if (a.empty() || a.size() != b.size()) return 0.0f;
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        sum += std::fabs(a[i] - b[i]);
+    }
+    return static_cast<float>(sum / static_cast<double>(a.size()));
+}
+
+
+// ============================================================================
+// TemporalAccumulator
+// ============================================================================
+
+TemporalAccumulator::TemporalAccumulator()
+    : seen_frame_(false), last_frame_index_(0),
+      last_width_(0), last_height_(0) {}
+
+TemporalAccumulator::~TemporalAccumulator() {
+    shutdown();
+}
+
+void TemporalAccumulator::initialize() {
+    history_.set_max_frames(2);
+    history_.clear();
+    state_.initialize(nullptr);
+    renderer_.initialize(nullptr);
+    seen_frame_ = false;
+    last_frame_index_ = 0;
+    last_width_ = 0;
+    last_height_ = 0;
+}
+
+void TemporalAccumulator::shutdown() {
+    renderer_.shutdown();
+    state_.shutdown();
+    history_.clear();
+    seen_frame_ = false;
+    last_frame_index_ = 0;
+    last_width_ = 0;
+    last_height_ = 0;
+}
+
+void TemporalAccumulator::reset() {
+    history_.clear();
+    state_.reset();
+    /* Parity with the pre-accumulator BackendCPU path, which reset all three. */
+    renderer_.reset();
+    seen_frame_ = false;
+    last_frame_index_ = 0;
+    last_width_ = 0;
+    last_height_ = 0;
+}
+
+TemporalAccumulator::Result TemporalAccumulator::apply(
+    const NRRFrameInput& input, std::vector<uint8_t>& rgb8,
+    uint32_t width, uint32_t height, const MotionProvider& motion) {
+
+    Result result;
+
+    /* A sequence that restarts (the frame index does not advance past the last one
+     * rendered) or a change of render resolution means the accumulated history
+     * belongs to a different scene or viewport. Reprojecting it would draw the old
+     * scene through the new one, so it is discarded. Detected here so a caller that
+     * forgets to announce a camera cut cannot ghost; an explicit reset covers the
+     * case a caller must announce (a cut that keeps indices and resolution). */
+    if (temporal_scene_changed(seen_frame_, last_frame_index_,
+                               input.temporal.frame_index, last_width_, last_height_,
+                               width, height)) {
+        history_.clear();
+        state_.reset();
+        seen_frame_ = false;
+    }
+
+    result.state = state_.compute_state(input, history_);
+
+    std::vector<float> displayed;
+    rgb8_to_interleaved_float(rgb8, displayed);
+
+    std::vector<float> prev_color, prev_depth, prev_motion;
+    uint32_t prev_w = 0, prev_h = 0;
+    const bool have_previous =
+        history_.get_previous_frame(input.temporal.frame_index, prev_color,
+                                    prev_depth, prev_motion, prev_w, prev_h) &&
+        prev_w == width && prev_h == height &&
+        prev_color.size() == displayed.size();
+
+    if (!have_previous) {
+        result.note = "no previous frame";
+    } else if (result.state.temporal_alpha <= 0.0f) {
+        result.note = "alpha=0 (motion above threshold)";
+    } else {
+        /* Ask for the motion field only now: a frame that cannot blend must not pay
+         * for converting one. */
+        std::vector<float> motion_out;
+        const MotionImage field = motion ? motion() : MotionImage();
+        if (field.valid()) {
+            std::vector<float> motion_nchw;
+            if (texture_to_nchw(field.pixels, field.width, field.height, field.format,
+                                2, motion_nchw)) {
+                resample_motion_field_nchw(motion_nchw, field.width, field.height,
+                                           width, height, motion_out);
+            }
+        }
+
+        HistoryEntry previous;
+        previous.frame_index = input.temporal.frame_index;
+        previous.color_data = prev_color;
+        previous.width = prev_w;
+        previous.height = prev_h;
+
+        result.blended = renderer_.blend_frame(
+            displayed, width, height, previous, motion_out,
+            input.temporal.motion_vectors_scale, result.state.temporal_alpha,
+            &result.blend_stats);
+        result.note = result.blended ? "accumulated"
+                                     : "no motion field to reproject with";
+    }
+
+    if (result.blended) {
+        interleaved_float_to_rgb8(displayed, rgb8);
+    }
+
+    /* Frame-to-frame change of what is actually displayed, measured against the
+     * previous displayed frame (after any blending). */
+    result.displayed_delta = have_previous
+        ? mean_abs_difference(displayed, prev_color) : 0.0f;
+
+    /* Record the frame that was displayed so the next frame can reproject it. Only
+     * the image is kept: backward reprojection consumes the *next* frame's motion
+     * field, so storing motion (or depth, unused until disocclusion rejection
+     * exists) would cost memory without ever being read. */
+    {
+        TemporalFrameData frame;
+        frame.width = width;
+        frame.height = height;
+        frame.color = displayed;
+        frame.color_format = NRR_TEXTURE_FORMAT_RGB8;
+        state_.record_frame(input, frame, history_);
+    }
+
+    seen_frame_ = true;
+    last_frame_index_ = input.temporal.frame_index;
+    last_width_ = width;
+    last_height_ = height;
+
+    return result;
+}
+
 
 } // namespace nrr

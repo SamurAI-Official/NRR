@@ -262,6 +262,19 @@ NRR_TEST(test_accel_vendor_backends_structure) {
                         "Intel is_supported helper matches instance");
         NRR_EXPECT_TRUE(riscv->is_supported(options) == riscv_sup,
                         "RISC-V is_supported helper matches instance");
+        // Every vendor backend must honour the documented temporal reset rather than
+        // inheriting the NRR_ERROR_NOT_SUPPORTED default: the history lives in the
+        // shared accelerator kernel, so a backend that does not forward the call lets
+        // a camera cut keep ghosting while the CPU backend behaves correctly.
+        NRR_EXPECT_TRUE(nv->reset_temporal_history() != NRR_ERROR_NOT_SUPPORTED,
+                        "NVIDIA forwards the temporal reset to the kernel");
+        NRR_EXPECT_TRUE(amd->reset_temporal_history() != NRR_ERROR_NOT_SUPPORTED,
+                        "AMD forwards the temporal reset to the kernel");
+        NRR_EXPECT_TRUE(intel->reset_temporal_history() != NRR_ERROR_NOT_SUPPORTED,
+                        "Intel forwards the temporal reset to the kernel");
+        NRR_EXPECT_TRUE(riscv->reset_temporal_history() != NRR_ERROR_NOT_SUPPORTED,
+                        "RISC-V forwards the temporal reset to the kernel");
+
     }
 
     // A default device on a non-vendor host stays vendor-neutral (CPU), i.e.
@@ -334,6 +347,112 @@ NRR_TEST(test_device_capabilities_track_measured_provider) {
         NRR_EXPECT_TRUE(after.neural_acceleration == NRR_CAPABILITY_ABSENT,
                         "neural_acceleration is withdrawn once no session exists");
     }
+    nrr_device_destroy(device);
+}
+
+
+NRR_TEST(test_accel_kernel_accumulates_temporal_history) {
+    // D9 guard: the accelerator frame path must run the SAME temporal pass as the
+    // CPU backend (M1.1/M1.3). Before TemporalAccumulator existed it rendered every
+    // frame with no history at all - no scene-change detection, no blend toward
+    // previous frames, and no render stats - so every vendor backend silently lost
+    // behaviour the CPU path is tested for.
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRRResult r = nrr_device_create(&options, &device);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "device for the accel temporal parity test");
+    if (!device) return;
+
+    NRRModel* model = nullptr;
+    r = nrr_model_load(device, NRR_PASSTHROUGH_MODEL, &model);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "load model for the accel temporal parity test");
+    if (!model) { nrr_device_destroy(device); return; }
+
+    NRRTextureDesc td = {};
+    td.width = 32;
+    td.height = 32;
+    td.format = NRR_TEXTURE_FORMAT_RGBA8;
+    td.usage = NRR_TEXTURE_USAGE_COLOR;
+    NRRTexture* color = nullptr;
+    r = nrr_texture_create(device, &td, &color);
+    NRR_EXPECT_EQ(r, NRR_SUCCESS, "create color texture for the temporal test");
+    if (!color) { nrr_model_unload(model); nrr_device_destroy(device); return; }
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(32) * 32 * 4, 96);
+    nrr_texture_upload(device, color, rgba.data(), rgba.size());
+
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    NRR_EXPECT_TRUE(kernel != nullptr, "shared accelerator kernel handle");
+    if (kernel) {
+        NRR_EXPECT_TRUE(kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u,
+                                           true, false, true),
+                        "accelerator kernel initializes for the temporal test");
+        ModelImpl* impl = reinterpret_cast<ModelImpl*>(model);
+        NRR_EXPECT_TRUE(kernel->load_model(impl),
+                        "kernel loads the model session for the temporal test");
+
+        DeviceImpl* dev = reinterpret_cast<DeviceImpl*>(device);
+        Backend* backend = dev ? dev->get_backend() : nullptr;
+        NRR_EXPECT_TRUE(backend != nullptr, "device exposes its backend");
+
+        kernel->reset_temporal_history();
+
+        auto render_index = [&](uint64_t index, NRRFrameOutput& out) -> NRRResult {
+            NRRFrameInput in = {};
+            in.color = color;
+            in.camera.viewport_width = 32;
+            in.camera.viewport_height = 32;
+            in.temporal.frame_index = index;
+            in.temporal.motion_vectors_scale = 1.0f;
+            return kernel->execute_frame(
+                impl, in, out,
+                [backend](void* bt, void* dst, std::size_t n) {
+                    return backend->download_texture(bt, dst, n);
+                },
+                [backend](void* bt, const void* src, std::size_t n) {
+                    return backend->upload_texture(bt, src, n);
+                });
+        };
+
+        NRRFrameOutput first = {};
+        NRR_EXPECT_EQ(render_index(1, first), NRR_SUCCESS,
+                      "first accelerator frame renders");
+        NRR_EXPECT_TRUE(first.temporal.history_frames == 0,
+                        "no history exists for the first accelerator frame");
+        NRR_EXPECT_TRUE(std::strstr(first.stats.debug_info, "no previous frame") != nullptr,
+                        "first accelerator frame reports it had nothing to reuse");
+        NRR_EXPECT_TRUE(first.stats.temporal_stability == 100,
+                        "first accelerator frame reports the no-measurement convention");
+
+        NRRFrameOutput second = {};
+        NRR_EXPECT_EQ(render_index(2, second), NRR_SUCCESS,
+                      "second accelerator frame renders");
+        NRR_EXPECT_TRUE(second.temporal.history_frames >= 1,
+                        "the accelerator path records history between frames");
+        NRR_EXPECT_TRUE(std::strstr(second.stats.debug_info, "no previous frame") == nullptr,
+                        "second accelerator frame consults the recorded history");
+        // Identical input frames must measure as perfectly stable - the number is
+        // derived from the displayed frames, so it cannot be faked by reporting 100.
+        NRR_EXPECT_TRUE(second.stats.temporal_stability == 100,
+                        "an unchanged accelerator frame measures as fully stable");
+
+        // The documented reset must reach this path too.
+        kernel->reset_temporal_history();
+        NRRFrameOutput after_reset = {};
+        NRR_EXPECT_EQ(render_index(3, after_reset), NRR_SUCCESS,
+                      "frame after the temporal reset renders");
+        NRR_EXPECT_TRUE(std::strstr(after_reset.stats.debug_info,
+                                    "no previous frame") != nullptr,
+                        "reset discards the accelerator path's history");
+
+        kernel->unload_model(impl);
+        kernel->cleanup_texture_cache();
+        kernel->shutdown();
+        destroy_accel_kernel();
+    }
+
+    nrr_texture_destroy(device, color);
+    nrr_model_unload(model);
     nrr_device_destroy(device);
 }
 
