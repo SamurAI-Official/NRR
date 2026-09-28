@@ -3,6 +3,8 @@
 #include "onnx_runtime.h"
 #include "nrr_inference.h"
 #include "nrr_quality.h"
+#include "nrr_test_backend.h"
+#include "accel_kernel.h"
 #include <cstring>
 #include <algorithm>
 #include <chrono>
@@ -341,6 +343,33 @@ NRRResult BackendCPU::execute_model(
         return NRR_ERROR_STATE_INVALID;
     }
 
+    /* Test-only route (NRR_TEST_BACKEND=kernel): execute this frame through the shared
+     * accelerator kernel, with this backend's host-memory textures as the kernel's resources, so
+     * the accelerator execution path can be exercised by *every* test on a machine that has no
+     * accelerator - which is every CI runner. See runtime/nrr_test_backend.h.
+     *
+     * The device still reports the CPU backend's own measured capabilities: this selects which
+     * code executes, it claims nothing about hardware. The kernel prefers the model's own session
+     * when it has one, so the frame that comes out is the same frame - tests/integration/
+     * test_path_parity.cpp is what asserts that. */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+        if (!kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, false, false, true)) {
+            return NRR_ERROR_BACKEND_UNAVAILABLE;
+        }
+        if (!kernel->load_model(model)) return NRR_ERROR_MODEL_LOAD_FAILED;
+        kernel->set_frame_references(references);
+        return kernel->execute_frame(
+            model, input, output,
+            [this](void* bt, void* dst, std::size_t n) {
+                return download_texture(bt, dst, n);
+            },
+            [this](void* bt, const void* src, std::size_t n) {
+                return upload_texture(bt, src, n);
+            });
+    }
+
     auto fill_placeholder_stats = [&](const char* debug) {
         output.temporal = input.temporal;
         output.stats.render_time_ms = 0.0f;
@@ -619,6 +648,16 @@ NRRResult BackendCPU::reset_temporal_history() {
     /* The accumulator also forgets that a frame was seen, so the next frame begins
      * a new sequence and is not judged a continuation of the discarded one. */
     temporal_.reset();
+    /* On the test route the frames are executed by the shared accelerator kernel, so the history
+     * that has to be discarded is the kernel's, not this backend's. Resetting only the
+     * accumulator that is not accumulating is exactly the defect the vendor backends' forwarding
+     * exists to prevent - and the suite found it here as soon as the whole suite could run over
+     * the accelerator path (test_temporal_reset_history_api: "the frame after a reset sees an
+     * empty history - expected 0 but got 1"). */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) kernel->reset_temporal_history();
+    }
     return NRR_SUCCESS;
 }
 

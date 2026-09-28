@@ -49,6 +49,29 @@ jobs:
         shell: pwsh
         run: ./tools/build.ps1 -Config Release -RunTests
 
+      # Then the same suite with the accelerator execution path forced on, so the whole test
+      # surface - not only tests/integration/test_path_parity.cpp - runs through
+      # AcceleratorExecutionKernel::execute_frame on a runner that has no accelerator. See
+      # runtime/nrr_test_backend.h: the override decides what automatic selection resolves to,
+      # and a red result here is a divergence between the two execution paths.
+      - name: Run the suite over the accelerator execution path
+        shell: pwsh
+        env:
+          NRR_TEST_BACKEND: kernel
+        run: ./tools/build.ps1 -Config Release -NoConfigure -NoBuild -RunTests
+
+      # Compile coverage for the configuration no other job builds: every vendor and mobile source
+      # (NRR_ENABLE_MOBILE_VENDOR turns on the mobile feature branches) plus the Vulkan backend's
+      # no-SDK branch, which - until this step existed - was compiled by *nothing* and was not even
+      # a valid translation unit (see the note in CMakeLists.txt). Build only: the mobile vendor
+      # tests assert the old "the flag means the vendor is supported" contract, which is recorded
+      # as a follow-up in docs/roadmap.md.
+      - name: Build the all-vendor / no-SDK-Vulkan configuration
+        shell: pwsh
+        run: |
+          ./tools/build.ps1 -Config Release -BuildDir build-backends -Clean `
+            -Define NRR_ENABLE_MOBILE_VENDOR=ON,NRR_ENABLE_NVIDIA=ON,NRR_ENABLE_RISCV=ON
+
       # Same reasoning as the CUDA job: a failing test name must be readable without
       # access to the job log.
       - name: Publish failing tests as annotations
@@ -241,6 +264,16 @@ jobs:
       - name: Configure, build and test against the CUDA provider
         shell: pwsh
         run: ./tools/build.ps1 -Config Release -BuildDir build-gpu -RunTests
+
+      # The whole suite through the accelerator execution path (see runtime/nrr_test_backend.h).
+      # On a device-less runner the frames run on the CPU provider with host-memory textures; on
+      # a runner with a device the kernel attaches the CUDA provider, so this step covers the
+      # accelerator path end to end either way.
+      - name: Run the suite over the accelerator execution path
+        shell: pwsh
+        env:
+          NRR_TEST_BACKEND: kernel
+        run: ./tools/build.ps1 -Config Release -BuildDir build-gpu -NoConfigure -NoBuild -RunTests
 
       # Job logs need authentication, and the whole point of this job is to catch a
       # configuration-specific failure nobody can reproduce locally. Publish the

@@ -1,10 +1,129 @@
-﻿#ifdef NRR_ENABLE_VULKAN
+/**
+ * @file backend_vulkan.cpp
+ * @brief Vulkan backend - see backend_vulkan.h.
+ *
+ * The body below is what it always was. What it never had was a head: the includes and the first
+ * eight methods were missing, so this file was not a valid translation unit in any configuration
+ * - and because NRR_ENABLE_VULKAN is ON only where a mobile toolchain is present, nothing ever
+ * compiled it. That is how it kept an undeclared identifier (NRR_CAPABILITY_STATE_AVAILABLE) and
+ * a misnamed enum (AccelEp::VULKAN) for as long as it did. The compile-coverage configuration in
+ * CMakeLists.txt compiles the no-SDK branch of this file on every machine now; the SDK branch
+ * still needs the SDK, and remains as unverified as the rest of the platform configuration (see
+ * docs/roadmap.md).
+ */
+
+#include "backend_vulkan.h"
+#include "nrr_device.h"
+
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
+namespace nrr {
+
+BackendVulkan::BackendVulkan() {
+    std::memset(&capabilities_, 0, sizeof(capabilities_));
+    std::strncpy(capabilities_.active_backend, "Vulkan",
+                 sizeof(capabilities_.active_backend) - 1);
+    std::strncpy(capabilities_.backend_version, "1.0",
+                 sizeof(capabilities_.backend_version) - 1);
+}
+
+BackendVulkan::~BackendVulkan() { shutdown(); }
+
+NRRResult BackendVulkan::initialize(const NRRDeviceOptions& options) {
+    if (initialized_) return NRR_SUCCESS;
+    if (!initialize_vulkan(options)) {
+        /* Without the SDK, or without a usable device, there is nothing to initialise. A backend
+         * that reports success anyway is how a placeholder becomes a lie. */
+        return NRR_ERROR_BACKEND_UNAVAILABLE;
+    }
+    initialized_ = true;
+    return NRR_SUCCESS;
+}
+
+void BackendVulkan::shutdown() {
+    if (!initialized_) return;
+    shutdown_vulkan();
+    textures_.clear();
+    buffers_.clear();
+    loaded_models_.clear();
+    loaded_references_.clear();
+    initialized_ = false;
+}
+
+const NRRCapabilities& BackendVulkan::get_capabilities() const { return capabilities_; }
+
+const std::string& BackendVulkan::get_name() const { return name_; }
+
+bool BackendVulkan::is_supported(const NRRDeviceOptions& options) const {
+    (void)options;
+#ifdef NRR_ENABLE_VULKAN
+    /* A real probe, on a temporary instance: a capability question must not leave a device open
+     * behind it, and it must never be answered from a request. */
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "NRR";
+    app_info.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) return false;
+    uint32_t device_count = 0;
+    const bool usable =
+        vkEnumeratePhysicalDevices(instance, &device_count, nullptr) == VK_SUCCESS &&
+        device_count > 0;
+    vkDestroyInstance(instance, nullptr);
+    return usable;
+#else
+    /* No SDK, no Vulkan. Saying otherwise would make automatic selection prefer this backend -
+     * its registry priority is 50, above the CPU backend's 10 - with nothing behind it. */
+    return false;
+#endif
+}
+
+bool BackendVulkan::initialize_vulkan(const NRRDeviceOptions& options) {
+    (void)options;
+#ifdef NRR_ENABLE_VULKAN
+    if (vulkan_available_) return true;
+    if (create_vulkan_instance() != NRR_SUCCESS) return false;
+    uint32_t device_index = 0;
+    if (select_physical_device(&device_index) != NRR_SUCCESS) {
+        cleanup_vulkan();
+        return false;
+    }
+    if (create_logical_device() != NRR_SUCCESS) {
+        cleanup_vulkan();
+        return false;
+    }
+    if (query_capabilities() != NRR_SUCCESS) {
+        cleanup_vulkan();
+        return false;
+    }
+    vulkan_available_ = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void BackendVulkan::shutdown_vulkan() {
+    cleanup_vulkan();
+    vulkan_available_ = false;
+}
+
+NRRResult BackendVulkan::execute_model(ModelImpl* model, const NRRFrameInput& input,
+                                       NRRFrameOutput& output,
+                                       const NRRReferenceSet* references) {
+#ifdef NRR_ENABLE_VULKAN
     (void)references;
     if (!initialized_ || !model) return NRR_ERROR_STATE_INVALID;
     if (!input.color) return NRR_ERROR_INVALID_ARGUMENT;
     AcceleratorExecutionKernel* kernel = get_accel_kernel();
     if (!kernel->is_initialized())
-        kernel->initialize(AccelEp::VULKAN, 1024ull * 1024ull * 1024ull,
+        kernel->initialize(AccelEP::VULKAN, 1024ull * 1024ull * 1024ull,
                           true, false, true);
     return kernel->execute_frame(
         model, input, output,
@@ -14,7 +133,9 @@
     (void)model; (void)input; (void)output; (void)references;
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
- NRRResult BackendVulkan::load_reference(ReferenceImpl* reference) {
+}
+
+NRRResult BackendVulkan::load_reference(ReferenceImpl* reference) {
 #ifdef NRR_ENABLE_VULKAN
     if (!initialized_ || !reference) return NRR_ERROR_INVALID_ARGUMENT;
     loaded_references_.push_back(reference);
@@ -119,7 +240,7 @@ NRRResult BackendVulkan::select_physical_device(uint32_t* device_index) {
     uint32_t best_score = 0;
     uint32_t best_idx = 0;
     for (uint32_t i = 0; i < device_count; i++) {
-        uint32_t score = score_physical_device(devices[i]);
+        uint32_t score = score_physical_device(i);
         if (score > best_score) {
             best_score = score;
             best_idx = i;
@@ -275,8 +396,21 @@ void BackendVulkan::cleanup_vulkan() {
 // Device Scoring
 // ============================================================================
 
-uint32_t BackendVulkan::score_physical_device(VkPhysicalDevice device) {
+uint32_t BackendVulkan::score_physical_device(uint32_t device_index) {
 #ifdef NRR_ENABLE_VULKAN
+    /* By index rather than by handle: this signature has to compile where Vulkan does not exist,
+     * so it cannot take a VkPhysicalDevice. The caller has just enumerated the devices and knows
+     * the index. */
+    uint32_t device_count = 0;
+    if (vkEnumeratePhysicalDevices(instance_, &device_count, nullptr) != VK_SUCCESS ||
+        device_index >= device_count) {
+        return 0;
+    }
+    std::vector<VkPhysicalDevice> devices(device_count);
+    if (vkEnumeratePhysicalDevices(instance_, &device_count, devices.data()) != VK_SUCCESS) {
+        return 0;
+    }
+    VkPhysicalDevice device = devices[device_index];
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(device, &properties);
     VkPhysicalDeviceFeatures features;
@@ -300,9 +434,121 @@ uint32_t BackendVulkan::score_physical_device(VkPhysicalDevice device) {
     score += std::min(properties.limits.maxImageDimension2D / 1024, 16u);
     return score;
 #else
-    (void)device;
+    (void)device_index;
     return 0;
 #endif
+}
+
+// ============================================================================
+// Host-side resources
+// ============================================================================
+
+/* Textures and buffers are host allocations: the kernel reads and writes them through
+ * download_texture()/upload_texture(), exactly as it does for the CPU backend in
+ * tests/integration/test_path_parity.cpp. The Vulkan objects below are what the SDK branch uses
+ * for its own memory and presentation, not what the frame path needs. */
+
+NRRResult BackendVulkan::create_texture(const NRRTextureDesc& desc, void*& backend_texture) {
+    backend_texture = nullptr;
+    if (!initialized_) return NRR_ERROR_STATE_INVALID;
+    const size_t bytes = accel_texture_bytes(desc.width, desc.height, desc.format);
+    if (bytes == 0) return NRR_ERROR_INVALID_ARGUMENT;
+
+    HostTexture* tex = new HostTexture();
+    tex->width = desc.width;
+    tex->height = desc.height;
+    tex->format = desc.format;
+    tex->bytes.assign(bytes, 0);
+    textures_[tex] = tex;
+    backend_texture = tex;
+    return NRR_SUCCESS;
+}
+
+void BackendVulkan::destroy_texture(void* backend_texture) {
+    auto it = textures_.find(backend_texture);
+    if (it == textures_.end()) return;
+    delete it->second;
+    textures_.erase(it);
+}
+
+NRRResult BackendVulkan::upload_texture(void* backend_texture, const void* data, size_t size) {
+    auto it = textures_.find(backend_texture);
+    if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    HostTexture* tex = it->second;
+    if (size == 0 || size > tex->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
+    std::memcpy(tex->bytes.data(), data, size);
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::download_texture(void* backend_texture, void* data, size_t size) {
+    auto it = textures_.find(backend_texture);
+    if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    HostTexture* tex = it->second;
+    if (size == 0 || size > tex->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
+    std::memcpy(data, tex->bytes.data(), size);
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::create_buffer(const NRRBufferDesc& desc, void*& backend_buffer) {
+    backend_buffer = nullptr;
+    if (!initialized_ || desc.size == 0) return NRR_ERROR_INVALID_ARGUMENT;
+    HostBuffer* buffer = new HostBuffer();
+    buffer->bytes.assign(desc.size, 0);
+    buffers_[buffer] = buffer;
+    backend_buffer = buffer;
+    return NRR_SUCCESS;
+}
+
+void BackendVulkan::destroy_buffer(void* backend_buffer) {
+    auto it = buffers_.find(backend_buffer);
+    if (it == buffers_.end()) return;
+    delete it->second;
+    buffers_.erase(it);
+}
+
+NRRResult BackendVulkan::upload_buffer(void* backend_buffer, const void* data, size_t size,
+                                       size_t offset) {
+    auto it = buffers_.find(backend_buffer);
+    if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    HostBuffer* buffer = it->second;
+    if (size == 0 || offset + size > buffer->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
+    std::memcpy(buffer->bytes.data() + offset, data, size);
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::download_buffer(void* backend_buffer, void* data, size_t size,
+                                         size_t offset) {
+    auto it = buffers_.find(backend_buffer);
+    if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    HostBuffer* buffer = it->second;
+    if (size == 0 || offset + size > buffer->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
+    std::memcpy(data, buffer->bytes.data() + offset, size);
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::load_model(ModelImpl* model) {
+    if (!initialized_ || model == nullptr) return NRR_ERROR_STATE_INVALID;
+    if (std::find(loaded_models_.begin(), loaded_models_.end(), model) == loaded_models_.end()) {
+        loaded_models_.push_back(model);
+    }
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::unload_model(ModelImpl* model) {
+    if (model == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    loaded_models_.erase(std::remove(loaded_models_.begin(), loaded_models_.end(), model),
+                         loaded_models_.end());
+    return NRR_SUCCESS;
+}
+
+NRRResult BackendVulkan::reset_temporal_history() {
+    /* The history lives in the shared accelerator kernel, because that is where the frames run
+     * (see backend_vulkan.h). A reset that does not reach the accumulator that accumulated is
+     * exactly the defect the vendor backends' forwarding exists to prevent. */
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) return NRR_ERROR_STATE_INVALID;
+    kernel->reset_temporal_history();
+    return NRR_SUCCESS;
 }
 
 // ============================================================================

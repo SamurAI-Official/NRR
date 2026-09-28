@@ -243,6 +243,64 @@ somewhere worse than the field itself.
 Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
 through the public API, and the two source guards above run on every build.
 
+### M2 follow-up: both execution paths, for the whole suite (NRR_TEST_BACKEND)
+
+The parity harness compares the two paths on three frames of one model. Everything else in the
+suite still ran whichever path automatic selection picked, so a CUDA host exercised the accelerator
+path for 110 tests and CI exercised the CPU path for the same 110 - and neither ran both.
+`NRR_TEST_BACKEND` (`runtime/nrr_test_backend.{h,cpp}`) decides what an *automatic* choice resolves
+to, for a test run only:
+
+```
+NRR_TEST_BACKEND=auto     the default; nothing changes
+NRR_TEST_BACKEND=cpu      automatic selection resolves to the CPU backend, even on a CUDA host
+NRR_TEST_BACKEND=kernel   a CPU device executes its frames through
+                          AcceleratorExecutionKernel::execute_frame, with host-memory textures as
+                          the kernel's resources - so the accelerator path runs where there is no
+                          accelerator at all, which is every CI runner
+NRR_TEST_BACKEND=<name>   any registered backend name, as if preferred_backend had been set
+```
+
+It is read per frame rather than cached, so one process can switch routes and a test can exercise
+both. **Measured, 113 tests / 0 failures:** `auto` 113/113, `cpu` 113/113, `kernel` 113/113.
+
+The first `kernel` run failed one test - `test_temporal_reset_history_api`, "the frame after a reset
+sees an empty history - expected 0 but got 1" - because `BackendCPU::reset_temporal_history()` reset
+the accumulator that was *not* accumulating: on that route the history lives in the shared kernel.
+The same defect the vendor backends' forwarding exists to prevent, fixed the same way. CI now runs
+the whole suite both ways, in the CPU job and in the CUDA job.
+
+### M2 follow-up: the configuration nothing compiled, compiled
+
+`runtime/backend_vulkan.cpp` was **not a valid translation unit**. Its includes and its first eight
+methods were missing - the file began inside `execute_model` - it named an enum that does not exist
+(`AccelEp::VULKAN`), it was missing the closing brace of that method, and its header carried a
+second, older class definition *after* its own `#endif`. Nothing noticed, because the only switch
+that compiles it - `NRR_ENABLE_VULKAN` - needs the Vulkan SDK and is therefore ON only for mobile
+platforms: desktop CI never built the file, and the mobile configuration has been broken since the
+file was written.
+
+`NRR_ENABLE_VULKAN_STUB` (default ON) compiles that same file with the macro undefined, so the
+no-SDK branch is built by every build on every machine. The first compile found and fixed the
+defects above plus a stub `is_supported()` that would have made automatic selection prefer a backend
+with nothing behind it (`priority 50`, above the CPU backend). A CI step now builds the
+all-vendor/no-SDK-Vulkan configuration - `NRR_ENABLE_MOBILE_VENDOR=ON`, `NRR_ENABLE_NVIDIA=ON`,
+`NRR_ENABLE_RISCV=ON` - from scratch, via a new `-Define` argument on `tools/build.ps1`.
+
+**That configuration also found a capability claimed from a build flag.** All six mobile backends'
+`is_supported()` returned `true` whenever `NRR_ENABLE_MOBILE_VENDOR` was defined - a configuration
+fact, not a measurement - so with the flag on, a desktop host claimed Adreno, Mali, PowerVR, Apple,
+Xenos and Radeon support and then failed to initialise. They answer from the platform now
+(`NRR_PLATFORM_ANDROID`/`NRR_PLATFORM_IOS`), and the standard build is unaffected (113/113).
+
+**Recorded, not fixed:** six mobile-only tests still fail in that configuration -
+`test_adreno_backend_registration`, `test_mali_backend_registration`, `test_adreno_capabilities`,
+`test_mali_capabilities`, `test_mobile_texture_operations`, `test_mobile_buffer_operations` - because
+they assert the contract that was just removed: flag on means a device can be created. They test the
+defect. Making them right needs a per-GPU probe (`eglQueryString(GL_RENDERER)`) and the NDK, or a
+re-scoped assertion that says what a non-mobile host must do; that is why the CI step for this
+configuration *builds* rather than runs.
+
 ### M2 follow-up: `quality_metric` is measured, against a reference image
 
 `NRRRenderStats::quality_metric` held three different constants - `0.75f` on the CPU path, `0` on

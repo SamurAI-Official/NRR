@@ -37,7 +37,11 @@ param(
     [switch]$NoBuild,
 
     # Delete the build directory before configuring
-    [switch]$Clean
+    [switch]$Clean,
+
+    # Extra CMake cache options, e.g. -Define NRR_ENABLE_MOBILE_VENDOR=ON. Used to build the
+    # configurations that no other job builds (see the compile-coverage note in CMakeLists.txt).
+    [string[]]$Define = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -240,6 +244,7 @@ if (-not $NoConfigure) {
         '-DNRR_BUILD_TESTS=ON'
     )
     if ($Sanitize) { $configureArgs += '-DNRR_ENABLE_SANITIZERS=ON' }
+    foreach ($define in $Define) { $configureArgs += "-D$define" }
     if ($generator) { $configureArgs += @('-G', $generator, '-A', 'x64') }
 
     Write-Host "[build] configure: cmake $($configureArgs -join ' ')"

@@ -655,6 +655,46 @@ probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its o
 error rather than retrying on the CPU. Silently degrading a genuinely broken GPU is the worse
 failure mode for a rendering runtime, but the choice is a product decision rather than a bug
 fix and is left explicit here.
+### M2 follow-up: both execution paths, for the whole suite (`NRR_TEST_BACKEND`)
+
+The parity harness compares the two paths on three frames of one model; everything else in the suite
+ran whichever path automatic selection picked, so a CUDA host exercised the accelerator path for the
+whole suite and CI exercised the CPU path for the whole suite. `runtime/nrr_test_backend.{h,cpp}`
+adds a test-only override - `auto` (default), `cpu`, `kernel`, or any registered backend name - that
+decides what an *automatic* choice resolves to. `kernel` is the interesting one: a CPU device then
+executes its frames through `AcceleratorExecutionKernel::execute_frame` with host-memory textures as
+the kernel's resources, so the accelerator path runs on a machine with no accelerator at all. It is
+read per frame, so a process can switch routes mid-run.
+
+**Measured: `auto` 113/113, `cpu` 113/113, `kernel` 113/113.** The first `kernel` run failed
+`test_temporal_reset_history_api` - `BackendCPU::reset_temporal_history()` was resetting the
+accumulator that was not accumulating, because on that route the history lives in the shared kernel.
+Same defect family as the vendor backends' forwarding, fixed the same way. CI runs the whole suite
+both ways in the CPU job and the CUDA job now, so a divergence between the paths fails there instead
+of being discovered by a user.
+
+### M2 follow-up: the configuration nothing compiled, compiled
+
+`runtime/backend_vulkan.cpp` was not a valid translation unit: no includes, the first eight methods
+missing (the file began inside `execute_model`), its closing brace missing, an enum name that does
+not exist, and a header carrying a second, older class after its own `#endif`. Nothing caught it
+because `NRR_ENABLE_VULKAN` needs the SDK and is ON only for mobile, so *no* configuration compiled
+the file. `NRR_ENABLE_VULKAN_STUB` (default ON) compiles the same file with the macro undefined, so
+every build now checks it; a CI step builds the all-vendor/no-SDK-Vulkan configuration from scratch.
+
+**Turning on `NRR_ENABLE_MOBILE_VENDOR` on the host found a capability claimed from a build flag:**
+all six mobile backends' `is_supported()` returned `true` whenever that option was defined, so the
+host claimed Adreno/Mali/PowerVR/Apple/Xenos/Radeon support and then failed to initialise. They
+answer from the platform now, and the standard build is unaffected.
+
+**Recorded, not fixed:** six mobile-only tests assert the contract that was removed (flag on means a
+device can be created) - `test_adreno_backend_registration`, `test_mali_backend_registration`,
+`test_adreno_capabilities`, `test_mali_capabilities`, `test_mobile_texture_operations`,
+`test_mobile_buffer_operations` - so the CI step for that configuration builds rather than runs. What
+would make them right is a per-GPU probe (`eglQueryString(GL_RENDERER)`) with the NDK, or an
+assertion re-scoped to what a non-mobile host must do; both need a device or a toolchain this
+repository still does not have.
+
 ### M2 follow-up: `quality_metric` is measured now, against a reference image
 
 The follow-up to the parity harness's first finding. `NRRRenderStats::quality_metric` held three

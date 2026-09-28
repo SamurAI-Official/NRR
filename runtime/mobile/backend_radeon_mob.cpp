@@ -45,7 +45,8 @@ void BackendRadeonMob::shutdown() { initialized_ = false; }
 const NRRCapabilities& BackendRadeonMob::get_capabilities() const { return caps_; }
 
 bool BackendRadeonMob::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_MOBILE_VENDOR
+    /* Platform, not build option - see the note in backend_adreno.cpp. */
+#if defined(NRR_PLATFORM_ANDROID) || defined(NRR_PLATFORM_IOS)
     return true;
 #else
     return false;

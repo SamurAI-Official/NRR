@@ -44,7 +44,8 @@ void BackendPVR::shutdown() { initialized_ = false; }
 const NRRCapabilities& BackendPVR::get_capabilities() const { return caps_; }
 
 bool BackendPVR::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_MOBILE_VENDOR
+    /* Platform, not build option - see the note in backend_adreno.cpp. */
+#if defined(NRR_PLATFORM_ANDROID) || defined(NRR_PLATFORM_IOS)
     return true;
 #else
     return false;

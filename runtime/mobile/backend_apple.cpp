@@ -65,7 +65,8 @@ const std::string& BackendApple::get_name() const { return name_; }
 const AppleCapabilities& BackendApple::get_apple_capabilities() const { return apple_caps_; }
 
 bool BackendApple::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_MOBILE_VENDOR
+    /* Platform, not build option - see the note in backend_adreno.cpp. */
+#if defined(NRR_PLATFORM_IOS)
     return true;
 #else
     return false;

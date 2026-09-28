@@ -6,6 +6,7 @@
  */
 
 #include "nrr_backend.h"
+#include "nrr_test_backend.h"
 #include "backend_cpu.h"
 /* The desktop accelerator backends are registered unconditionally: their
  * is_supported() probes for real hardware (NVIDIA through the driver ABI, see
@@ -99,6 +100,30 @@ std::unique_ptr<Backend> select_best_backend(const NRRDeviceOptions& options) {
 
         // Preferred backend not found - if force_backend is set, fail
         if (options.force_backend) {
+            return nullptr;
+        }
+    }
+
+    /* Test-only: NRR_TEST_BACKEND decides what an *automatic* choice resolves to, so one suite can
+     * be run against either execution path without editing a single test (see
+     * nrr_test_backend.h). It is applied here, where the automatic choice is made, and only when
+     * the caller made no choice of its own. "kernel" resolves to the CPU backend because that is
+     * the backend whose execute_model takes the kernel test route; a name that is not registered
+     * in this build fails rather than silently running a different path than the caller asked
+     * for. */
+    if (!options.preferred_backend) {
+        std::string wanted = to_lower(std::string(test_backend_override()));
+        if (wanted == "kernel") wanted = "cpu";
+        if (!wanted.empty() && wanted != "auto") {
+            for (auto& info : registry) {
+                if (to_lower(std::string(info.name)).find(wanted) == std::string::npos) {
+                    continue;
+                }
+                if (!info.is_supported(options)) {
+                    return nullptr;
+                }
+                return info.create(options);
+            }
             return nullptr;
         }
     }

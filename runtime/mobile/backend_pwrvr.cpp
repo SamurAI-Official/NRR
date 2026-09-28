@@ -52,7 +52,8 @@ const std::string& BackendPWRVR::get_name() const { return name_; }
 const PWRVRCapabilities& BackendPWRVR::get_pwrvr_capabilities() const { return pwrvr_caps_; }
 
 bool BackendPWRVR::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_MOBILE_VENDOR
+    /* Platform, not build option - see the note in backend_adreno.cpp. */
+#if defined(NRR_PLATFORM_ANDROID) || defined(NRR_PLATFORM_IOS)
     return true;
 #else
     return false;

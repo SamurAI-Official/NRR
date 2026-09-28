@@ -85,6 +85,22 @@ if(NRR_ENABLE_MOBILE_VENDOR)
     add_compile_definitions(NRR_ENABLE_MOBILE_VENDOR=1)
 endif()
 
+# ---------------------------------------------------------------------------
+# Compiling the configuration nothing compiles
+#
+# NRR_ENABLE_VULKAN needs the Vulkan SDK and is therefore ON only for mobile platforms, which
+# meant runtime/backend_vulkan.cpp was compiled by *nothing* - and it is not a valid translation
+# unit (its includes and first eight methods were missing, and it named an enum that does not
+# exist). A source that no configuration compiles is a source that is only reviewed, never
+# checked. This option compiles the same file with NRR_ENABLE_VULKAN undefined, i.e. its stub
+# branch, on every machine, and is ON for desktop too; a real Vulkan build still needs the SDK
+# and the platform toolchain (see docs/roadmap.md).
+# ---------------------------------------------------------------------------
+option(NRR_ENABLE_VULKAN_STUB "Compile the Vulkan backend in its no-SDK (stub) configuration" ON)
+if(NRR_ENABLE_VULKAN_STUB AND NOT NRR_ENABLE_VULKAN)
+    message(STATUS "Vulkan backend: compiled in its no-SDK (stub) configuration")
+endif()
+
 # Desktop/embedded vendor backends: compiled unconditionally into the runtime
 # (inert stubs) and *activated* (registry registration, EP selection, HIP/CUDA
 # device paths) only when the corresponding option is enabled.
@@ -299,6 +315,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_reference_impl.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_quality.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_test_backend.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_cuda_driver.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
@@ -328,6 +345,12 @@ if(NRR_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
     include_directories(${Vulkan_INCLUDE_DIRS})
     link_directories(${Vulkan_LIBRARY_DIRS})
+elseif(NRR_ENABLE_VULKAN_STUB)
+    # Same source, no SDK: the stub branch is what gets compiled, so the file is checked rather
+    # than merely present.
+    list(APPEND NRR_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
+    )
 endif()
 
 # Desktop/embedded vendor backends are compiled unconditionally (like the

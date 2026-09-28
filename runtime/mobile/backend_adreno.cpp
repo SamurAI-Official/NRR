@@ -66,7 +66,10 @@ const NRRCapabilities& BackendAdreno::get_capabilities() const { return capabili
 const std::string& BackendAdreno::get_name() const { return name_; }
 
 bool BackendAdreno::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_MOBILE_VENDOR
+    /* The platform decides, not the build option: "NRR_ENABLE_MOBILE_VENDOR is defined" is a
+     * configuration fact, not a capability. A per-GPU probe (eglQueryString(GL_RENDERER)) is the
+     * real answer and needs the NDK - see docs/roadmap.md. */
+#if defined(NRR_PLATFORM_ANDROID) || defined(NRR_PLATFORM_IOS)
     return true;
 #else
     return false;

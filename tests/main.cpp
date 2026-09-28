@@ -19,6 +19,7 @@
 #include "unit/test_engine_plugins.cpp"
 #include "unit/test_gpu_ep.cpp"
 #include "unit/test_quality_metric.cpp"
+#include "unit/test_backend_override.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
 #include "mobile/test_ios.cpp"
@@ -195,6 +196,13 @@ void run_all_tests() {
     NRR_RUN_TEST(test_quality_is_unmeasured_when_the_target_resolution_differs);
     NRR_RUN_TEST(test_quality_measures_the_target_the_reference_carries);
     NRR_RUN_TEST(test_quality_reference_frame_is_decoded_from_the_reference_file);
+
+    std::cout << "\n--- Execution Path Coverage (NRR_TEST_BACKEND) ---\n";
+    /* Both execution paths in one environment: the override decides what automatic selection
+     * resolves to, and "kernel" makes a CPU device execute through the accelerator kernel. */
+    NRR_RUN_TEST(test_test_backend_override_parsing);
+    NRR_RUN_TEST(test_test_backend_override_forces_the_backend);
+    NRR_RUN_TEST(test_test_backend_override_kernel_route_is_the_accelerator_path);
     
     std::cout << "\n--- Engine Plugin Tests ---\n";
     /* Source-level drift guards for engine_plugins/. They read the addon files
