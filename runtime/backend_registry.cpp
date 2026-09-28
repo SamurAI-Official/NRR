@@ -168,11 +168,29 @@ static struct CpuBackendRegistrar {
     }
 } g_cpu_backend_registrar;
 
-/* Registered unconditionally. is_supported() probes for a real CUDA device through
- * the driver ABI, so auto-selection still lands on the CPU backend on a machine
- * without NVIDIA hardware - the registry does not have to know that at compile
- * time. Previously this registrar existed only under NRR_ENABLE_NVIDIA, which is
- * off by default, so the backend was unreachable in every default build (C1). */
+/* Registered unless this build has an ONNX Runtime but no CUDA provider for it: that is the case
+ * where auto-selection could report "NVIDIA" for a backend whose frames execute on the CPU
+ * provider - the "loadable without usable" trap this repository has already been bitten by once
+ * (the M2 CUDA-gate follow-up). NRR_HAVE_CUDA_EP is set exactly when the CUDA provider's runtime
+ * is present, so:
+ *
+ *   ORT + CUDA provider      registered, and it accelerates for real
+ *   ORT + no CUDA provider   not registered (e.g. the CPU-flavour CI job)
+ *   no ORT at all            registered: there is no execution provider to be misled about, the
+ *                            frames are passthrough either way, and this is the only path that
+ *                            still produces measured temporal state and an output texture - the
+ *                            CPU placeholder path fabricates stats and allocates nothing
+ *
+ * It also matters to consumers that own their own source list: ShugoCore's Android build (ORT
+ * present, no CUDA provider) compiles our sources directly, and an unconditional reference would
+ * make it ship backend_nvidia.cpp *and* nrr_cuda_driver.cpp. NVIDIA was the only vendor registered
+ * without a guard; AMD/Intel/RISC-V/Apple are gated on their own options.
+ *
+ * is_supported() still probes for a real CUDA device through the driver ABI, so a machine with a
+ * GPU but no runtime does not select it either. (This registrar once existed only under
+ * NRR_ENABLE_NVIDIA, which is off by default, so the backend was unreachable in every default
+ * build - C1.) */
+#if defined(NRR_HAVE_CUDA_EP) || !defined(NRR_HAVE_ONNXRUNTIME)
 static struct NvidiaBackendRegistrar {
     NvidiaBackendRegistrar() {
         register_backend({
@@ -183,6 +201,7 @@ static struct NvidiaBackendRegistrar {
         });
     }
 } g_nvidia_backend_registrar;
+#endif
 
 #ifdef NRR_ENABLE_AMD
 static struct AmdBackendRegistrar {

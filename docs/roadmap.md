@@ -655,6 +655,56 @@ probe, so a device-less host cannot claim CUDA even if ONNX Runtime defers its o
 error rather than retrying on the CPU. Silently degrading a genuinely broken GPU is the worse
 failure mode for a rendering runtime, but the choice is a product decision rather than a bug
 fix and is left explicit here.
+### M2 follow-up: the mobile execution provider is measured too
+
+`MobileExecutionKernel` set `active_ep_name_ = "NNAPI"`, `supports_nnapi = true` and
+`supports_nnapi_decoupled = true` from the *request*, then asked ONNX Runtime for `nnapi` - which no
+Windows, Linux or stock Android session provides - so the session ran on the CPU provider while the
+kernel advertised NNAPI. ShugoCore's Android port documented exactly this ("requests nnapi then sets
+supports_nnapi = true, but the session silently runs on the default CPU provider - so ShugoCore must
+not advertise NNAPI"). It is the same defect the desktop kernel had, and it now has the same cure:
+`select_best_execution_provider()` records the request in `requested_ep_name_`, and
+`apply_measured_provider()` folds `ONNXRuntime::active_provider()` of the session that actually ran
+into the claims, called from `load_model()`, `execute_frame()`, `unload_model()` and `shutdown()`.
+With no session, nothing is claimed. `supports_fp16` remains configured policy (documented in
+`mobile_kernel.h`), not a capability; the public `NRRCapabilities::fp16` stays ABSENT.
+
+Pinned by `test_mobile_provider_is_measured_not_requested`, which requests NNAPI, checks that a
+request alone claims nothing, then loads a session and checks that the reported provider is the
+measured one and that NNAPI/Core ML are not claimed on a host that has neither.
+
+### M2 follow-up: NVIDIA is registered only where it can accelerate
+
+The NVIDIA registrar was the one vendor registration with no guard, which had two consequences: a
+build without the ONNX Runtime CUDA provider could have auto-selection report "NVIDIA" for a backend
+executing on the CPU provider, and every consumer that owns its own source list had to compile
+`backend_nvidia.cpp` *and* `nrr_cuda_driver.cpp` to satisfy the reference. It is now gated on
+`NRR_HAVE_CUDA_EP`, which CMake sets exactly when the CUDA provider's runtime is present - so
+ShugoCore's Android build no longer has to ship those two sources on re-pin. Verified both ways: the
+CUDA build still auto-selects `NVIDIA` (114/114, byte-identical frames against the CPU path), and a
+CPU-EP-only ORT SDK builds 113/113 with auto-selection on `CPU`.
+
+### Re-pin checklist for ShugoCore (external consumer, pinned at `6c977e2`)
+
+ShugoCore compiles this runtime for Android from its own CMake source list and consumes the C ABI, so
+the pin is a real contract. Its own structural tests (58, all green at the pin) cover the wiring;
+these are the items a re-pin to the current commit has to carry:
+
+| # | Item | Why |
+| --- | --- | --- |
+| 1 | Add `runtime/nrr_quality.cpp`, `runtime/nrr_test_backend.cpp`, `runtime/accel_kernel.cpp` to its `NRR_SOURCES` | `backend_cpu.cpp`, `backend_registry.cpp` and `nrr_reference_impl.cpp` reference symbols defined there (verified by grep, not by inference); without them the Android link fails |
+| 2 | `NRR_ENTRY_POINT_COUNT` 43 -> 44 | The C API grew an entry point; nothing in ShugoCore asserts the count |
+| 3 | `NRRCapabilities::fp16_hardware` appended | An output struct field added at the end: a consumer that *mirrors* the struct must add it or the library writes past the end of its copy. ShugoCore's Python layer exchanges mesh messages rather than mirroring the struct, so it is unaffected |
+| 4 | `quality_metric` semantics | Now SSIM in [0,1] against a `reference_frame` image from the reference set; `0.0` means *unmeasured*, not "bad". `memory_used_mb` is now non-zero on the accelerator path |
+| 5 | Retire `patches/nrr/*.patch` in the same commit as the re-pin | Both are upstream now: the portability hunks (power-manager `extern "C"`, `ORTCHAR_T`, apple declarations/ObjC guard, vendor priorities) and the Godot `plugin.cfg` INI descriptor. `scripts/apply_nrr_patches.sh` treats a patch that stops applying as a hard error, so they must go together |
+| 6 | Update the stale rationale in `test_onnxruntime_is_a_hard_requirement` | It explains itself with "upstream's ORT-less path does not compile"; that is fixed here (the ORT-less flavour configures, compiles and runs) |
+
+Still not verified here: the Android target itself. No NDK or Vulkan SDK is present in this
+repository, so `runtime/platform/android/nrr_android.cpp` and the Vulkan-enabled branch are compiled
+by no job of ours; the device-side evidence is ShugoCore's `nrr_probe` run (Galaxy A51, CPU EP,
+`failures: 0`). What our compile-coverage configuration does establish is that the shared sources its
+list draws from compile in a configuration any machine can produce.
+
 ### M2 follow-up: both execution paths, for the whole suite (`NRR_TEST_BACKEND`)
 
 The parity harness compares the two paths on three frames of one model; everything else in the suite

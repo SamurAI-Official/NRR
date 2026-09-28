@@ -158,6 +158,81 @@ NRR_TEST(test_mobile_kernel_execute_frame) {
 
 // Platform-agnostic mobile constraint tests
 
+#ifndef NRR_SAMPLE_MODEL
+#define NRR_SAMPLE_MODEL "models/nrr_upscaler_v0.1.onnx"
+#endif
+
+NRR_TEST(test_mobile_provider_is_measured_not_requested) {
+    /* Requesting an execution provider is not evidence that it ran. This kernel used to set
+     * active_ep_name_ = "NNAPI" and supports_nnapi = true from the request alone, while the
+     * session fell back to the CPU provider - which is why ShugoCore's Android port documents
+     * "must not advertise NNAPI until the EP is genuinely appended". The claims are measured now,
+     * from the session that actually ran (runtime/mobile/mobile_kernel.cpp
+     * apply_measured_provider). */
+    MobileExecutionKernel* kernel = get_mobile_kernel();
+    NRR_EXPECT_TRUE(kernel != nullptr, "mobile kernel handle");
+    if (kernel == nullptr) return;
+
+    /* Known state: this singleton may already be initialized by an earlier test, and
+     * initialize() keeps the settings of whoever got there first. */
+    kernel->shutdown();
+    NRR_EXPECT_TRUE(kernel->initialize(MobileEP::NNAPI, 256u * 1024u * 1024u,
+                                       false /* fp16 */, false /* quantized */,
+                                       true /* cpu fallback */),
+                    "the kernel initializes for a NNAPI request");
+
+    /* No session yet: the request claims nothing. */
+    NRR_EXPECT_FALSE(kernel->get_capabilities().supports_nnapi,
+                     "a NNAPI request with no session is not a NNAPI capability");
+    NRR_EXPECT_FALSE(kernel->get_capabilities().supports_nnapi_decoupled,
+                     "and the decoupled claim is not set either");
+    NRR_EXPECT_FALSE(kernel->get_capabilities().supports_core_ml,
+                     "nor is Core ML claimed from a NNAPI request");
+    NRR_EXPECT_TRUE(kernel->get_active_ep_name().empty(),
+                    "with no session there is no provider to report");
+
+#ifndef NRR_HAVE_ONNXRUNTIME
+    std::cout << "  no ONNX Runtime in this build: there is no session to measure, skipping "
+                 "the session half" << std::endl;
+    kernel->shutdown();
+    return;
+#else
+    /* Load a real session, so the provider becomes measurable. */
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRRModel* model = nullptr;
+    NRR_EXPECT_EQ(nrr_device_create(&options, &device), NRR_SUCCESS, "device creation");
+    NRR_EXPECT_EQ(nrr_model_load(device, NRR_SAMPLE_MODEL, &model), NRR_SUCCESS,
+                  "sample model load");
+    NRR_ASSERT(device != nullptr && model != nullptr, "a device and the sample model");
+    NRR_EXPECT_TRUE(kernel->load_model(reinterpret_cast<ModelImpl*>(model)),
+                    "the kernel loads the model session");
+
+    const std::string measured = kernel->get_active_ep_name();
+    NRR_EXPECT_FALSE(measured.empty(), "a loaded session reports the provider it runs on");
+    NRR_EXPECT_TRUE(measured != "NNAPI" && measured != "CoreML",
+                    "the reported provider is the measured one, not the request (got '" +
+                        measured + "')");
+
+    /* NNAPI and Core ML are Android/iOS execution providers; no Windows or Linux ONNX Runtime
+     * ships either, so on this host the honest answer is "not supported" - and the kernel must
+     * say so even though NNAPI was requested. */
+    NRR_EXPECT_FALSE(kernel->get_capabilities().supports_nnapi,
+                     "no NNAPI provider exists in this build, so none is claimed");
+    NRR_EXPECT_FALSE(kernel->get_capabilities().supports_core_ml,
+                     "no Core ML provider exists in this build either");
+
+    /* Unloading removes the session, so the measurement goes with it. */
+    kernel->unload_model(reinterpret_cast<ModelImpl*>(model));
+    NRR_EXPECT_TRUE(kernel->get_active_ep_name().empty(),
+                    "with the session gone there is nothing truthful to report");
+
+    nrr_model_unload(model);
+    nrr_device_destroy(device);
+    kernel->shutdown();
+#endif
+}
+
 NRR_TEST(test_device_options_zero_init) {
     NRRDeviceOptions opts = {};
     NRR_EXPECT_TRUE(opts.force_backend == 0, "NRRDeviceOptions zero-initialized");

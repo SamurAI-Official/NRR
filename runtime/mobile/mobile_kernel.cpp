@@ -57,9 +57,11 @@ bool MobileExecutionKernel::initialize(
         onnx_.reset();
         return false;
     }
-    mobile_caps_.preferred_ep = preferred_ep_;
+    mobile_caps_.preferred_ep = MobileEP::CPU;
     apply_mobile_optimizations();
     select_best_execution_provider();
+    /* No session yet, so nothing is claimed and active_ep_name_ stays empty. */
+    refresh_provider_state();
     initialized_ = true;
     return true;
 }
@@ -77,6 +79,8 @@ void MobileExecutionKernel::shutdown() {
     peak_memory_usage_ = 0;
     current_memory_usage_bytes_ = 0;
     peak_memory_usage_bytes_ = 0;
+    /* The session is gone, so the provider measurement goes with it. */
+    refresh_provider_state();
     initialized_ = false;
 }
 
@@ -93,12 +97,16 @@ bool MobileExecutionKernel::load_model(ModelImpl* model) {
    if (!onnx_) return false;
    if (!onnx_->load_model(path)) return false;
    active_model_ = model;
+   /* The session exists, so the execution provider is finally measurable - and only now is
+    * anything claimed about it. */
+   refresh_provider_state();
    return true;
 }
 
 void MobileExecutionKernel::unload_model(ModelImpl* /*model*/) {
    if (onnx_) onnx_->unload_model();
    active_model_ = nullptr;
+   refresh_provider_state();
 }
 bool MobileExecutionKernel::execute_model(
     ModelImpl* model, std::vector<float>& input_data,
@@ -165,6 +173,7 @@ NRRResult MobileExecutionKernel::execute_frame(
     bool ok = false;
     std::vector<float> out;
     ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
+    ONNXRuntime* used_rt = nullptr;
 
     auto run_session = [&](ONNXRuntime* rt) {
         std::vector<TensorInput> tins;
@@ -179,6 +188,7 @@ NRRResult MobileExecutionKernel::execute_frame(
         if (!rt->run_inference_multi(tins, o, os)) return false;
         out = std::move(o);
         out_shape = std::move(os);
+        used_rt = rt;
         return true;
     };
 
@@ -190,6 +200,9 @@ NRRResult MobileExecutionKernel::execute_frame(
         if (!onnx_->is_loaded()) ok = load_model(model);
         if (ok) ok = run_session(onnx_.get());
     }
+    /* Record where the frame actually ran, measured from the session that ran it - a request for
+     * NNAPI must not become an NNAPI claim when the session fell back to the CPU provider. */
+    if (used_rt != nullptr) apply_measured_provider(used_rt->active_provider());
     if (!ok) {
         out.assign(nchw.begin(), nchw.end());
         out_shape = in_shape;
@@ -256,6 +269,10 @@ void MobileExecutionKernel::reset_peak_memory() {
 
 bool MobileExecutionKernel::apply_mobile_optimizations() {
     if (!onnx_) return false;
+    /* Configured policy, not measured capability: use_fp16 is what the caller asked the kernel to
+     * prefer. The capability fields (supports_nnapi / supports_core_ml / preferred_ep) are
+     * measured from the session instead - see apply_measured_provider - and the public
+     * NRRCapabilities::fp16 field stays ABSENT everywhere. */
     mobile_caps_.supports_fp16 = mem_config_.use_fp16;
     mobile_caps_.use_fp16_decoupled = mem_config_.use_fp16;
     mobile_caps_.use_quantized_decoupled = mem_config_.use_quantized;
@@ -265,35 +282,77 @@ bool MobileExecutionKernel::apply_mobile_optimizations() {
 
 bool MobileExecutionKernel::select_best_execution_provider() {
 #ifdef NRR_HAVE_ONNXRUNTIME
+    /* Records the REQUEST only. Which provider the runtime offers and which one the session ends
+     * up on are measured later, from the session itself (apply_measured_provider), because a
+     * request is not an attachment - the defect this file used to have and the one ShugoCore's
+     * Android port documented as a reason not to advertise NNAPI at all. The ONNX Runtime layer
+     * already refuses to pretend: an unknown provider name falls back to the CPU EP and records
+     * ONNXRuntime::provider_note() saying so. */
     switch (preferred_ep_) {
         case MobileEP::NNAPI:
-            active_ep_name_ = "NNAPI";
-            mobile_caps_.supports_nnapi = true;
-            mobile_caps_.supports_nnapi_decoupled = true;
-            mobile_caps_.supports_core_ml = false;
-            mobile_caps_.supports_core_ml_decoupled = false;
+            requested_ep_name_ = "nnapi";
             onnx_->set_execution_provider("nnapi");
             return true;
         case MobileEP::CORE_ML:
-            active_ep_name_ = "CoreML";
-            mobile_caps_.supports_core_ml = true;
-            mobile_caps_.supports_core_ml_decoupled = true;
-            mobile_caps_.supports_nnapi = false;
-            mobile_caps_.supports_nnapi_decoupled = false;
+            requested_ep_name_ = "coreml";
             onnx_->set_execution_provider("coreml");
             return true;
         case MobileEP::CPU:
         default:
-            active_ep_name_ = "CPU";
-            mobile_caps_.supports_nnapi = false;
-            mobile_caps_.supports_core_ml = false;
+            requested_ep_name_ = "cpu";
             onnx_->set_execution_provider("cpu");
             return true;
     }
 #else
-    active_ep_name_ = "CPU (no ORT)";
+    requested_ep_name_ = "cpu";
     return true;
 #endif
+}
+
+void MobileExecutionKernel::apply_measured_provider(const std::string& measured) {
+    if (measured == active_ep_name_) return; /* unchanged: nothing to redo */
+    active_ep_name_ = measured;
+
+    if (measured.empty()) {
+        /* No session exists, so nothing has landed anywhere and nothing may be claimed. */
+        mobile_caps_.preferred_ep = MobileEP::CPU;
+        mobile_caps_.supports_nnapi = false;
+        mobile_caps_.supports_nnapi_decoupled = false;
+        mobile_caps_.supports_core_ml = false;
+        mobile_caps_.supports_core_ml_decoupled = false;
+        return;
+    }
+
+    const bool nnapi = (measured == "NnapiExecutionProvider");
+    const bool core_ml = (measured == "CoreMLExecutionProvider");
+    mobile_caps_.supports_nnapi = nnapi;
+    mobile_caps_.supports_nnapi_decoupled = nnapi;
+    mobile_caps_.supports_core_ml = core_ml;
+    mobile_caps_.supports_core_ml_decoupled = core_ml;
+
+    /* preferred_ep reports where execution LANDED, not where it was aimed. */
+    mobile_caps_.preferred_ep = nnapi ? MobileEP::NNAPI
+                                       : (core_ml ? MobileEP::CORE_ML : MobileEP::CPU);
+}
+
+void MobileExecutionKernel::refresh_provider_state() {
+    /* execute_frame() runs the model's OWN session when it has one, so that - not this kernel's
+     * fallback session - is the provider a caller cares about. */
+    if (active_model_) {
+        ModelONNX* monx = dynamic_cast<ModelONNX*>(active_model_);
+        if (monx) {
+            ONNXRuntime* rt = monx->get_onnx_runtime();
+            if (rt && rt->is_loaded()) {
+                apply_measured_provider(rt->active_provider());
+                return;
+            }
+        }
+    }
+    if (onnx_ && onnx_->is_loaded()) {
+        apply_measured_provider(onnx_->active_provider());
+        return;
+    }
+    apply_measured_provider(std::string());
 }
 
 // Global kernel instance (one per process)

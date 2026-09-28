@@ -243,6 +243,45 @@ somewhere worse than the field itself.
 Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
 through the public API, and the two source guards above run on every build.
 
+### M2 follow-up: the mobile execution provider is measured too, and NVIDIA is registered only where it can accelerate
+
+Two changes on the path an external consumer compiles: ShugoCore's Android port builds this runtime
+directly and runs `nrr_render` on a device.
+
+**`MobileExecutionKernel` claimed NNAPI and Core ML from the request.** `select_best_execution_provider()`
+set `active_ep_name_ = "NNAPI"`, `supports_nnapi = true` and `supports_nnapi_decoupled = true`, and
+then asked ONNX Runtime for `nnapi` - which no Windows, Linux or stock Android session provides, so
+the session ran on the CPU provider while the kernel advertised NNAPI. ShugoCore documented exactly
+that as the reason it cannot advertise NNAPI. It is the defect the desktop kernel had (WS5/WS0),
+fixed the same way: the selector now records the *request* (`requested_ep_name_`), and a new
+`apply_measured_provider()` folds `ONNXRuntime::active_provider()` of the session that actually ran
+into `active_ep_name_`, `supports_nnapi`/`supports_core_ml` (and their decoupled fields) and
+`preferred_ep`. It is called after `load_model()`, at the top of `execute_frame()` and on
+unload/shutdown, so a claim cannot outlive its session; with no session nothing is claimed and
+`active_ep_name_` is empty. `supports_fp16` stays what it always was - configured policy, like the
+desktop kernel's - and the public `NRRCapabilities::fp16` stays ABSENT.
+
+**Measured:** `tests/unit/test_mobile.cpp::test_mobile_provider_is_measured_not_requested` requests
+NNAPI, asserts nothing is claimed before a session exists, then loads a real session and asserts the
+reported provider is the measured one (not `"NNAPI"`) and that `supports_nnapi`/`supports_core_ml`
+are false on a host whose ONNX Runtime has neither - i.e. every Windows and Linux build. Against the
+previous code those assertions fail, because it set both from the request.
+
+**NVIDIA is registered only where the build can accelerate through it.** The registrar was
+unconditional, so a build without the ONNX Runtime CUDA provider could let auto-selection report
+`"NVIDIA"` for a backend executing on the CPU provider - and any consumer that owns its own source
+list has to ship `backend_nvidia.cpp` *and* `nrr_cuda_driver.cpp` to satisfy the reference
+(ShugoCore's Android build owns its list; that is how the requirement surfaced). It is gated on
+`NRR_HAVE_CUDA_EP`, which CMake sets exactly when the CUDA provider's runtime is present.
+**Measured both ways:** the CUDA build still resolves auto-selection to `NVIDIA` and runs 114/114
+with byte-identical frames; a CPU-EP-only ORT SDK builds 113/113 with auto-selection on `CPU`.
+
+**For ShugoCore's re-pin** (recorded in `docs/roadmap.md` and the README consumer table): three
+runtime sources to add to its `NRR_SOURCES` (`nrr_quality.cpp`, `nrr_test_backend.cpp`,
+`accel_kernel.cpp`), `NRR_ENTRY_POINT_COUNT` 43 -> 44, `NRRCapabilities::fp16_hardware` appended,
+and `quality_metric` now meaning SSIM (0.0 = unmeasured) with `memory_used_mb` non-zero on the
+accelerator path.
+
 ### M2 follow-up: both execution paths, for the whole suite (NRR_TEST_BACKEND)
 
 The parity harness compares the two paths on three frames of one model. Everything else in the

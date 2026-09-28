@@ -144,6 +144,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_caps_name_buffer_size);
     NRR_RUN_TEST(test_mobile_texture_format_support);
     NRR_RUN_TEST(test_mobile_kernel_execute_frame);
+    NRR_RUN_TEST(test_mobile_provider_is_measured_not_requested);
 
     std::cout << "\n--- Accelerator Vendor Tests ---\n";
     NRR_RUN_TEST(test_accel_kernel_execute_frame);

@@ -111,7 +111,18 @@ public:
         const std::function<NRRResult(void*, void*, std::size_t)>& download,
         const std::function<NRRResult(void*, const void*, std::size_t)>& upload);
 
+    /* Capability claims + the provider execution landed on. Both are measured: `active_ep_name_`
+     * and `supports_nnapi`/`supports_core_ml` come from the session that actually ran, never from
+     * the request (see apply_measured_provider below).
+     *
+     * supports_fp16 is the exception and deliberately so: it is CONFIGURED POLICY - what
+     * MobileMemoryConfig::use_fp16 asked for - exactly like
+     * AcceleratorExecutionKernel::apply_accel_optimizations(), and it is not a measured hardware
+     * or execution fact. The public NRRCapabilities::fp16 field stays ABSENT everywhere; see
+     * specification/capability_matrix.md. */
     const MobileCapabilities& get_capabilities() const { return mobile_caps_; }
+    /* Where execution LANDED, verbatim from the session that ran it. EMPTY until a session
+     * exists: before ONNX Runtime has chosen a provider there is nothing truthful to report. */
     const std::string& get_active_ep_name() const { return active_ep_name_; }
     size_t get_current_memory_usage() const;
     size_t get_peak_memory_usage() const;
@@ -129,12 +140,25 @@ public:
 private:
     bool apply_mobile_optimizations();
     bool select_best_execution_provider();
+    /* Folds a MEASURED execution provider name into active_ep_name_ and the capability claims.
+     * `measured` must come from ONNXRuntime::active_provider() of the session that actually ran -
+     * never from the request. An empty name means no session exists, and then nothing is claimed:
+     * "the caller asked for NNAPI" is not evidence that NNAPI ran. This is the treatment
+     * AcceleratorExecutionKernel got first (runtime/accel_kernel.cpp apply_measured_provider),
+     * and it is exactly why ShugoCore's Android port documents "must not advertise NNAPI": its
+     * probe observed the old behaviour, where the kernel requested nnapi, claimed
+     * supports_nnapi, and the session silently ran on the CPU provider. */
+    void apply_measured_provider(const std::string& measured);
+    /* Re-reads the provider of whichever session exists (the model's own, or this kernel's
+     * fallback), so a claim is never left behind by a session that has gone away. */
+    void refresh_provider_state();
 
     bool                 initialized_;
     MobileCapabilities   mobile_caps_;
     MobileMemoryConfig   mem_config_;
-    MobileEP             preferred_ep_;
-    std::string          active_ep_name_;
+    MobileEP             preferred_ep_;      /* the REQUEST */
+    std::string          requested_ep_name_; /* the request, verbatim */
+    std::string          active_ep_name_;    /* where execution LANDED; empty until measured */
     std::unique_ptr<ONNXRuntime> onnx_;
 
     ModelImpl*           active_model_;
