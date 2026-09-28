@@ -796,6 +796,13 @@ and then verifies the artefact against the build log's own record of the toolcha
 Vulkan library, and against `llvm-ar t` for the four translation units that only exist in this
 configuration. A red result means the Android path rotted again, which is what no job could say before.
 
+**Verified in CI on the commit that added it** (`88ab177`): the `android-ndk` job succeeded on its
+first run, with a cold cache - NDK fetched, AAR fetched, configure (`ONNX Runtime: ... Android
+arm64-v8a`, `Vulkan: ... (NDK sysroot, arm64-v8a)`, `Vulkan Backend: ON`), cross-build, and all four
+artefact checks. The other three jobs (`ORT CPU EP`, `CUDA ONNX Runtime`, `AddressSanitizer`) were
+green on that commit too, so the CMake and `onnx_runtime.cpp` changes are checked against every
+existing configuration as well.
+
 **Recorded as still uncovered:** running on a device or emulator. An emulator image is a separate
 ~1.5 GB download and needs WHPX; the device-side evidence remains the consumer's `nrr_probe` run, and
 the six mobile-only tests that assert the removed contract (above) still cannot run on a host.

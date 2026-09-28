@@ -293,7 +293,9 @@ exactly those four undefined symbols, which is why the target here is `nrr_stati
 
 **CI:** a new job (`Windows x64 - Android cross-build (NDK r27, arm64-v8a)`) caches the NDK and the
 AAR, cross-builds, and verifies the artifact against the log's own record of the toolchain and
-options - so "the Android configuration compiles" is checked on every push rather than assumed.
+options - so "the Android configuration compiles" is checked on every push rather than assumed. It
+succeeded on its first run, with a cold cache, on the commit that added it (`88ab177`); the three
+existing jobs were green on that commit as well.
 **Still not covered here:** running on a device or emulator (no device; an emulator system image is
 a separate ~1.5 GB download, so that stays a local, optional step), and iOS/macOS, which still have
 no toolchain here. The device-side evidence remains the Android port's own `nrr_probe` run.
