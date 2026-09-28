@@ -217,6 +217,16 @@ NRR_TEST(test_test_backend_override_kernel_route_is_the_accelerator_path) {
     backend_override::Fixture fx;
     NRR_ASSERT(backend_override::make_fixture(fx), "a device, a colour texture and the model");
 
+    /* The route needs the kernel, and the kernel needs an ONNX session: in a build without the
+     * ONNX Runtime there is no accelerator path to exercise on any machine, so that configuration
+     * skips with the reason - the convention the inference and EP tests already follow
+     * (NRR_HAVE_ONNXRUNTIME, see tests/unit/test_inference.cpp). The ORT-less flavour is a scratch
+     * configuration no CI job builds (see docs/roadmap.md). */
+#ifndef NRR_HAVE_ONNXRUNTIME
+    std::cout << "  no ONNX Runtime in this build: there is no accelerator path to take "
+                 "here, skipping" << std::endl;
+    return;
+#else
     std::vector<backend_override::FrameResult> cpu_path;
     NRR_EXPECT_TRUE(backend_override::run_two_frames(fx, cpu_path),
                     "the CPU path renders the two frames");
@@ -251,6 +261,7 @@ NRR_TEST(test_test_backend_override_kernel_route_is_the_accelerator_path) {
                     "the CPU path's debug_info does not");
     NRR_EXPECT_TRUE(kernel_path[1].history >= 1u,
                     "and it accumulates history like the CPU path does");
+#endif
 }
 
 } // namespace test
