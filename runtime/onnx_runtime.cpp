@@ -59,6 +59,18 @@ std::string provider_preference_from_env() {
     return to_lower(std::string(value));
 }
 
+/* ONNX Runtime declares its status-returning C API functions `warn_unused_result` under clang and
+ * gcc - the attribute MSVC does not implement, which is why the Android cross-build was the first
+ * to point these out. The call sites below are session tuning and shape queries whose failure is
+ * non-fatal (or already handled by a surrounding guard), so the status is *released* here rather
+ * than dropped: the compiler is right to ask, and the answer is "checked and discarded on
+ * purpose". */
+void release_ignored_status(const OrtApi* api, OrtStatus* status) {
+    if (api != nullptr && status != nullptr) {
+        api->ReleaseStatus(status);
+    }
+}
+
 /* Process-wide ONNX Runtime environment, shared by every ONNXRuntime instance.
  *
  * ORT requires an OrtEnv to outlive every OrtSession created from it, and each
@@ -237,9 +249,10 @@ bool ONNXRuntime::load_model(const std::string& model_path) {
     if (!env_) return fail(ort_error_);
     if (!check(api_->CreateSessionOptions(&session_options_),
                "CreateSessionOptions")) return fail(ort_error_);
-    api_->SetIntraOpNumThreads(session_options_, 2);
-    api_->SetInterOpNumThreads(session_options_, 1);
-    api_->SetSessionGraphOptimizationLevel(session_options_, ORT_ENABLE_ALL);
+    release_ignored_status(api_, api_->SetIntraOpNumThreads(session_options_, 2));
+    release_ignored_status(api_, api_->SetInterOpNumThreads(session_options_, 1));
+    release_ignored_status(api_,
+                           api_->SetSessionGraphOptimizationLevel(session_options_, ORT_ENABLE_ALL));
 
     apply_provider(preferred_provider_);
 
@@ -517,12 +530,13 @@ bool ONNXRuntime::run_inference_multi(const std::vector<TensorInput>& inputs,
         OrtStatus* st = api_->GetTensorTypeAndShape(out_values[0], &tsi);
         if (!st && tsi) {
             size_t dim_count = 0;
-            api_->GetDimensionsCount(tsi, &dim_count);
+            release_ignored_status(api_, api_->GetDimensionsCount(tsi, &dim_count));
             actual_output_shape.assign(dim_count, 0);
             if (dim_count > 0)
-                api_->GetDimensions(tsi, actual_output_shape.data(), dim_count);
+                release_ignored_status(
+                    api_, api_->GetDimensions(tsi, actual_output_shape.data(), dim_count));
             size_t elem_count = 0;
-            api_->GetTensorShapeElementCount(tsi, &elem_count);
+            release_ignored_status(api_, api_->GetTensorShapeElementCount(tsi, &elem_count));
             api_->ReleaseTensorTypeAndShapeInfo(tsi);
             void* raw = nullptr;
             OrtStatus* st2 = api_->GetTensorMutableData(out_values[0], &raw);
@@ -757,7 +771,7 @@ std::vector<std::string> ONNXRuntime::available_providers() {
     for (int i = 0; i < count; ++i) {
         if (names[i] != nullptr) providers.emplace_back(names[i]);
     }
-    api->ReleaseAvailableProviders(names, count);
+    release_ignored_status(api, api->ReleaseAvailableProviders(names, count));
     return providers;
 }
 #else

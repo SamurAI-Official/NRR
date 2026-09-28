@@ -41,7 +41,15 @@ param(
 
     # Extra CMake cache options, e.g. -Define NRR_ENABLE_MOBILE_VENDOR=ON. Used to build the
     # configurations that no other job builds (see the compile-coverage note in CMakeLists.txt).
-    [string[]]$Define = @()
+    [string[]]$Define = @(),
+
+    # Cross-build the Android runtime with the NDK instead of the host build (see the -Android
+    # branch below). Needs tools/fetch_ndk.ps1 (or an installed NDK) and tools/fetch_ort_android.ps1.
+    [switch]$Android,
+    [string]$Ndk = '',
+    [string]$Abi = 'arm64-v8a',
+    [string]$ApiLevel = '28',
+    [string]$Ninja = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -201,7 +209,166 @@ function Assert-MsvcAsanRuntime {
 }
 
 # ---------------------------------------------------------------------------
-# Configure
+# Android cross-build (-Android)
+#
+# Android is the one target this repository had never compiled, which is how six defects an
+# external consumer hit stayed invisible here (docs/roadmap.md) - and the reason its port owns its
+# own CMake wiring. This branch configures with the NDK toolchain and builds the static runtime for
+# one ABI, with the real ONNX Runtime for Android and Vulkan from the NDK sysroot (so
+# runtime/backend_vulkan.cpp's Vulkan branch is compiled at last).
+#
+# nrr_static is the target on purpose: the shared library needs the four Android power-manager
+# hooks, which the *consuming application* implements (that is the JNI/Context plumbing an app
+# owns; see runtime/platform/android/nrr_android.h). Linking libnrr.so without them fails with
+# exactly those four undefined symbols.
+#
+#   pwsh tools/build.ps1 -Android -Config Release
+#   pwsh tools/build.ps1 -Android -Config Release -Abi x86_64 -ApiLevel 34
+# ---------------------------------------------------------------------------
+if ($Android) {
+    $sdkRoots = @()
+    if ($env:ANDROID_SDK_ROOT) { $sdkRoots += $env:ANDROID_SDK_ROOT }
+    if ($env:ANDROID_HOME) { $sdkRoots += $env:ANDROID_HOME }
+    $sdkRoots += (Join-Path $env:LOCALAPPDATA 'Android\Sdk')
+    $sdkRoots += 'G:\Android\Sdk'
+    $sdkRoots = @($sdkRoots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+
+    # --- NDK -----------------------------------------------------------------
+    $ndkPath = $Ndk
+    if (-not $ndkPath -and $env:ANDROID_NDK_HOME) { $ndkPath = $env:ANDROID_NDK_HOME }
+    if (-not $ndkPath -and $env:ANDROID_NDK_ROOT) { $ndkPath = $env:ANDROID_NDK_ROOT }
+    if (-not $ndkPath) {
+        $candidates = @(Get-ChildItem (Join-Path $repoRoot 'third_party') -Directory `
+                          -Filter 'android-ndk-*' -ErrorAction SilentlyContinue |
+                       Select-Object -ExpandProperty FullName)
+        foreach ($sdk in $sdkRoots) {
+            $ndkRoot = Join-Path $sdk 'ndk'
+            if (Test-Path $ndkRoot) {
+                $candidates += @(Get-ChildItem $ndkRoot -Directory -ErrorAction SilentlyContinue |
+                                 Select-Object -ExpandProperty FullName)
+            }
+        }
+        foreach ($candidate in ($candidates | Sort-Object -Descending)) {
+            if (Test-Path (Join-Path $candidate 'build\cmake\android.toolchain.cmake')) {
+                $ndkPath = $candidate
+                break
+            }
+        }
+    }
+    if (-not $ndkPath) {
+        throw "No Android NDK found. Run 'pwsh tools/fetch_ndk.ps1', set ANDROID_NDK_HOME, or pass -Ndk <path>."
+    }
+    $toolchain = Join-Path $ndkPath 'build\cmake\android.toolchain.cmake'
+    if (-not (Test-Path $toolchain)) { throw "Not an Android NDK (no $toolchain): $ndkPath" }
+    # Absolute, because the CI form passes a repository-relative path and CMake resolves
+    # CMAKE_TOOLCHAIN_FILE against the build directory, not the working directory.
+    $ndkPath = [System.IO.Path]::GetFullPath($ndkPath)
+    $toolchain = [System.IO.Path]::GetFullPath($toolchain)
+
+    # --- Ninja ---------------------------------------------------------------
+    # Cross-compiling needs a single-config generator; the Visual Studio generator cannot
+    # cross-compile. Ninja ships with the Android SDK's CMake bundle, and CI installs it with pip.
+    $ninjaPath = $Ninja
+    if (-not $ninjaPath) {
+        $onPath = Get-Command ninja -CommandType Application -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+        if ($onPath) { $ninjaPath = $onPath.Source }
+    }
+    if (-not $ninjaPath) {
+        foreach ($sdk in $sdkRoots) {
+            $bundleRoot = Join-Path $sdk 'cmake'
+            if (-not (Test-Path $bundleRoot)) { continue }
+            $bundle = Get-ChildItem $bundleRoot -Directory -ErrorAction SilentlyContinue |
+                      Sort-Object Name -Descending | Select-Object -First 1
+            if ($bundle -and (Test-Path (Join-Path $bundle.FullName 'bin\ninja.exe'))) {
+                $ninjaPath = Join-Path $bundle.FullName 'bin\ninja.exe'
+                break
+            }
+        }
+    }
+    if (-not $ninjaPath) {
+        throw "Ninja not found (needed to cross-compile). Install it ('python -m pip install ninja'), or pass -Ninja <path>."
+    }
+    $ninjaPath = [System.IO.Path]::GetFullPath($ninjaPath)
+
+    # --- CMake ---------------------------------------------------------------
+    # The SDK's bundled CMake is the version the NDK is tested against, so it wins when present;
+    # otherwise the same resolution the host build uses.
+    $cmakeExe = $null
+    foreach ($sdk in $sdkRoots) {
+        $bundleRoot = Join-Path $sdk 'cmake'
+        if (-not (Test-Path $bundleRoot)) { continue }
+        $bundle = Get-ChildItem $bundleRoot -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if ($bundle -and (Test-Path (Join-Path $bundle.FullName 'bin\cmake.exe'))) {
+            $cmakeExe = Join-Path $bundle.FullName 'bin\cmake.exe'
+            break
+        }
+    }
+    if (-not $cmakeExe) { $cmakeExe = Find-CMake }
+
+    $androidBuild = Join-Path $repoRoot 'build-android'
+    Write-Host "[android] repo:      $repoRoot"
+    Write-Host "[android] NDK:       $ndkPath"
+    Write-Host "[android] cmake:     $cmakeExe"
+    Write-Host "[android] ninja:     $ninjaPath"
+    Write-Host "[android] ABI:       $Abi  (android-$ApiLevel)"
+    Write-Host "[android] build dir: $androidBuild"
+
+    if ($Clean -and (Test-Path $androidBuild)) {
+        Write-Host "[android] removing $androidBuild"
+        Remove-Item -Recurse -Force $androidBuild
+    }
+
+    if (-not $NoConfigure) {
+        $configureArgs = @(
+            '-S', $repoRoot,
+            '-B', $androidBuild,
+            '-G', 'Ninja',
+            "-DCMAKE_MAKE_PROGRAM=$ninjaPath",
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+            "-DANDROID_ABI=$Abi",
+            "-DANDROID_PLATFORM=android-$ApiLevel",
+            "-DCMAKE_BUILD_TYPE=$Config",
+            '-DNRR_BUILD_TESTS=OFF'
+        )
+        foreach ($define in $Define) { $configureArgs += "-D$define" }
+        Write-Host "[android] configure: cmake $($configureArgs -join ' ')"
+        # Not suppressed: the status lines (which ONNX Runtime, which Vulkan, which sysroot) are
+        # what the CI job verifies the artifact against, and they are the first thing a person
+        # wants in the log when this configuration breaks.
+        Invoke-NativeCommand { & $cmakeExe @configureArgs } 'CMake configure (Android)'
+    }
+
+    if (-not $NoBuild) {
+        Write-Host "[android] building nrr_static for $Abi"
+        # Not suppressed either: a cross-build failure has to be readable in the log the CI job
+        # publishes as annotations.
+        Invoke-NativeCommand { & $cmakeExe --build $androidBuild --target nrr_static } `
+            'Build (Android nrr_static)'
+    }
+
+    $artifact = Join-Path $androidBuild 'libnrr_static.a'
+    if (Test-Path $artifact) {
+        Write-Host ("[android] OK: {0} ({1:N1} MB, {2})" -f $artifact,
+                    ((Get-Item $artifact).Length / 1MB), $Abi)
+    } else {
+        Write-Host "[android] no libnrr_static.a produced" -ForegroundColor Yellow
+    }
+    Write-Host "[android] note: libnrr.so additionally needs the four power-manager hooks"
+    Write-Host "[android]       (nrr::mobile::android_*) that the consuming application implements."
+
+    # Machine-readable facts, on the success stream rather than through Write-Host: the CI job
+    # parses this log to verify the artifact, and Write-Host output goes via the console host,
+    # where it is wrapped at the console width - which truncates exactly the paths a verifier needs.
+    Write-Output "nrr-android-ndk=$ndkPath"
+    Write-Output "nrr-android-abi=$Abi"
+    Write-Output "nrr-android-artifact=$artifact"
+    Write-Output "nrr-android-artifact-bytes=$((Get-Item $artifact -ErrorAction SilentlyContinue).Length)"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 $cmake = Find-CMake

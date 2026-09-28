@@ -699,11 +699,16 @@ these are the items a re-pin to the current commit has to carry:
 | 5 | Retire `patches/nrr/*.patch` in the same commit as the re-pin | Both are upstream now: the portability hunks (power-manager `extern "C"`, `ORTCHAR_T`, apple declarations/ObjC guard, vendor priorities) and the Godot `plugin.cfg` INI descriptor. `scripts/apply_nrr_patches.sh` treats a patch that stops applying as a hard error, so they must go together |
 | 6 | Update the stale rationale in `test_onnxruntime_is_a_hard_requirement` | It explains itself with "upstream's ORT-less path does not compile"; that is fixed here (the ORT-less flavour configures, compiles and runs) |
 
-Still not verified here: the Android target itself. No NDK or Vulkan SDK is present in this
-repository, so `runtime/platform/android/nrr_android.cpp` and the Vulkan-enabled branch are compiled
-by no job of ours; the device-side evidence is ShugoCore's `nrr_probe` run (Galaxy A51, CPU EP,
-`failures: 0`). What our compile-coverage configuration does establish is that the shared sources its
-list draws from compile in a configuration any machine can produce.
+**Optional after this commit, not required by the re-pin:** the port can keep its own `NRR_SOURCES`
+list and its own ONNX Runtime wiring. An Android configure here now sets `NRR_HAVE_ONNXRUNTIME` itself
+from the AAR layout (`include/` + `lib/<abi>/libonnxruntime.so`, extracted by
+`tools/fetch_ort_android.ps1`), so `add_subdirectory()` would work for them - but a consumer that
+already builds is under no obligation to change how it builds.
+
+**Superseded - the Android target is compiled here now** (see "the Android configuration compiles at
+last" below): `runtime/platform/android/nrr_android.cpp` and the Vulkan-enabled branch both compile in
+the `android-ndk` CI job. What remains unverified is behaviour on a device, where the evidence is still
+ShugoCore's `nrr_probe` run (Galaxy A51, CPU EP, `failures: 0`).
 
 ### M2 follow-up: both execution paths, for the whole suite (`NRR_TEST_BACKEND`)
 
@@ -745,7 +750,56 @@ would make them right is a per-GPU probe (`eglQueryString(GL_RENDERER)`) with th
 assertion re-scoped to what a non-mobile host must do; both need a device or a toolchain this
 repository still does not have.
 
-### M2 follow-up: `quality_metric` is measured now, against a reference image
+### M2 follow-up: the Android configuration compiles at last
+
+Android was the one target no configuration here had ever built - the reason six defects from the
+external port (M1.4) were invisible until that port hit them, and the reason it cannot simply call
+`add_subdirectory()`. Three gaps stood between "we support mobile" and "it compiles":
+
+1. **ORT detection was Windows-shaped.** It required `lib/onnxruntime.lib`; the Maven AAR ships
+   `include/` plus `jni/<abi>/libonnxruntime.so`. `CMakeLists.txt` now accepts that layout for
+   `NRR_PLATFORM_ANDROID`, so the build *itself* defines `NRR_HAVE_ONNXRUNTIME` and links the real
+   runtime. `tools/fetch_ort_android.ps1` extracts it from `onnxruntime-android-1.30.0.aar` - the same
+   ORT release `tools/fetch_ort.ps1` installs for Windows, so one version covers every target.
+2. **`NRR_ENABLE_VULKAN` needed a desktop Vulkan SDK**, and it is ON by default for mobile, so the
+   mobile configuration could not be configured at all. The NDK sysroot carries `vulkan/vulkan.h` and
+   a `libvulkan.so` link stub per ABI triple (`sysroot/usr/lib/aarch64-linux-android/<api>/`), and the
+   Android arm takes both from there. **This is the first build ever to compile `backend_vulkan.cpp`'s
+   Vulkan branch** - the WS4 repair got only the no-SDK stub branch compiled - so
+   `select_physical_device`, `create_logical_device`, `query_capabilities`, `cleanup_vulkan` and
+   `score_physical_device` are type-checked, not merely present.
+3. **The non-Windows ORT path had never been compiled either.** Its first compile surfaced seven
+   `-Wunused-result` warnings (ORT declares status-returning C API functions `warn_unused_result`
+   under clang/gcc, an attribute MSVC does not implement): ignored statuses in `onnx_runtime.cpp`,
+   now released deliberately by `release_ignored_status`. This is the same file whose `ORTCHAR_T`/
+   `ort_path()` handling was one of the portability fixes from M1.4 - verified by compilation now.
+
+**Measured: NDK r27 (`27.0.12077973`), `ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM=android-28`,
+Release, ORT 1.30.0, Vulkan ON** (`pwsh tools/build.ps1 -Android -Config Release`):
+
+```
+-- ONNX Runtime: third_party/onnxruntime-android-1.30.0 (real inference, Android arm64-v8a)
+-- Vulkan: .../sysroot/usr/lib/aarch64-linux-android/24/libvulkan.so (NDK sysroot, arm64-v8a)
+-- Vulkan Backend:   ON
+nrr_static: 14.8 MB, 30 object file(s), arm64-v8a       (llvm-ar t)
+```
+
+`nrr_static` is the target because **`libnrr.so` needs the four Android power-manager hooks**
+(`android_get_battery_level`, `android_get_battery_status`, `android_get_thermal_headroom`,
+`android_is_low_power`): they are declared `extern "C"` in `runtime/platform/android/nrr_android.h`
+and implemented by the *application*, which owns the JNI/Context plumbing. Linking without them fails
+with exactly those four undefined symbols - confirmed by running the link - which is why the shared
+library is the consumer's to complete and the static one is what this repository can verify to the end.
+
+**CI:** the `android-ndk` job caches the NDK and the AAR (745 MB and 51 MB), cross-builds arm64-v8a,
+and then verifies the artefact against the build log's own record of the toolchain, the ORT and the
+Vulkan library, and against `llvm-ar t` for the four translation units that only exist in this
+configuration. A red result means the Android path rotted again, which is what no job could say before.
+
+**Recorded as still uncovered:** running on a device or emulator. An emulator image is a separate
+~1.5 GB download and needs WHPX; the device-side evidence remains the consumer's `nrr_probe` run, and
+the six mobile-only tests that assert the removed contract (above) still cannot run on a host.
+
 
 The follow-up to the parity harness's first finding. `NRRRenderStats::quality_metric` held three
 different constants - `0.75f` on the CPU path, `0` on every accelerator frame, `0.5f` in the
@@ -1005,7 +1059,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | Vulkan SDK (headers + glslc) | M4 | Not present |
 | Unreal Engine install | M5 | Not present |
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
-| Android / iOS device + toolchain | M8 | Not present |
+| Android / iOS device + toolchain | M8 | **Android toolchain: present.** NDK r27 (`27.0.12077973`), adopted if installed and otherwise fetched by `tools/fetch_ndk.ps1` (cached in CI), so the Android configuration now compiles in the `android-ndk` job (arm64-v8a, `nrr_static`, Vulkan from the NDK sysroot). No device and no emulator image, so device behaviour is still evidenced only by the consumer's `nrr_probe` run. **iOS: no toolchain** (needs macOS/Xcode) |
 | Model weights: train in-house vs license | M1 quality gate, M9 licensing | Undecided |
 | `NRRRenderStats::quality_metric`: measure it for real, or declare the field reserved and unset on every path | The field is published to integrators and held three different fabricated constants (0.75 CPU / 0 accelerator / 0.5 legacy), so no caller could interpret it | **Decided and implemented: measured** - SSIM against a `reference_frame` image from the reference set, `0.0` with the reason in `debug_info` when there is nothing to measure against |
 | Performance bar for v1.0 | Whether <16 ms at 1080p->4K is the gate or a lower internal tier is acceptable | Undecided |

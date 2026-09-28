@@ -200,7 +200,24 @@ endif()
 
 set(NRR_ORT_DLL "")
 set(NRR_HAVE_CUDA_EP OFF)
-if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h"
+if(NRR_PLATFORM_ANDROID
+   AND EXISTS "${NRR_ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h"
+   AND EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/${ANDROID_ABI}/libonnxruntime.so")
+    # Android layout. The Maven AAR ships headers/ + jni/<abi>/libonnxruntime.so, which
+    # tools/fetch_ort_android.ps1 extracts to include/ + lib/<abi>/. There is no onnxruntime.lib
+    # and no separate provider DLL: on Android every provider lives inside the one .so, and the
+    # NNAPI/AIDL execution provider (where a device has one) is chosen by ONNX Runtime itself when
+    # the session is created.
+    #
+    # This arm is why an Android build can define NRR_HAVE_ONNXRUNTIME at all: the Windows test
+    # below requires lib/onnxruntime.lib, which made the ORT-enabled path unreachable for Android -
+    # the reason the Android port of this runtime owns its own CMake wiring instead of using
+    # add_subdirectory() (see docs/roadmap.md).
+    set(NRR_HAVE_ONNXRUNTIME ON)
+    set(NRR_ORT_INCLUDE_DIR "${NRR_ONNXRUNTIME_ROOT}/include")
+    set(NRR_ORT_LIB "${NRR_ONNXRUNTIME_ROOT}/lib/${ANDROID_ABI}/libonnxruntime.so")
+    message(STATUS "ONNX Runtime: ${NRR_ONNXRUNTIME_ROOT} (real inference, Android ${ANDROID_ABI})")
+elseif(EXISTS "${NRR_ONNXRUNTIME_ROOT}/include/onnxruntime_c_api.h"
    AND EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib")
     set(NRR_HAVE_ONNXRUNTIME ON)
     set(NRR_ORT_INCLUDE_DIR "${NRR_ONNXRUNTIME_ROOT}/include")
@@ -250,7 +267,7 @@ endfunction()
 #     16 MB file into one directory concurrently, and the Visual Studio generator
 #     runs those steps in parallel, so the build intermittently fails with
 #     "Error copying file ... Permission denied".
-if(NRR_HAVE_ONNXRUNTIME)
+if(NRR_HAVE_ONNXRUNTIME AND NRR_ORT_DLL)
     if(CMAKE_CONFIGURATION_TYPES)
         set(_NRR_ORT_DEPLOY_DIR "${CMAKE_BINARY_DIR}/$<CONFIG>")
     else()
@@ -276,7 +293,9 @@ if(NRR_HAVE_ONNXRUNTIME)
 endif()
 
 function(nrr_copy_ort_dll target)
-    if(NRR_HAVE_ONNXRUNTIME)
+    # The deploy target only exists where there is a Windows-style onnxruntime.dll to deploy
+    # (see above); the Android .so is packaged by the consuming application instead.
+    if(TARGET nrr_deploy_runtime_dlls)
         add_dependencies(${target} nrr_deploy_runtime_dlls)
     endif()
 endfunction()
@@ -287,7 +306,7 @@ endfunction()
 # copied next to each executable: the CUDA set is ~2.3 GB and there are six
 # executables.
 set(NRR_RUNTIME_DLL_DIRS "")
-if(NRR_HAVE_ONNXRUNTIME)
+if(NRR_HAVE_ONNXRUNTIME AND NRR_ORT_DLL)
     list(APPEND NRR_RUNTIME_DLL_DIRS "${NRR_ONNXRUNTIME_ROOT}/lib")
 endif()
 if(NRR_CUDA_RUNTIME_DIR)
@@ -342,9 +361,48 @@ if(NRR_ENABLE_VULKAN)
     list(APPEND NRR_RUNTIME_SOURCES
         ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
     )
-    find_package(Vulkan REQUIRED)
-    include_directories(${Vulkan_INCLUDE_DIRS})
-    link_directories(${Vulkan_LIBRARY_DIRS})
+    if(NRR_PLATFORM_ANDROID)
+        # The NDK sysroot carries Vulkan: <sysroot>/usr/include/vulkan/vulkan.h plus a
+        # libvulkan.so link stub per ABI triple and API level (the real loader is a platform
+        # library on the device). find_package(Vulkan) looks for a desktop SDK, so it is not used
+        # here - which is also what made NRR_ENABLE_VULKAN (the mobile default) impossible to
+        # configure away from a desktop Vulkan installation before this arm existed.
+        #
+        # The sysroot is laid out by GNU triple, not by ABI name: <sysroot>/usr/lib/
+        # aarch64-linux-android/<api>/libvulkan.so.
+        if(ANDROID_ABI STREQUAL "arm64-v8a")
+            set(_NRR_ANDROID_TRIPLE "aarch64-linux-android")
+        elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+            set(_NRR_ANDROID_TRIPLE "arm-linux-androideabi")
+        elseif(ANDROID_ABI STREQUAL "x86_64")
+            set(_NRR_ANDROID_TRIPLE "x86_64-linux-android")
+        elseif(ANDROID_ABI STREQUAL "x86")
+            set(_NRR_ANDROID_TRIPLE "i686-linux-android")
+        else()
+            set(_NRR_ANDROID_TRIPLE "")
+        endif()
+
+        set(_NRR_VULKAN_INCLUDE "${CMAKE_SYSROOT}/usr/include")
+        file(GLOB _NRR_VULKAN_SYSROOT_LIBS
+             "${CMAKE_SYSROOT}/usr/lib/${_NRR_ANDROID_TRIPLE}/*/libvulkan.so")
+        if(NOT EXISTS "${_NRR_VULKAN_INCLUDE}/vulkan/vulkan.h"
+           OR NOT _NRR_VULKAN_SYSROOT_LIBS)
+            message(FATAL_ERROR
+                "Vulkan was requested but the NDK sysroot (${CMAKE_SYSROOT}) has no "
+                "vulkan/vulkan.h or libvulkan.so for ABI '${ANDROID_ABI}' "
+                "(triple '${_NRR_ANDROID_TRIPLE}'). Use NDK r21+, or configure with "
+                "-DNRR_ENABLE_VULKAN=OFF.")
+        endif()
+        list(GET _NRR_VULKAN_SYSROOT_LIBS 0 _NRR_VULKAN_LIB)
+        add_library(Vulkan::Vulkan UNKNOWN IMPORTED)
+        set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${_NRR_VULKAN_LIB}")
+        include_directories("${_NRR_VULKAN_INCLUDE}")
+        message(STATUS "Vulkan: ${_NRR_VULKAN_LIB} (NDK sysroot, ${ANDROID_ABI})")
+    else()
+        find_package(Vulkan REQUIRED)
+        include_directories(${Vulkan_INCLUDE_DIRS})
+        link_directories(${Vulkan_LIBRARY_DIRS})
+    endif()
 elseif(NRR_ENABLE_VULKAN_STUB)
     # Same source, no SDK: the stub branch is what gets compiled, so the file is checked rather
     # than merely present.

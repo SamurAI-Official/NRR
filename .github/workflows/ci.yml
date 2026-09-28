@@ -314,3 +314,136 @@ jobs:
           name: gpu-test-logs-${{ github.run_number }}
           path: build-gpu/test-results/
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Android cross-build (NDK)
+  #
+  # Android is the one configuration nothing here had ever compiled, so six defects an external
+  # consumer's Android port reported were invisible in this repository (see the M1.4 table and the
+  # Android follow-up in docs/roadmap.md). This job closes that: the NDK is cached, ONNX Runtime
+  # for Android comes from the official Maven AAR, and the runtime is cross-compiled for arm64-v8a
+  # with the real ORT path and with Vulkan taken from the NDK sysroot - which is also the only
+  # build that compiles runtime/backend_vulkan.cpp's Vulkan branch.
+  #
+  # nrr_static is the target on purpose: libnrr.so additionally needs the four Android
+  # power-manager hooks (nrr::mobile::android_*) that the consuming application implements, which
+  # is the JNI/Context plumbing an app owns. The claim this job makes is "the Android
+  # configuration compiles", and a red result means that path rotted again.
+  # ---------------------------------------------------------------------------
+  android-ndk:
+    name: Windows x64 - Android cross-build (NDK r27, arm64-v8a)
+    runs-on: windows-latest
+    # 745 MB NDK on a cold cache, then a ~30-file cross-build; 45 is a fail-fast ceiling.
+    timeout-minutes: 45
+    env:
+      NRR_NDK_VERSION: r27c
+      NRR_ORT_ANDROID_VERSION: 1.30.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore Android NDK from cache
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/android-ndk-${{ env.NRR_NDK_VERSION }}
+          key: android-ndk-${{ env.NRR_NDK_VERSION }}
+
+      - name: Fetch the Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        # Adopts an NDK already installed on the runner, and only downloads when there is none:
+        # build.ps1 resolves the same way, so this job never pins a path that may not exist.
+        run: ./tools/fetch_ndk.ps1 -Version $env:NRR_NDK_VERSION
+
+      - name: Restore ONNX Runtime for Android from cache
+        id: ort-android-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/onnxruntime-android-${{ env.NRR_ORT_ANDROID_VERSION }}
+          key: ort-android-${{ env.NRR_ORT_ANDROID_VERSION }}
+
+      - name: Fetch ONNX Runtime for Android (Maven AAR)
+        if: steps.ort-android-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ort_android.ps1 -Version $env:NRR_ORT_ANDROID_VERSION -Abi arm64-v8a
+
+      # Cross-compiling needs a single-config generator, and the Visual Studio generator cannot
+      # cross-compile at all. The NDK does not bundle Ninja; an installed Android SDK or this pip
+      # install does, so make it explicit rather than assumed.
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          python -m pip install --quiet ninja
+          $ninja = Join-Path (Split-Path (Get-Command python).Source) 'Scripts\ninja.exe'
+          if (-not (Test-Path $ninja)) { $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source }
+          if (-not $ninja) { throw "ninja not found after 'pip install ninja'" }
+          Write-Host "ninja: $ninja"
+          "NRR_NINJA=$ninja" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Cross-build for Android (arm64-v8a, real ORT, Vulkan on)
+        shell: pwsh
+        run: |
+          # *>&1 merges the PowerShell streams as well as native stdout/stderr: build.ps1 reports
+          # its resolved toolchain with Write-Output, and CMake's status lines are native stdout.
+          ./tools/build.ps1 -Android -Config Release -Ninja "$env:NRR_NINJA" *>&1 |
+            Tee-Object -FilePath android-build.log
+
+      # The artefact is the claim, and the build log names the toolchain that produced it, so
+      # nothing here guesses where the NDK lives. Every source in NRR_RUNTIME_SOURCES lands in
+      # nrr_static, so a shrunken archive means sources were dropped rather than that the build
+      # succeeded; backend_vulkan.cpp only reaches the compiler with NRR_ENABLE_VULKAN defined, so
+      # its member is the evidence that branch was type-checked at last.
+      - name: Verify the cross-built runtime
+        shell: pwsh
+        run: |
+          $log = Get-Content android-build.log
+          $ndkLine = $log | Select-String '^nrr-android-ndk=(.+)$' | Select-Object -First 1
+          if (-not $ndkLine) { throw "the build log does not name the NDK it used" }
+          $ndk = $ndkLine.Matches[0].Groups[1].Value.Trim()
+          Write-Host "NDK resolved by build.ps1: $ndk"
+          if (-not ($log | Select-String '^nrr-android-abi=arm64-v8a$')) {
+            throw "the build did not cross-compile for arm64-v8a"
+          }
+          if (-not ($log | Select-String '^-- Vulkan: .*\(NDK sysroot')) {
+            throw "the build did not take Vulkan from the NDK sysroot - NRR_ENABLE_VULKAN was not on"
+          }
+          if (-not ($log | Select-String '^-- ONNX Runtime: .*Android arm64-v8a')) {
+            throw "the build did not pick up the Android ONNX Runtime - it compiled the placeholder path"
+          }
+
+          $a = 'build-android/libnrr_static.a'
+          if (-not (Test-Path $a)) { throw "no $a - the Android configure or build did not run" }
+          $llvmAr = (Get-ChildItem "$ndk/toolchains/llvm/prebuilt/*/bin/llvm-ar.exe" |
+                     Select-Object -First 1).FullName
+          $objects = @(& $llvmAr t $a)
+          Write-Host ("nrr_static: {0:N1} MB, {1} object file(s), arm64-v8a" -f ((Get-Item $a).Length / 1MB), $objects.Count)
+          foreach ($need in 'backend_vulkan.cpp.o', 'nrr_android.cpp.o', 'mobile_kernel.cpp.o', 'onnx_runtime.cpp.o') {
+            if (-not ($objects -match [regex]::Escape($need))) { throw "nrr_static is missing $need" }
+          }
+          Write-Host "Vulkan branch object present: backend_vulkan.cpp.o"
+
+      - name: Publish build failures as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path android-build.log)) {
+            Write-Host "::warning::no android-build.log - the failure happened before the cross-build"
+            exit 0
+          }
+          $found = $false
+          Select-String -Path android-build.log -Pattern 'error:','error C','CMake Error','ninja: build stopped' |
+            Select-Object -First 25 | ForEach-Object {
+              $found = $true
+              Write-Host "::error::$($_.Line.Trim())"
+            }
+          if (-not $found) { Write-Host "::error::the Android cross-build failed; see the step output" }
+
+      - name: Upload the cross-build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-${{ github.run_number }}
+          path: android-build.log
+          if-no-files-found: ignore
+

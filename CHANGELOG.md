@@ -243,6 +243,61 @@ somewhere worse than the field itself.
 Addressed by 2 new tests (99 -> 101, all green): the fp16 invariant is asserted per backend and
 through the public API, and the two source guards above run on every build.
 
+### M2 follow-up: the Android configuration compiles at last
+
+Android is the one target this repository had never compiled, which is how six defects an external
+consumer's port reported stayed invisible here (M1.4) and why that port owns its own CMake wiring.
+It compiles now, on any machine and in CI:
+
+```
+pwsh tools/fetch_ndk.ps1           # adopts an installed NDK (r27) or fetches it (~745 MB)
+pwsh tools/fetch_ort_android.ps1   # ONNX Runtime 1.30.0 for Android, out of the official Maven AAR
+pwsh tools/build.ps1 -Android -Config Release
+```
+
+Three real gaps had to close first:
+
+- **Our ONNX Runtime detection could not enable the ORT path for Android at all.** It required
+  `lib/onnxruntime.lib` (the Windows layout); the AAR ships `include/` plus
+  `jni/<abi>/libonnxruntime.so`. A new arm accepts that layout, so CMake itself defines
+  `NRR_HAVE_ONNXRUNTIME` for an Android build - which is precisely what the port has to work around
+  today, and the reason it cannot use `add_subdirectory()`.
+- **`NRR_ENABLE_VULKAN` was impossible to configure away from a desktop Vulkan SDK**, and it is ON
+  by default for mobile. The NDK sysroot carries `vulkan/vulkan.h` plus a `libvulkan.so` link stub
+  per ABI triple, so the Android arm takes Vulkan from there. **That is also the first build ever to
+  compile `runtime/backend_vulkan.cpp`'s Vulkan branch** - the WS4 repair got only the no-SDK stub
+  branch compiled - so `select_physical_device`, `create_logical_device`, `query_capabilities`,
+  `cleanup_vulkan` and `score_physical_device` are type-checked now.
+- **The first compile of the non-Windows ORT path surfaced seven warnings MSVC cannot show.** ONNX
+  Runtime declares its status-returning C API functions `warn_unused_result` under clang/gcc only,
+  so the Android build was the first to notice seven ignored statuses in `runtime/onnx_runtime.cpp`.
+  They are released deliberately now (`release_ignored_status`) instead of dropped.
+
+**Measured: arm64-v8a, NDK r27 (27.0.12077973), ONNX Runtime 1.30.0 - the same ORT release the
+Windows SDK uses.**
+
+```
+-- ONNX Runtime: third_party/onnxruntime-android-1.30.0 (real inference, Android arm64-v8a)
+-- Vulkan: .../sysroot/usr/lib/aarch64-linux-android/24/libvulkan.so (NDK sysroot, arm64-v8a)
+-- Vulkan Backend:   ON
+[android] OK: build-android/libnrr_static.a (14.8 MB, arm64-v8a)
+nrr_static: 14.8 MB, 30 object file(s), arm64-v8a        (llvm-ar t)
+```
+
+The archive contains `backend_vulkan.cpp.o`, `nrr_android.cpp.o`, `mobile_kernel.cpp.o` and
+`onnx_runtime.cpp.o` - the translation units no host build compiles, or does not compile in full.
+**`libnrr.so` additionally needs the four Android power-manager hooks**
+(`android_get_battery_level`, `android_get_battery_status`, `android_get_thermal_headroom`,
+`android_is_low_power`), which the consuming application implements; linking without them fails with
+exactly those four undefined symbols, which is why the target here is `nrr_static`.
+
+**CI:** a new job (`Windows x64 - Android cross-build (NDK r27, arm64-v8a)`) caches the NDK and the
+AAR, cross-builds, and verifies the artifact against the log's own record of the toolchain and
+options - so "the Android configuration compiles" is checked on every push rather than assumed.
+**Still not covered here:** running on a device or emulator (no device; an emulator system image is
+a separate ~1.5 GB download, so that stays a local, optional step), and iOS/macOS, which still have
+no toolchain here. The device-side evidence remains the Android port's own `nrr_probe` run.
+
 ### M2 follow-up: the mobile execution provider is measured too, and NVIDIA is registered only where it can accelerate
 
 Two changes on the path an external consumer compiles: ShugoCore's Android port builds this runtime
