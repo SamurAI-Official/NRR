@@ -372,6 +372,7 @@ if(NRR_ENABLE_VULKAN)
     list(APPEND NRR_RUNTIME_SOURCES
         ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_api.cpp
+        ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_device.cpp
     )
     if(NRR_PLATFORM_ANDROID)
         # The NDK sysroot carries Vulkan: <sysroot>/usr/include/vulkan/vulkan.h plus a

@@ -19,6 +19,7 @@
 #include "unit/test_engine_plugins.cpp"
 #include "unit/test_gpu_ep.cpp"
 #include "unit/test_vulkan_api.cpp"
+#include "unit/test_vulkan_resources.cpp"
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
@@ -88,6 +89,15 @@ void run_all_tests() {
     NRR_RUN_TEST(test_vulkan_loader_probe_is_measured);
     NRR_RUN_TEST(test_vulkan_capability_answer_agrees_with_the_loader_probe);
     NRR_RUN_TEST(test_vulkan_backend_reports_only_what_it_measured);
+
+    std::cout << "\n--- Vulkan Device Tests (V1: queues, memory, transfers) ---\n";
+    /* The device these drive is the same object the backend uses, so a broken queue, a leak or a
+     * copy that drops bytes fails here rather than in a rendered frame. */
+    NRR_RUN_TEST(test_vulkan_device_measures_its_own_limits);
+    NRR_RUN_TEST(test_vulkan_buffer_round_trip_is_exact);
+    NRR_RUN_TEST(test_vulkan_image_round_trip_matches_the_bytes);
+    NRR_RUN_TEST(test_vulkan_memory_accounting_and_budget_is_enforced);
+    NRR_RUN_TEST(test_vulkan_transfers_reuse_the_command_ring);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);

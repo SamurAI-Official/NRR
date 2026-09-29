@@ -106,13 +106,17 @@ bool BackendVulkan::is_supported(const NRRDeviceOptions& options) const {
 }
 
 bool BackendVulkan::initialize_vulkan(const NRRDeviceOptions& options) {
-    (void)options;
+    /* NRRDeviceOptions.frames_in_flight is what sizes the device's submission ring, so it is read
+     * here rather than assumed - a caller that asks for two frames in flight gets two command
+     * buffers and two fences. */
+    frames_in_flight_ = options.frames_in_flight > 0 ? options.frames_in_flight : 1;
 #ifdef NRR_ENABLE_VULKAN
     if (vulkan_available_) return true;
     if (create_vulkan_instance() != NRR_SUCCESS) return false;
     /* The instance exists, so the loader can be asked for the instance-level entry
      * points (enumerate/query/create device). They are not usable before this. */
     if (!vk::load_instance(instance_)) {
+        vulkan_error_ = "load_instance: " + vk::unavailable_reason();
         cleanup_vulkan();
         return false;
     }
@@ -125,9 +129,12 @@ bool BackendVulkan::initialize_vulkan(const NRRDeviceOptions& options) {
         cleanup_vulkan();
         return false;
     }
-    /* ... and the device exists, so the device-level entry points (memory, images,
-     * command buffers, dispatch) resolve through vkGetDeviceProcAddr. */
-    if (!vk::load_device(device_)) {
+    /* ... and the device exists, so the device-level entry points (memory, images, command
+     * buffers, dispatch) resolve through vkGetDeviceProcAddr against that device. */
+    if (device_ == nullptr || !vk::load_device(device_->handle())) {
+        vulkan_error_ = "load_device: " +
+            (vk::missing_entry_point().empty() ? vk::unavailable_reason()
+                                               : "no " + vk::missing_entry_point());
         cleanup_vulkan();
         return false;
     }
@@ -197,7 +204,15 @@ NRRResult BackendVulkan::unload_reference(ReferenceImpl* reference) {
 
 NRRResult BackendVulkan::wait_idle() {
 #ifdef NRR_ENABLE_VULKAN
-    if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    device_->wait_idle();
+    if (device_->device_lost()) {
+        /* Reported rather than swallowed: after a lost device the frames are not the caller's data,
+         * and returning SUCCESS here is how a lost device turns into a rendering artefact nobody
+         * can explain. */
+        vulkan_error_ = device_->last_error();
+        return NRR_ERROR_RENDER_FAILED;
+    }
     return NRR_SUCCESS;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -313,55 +328,16 @@ NRRResult BackendVulkan::select_physical_device(uint32_t* device_index) {
 
 NRRResult BackendVulkan::create_logical_device() {
 #ifdef NRR_ENABLE_VULKAN
-    float queue_priority = 1.0f;
-    uint32_t queue_family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, nullptr);
-    std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, queue_families.data());
-
-    uint32_t graphics_family = UINT32_MAX;
-    uint32_t compute_family = UINT32_MAX;
-
-    for (uint32_t i = 0; i < queue_family_count; i++) {
-        if (queue_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) graphics_family = i;
-        if (queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-            if (compute_family == UINT32_MAX) compute_family = i;
-        }
+    /* This used to pick a queue family, create the device and stop there: no queue handle, no
+     * memory, no command buffers. All of that is VulkanDevice's job now, and the whole family
+     * search it replaces lives in vulkan_device.cpp where the vendor front-ends can share it. */
+    device_ = std::make_unique<VulkanDevice>();
+    std::string reason;
+    if (!device_->create(instance_, physical_device_, memory_budget_, frames_in_flight_, reason)) {
+        vulkan_error_ = reason;
+        device_.reset();
+        return NRR_ERROR_DEVICE_NOT_FOUND;
     }
-
-    if (graphics_family != UINT32_MAX &&
-        (queue_families[graphics_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
-        compute_family = graphics_family;
-    }
-    if (compute_family == UINT32_MAX) compute_family = graphics_family;
-    if (compute_family == UINT32_MAX) return NRR_ERROR_DEVICE_NOT_FOUND;
-
-    std::vector<VkDeviceQueueCreateInfo> queue_infos;
-    if (graphics_family != UINT32_MAX) {
-        VkDeviceQueueCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        info.queueFamilyIndex = graphics_family;
-        info.queueCount = 1;
-        info.pQueuePriorities = &queue_priority;
-        queue_infos.push_back(info);
-    }
-    if (compute_family != UINT32_MAX && compute_family != graphics_family) {
-        VkDeviceQueueCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        info.queueFamilyIndex = compute_family;
-        info.queueCount = 1;
-        info.pQueuePriorities = &queue_priority;
-        queue_infos.push_back(info);
-    }
-
-    VkDeviceCreateInfo device_info = {};
-    device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    device_info.queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size());
-    device_info.pQueueCreateInfos = queue_infos.data();
-
-    VkResult result = vkCreateDevice(physical_device_, &device_info, nullptr, &device_);
-    if (result != VK_SUCCESS) return NRR_ERROR_DEVICE_NOT_FOUND;
-
     return NRR_SUCCESS;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -425,21 +401,25 @@ NRRResult BackendVulkan::query_capabilities() {
 
 void BackendVulkan::cleanup_vulkan() {
 #ifdef NRR_ENABLE_VULKAN
-    for (auto& [ptr, tex] : vulkan_textures_) {
-        vkDestroyImage(device_, tex.image, nullptr);
-        vkFreeMemory(device_, tex.memory, nullptr);
-        vkDestroyImageView(device_, tex.view, nullptr);
-        vkDestroySampler(device_, tex.sampler, nullptr);
+    /* Anything the caller still holds is released here: the device owns that memory, so an entry
+     * that outlived it would be a handle into freed memory. These maps are the backend's record of
+     * what it handed out - the same record the dead vulkan_textures_/vulkan_buffers_ pretended to
+     * be before V1 (declared, never populated, while textures were host vectors). */
+    for (auto& pair : textures_) {
+        if (device_) device_->destroy_buffer(pair.second->buffer);
+        delete pair.second;
     }
-    vulkan_textures_.clear();
-    for (auto& [ptr, buf] : vulkan_buffers_) {
-        vkDestroyBuffer(device_, buf.buffer, nullptr);
-        vkFreeMemory(device_, buf.memory, nullptr);
+    textures_.clear();
+    for (auto& pair : buffers_) {
+        if (device_) device_->destroy_buffer(pair.second->buffer);
+        delete pair.second;
     }
-    vulkan_buffers_.clear();
-    if (device_ != VK_NULL_HANDLE) {
-        if (vkDestroyDevice != nullptr) vkDestroyDevice(device_, nullptr);
-        device_ = VK_NULL_HANDLE;
+    buffers_.clear();
+    /* The device releases its queues, command pool, fences and every allocation it made, and the
+     * memory counters go with it. */
+    if (device_) {
+        device_->destroy();
+        device_.reset();
     }
     /* The device is gone, so its entry points are stale: drop them before the instance is
      * asked for anything else. */
@@ -516,22 +496,38 @@ uint32_t BackendVulkan::score_physical_device(uint32_t device_index) {
 NRRResult BackendVulkan::create_texture(const NRRTextureDesc& desc, void*& backend_texture) {
     backend_texture = nullptr;
     if (!initialized_) return NRR_ERROR_STATE_INVALID;
+#ifdef NRR_ENABLE_VULKAN
     const size_t bytes = accel_texture_bytes(desc.width, desc.height, desc.format);
-    if (bytes == 0) return NRR_ERROR_INVALID_ARGUMENT;
-
-    HostTexture* tex = new HostTexture();
-    tex->width = desc.width;
-    tex->height = desc.height;
-    tex->format = desc.format;
-    tex->bytes.assign(bytes, 0);
-    textures_[tex] = tex;
-    backend_texture = tex;
+    if (bytes == 0 || !device_) return NRR_ERROR_INVALID_ARGUMENT;
+    /* A device-local buffer, not a host vector. This is the resource the kernels in M4/V2 will read,
+     * and until then it is what makes "upload" mean the GPU has the bytes. */
+    VulkanDevice::Buffer* buffer = device_->create_buffer(bytes);
+    if (buffer == nullptr) {
+        vulkan_error_ = device_->last_error();
+        return NRR_ERROR_OUT_OF_MEMORY;
+    }
+    TextureEntry* entry = new TextureEntry();
+    entry->buffer = buffer;
+    entry->width = desc.width;
+    entry->height = desc.height;
+    entry->format = desc.format;
+    entry->bytes = bytes;
+    textures_[entry] = entry;
+    backend_texture = entry;
     return NRR_SUCCESS;
+#else
+    (void)desc;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 void BackendVulkan::destroy_texture(void* backend_texture) {
+    if (backend_texture == nullptr) return;
     auto it = textures_.find(backend_texture);
     if (it == textures_.end()) return;
+#ifdef NRR_ENABLE_VULKAN
+    if (device_) device_->destroy_buffer(it->second->buffer);
+#endif
     delete it->second;
     textures_.erase(it);
 }
@@ -539,34 +535,68 @@ void BackendVulkan::destroy_texture(void* backend_texture) {
 NRRResult BackendVulkan::upload_texture(void* backend_texture, const void* data, size_t size) {
     auto it = textures_.find(backend_texture);
     if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-    HostTexture* tex = it->second;
-    if (size == 0 || size > tex->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
-    std::memcpy(tex->bytes.data(), data, size);
+#ifdef NRR_ENABLE_VULKAN
+    TextureEntry* entry = it->second;
+    if (size == 0 || size > entry->bytes) return NRR_ERROR_INVALID_ARGUMENT;
+    if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    if (!device_->upload_buffer(entry->buffer, data, size, 0)) {
+        vulkan_error_ = device_->last_error();
+        return device_->device_lost() ? NRR_ERROR_RENDER_FAILED : NRR_ERROR_OUT_OF_MEMORY;
+    }
     return NRR_SUCCESS;
+#else
+    (void)size;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 NRRResult BackendVulkan::download_texture(void* backend_texture, void* data, size_t size) {
     auto it = textures_.find(backend_texture);
     if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-    HostTexture* tex = it->second;
-    if (size == 0 || size > tex->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
-    std::memcpy(data, tex->bytes.data(), size);
+#ifdef NRR_ENABLE_VULKAN
+    TextureEntry* entry = it->second;
+    if (size == 0 || size > entry->bytes) return NRR_ERROR_INVALID_ARGUMENT;
+    if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    if (!device_->download_buffer(entry->buffer, data, size, 0)) {
+        vulkan_error_ = device_->last_error();
+        return device_->device_lost() ? NRR_ERROR_RENDER_FAILED : NRR_ERROR_OUT_OF_MEMORY;
+    }
     return NRR_SUCCESS;
+#else
+    (void)size;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 NRRResult BackendVulkan::create_buffer(const NRRBufferDesc& desc, void*& backend_buffer) {
     backend_buffer = nullptr;
     if (!initialized_ || desc.size == 0) return NRR_ERROR_INVALID_ARGUMENT;
-    HostBuffer* buffer = new HostBuffer();
-    buffer->bytes.assign(desc.size, 0);
-    buffers_[buffer] = buffer;
-    backend_buffer = buffer;
+#ifdef NRR_ENABLE_VULKAN
+    if (!device_) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    VulkanDevice::Buffer* buffer = device_->create_buffer(desc.size);
+    if (buffer == nullptr) {
+        vulkan_error_ = device_->last_error();
+        return NRR_ERROR_OUT_OF_MEMORY;
+    }
+    BufferEntry* entry = new BufferEntry();
+    entry->buffer = buffer;
+    entry->size = desc.size;
+    buffers_[entry] = entry;
+    backend_buffer = entry;
     return NRR_SUCCESS;
+#else
+    (void)desc;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 void BackendVulkan::destroy_buffer(void* backend_buffer) {
+    if (backend_buffer == nullptr) return;
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end()) return;
+#ifdef NRR_ENABLE_VULKAN
+    if (device_) device_->destroy_buffer(it->second->buffer);
+#endif
     delete it->second;
     buffers_.erase(it);
 }
@@ -575,20 +605,38 @@ NRRResult BackendVulkan::upload_buffer(void* backend_buffer, const void* data, s
                                        size_t offset) {
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-    HostBuffer* buffer = it->second;
-    if (size == 0 || offset + size > buffer->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
-    std::memcpy(buffer->bytes.data() + offset, data, size);
+#ifdef NRR_ENABLE_VULKAN
+    BufferEntry* entry = it->second;
+    if (size == 0 || offset + size > entry->size) return NRR_ERROR_INVALID_ARGUMENT;
+    if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    if (!device_->upload_buffer(entry->buffer, data, size, offset)) {
+        vulkan_error_ = device_->last_error();
+        return device_->device_lost() ? NRR_ERROR_RENDER_FAILED : NRR_ERROR_OUT_OF_MEMORY;
+    }
     return NRR_SUCCESS;
+#else
+    (void)size; (void)offset;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 NRRResult BackendVulkan::download_buffer(void* backend_buffer, void* data, size_t size,
                                          size_t offset) {
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-    HostBuffer* buffer = it->second;
-    if (size == 0 || offset + size > buffer->bytes.size()) return NRR_ERROR_INVALID_ARGUMENT;
-    std::memcpy(data, buffer->bytes.data() + offset, size);
+#ifdef NRR_ENABLE_VULKAN
+    BufferEntry* entry = it->second;
+    if (size == 0 || offset + size > entry->size) return NRR_ERROR_INVALID_ARGUMENT;
+    if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
+    if (!device_->download_buffer(entry->buffer, data, size, offset)) {
+        vulkan_error_ = device_->last_error();
+        return device_->device_lost() ? NRR_ERROR_RENDER_FAILED : NRR_ERROR_OUT_OF_MEMORY;
+    }
     return NRR_SUCCESS;
+#else
+    (void)size; (void)offset;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 NRRResult BackendVulkan::load_model(ModelImpl* model) {
