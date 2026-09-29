@@ -1001,20 +1001,39 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
 - [x] CI: a `vulkan-compile` job (no GPU, no SDK) plus the Android job's `-DNRR_ENABLE_VULKAN=1`
       check, because a member in the archive cannot tell the stub branch from the real one.
 
+### M4/V1 - the device (queues, memory, transfers): done, measured
+
+- [x] `runtime/vulkan/vulkan_device.{h,cpp}`: compute queue selection with `vkGetDeviceQueue`, a
+      memory-type search with byte accounting and a budget enforced before the driver is asked,
+      device-local buffers with host-visible staging twins, `VkImage` with layout barriers for the
+      formats that map unambiguously, a command ring sized by `frames_in_flight`, and device-lost
+      detection. Numbers in `CHANGELOG.md` ("Vulkan V1").
+- [x] The backend allocates through it, and the no-SDK configuration still compiles - which caught a
+      header naming a device type it could not have without the SDK.
+
+### M4/V2 - real compute: two kernels done, two to go, measured
+
+- [x] A real SPIR-V build step: `glslc` compiles `runtime/vulkan/shaders/*.comp` and
+      `tools/embed_spirv.py` embeds the bytecode with each kernel's SHA-256, so the runtime carries
+      bytecode derived from the checked-in source rather than a blob nobody can re-derive. With no
+      glslc the build still succeeds and reports the kernels as absent.
+- [x] `nchw_pack` (RGBA8 -> NCHW fp32) and `rgb8_unpack` (NCHW fp32 -> RGBA8), dispatched on the GPU
+      and compared with a CPU reference: 5.96e-08 worst error over 2257 pixels for the pack (one
+      float ulp, the division) and zero differing bytes for the unpack, alpha included.
+- [x] `plan_dispatch()`: workgroup counts from the device's *measured* limits and Vulkan's
+      65535-group ceiling, refused with a reason rather than truncated.
+- [x] CI's `vulkan-compile` job restores the cached NDK for glslc and asserts the kernel status line
+      and the generated header, so the kernels are verified where they are compiled.
+- [ ] The temporal blend and the bilinear upscale kernels (the next two shaders), plus a YUV input
+      kernel for video/mobile sources.
+- [ ] Wire pack/unpack into the frame path: the accelerator kernel still moves frames through host
+      staging, so today the GPU does this work only when it is called directly.
+
 Next, in order:
 
-- [ ] Device work in `runtime/vulkan/`: queues (`vkGetDeviceQueue` is still never called),
-      `VkImage`/`VkBuffer`/`VkDeviceMemory` with a staging ring and layout barriers, command pools,
-      fences, frames in flight, and device-lost handling. Today textures and buffers are host
-      `std::vector<uint8_t>` and the `VulkanTexture`/`VulkanBuffer` maps in `backend_vulkan.h` are
-      declared but never populated.
-- [ ] SPIR-V compute (NCHW pack/unpack, temporal blend, upscale, YUV) with a real build step
-      (`glslc`/`glslangValidator`) rather than checked-in blobs whose hash is not verified against
-      source. The ONNX graph itself stays on ONNX Runtime - no ORT build ships a Vulkan execution
-      provider - so the honest split is that the GPU owns the frame's pre/post stages.
-- [ ] Per-device capability measurement: vendor ID to vendor name, subgroup size, cooperative
-      matrix, integer dot product, `VK_EXT_memory_budget`, and the fp16 question answered by
-      measurement (ABSENT until a real fp16 path exists and is measured).
+- [ ] Per-device capability measurement: vendor ID to vendor name, cooperative matrix, integer dot
+      product, `VK_EXT_memory_budget`, and the fp16 question answered by measurement (ABSENT until a
+      real fp16 path exists and is measured).
 - [ ] Vendor front-doors over one engine (AMD, Intel, NVIDIA, and Adreno/Mali/PowerVR through the
       same path), each probing for its own hardware instead of reporting support from a build option.
 - [ ] Enable Vulkan on desktop by default once this path is green there.

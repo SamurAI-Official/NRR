@@ -506,6 +506,22 @@ jobs:
         shell: pwsh
         run: ./tools/fetch_vulkan_headers.ps1
 
+      # glslc comes from the NDK's shader-tools, which this job reaches through the same cache the
+      # Android job fills (the key is the NDK version, so the two jobs share one download). Without
+      # it the build still succeeds - the kernels are simply absent - so the point of these two
+      # steps is that this job verifies the kernels rather than reporting their absence.
+      - name: Restore the Android NDK from cache (for glslc)
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/android-ndk-${{ env.NRR_NDK_VERSION }}
+          key: android-ndk-${{ env.NRR_NDK_VERSION }}
+
+      - name: Fetch the Android NDK (only on a cache miss)
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ndk.ps1 -Version $env.NRR_NDK_VERSION
+
       - name: Build with the Vulkan branch compiled
         shell: pwsh
         run: |
@@ -537,6 +553,18 @@ jobs:
             throw "NRR_CONFIG_EXPECTS_VULKAN is missing, so the CMake/compiler tie has been undone (runtime/vulkan/vulkan_api.h)"
           }
           Write-Host "Vulkan branch enabled for the compiler in nrr.vcxproj"
+
+          # V2: the kernels have to be in this build, not merely in the repository. The build log
+          # names the glslc it used (from the NDK's shader-tools above), and the suite prints each
+          # kernel's SHA-256 - so "the SPIR-V kernels compiled here" is a checked fact rather than an
+          # assumption from the machine the change was written on.
+          $log = Get-Content vulkan-build.log
+          if (-not ($log | Select-String '^-- Vulkan kernels: .*glslc')) {
+            throw "the SPIR-V kernels were not compiled in this build (no glslc): see the kernel status line in CMakeLists.txt"
+          }
+          if (-not (Test-Path build-vulkan/shaders/vulkan_shaders_generated.h)) {
+            throw "the kernels were compiled but not embedded into a header"
+          }
 
           ./build-vulkan/Release/nrr_tests.exe 2>&1 | Tee-Object -FilePath vulkan-tests.log
           if ($LASTEXITCODE -ne 0) {

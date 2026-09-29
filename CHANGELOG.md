@@ -72,6 +72,78 @@ CI: a new `vulkan-compile` job builds this configuration on a runner with no GPU
 archive member it checked before cannot tell the stub branch from the real one.
 
 
+### Vulkan V1: the device the backend should always have had (queues, memory, transfers)
+
+At V0 the branch compiled and did nothing with that: `vkGetDeviceQueue` was never called, no memory
+was ever allocated, and textures and buffers were host `std::vector<uint8_t>` while the
+`VulkanTexture`/`VulkanBuffer` structs and their maps sat in the header declared and never populated.
+
+`runtime/vulkan/vulkan_device.{h,cpp}` is that device - kept out of the backend because the vendor
+front-doors in M4/V4 share it. At create time it measures what the device is (name, vendor and device
+id, driver and API version, heaps, subgroup size, workgroup and shared-memory limits, and the
+extension facts a dispatch will depend on); prefers a compute-only queue family and reports *that*,
+not a vendor name, as the async_compute evidence; searches memory types for the properties it needs
+and still works where a device has no device-local memory; accounts for every byte it allocates,
+enforces a budget before asking the driver, and refuses what cannot fit with a reason. Resources are
+device-local `VkBuffer`s with a permanently mapped host-visible staging twin, plus `VkImage`+view with
+layout barriers for the formats whose texel size matches NRR's byte size - and RGB8 (a 24-bit texel)
+and D24S8 are refused rather than mapped to something close, because the frame path copies raw bytes.
+One submit path records into the ring's command buffer, submits on the compute queue and waits on its
+fence; `frames_in_flight` sizes that ring, and `VK_ERROR_DEVICE_LOST` is surfaced rather than
+swallowed.
+
+Two defects the first run found, both invisible without a device: `vkGetDeviceQueue` and every
+teardown entry point are *device-level*, so calling them before the table was resolved against the new
+device went through a null pointer (an access violation - the first run's exit code), and the
+resource-entry types named a device type that does not exist without the SDK, which broke the no-SDK
+configuration `windows-build-test` builds.
+
+**Measured** (Windows x64, RTX 4070 Ti, no SDK, loader `vulkan-1.dll`):
+
+```
+device: NVIDIA GeForce RTX 4070 Ti vendor=0x10de api=1.4 subgroup=32 workgroup<=1024 shared=49152 vram=11996MB dedicated_compute=yes
+allocated=2048KB peak=2048KB budget=256MB      refusal: the memory budget would be exceeded
+nrr_tests: 122/0 in the Vulkan configuration, 122/0 in the stub configuration
+```
+Round trips compared with `memcmp` at 1/4096/100003 bytes, at an offset, through a reused command
+ring, and the image path at 127x53 through two layout transitions.
+
+### Vulkan V2: the GPU runs NRR's own kernels
+
+`runtime/vulkan/shaders/nchw_pack.comp` and `rgb8_unpack.comp` are the frame-to-tensor and
+tensor-to-frame stages, each with its contract stated in the file so the test checks it rather than
+assumes it. `glslc` compiles them at build time and `tools/embed_spirv.py` embeds the bytecode with
+each kernel's SHA-256 beside it - the M4 item that asked for a real SPIR-V step instead of
+unchecked-in blobs. glslc is found where it actually lives (`-DNRR_GLSLANG_ROOT`, the Vulkan SDK, the
+Android NDK's `shader-tools` - where it comes from on this machine and where the Android CI job
+already has it - or `PATH`); with none of those the build still succeeds with the kernels absent,
+which the pipeline and the tests report instead of dispatching nothing.
+`runtime/vulkan/vulkan_pipeline.{h,cpp}` adds the pipeline objects (module, descriptor set layout of
+storage buffers, pipeline layout with push constants, compute pipeline) and one `dispatch()` on the
+device's ring, plus `plan_dispatch()`: pure arithmetic against the measured workgroup limit and
+Vulkan's 65535-group ceiling, because a plan that overflows either is a validation error or a silently
+truncated frame depending on the driver.
+
+**Measured**, both kernels embedded, `glslc` from NDK r27:
+
+```
+kernel nchw_pack   sha256 4591eca453838c9a26588a71ab756a01296ab56c0ce51338c30b9d8a0e74dbb7
+kernel rgb8_unpack sha256 afdcfff8e489a883f66356cc976ace2a19b6f97a4ac1c108e0a59b21be85224d
+pack:   worst |gpu - cpu| = 5.96046e-08 over 2257 pixels   (one float ulp: the division)
+unpack: 0 byte(s) differ from the CPU reference over 2257 pixels, alpha included
+nrr_tests: 125/0
+```
+The planner also refused the cases that must never pass silently: a workgroup the device cannot run
+(2048 > 1024), a dispatch past 65535 groups, and no work at all - each with its reason. CI's
+`vulkan-compile` job now restores the cached NDK so its build has glslc and asserts both the kernel
+status line and the generated header, so "the kernels compiled here" is checked rather than assumed
+from the machine the change was written on.
+
+Still not done, and named rather than implied: the temporal blend and upscale kernels, and wiring
+these two into the frame path (the accelerator kernel still moves frames through host staging). The
+ONNX graph itself stays on ONNX Runtime - no ORT build ships a Vulkan execution provider - so the GPU
+owns the pre/post stages and ORT owns the graph.
+
 ### M2 follow-up: honest reporting, a real warm-up, one shared temporal pass, and a first-class NVIDIA backend
 
 A pass over every claim the M2 work touched, on the same machine and under the same rule
