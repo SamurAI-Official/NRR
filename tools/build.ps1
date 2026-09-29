@@ -49,7 +49,11 @@ param(
     [string]$Ndk = '',
     [string]$Abi = 'arm64-v8a',
     [string]$ApiLevel = '28',
-    [string]$Ninja = ''
+    [string]$Ninja = '',
+
+    # Host build with the Vulkan backend compiled (adds NRR_ENABLE_VULKAN=ON and makes the
+    # headers available first - see the -Vulkan branch below). Needs no SDK.
+    [switch]$Vulkan
 )
 
 $ErrorActionPreference = 'Stop'
@@ -369,6 +373,47 @@ if ($Android) {
 }
 
 # ---------------------------------------------------------------------------
+# Vulkan header availability for a host build (-Vulkan)
+#
+# NRR_ENABLE_VULKAN could not be enabled on a desktop before this existed: CMake called
+# find_package(Vulkan REQUIRED), which needs the LunarG SDK, so the branch was compiled by
+# nothing but the Android cross-build - and even there the macro never reached the compiler,
+# because the option was never turned into a compile definition. So "the Vulkan branch
+# compiles" was never true for any configuration (docs/roadmap.md M4).
+#
+#   pwsh tools/build.ps1 -Vulkan -RunTests
+#   pwsh tools/build.ps1 -Vulkan -Config Release -BuildDir build-vulkan
+#
+# No SDK, no import library and no admin: the loader is resolved at runtime (vulkan-1.dll is
+# installed by the graphics driver), so the only prerequisite is the header set, which
+# tools/fetch_vulkan_headers.ps1 fetches from KhronosGroup/Vulkan-Headers.
+# ---------------------------------------------------------------------------
+if ($Vulkan) {
+    function Get-VulkanHeadersRoot {
+        $candidates = @(Get-ChildItem (Join-Path $repoRoot 'third_party') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'vulkan-headers-*' } | Sort-Object Name -Descending)
+        foreach ($candidate in $candidates) {
+            if (Test-Path (Join-Path $candidate.FullName 'include\vulkan\vulkan.h')) { return $candidate.FullName }
+        }
+        if ($env:VULKAN_SDK -and (Test-Path (Join-Path $env:VULKAN_SDK 'include\vulkan\vulkan.h'))) {
+            return $env:VULKAN_SDK
+        }
+        return ''
+    }
+
+    $headersRoot = Get-VulkanHeadersRoot
+    if (-not $headersRoot) {
+        Write-Host '[build] no Vulkan headers found - fetching them (no SDK required)'
+        $fetchScript = Join-Path $PSScriptRoot 'fetch_vulkan_headers.ps1'
+        Invoke-NativeCommand { & $fetchScript } 'Vulkan headers fetch'
+        $headersRoot = Get-VulkanHeadersRoot
+    }
+    if (-not $headersRoot) { throw 'Vulkan headers could not be made available (see tools/fetch_vulkan_headers.ps1).' }
+
+    Write-Host "[build] Vulkan headers: $headersRoot"
+    if (-not ($Define -match '^NRR_ENABLE_VULKAN=')) { $Define += 'NRR_ENABLE_VULKAN=ON' }
+}
+
 # ---------------------------------------------------------------------------
 
 $cmake = Find-CMake

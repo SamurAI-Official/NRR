@@ -21,6 +21,15 @@
 
 namespace nrr {
 
+#ifdef NRR_ENABLE_VULKAN
+/* Every Vulkan call below reads as plain Vulkan (vkCreateInstance, and not
+ * api().create_instance) because the loader table declares the entry points as
+ * function-pointer variables in nrr::vk. They are null until load() has opened
+ * the loader, which is why the probe and initialize() check that first - a null
+ * entry point is a crash, not a degraded mode. */
+using namespace vk;
+#endif
+
 BackendVulkan::BackendVulkan() {
     std::memset(&capabilities_, 0, sizeof(capabilities_));
     std::strncpy(capabilities_.active_backend, "Vulkan",
@@ -60,7 +69,13 @@ bool BackendVulkan::is_supported(const NRRDeviceOptions& options) const {
     (void)options;
 #ifdef NRR_ENABLE_VULKAN
     /* A real probe, on a temporary instance: a capability question must not leave a device open
-     * behind it, and it must never be answered from a request. */
+     * behind it, and it must never be answered from a request.
+     *
+     * Since the loader is resolved at runtime (runtime/vulkan/vulkan_api.h), "is the loader
+     * there?" is part of the same measurement: a machine with the headers but no loader gets
+     * false and a reason, not a crash and not a guess. */
+    if (!vk::load()) return false;
+
     VkApplicationInfo app_info = {};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app_info.pApplicationName = "NRR";
@@ -70,12 +85,18 @@ bool BackendVulkan::is_supported(const NRRDeviceOptions& options) const {
     create_info.pApplicationInfo = &app_info;
 
     VkInstance instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) return false;
-    uint32_t device_count = 0;
-    const bool usable =
-        vkEnumeratePhysicalDevices(instance, &device_count, nullptr) == VK_SUCCESS &&
-        device_count > 0;
-    vkDestroyInstance(instance, nullptr);
+    const bool created = vkCreateInstance(&create_info, nullptr, &instance) == VK_SUCCESS;
+    bool usable = false;
+    if (created && vk::load_instance(instance)) {
+        uint32_t device_count = 0;
+        usable = vkEnumeratePhysicalDevices(instance, &device_count, nullptr) == VK_SUCCESS &&
+                 device_count > 0;
+    }
+    if (created && vkDestroyInstance != nullptr) vkDestroyInstance(instance, nullptr);
+    /* Nothing is left open: the instance is gone, so are its entry points, and this
+     * probe's reference on the loader goes with them. */
+    vk::forget_instance();
+    vk::unload();
     return usable;
 #else
     /* No SDK, no Vulkan. Saying otherwise would make automatic selection prefer this backend -
@@ -89,12 +110,24 @@ bool BackendVulkan::initialize_vulkan(const NRRDeviceOptions& options) {
 #ifdef NRR_ENABLE_VULKAN
     if (vulkan_available_) return true;
     if (create_vulkan_instance() != NRR_SUCCESS) return false;
+    /* The instance exists, so the loader can be asked for the instance-level entry
+     * points (enumerate/query/create device). They are not usable before this. */
+    if (!vk::load_instance(instance_)) {
+        cleanup_vulkan();
+        return false;
+    }
     uint32_t device_index = 0;
     if (select_physical_device(&device_index) != NRR_SUCCESS) {
         cleanup_vulkan();
         return false;
     }
     if (create_logical_device() != NRR_SUCCESS) {
+        cleanup_vulkan();
+        return false;
+    }
+    /* ... and the device exists, so the device-level entry points (memory, images,
+     * command buffers, dispatch) resolve through vkGetDeviceProcAddr. */
+    if (!vk::load_device(device_)) {
         cleanup_vulkan();
         return false;
     }
@@ -174,6 +207,11 @@ NRRResult BackendVulkan::wait_idle() {
 NRRResult BackendVulkan::create_vulkan_instance() {
 #ifdef NRR_ENABLE_VULKAN
     if (instance_ != VK_NULL_HANDLE) return NRR_SUCCESS;
+    /* vkCreateInstance is the one entry point resolved straight from the library handle, so
+     * this is the one place that opens the loader itself; everything after it is resolved
+     * through load_instance()/load_device(), and a null entry point is a crash rather than a
+     * degraded mode - hence the check. */
+    if (!vk::load()) return NRR_ERROR_BACKEND_UNAVAILABLE;
 
     VkApplicationInfo app_info = {};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -335,19 +373,26 @@ NRRResult BackendVulkan::query_capabilities() {
     if (physical_device_ == VK_NULL_HANDLE) return NRR_ERROR_STATE_INVALID;
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physical_device_, &props);
-    VkPhysicalDeviceFeatures features;
-    vkGetPhysicalDeviceFeatures(physical_device_, &features);
 
     /* The documented enum is ABSENT/BASIC/OPTIMIZED/FULL/EXPERIMENTAL. This block used
-     * NRR_CAPABILITY_STATE_AVAILABLE/_UNAVAILABLE, which exist nowhere in the
-     * repository - it compiled only because the whole file sits behind
-     * NRR_ENABLE_VULKAN, which is OFF on desktop and ON for Android/iOS, so every
-     * mobile build failed on six undeclared identifiers while desktop CI never
-     * compiled the file at all. AVAILABLE maps to BASIC to keep the original intent.
-     * These fields are still claims this placeholder does not measure. */
-    capabilities_.neural_acceleration = features.computeShader ?
+     * NRR_CAPABILITY_STATE_AVAILABLE/_UNAVAILABLE, which exist nowhere in the repository - it
+     * compiled only because the whole file sits behind NRR_ENABLE_VULKAN, which no configuration
+     * ever defined, so nothing ever type-checked this file. AVAILABLE maps to BASIC to keep the
+     * original intent.
+     *
+     * The feature query this block used to make read features.computeShader, and that is not a
+     * member of VkPhysicalDeviceFeatures: compute shaders are CORE Vulkan 1.0, so there is no
+     * feature bit for them to report. What is device-specific is the compute CAPACITY, which is
+     * what a dispatch has to fit inside, and that is what is measured here. */
+    const bool compute_capable = props.limits.maxComputeWorkGroupInvocations > 0 &&
+                                 props.limits.maxComputeSharedMemorySize > 0;
+    /* DELIBERATELY conservative: this says the device can dispatch, not that NRR does its
+     * work on the GPU. The frame's inference still runs through ONNX Runtime (no Vulkan
+     * execution provider exists), so neural_acceleration and fp32 stay at BASIC until the
+     * compute kernels in docs/roadmap.md M4 own that work and are measured. */
+    capabilities_.neural_acceleration = compute_capable ?
         NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
-    capabilities_.compute_shader = features.computeShader ?
+    capabilities_.compute_shader = compute_capable ?
         NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
     capabilities_.tensor_cores = NRR_CAPABILITY_ABSENT;
     capabilities_.fp32 = NRR_CAPABILITY_BASIC;
@@ -357,6 +402,8 @@ NRRResult BackendVulkan::query_capabilities() {
     set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
     capabilities_.int8 = NRR_CAPABILITY_BASIC;
     capabilities_.max_texture_size = props.limits.maxImageDimension2D;
+    /* A dedicated compute queue family is what would justify more, and that is measured in
+     * create_logical_device(); until it distinguishes one, this stays BASIC. */
     capabilities_.async_compute = NRR_CAPABILITY_BASIC;
     std::strncpy(capabilities_.active_backend, "Vulkan",
                  sizeof(capabilities_.active_backend) - 1);
@@ -386,8 +433,21 @@ void BackendVulkan::cleanup_vulkan() {
         vkFreeMemory(device_, buf.memory, nullptr);
     }
     vulkan_buffers_.clear();
-    if (device_ != VK_NULL_HANDLE) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
-    if (instance_ != VK_NULL_HANDLE) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+    if (device_ != VK_NULL_HANDLE) {
+        if (vkDestroyDevice != nullptr) vkDestroyDevice(device_, nullptr);
+        device_ = VK_NULL_HANDLE;
+    }
+    /* The device is gone, so its entry points are stale: drop them before the instance is
+     * asked for anything else. */
+    vk::forget_device();
+    if (instance_ != VK_NULL_HANDLE) {
+        if (vkDestroyInstance != nullptr) vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+    }
+    vk::forget_instance();
+    /* Release this backend's reference on the loader. The table is cleared when the last
+     * reference goes, so nothing calls into a library that is gone. */
+    vk::unload();
     physical_device_ = VK_NULL_HANDLE;
 #endif
 }
@@ -413,13 +473,14 @@ uint32_t BackendVulkan::score_physical_device(uint32_t device_index) {
     VkPhysicalDevice device = devices[device_index];
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(device, &properties);
-    VkPhysicalDeviceFeatures features;
-    vkGetPhysicalDeviceFeatures(device, &features);
 
     uint32_t score = 0;
     if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 1000;
     else if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 100;
-    if (!features.computeShader) return 0;
+    /* Compute shaders are core Vulkan 1.0 - there is no features.computeShader, and the check
+     * that used to be here could not have compiled. What decides usability is whether the
+     * device can dispatch at all, which its workgroup limits answer. */
+    if (properties.limits.maxComputeWorkGroupInvocations == 0) return 0;
     score += 500;
 
     VkPhysicalDeviceMemoryProperties mem_props;

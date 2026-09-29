@@ -14,6 +14,64 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### Vulkan: the branch no build ever compiled, and a way to reach a device without the SDK
+
+The Vulkan backend was the one part of the runtime with no compiled configuration at all, and the
+cause was not hardware. `CMakeLists.txt` declared `NRR_ENABLE_VULKAN` and never turned it into a
+compile definition (only `NRR_ENABLE_MOBILE_VENDOR` and the four vendor options were), so
+`#ifdef NRR_ENABLE_VULKAN` was false everywhere: CMake took the SDK arm, printed
+`-- Vulkan Backend: ON`, and the compiler saw the no-SDK stub branch. The Android job believed to be
+the exception had `backend_vulkan.cpp.o` in its archive, which proved the file was compiled - not
+which branch of it, and not that the branch had ever been type-checked.
+
+Wired up (the option now reaches the compiler, and an `#error` in `runtime/vulkan/vulkan_api.h`
+makes the two impossible to separate silently again), the first real compile found three defects
+that had been sitting in the file:
+
+- **`features.computeShader` does not exist.** It is not a member of `VkPhysicalDeviceFeatures` -
+  compute shaders are core Vulkan 1.0, so there is no feature bit for them. Both uses (the
+  capability query and the device score) now measure capacity instead:
+  `maxComputeWorkGroupInvocations` and `maxComputeSharedMemorySize`.
+- **`std::min` was broken by `windows.h`.** `VK_USE_PLATFORM_WIN32_KHR` pulls in `windows.h`, whose
+  `min`/`max` macros broke `std::min` in `score_physical_device`; `NOMINMAX` +
+  `WIN32_LEAN_AND_MEAN` now precede it. The stub branch includes no `windows.h`, so this could only
+  appear in the branch nobody compiled.
+- **The mobile backends' Vulkan probes linked prototypes rather than a loader.**
+  `backend_adreno.cpp` and `backend_mali.cpp` included `vulkan.h` directly, so they were the
+  unresolved `vkCreateInstance` / `vkEnumeratePhysicalDevices` / `vkGetPhysicalDeviceProperties`
+  the first link reported.
+
+No SDK required any more: `tools/fetch_vulkan_headers.ps1` fetches the Khronos/Vulkan-Headers set
+(`vulkan-sdk-1.4.363.0`, 34 headers, no admin, ~5 MB), the loader is resolved at runtime
+(`runtime/vulkan/vulkan_api.{h,cpp}`, compiled with `VK_NO_PROTOTYPES`, opening `vulkan-1.dll` /
+`libvulkan.so.1`), so a desktop build needs the headers and nothing else - no import library is
+linked. `tools/build.ps1 -Vulkan` does the whole thing (fetches the headers if absent, adds the
+define). The `vulkan-api` tests state the loader's real state in either configuration, and
+`is_supported()` answers from that probe rather than from the request.
+
+Fixed while these probes became reachable: the Adreno probe matched vendor ID `0x0EBD` (Vivante's)
+instead of Qualcomm's `0x5143`, so it could only ever have matched on the device name; and both
+mobile probes kept a `VkPhysicalDevice` handle after destroying the temporary instance it belonged
+to.
+
+**Measured** (Windows x64, RTX 4070 Ti, no Vulkan SDK installed, headers 1.4.363.0, loader
+`vulkan-1.dll`):
+
+```
+-- Vulkan: third_party/vulkan-headers-1.4.363.0/include (headers only; loader resolved at runtime)
+-- Vulkan Backend:   ON
+nrr_tests: Passed: 117, Failed: 0          (114 before; the 3 Vulkan tests are new)
+  loader: vulkan-1.dll
+  device: NVIDIA GeForce RTX 4070 Ti | max_texture=32768
+nrr_static, Android arm64-v8a, NDK r27: -DNRR_ENABLE_VULKAN=1 in the Ninja DEFINES,
+  31 objects including runtime/vulkan/vulkan_api.cpp.o and backend_vulkan.cpp.o
+```
+
+CI: a new `vulkan-compile` job builds this configuration on a runner with no GPU and no SDK, and the
+`android-ndk` job now checks `-DNRR_ENABLE_VULKAN=1` in the generated Ninja defines - because the
+archive member it checked before cannot tell the stub branch from the real one.
+
+
 ### M2 follow-up: honest reporting, a real warm-up, one shared temporal pass, and a first-class NVIDIA backend
 
 A pass over every claim the M2 work touched, on the same machine and under the same rule
@@ -264,10 +322,12 @@ Three real gaps had to close first:
   today, and the reason it cannot use `add_subdirectory()`.
 - **`NRR_ENABLE_VULKAN` was impossible to configure away from a desktop Vulkan SDK**, and it is ON
   by default for mobile. The NDK sysroot carries `vulkan/vulkan.h` plus a `libvulkan.so` link stub
-  per ABI triple, so the Android arm takes Vulkan from there. **That is also the first build ever to
-  compile `runtime/backend_vulkan.cpp`'s Vulkan branch** - the WS4 repair got only the no-SDK stub
-  branch compiled - so `select_physical_device`, `create_logical_device`, `query_capabilities`,
-  `cleanup_vulkan` and `score_physical_device` are type-checked now.
+  per ABI triple, so the Android arm takes Vulkan from there.
+  *Correction:* this entry originally added "That is also the first build ever to compile
+  `runtime/backend_vulkan.cpp`'s Vulkan branch". It was not - the CMake option was never a compile
+  definition, so every build compiled the no-SDK stub branch and the Android arm only proved CMake
+  found the sysroot headers. The first real compile of that branch, and the three defects it found,
+  are recorded in the Vulkan entry at the top of this file.
 - **The first compile of the non-Windows ORT path surfaced seven warnings MSVC cannot show.** ONNX
   Runtime declares its status-returning C API functions `warn_unused_result` under clang/gcc only,
   so the Android build was the first to notice seven ignored statuses in `runtime/onnx_runtime.cpp`.

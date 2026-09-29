@@ -14,7 +14,7 @@
 
 #include "nrr_backend.h"
 #ifdef NRR_ENABLE_VULKAN
-#include <vulkan/vulkan.h>
+#include "../vulkan/vulkan_api.h"  /* the runtime-resolved table: VK_NO_PROTOTYPES must reach vulkan.h first */
 #endif
 
 namespace nrr {

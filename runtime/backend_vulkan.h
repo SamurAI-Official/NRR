@@ -27,10 +27,11 @@
 #include <unordered_map>
 #include <vector>
 #ifdef NRR_ENABLE_VULKAN
-#if defined(_WIN32) || defined(_WIN64)
-#define VK_USE_PLATFORM_WIN32_KHR
-#endif
-#include <vulkan/vulkan.h>
+/* Vulkan types and entry points come from the loader table, not from linked
+ * prototypes: every Vulkan translation unit must reach vulkan.h through
+ * vulkan_api.h, which defines VK_NO_PROTOTYPES first and is why a build needs
+ * the headers and nothing else (see runtime/vulkan/vulkan_api.h). */
+#include "vulkan/vulkan_api.h"
 #endif
 
 namespace nrr {

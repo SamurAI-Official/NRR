@@ -764,10 +764,16 @@ external port (M1.4) were invisible until that port hit them, and the reason it 
 2. **`NRR_ENABLE_VULKAN` needed a desktop Vulkan SDK**, and it is ON by default for mobile, so the
    mobile configuration could not be configured at all. The NDK sysroot carries `vulkan/vulkan.h` and
    a `libvulkan.so` link stub per ABI triple (`sysroot/usr/lib/aarch64-linux-android/<api>/`), and the
-   Android arm takes both from there. **This is the first build ever to compile `backend_vulkan.cpp`'s
-   Vulkan branch** - the WS4 repair got only the no-SDK stub branch compiled - so
-   `select_physical_device`, `create_logical_device`, `query_capabilities`, `cleanup_vulkan` and
-   `score_physical_device` are type-checked, not merely present.
+   Android arm takes both from there.
+   **Correction (M4/V0).** This section originally continued "This is the first build ever to compile
+   `backend_vulkan.cpp`'s Vulkan branch", and that was false - for this configuration and for every
+   other. The CMake option was never turned into a compile definition, so `#ifdef NRR_ENABLE_VULKAN`
+   was false in every build and the no-SDK stub branch is what compiled; the Android arm proved only
+   that CMake *found* the sysroot headers and the link stub. The first compile of the real branch is
+   recorded in the M4/V0 section below, and it immediately found three defects this text had credited
+   as type-checked: a non-existent `VkPhysicalDeviceFeatures::computeShader`, a `std::min` that
+   `windows.h`'s `min` macro broke, and `vkCreateInstance`-family calls resolving to prototypes with no
+   import library behind them.
 3. **The non-Windows ORT path had never been compiled either.** Its first compile surfaced seven
    `-Wunused-result` warnings (ORT declares status-returning C API functions `warn_unused_result`
    under clang/gcc, an attribute MSVC does not implement): ignored statuses in `onnx_runtime.cpp`,
@@ -967,16 +973,51 @@ No external prerequisites (the specification documents already exist).
       pipeline per `specification/frame_contract.md`, frame-index monotonicity, and
       multi-instance/thread-safety contracts with tests
 
-## M4 - Real Vulkan compute `gated: Vulkan SDK + GPU`
+## M4 - Real Vulkan compute `gated: a GPU for the vendor claims; the branch itself compiles without one`
 
-Prerequisite: Vulkan SDK (or the Vulkan headers and `glslc`/`glslangValidator`) -
-none found on the current machine, and `NRR_ENABLE_VULKAN` is OFF on desktop.
+Prerequisite, now satisfied without the SDK: the Vulkan headers (`tools/fetch_vulkan_headers.ps1`;
+the NDK sysroot supplies them for Android) and a loader at runtime (`vulkan-1.dll` on this machine,
+`libvulkan.so` on Android). `glslc`/`glslangValidator` are still needed for the SPIR-V step and are
+the one prerequisite left.
 
-- [ ] Real `runtime/backend_vulkan.cpp`: instance/device/queue setup, SPIR-V compute
-      pre/post-processing, GPU-resident texture pool, capability-driven fallback chain
-- [ ] SPIR-V build step in CMake (glslc/glslang) instead of unchecked-in blobs
-- [ ] Enable Vulkan on desktop by default once the suite is green on that path
-- [ ] Vendor mobile GPUs (Adreno, Mali) through the same path
+### M4/V0 - the configuration compiles, and the claims it had been credited with were not there
+
+Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever compiled"):
+
+- [x] The CMake option reaches the compiler, and `runtime/vulkan/vulkan_api.h` fails the build if it
+      ever stops doing so. This was the defect that made "the Vulkan branch compiles" untrue in every
+      configuration - including the Android one that was believed to be the exception, whose archive
+      member proved only that the file was compiled.
+- [x] Headers without the SDK (`tools/fetch_vulkan_headers.ps1`, `-DNRR_VULKAN_HEADERS_ROOT`) plus a
+      runtime-resolved loader (`runtime/vulkan/vulkan_api.{h,cpp}`, `VK_NO_PROTOTYPES`), so
+      `tools/build.ps1 -Vulkan` builds it on a desktop with no SDK, no admin rights and no import
+      library.
+- [x] The real branch compiled for the first time, on this machine and for arm64: `nrr_static`,
+      117/117 in the suite, a real device (`NVIDIA GeForce RTX 4070 Ti`, `max_texture=32768`), and
+      its three defects fixed - a non-existent `VkPhysicalDeviceFeatures::computeShader`, a
+      `std::min` broken by `windows.h`'s macros, and the mobile probes linking prototypes.
+- [x] `is_supported()` probes the loader and a device, and the stub configuration claims nothing -
+      asserted by `tests/unit/test_vulkan_api.cpp` in both configurations.
+- [x] CI: a `vulkan-compile` job (no GPU, no SDK) plus the Android job's `-DNRR_ENABLE_VULKAN=1`
+      check, because a member in the archive cannot tell the stub branch from the real one.
+
+Next, in order:
+
+- [ ] Device work in `runtime/vulkan/`: queues (`vkGetDeviceQueue` is still never called),
+      `VkImage`/`VkBuffer`/`VkDeviceMemory` with a staging ring and layout barriers, command pools,
+      fences, frames in flight, and device-lost handling. Today textures and buffers are host
+      `std::vector<uint8_t>` and the `VulkanTexture`/`VulkanBuffer` maps in `backend_vulkan.h` are
+      declared but never populated.
+- [ ] SPIR-V compute (NCHW pack/unpack, temporal blend, upscale, YUV) with a real build step
+      (`glslc`/`glslangValidator`) rather than checked-in blobs whose hash is not verified against
+      source. The ONNX graph itself stays on ONNX Runtime - no ORT build ships a Vulkan execution
+      provider - so the honest split is that the GPU owns the frame's pre/post stages.
+- [ ] Per-device capability measurement: vendor ID to vendor name, subgroup size, cooperative
+      matrix, integer dot product, `VK_EXT_memory_budget`, and the fp16 question answered by
+      measurement (ABSENT until a real fp16 path exists and is measured).
+- [ ] Vendor front-doors over one engine (AMD, Intel, NVIDIA, and Adreno/Mali/PowerVR through the
+      same path), each probing for its own hardware instead of reporting support from a build option.
+- [ ] Enable Vulkan on desktop by default once this path is green there.
 
 ## M5 - Unreal integration `gated: Unreal Engine install`
 
@@ -1063,7 +1104,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | NVIDIA GPU + CUDA toolkit matching the ORT build | M2 CUDA path, M7 NVIDIA kernels | Not present (no nvcc) |
 | AMD (HIP/ROCm) and Intel (oneAPI) toolchains + hardware | M7 AMD/Intel kernels | Not present |
 | RISC-V toolchain + board | M7 RVV validation | Not present |
-| Vulkan SDK (headers + glslc) | M4 | Not present |
+| Vulkan: headers, loader, and `glslc` for SPIR-V | M4 | **Headers and loader: present.** `tools/fetch_vulkan_headers.ps1` fetches the Khronos header set (`vulkan-sdk-1.4.363.0`), the loader is installed by the graphics driver (`vulkan-1.dll`), and the runtime resolves it at run time - so the Vulkan configuration compiles and enumerates a real device with no SDK and no admin rights. **Still missing: `glslc`/`glslangValidator`** for the SPIR-V build step |
 | Unreal Engine install | M5 | Not present |
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | **Android toolchain: present.** NDK r27 (`27.0.12077973`), adopted if installed and otherwise fetched by `tools/fetch_ndk.ps1` (cached in CI), so the Android configuration now compiles in the `android-ndk` job (arm64-v8a, `nrr_static`, Vulkan from the NDK sysroot). No device and no emulator image, so device behaviour is still evidenced only by the consumer's `nrr_probe` run. **iOS: no toolchain** (needs macOS/Xcode) |

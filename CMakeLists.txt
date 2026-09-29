@@ -101,6 +101,17 @@ if(NRR_ENABLE_VULKAN_STUB AND NOT NRR_ENABLE_VULKAN)
     message(STATUS "Vulkan backend: compiled in its no-SDK (stub) configuration")
 endif()
 
+if(NRR_ENABLE_VULKAN)
+    # The option has to reach the compiler, and it never did: NRR_ENABLE_MOBILE_VENDOR and the
+    # four vendor options were turned into definitions, this one was not, so *every* build -
+    # including the Android cross-build that was meant to be the one Vulkan configuration -
+    # compiled backend_vulkan.cpp's stub branch while CMake reported the SDK arm as taken. The
+    # branch is what makes the Vulkan code real, so the two are now tied together:
+    # NRR_CONFIG_EXPECTS_VULKAN makes runtime/vulkan/vulkan_api.h fail the build with a #error
+    # if the macro ever fails to arrive again (docs/roadmap.md, M4).
+    add_compile_definitions(NRR_ENABLE_VULKAN=1 NRR_CONFIG_EXPECTS_VULKAN=1)
+endif()
+
 # Desktop/embedded vendor backends: compiled unconditionally into the runtime
 # (inert stubs) and *activated* (registry registration, EP selection, HIP/CUDA
 # device paths) only when the corresponding option is enabled.
@@ -360,6 +371,7 @@ set(NRR_RUNTIME_SOURCES
 if(NRR_ENABLE_VULKAN)
     list(APPEND NRR_RUNTIME_SOURCES
         ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
+        ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_api.cpp
     )
     if(NRR_PLATFORM_ANDROID)
         # The NDK sysroot carries Vulkan: <sysroot>/usr/include/vulkan/vulkan.h plus a
@@ -399,9 +411,47 @@ if(NRR_ENABLE_VULKAN)
         include_directories("${_NRR_VULKAN_INCLUDE}")
         message(STATUS "Vulkan: ${_NRR_VULKAN_LIB} (NDK sysroot, ${ANDROID_ABI})")
     else()
-        find_package(Vulkan REQUIRED)
-        include_directories(${Vulkan_INCLUDE_DIRS})
-        link_directories(${Vulkan_LIBRARY_DIRS})
+        # Desktop: headers only. Every entry point is resolved at runtime by
+        # runtime/vulkan/vulkan_api.cpp (compiled with VK_NO_PROTOTYPES), so no import
+        # library is needed and find_package(Vulkan) - which requires an installed LunarG
+        # SDK - is no longer used. That requirement is what kept NRR_ENABLE_VULKAN OFF on
+        # every desktop, so the backend was compiled by nothing but the Android cross-build
+        # (docs/roadmap.md M4).
+        #
+        # Searched in order: an explicit root, an installed SDK, then a header set fetched
+        # into third_party/ (tools/fetch_vulkan_headers.ps1). Newest third_party set first.
+        set(NRR_VULKAN_HEADERS_ROOT "" CACHE PATH
+            "Directory containing include/vulkan/vulkan.h (Vulkan-Headers or Vulkan SDK)")
+        set(_NRR_VULKAN_HEADERS_CANDIDATES "")
+        if(NRR_VULKAN_HEADERS_ROOT)
+            list(APPEND _NRR_VULKAN_HEADERS_CANDIDATES "${NRR_VULKAN_HEADERS_ROOT}")
+        endif()
+        if(DEFINED ENV{VULKAN_SDK})
+            list(APPEND _NRR_VULKAN_HEADERS_CANDIDATES "$ENV{VULKAN_SDK}")
+        endif()
+        file(GLOB _NRR_VULKAN_FETCHED "${CMAKE_SOURCE_DIR}/third_party/vulkan-headers-*")
+        list(SORT _NRR_VULKAN_FETCHED ORDER DESCENDING)
+        list(APPEND _NRR_VULKAN_HEADERS_CANDIDATES ${_NRR_VULKAN_FETCHED})
+
+        set(_NRR_VULKAN_INCLUDE "")
+        foreach(_candidate IN LISTS _NRR_VULKAN_HEADERS_CANDIDATES)
+            if(EXISTS "${_candidate}/include/vulkan/vulkan.h")
+                set(_NRR_VULKAN_INCLUDE "${_candidate}/include")
+                break()
+            endif()
+        endforeach()
+        if(NOT _NRR_VULKAN_INCLUDE)
+            message(FATAL_ERROR
+                "NRR_ENABLE_VULKAN is ON but no Vulkan headers were found. Fetch them with "
+                "'pwsh tools/fetch_vulkan_headers.ps1' (no SDK and no admin needed), or point "
+                "-DNRR_VULKAN_HEADERS_ROOT at an extracted Vulkan-Headers directory or an "
+                "installed Vulkan SDK, or configure with -DNRR_ENABLE_VULKAN=OFF.")
+        endif()
+        include_directories("${_NRR_VULKAN_INCLUDE}")
+        # The loader is dlopen/LoadLibrary'd at runtime; the define documents that the
+        # table (not an import library) is what every call site goes through.
+        add_compile_definitions(NRR_VULKAN_DYNAMIC_LOADER=1)
+        message(STATUS "Vulkan: ${_NRR_VULKAN_INCLUDE} (headers only; loader resolved at runtime)")
     endif()
 elseif(NRR_ENABLE_VULKAN_STUB)
     # Same source, no SDK: the stub branch is what gets compiled, so the file is checked rather
@@ -479,7 +529,10 @@ if(NRR_BUILD_SHARED)
     nrr_link_ort(nrr PRIVATE)
     nrr_copy_ort_dll(nrr)
 
-    if(NRR_ENABLE_VULKAN)
+    if(NRR_ENABLE_VULKAN AND NRR_PLATFORM_ANDROID)
+        # Android only: the NDK stub is linked so libvulkan.so is a recorded dependency.
+        # Desktop resolves the loader at runtime instead, and therefore links nothing -
+        # which is what makes a header-only build possible.
         target_link_libraries(nrr PRIVATE
             Vulkan::Vulkan
         )
@@ -513,7 +566,7 @@ target_link_libraries(nrr_static PUBLIC
 nrr_link_ort(nrr_static PRIVATE)
 nrr_copy_ort_dll(nrr_static)
 
-if(NRR_ENABLE_VULKAN)
+if(NRR_ENABLE_VULKAN AND NRR_PLATFORM_ANDROID)
     target_link_libraries(nrr_static PUBLIC
         Vulkan::Vulkan
     )

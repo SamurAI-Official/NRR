@@ -132,8 +132,20 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
 - [x] Backend selection
 - [x] Basic test
 
-### Phase 2 - Vulkan Backend (not implemented)
-- [ ] Full Vulkan implementation
+### Phase 2 - Vulkan Backend (compiled, prober-verified; no compute yet)
+- [x] The branch compiles in every configuration with no Vulkan SDK: headers come from
+      `tools/fetch_vulkan_headers.ps1` and the loader is resolved at run time
+      (`runtime/vulkan/vulkan_api.{h,cpp}`, `VK_NO_PROTOTYPES`). Until this milestone the CMake
+      option never reached the compiler, so *every* build - the Android job included - compiled
+      the no-SDK stub branch while CMake reported the SDK arm as taken
+- [x] Instance creation, device enumeration and scoring, `vkCreateDevice`, capability query, and a
+      probe that reports what is really there (`NVIDIA GeForce RTX 4070 Ti`, `max_texture=32768` on
+      the development machine; the stub configuration claims nothing)
+- [ ] Full Vulkan implementation: GPU-resident `VkImage`/`VkBuffer` with staging and barriers,
+      command buffers and fences, and SPIR-V compute for the frame's pre/post stages (see M4 in
+      docs/roadmap.md). `vkGetDeviceQueue` is still never called, and textures/buffers are host
+      `std::vector<uint8_t>` today
+- [ ] Vendor GPUs (Adreno, Mali, AMD, Intel, NVIDIA) through this same path
 
 ### Phase 3 - Neural Model Execution (CPU only)
 - [x] ONNX Runtime wrapper (real OrtSession via the stable OrtApi C interface)

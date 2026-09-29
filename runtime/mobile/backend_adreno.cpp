@@ -15,10 +15,23 @@
 #include <vector>
 
 #ifdef NRR_ENABLE_VULKAN
-#include <vulkan/vulkan.h>
+/* The entry points are the runtime-resolved table (runtime/vulkan/vulkan_api.h). vulkan.h must
+ * not be included directly anywhere else: VK_NO_PROTOTYPES has to be defined before it, and a
+ * direct include is exactly what turned these calls into prototypes - the unresolved
+ * vkCreateInstance / vkEnumeratePhysicalDevices / vkGetPhysicalDeviceProperties the first
+ * build of this configuration hit, because there is no Vulkan import library to link on a
+ * machine without the SDK. */
+#include "../vulkan/vulkan_api.h"
 #endif
 
 namespace nrr {
+
+#ifdef NRR_ENABLE_VULKAN
+/* Every Vulkan call below reads as plain Vulkan because the table (runtime/vulkan/
+ * vulkan_api.h) declares its entry points as variables in nrr::vk. They are null until
+ * load() opens a loader, which is why the probe below loads it before it probes. */
+using namespace nrr::vk;
+#endif
 
 BackendAdreno::BackendAdreno()
     : initialized_(false), is_adreno_(false), adreno_gpu_model_(0),
@@ -54,8 +67,19 @@ NRRResult BackendAdreno::initialize(const NRRDeviceOptions& options) {
 void BackendAdreno::shutdown() {
     if (!initialized_) return;
 #ifdef NRR_ENABLE_VULKAN
-    if (device_ != VK_NULL_HANDLE) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
-    if (instance_ != VK_NULL_HANDLE) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+    if (device_ != VK_NULL_HANDLE) {
+        if (vkDestroyDevice != nullptr) vkDestroyDevice(device_, nullptr);
+        device_ = VK_NULL_HANDLE;
+        vk::forget_device();
+    }
+    if (instance_ != VK_NULL_HANDLE) {
+        if (vkDestroyInstance != nullptr) vkDestroyInstance(instance_, nullptr);
+        instance_ = VK_NULL_HANDLE;
+        vk::forget_instance();
+    }
+    /* Balanced with detect_adreno_gpu()'s load(): harmless when the probe already released it,
+     * because the loader handle is reference-counted. */
+    vk::unload();
     physical_device_ = VK_NULL_HANDLE;
 #endif
     initialized_ = false;
@@ -146,6 +170,8 @@ NRRResult BackendAdreno::wait_idle() {
 
 NRRResult BackendAdreno::detect_adreno_gpu() {
 #ifdef NRR_ENABLE_VULKAN
+    /* A loader is a precondition, not an assumption: without one there is no Adreno either. */
+    if (!vk::load()) return NRR_ERROR_BACKEND_UNAVAILABLE;
     VkApplicationInfo app_info = {};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app_info.apiVersion = VK_API_VERSION_1_0;
@@ -153,12 +179,23 @@ NRRResult BackendAdreno::detect_adreno_gpu() {
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
     VkInstance temp_instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS)
+    if (vkCreateInstance(&create_info, nullptr, &temp_instance) != VK_SUCCESS) {
+        vk::unload();
         return NRR_ERROR_BACKEND_UNAVAILABLE;
+    }
+    /* The instance-level entry points resolve only once an instance exists. */
+    if (!vk::load_instance(temp_instance)) {
+        if (vkDestroyInstance != nullptr) vkDestroyInstance(temp_instance, nullptr);
+        vk::forget_instance();
+        vk::unload();
+        return NRR_ERROR_BACKEND_UNAVAILABLE;
+    }
     uint32_t device_count = 0;
     vkEnumeratePhysicalDevices(temp_instance, &device_count, nullptr);
     if (device_count == 0) {
         vkDestroyInstance(temp_instance, nullptr);
+        vk::forget_instance();
+        vk::unload();
         return NRR_ERROR_DEVICE_NOT_FOUND;
     }
     std::vector<VkPhysicalDevice> devices(device_count);
@@ -166,10 +203,11 @@ NRRResult BackendAdreno::detect_adreno_gpu() {
     for (uint32_t i = 0; i < device_count; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
-        if (props.vendorID == 0x0EBD ||
+        /* 0x5143 is Qualcomm's Vulkan vendor ID. The value that used to be here (0x0EBD) is
+         * Vivante's, so this condition could only ever have matched through the device name. */
+        if (props.vendorID == 0x5143 ||
             std::string(props.deviceName).find("Adreno") != std::string::npos) {
             is_adreno_ = true;
-            physical_device_ = devices[i];
             std::string name(props.deviceName);
             size_t pos = name.find("Adreno");
             if (pos != std::string::npos) {
@@ -180,6 +218,14 @@ NRRResult BackendAdreno::detect_adreno_gpu() {
         }
     }
     vkDestroyInstance(temp_instance, nullptr);
+    /* A VkPhysicalDevice is valid only while its instance lives and this one was a probe that
+     * has just been destroyed, so the handle is deliberately not kept: leaving it set is how a
+     * dangling device gets read later. Nothing needs it - query_adreno_capabilities() does not
+     * dereference it, and the persistent instance belongs to the real Vulkan device in
+     * docs/roadmap.md M4/V1. */
+    physical_device_ = VK_NULL_HANDLE;
+    vk::forget_instance();
+    vk::unload();
     return is_adreno_ ? NRR_SUCCESS : NRR_ERROR_BACKEND_UNAVAILABLE;
 #else
     return NRR_ERROR_BACKEND_UNAVAILABLE;

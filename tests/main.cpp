@@ -18,6 +18,7 @@
 #include "unit/test_capability_claims.cpp"
 #include "unit/test_engine_plugins.cpp"
 #include "unit/test_gpu_ep.cpp"
+#include "unit/test_vulkan_api.cpp"
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
@@ -78,6 +79,15 @@ void run_all_tests() {
 #ifdef NRR_HAVE_CUDA_EP
     NRR_RUN_TEST(test_cuda_ep_is_measurably_faster_than_cpu);
 #endif
+
+    std::cout << "\n--- Vulkan Tests ---\n";
+    /* This branch had never been compiled before this milestone (CMake never defined the macro
+     * its guards use), so the file's defects - a non-existent VkPhysicalDeviceFeatures member,
+     * a std::min that windows.h broke, prototypes with no import library - were all invisible.
+     * These tests keep it that way: they pass in both configurations and say which one ran. */
+    NRR_RUN_TEST(test_vulkan_loader_probe_is_measured);
+    NRR_RUN_TEST(test_vulkan_capability_answer_agrees_with_the_loader_probe);
+    NRR_RUN_TEST(test_vulkan_backend_reports_only_what_it_measured);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);

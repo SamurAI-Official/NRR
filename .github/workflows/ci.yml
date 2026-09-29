@@ -392,8 +392,14 @@ jobs:
       # The artefact is the claim, and the build log names the toolchain that produced it, so
       # nothing here guesses where the NDK lives. Every source in NRR_RUNTIME_SOURCES lands in
       # nrr_static, so a shrunken archive means sources were dropped rather than that the build
-      # succeeded; backend_vulkan.cpp only reaches the compiler with NRR_ENABLE_VULKAN defined, so
-      # its member is the evidence that branch was type-checked at last.
+      # succeeded.
+      #
+      # An archive member proves which FILE was compiled, not which branch of it. This check
+      # used to claim that backend_vulkan.cpp's member was evidence its Vulkan branch had been
+      # type-checked, and it was not: the macro that branch is guarded by was never turned into
+      # a compile definition, so every build - this one included - compiled the no-SDK stub
+      # while the job reported success about a branch it had never seen (docs/roadmap.md M4).
+      # The generated Ninja DEFINES line is the compiler's own view, so that is checked too.
       - name: Verify the cross-built runtime
         shell: pwsh
         run: |
@@ -408,6 +414,18 @@ jobs:
           if (-not ($log | Select-String '^-- Vulkan: .*\(NDK sysroot')) {
             throw "the build did not take Vulkan from the NDK sysroot - NRR_ENABLE_VULKAN was not on"
           }
+
+          # ... and that is only the CMake option. The macro has to reach the compiler, which is
+          # the mistake that made "the Vulkan branch compiles" untrue here for as long as it was
+          # (the option was never a compile definition, so the stub branch was what compiled).
+          $ninja = Get-Content build-android/build.ninja -Raw
+          if ($ninja -notmatch '-DNRR_ENABLE_VULKAN=1') {
+            throw "NRR_ENABLE_VULKAN never reached the compiler: backend_vulkan.cpp compiled as its no-SDK stub"
+          }
+          if ($ninja -notmatch '-DNRR_CONFIG_EXPECTS_VULKAN=1') {
+            throw "NRR_CONFIG_EXPECTS_VULKAN is missing, so the CMake/compiler tie has been undone (runtime/vulkan/vulkan_api.h)"
+          }
+          Write-Host "Vulkan branch enabled for the compiler: -DNRR_ENABLE_VULKAN=1 in the Ninja DEFINES"
           if (-not ($log | Select-String '^-- ONNX Runtime: .*Android arm64-v8a')) {
             throw "the build did not pick up the Android ONNX Runtime - it compiled the placeholder path"
           }
@@ -445,5 +463,68 @@ jobs:
         with:
           name: android-build-${{ github.run_number }}
           path: android-build.log
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # The Vulkan branch, compiled on a desktop with no Vulkan SDK and no GPU.
+  #
+  # This job exists because that branch had never been compiled by anything. The CMake option
+  # was never turned into a compile definition, so every build compiled the no-SDK stub while
+  # CMake reported the SDK arm as taken - which is why the file kept a non-existent
+  # VkPhysicalDeviceFeatures member, a std::min that windows.h's min macro broke, and calls to
+  # prototypes with no import library to link against (docs/roadmap.md M4). Headers come from
+  # Vulkan-Headers (no SDK, no admin) and the loader is resolved at runtime, so nothing here
+  # needs a GPU: the Vulkan tests report either a real device or the measured reason there is
+  # none, and pass either way. What this job will not tolerate is the branch silently
+  # compiling as its stub again.
+  # ---------------------------------------------------------------------------
+  vulkan-compile:
+    name: Windows x64 - Vulkan branch (headers only, no SDK)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the Vulkan headers
+        uses: actions/cache@v4
+        with:
+          path: third_party/vulkan-headers-*
+          key: vulkan-headers-1.4.363.0
+
+      - name: Fetch the Vulkan headers (no SDK and no admin required)
+        shell: pwsh
+        run: ./tools/fetch_vulkan_headers.ps1
+
+      - name: Build with the Vulkan branch compiled
+        shell: pwsh
+        run: |
+          ./tools/build.ps1 -Vulkan -Config Release -BuildDir build-vulkan *>&1 |
+            Tee-Object -FilePath vulkan-build.log
+
+      # The option being ON is not evidence: the macro has to reach the compiler, and the gap
+      # between the two is exactly what this job exists to close. The generated project file is
+      # the compiler's own view of the definitions.
+      - name: Verify the branch reached the compiler, then run the suite
+        shell: pwsh
+        run: |
+          $proj = Get-Content build-vulkan/nrr.vcxproj -Raw
+          if ($proj -notmatch 'NRR_ENABLE_VULKAN=1') {
+            throw "NRR_ENABLE_VULKAN never reached the compiler: backend_vulkan.cpp compiled as its no-SDK stub"
+          }
+          if ($proj -notmatch 'NRR_CONFIG_EXPECTS_VULKAN=1') {
+            throw "NRR_CONFIG_EXPECTS_VULKAN is missing, so the CMake/compiler tie has been undone (runtime/vulkan/vulkan_api.h)"
+          }
+          Write-Host "Vulkan branch enabled for the compiler in nrr.vcxproj"
+
+          # The suite must stay green without a GPU: the Vulkan tests measure the loader and
+          # record the reason when there is no device, which is a result rather than a skip.
+          ./build-vulkan/Release/nrr_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "the suite failed in the Vulkan configuration" }
+
+      - name: Upload the Vulkan build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-build-${{ github.run_number }}
+          path: vulkan-build.log
           if-no-files-found: ignore
 
