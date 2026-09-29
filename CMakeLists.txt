@@ -373,6 +373,7 @@ if(NRR_ENABLE_VULKAN)
         ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_api.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_device.cpp
+        ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_pipeline.cpp
     )
     if(NRR_PLATFORM_ANDROID)
         # The NDK sysroot carries Vulkan: <sysroot>/usr/include/vulkan/vulkan.h plus a
@@ -453,6 +454,108 @@ if(NRR_ENABLE_VULKAN)
         # table (not an import library) is what every call site goes through.
         add_compile_definitions(NRR_VULKAN_DYNAMIC_LOADER=1)
         message(STATUS "Vulkan: ${_NRR_VULKAN_INCLUDE} (headers only; loader resolved at runtime)")
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # SPIR-V kernels (M4/V2)
+    #
+    # runtime/vulkan/shaders/*.comp is the source of truth; glslc compiles it and
+    # tools/embed_spirv.py embeds the bytecode in a generated header, with the SHA-256 of each
+    # kernel travelling beside it so a machine that has a compiler can re-derive and compare it
+    # (a test does). That is the difference between a checked-in blob and a verified one - the M4
+    # item that asked for a real build step.
+    #
+    # glslc is looked for where it actually is on the machines this builds on: an explicit
+    # NRR_GLSLANG_ROOT, the Vulkan SDK, the Android NDK's shader-tools (which the Android CI job and
+    # any Android developer already have - that is where glslc comes from on this machine), or PATH.
+    # Without it the build still succeeds: the kernels are absent, the pipeline says so, and the
+    # tests report it instead of pretending.
+    # ---------------------------------------------------------------------------
+    set(NRR_GLSLANG_ROOT "" CACHE PATH "Directory holding glslc/glslangValidator")
+    set(_NRR_GLSLC_CANDIDATES "")
+    if(NRR_GLSLANG_ROOT)
+        list(APPEND _NRR_GLSLC_CANDIDATES "${NRR_GLSLANG_ROOT}/bin/glslc.exe"
+             "${NRR_GLSLANG_ROOT}/glslc.exe" "${NRR_GLSLANG_ROOT}/bin/glslc" "${NRR_GLSLANG_ROOT}/glslc")
+    endif()
+    if(DEFINED ENV{VULKAN_SDK})
+        list(APPEND _NRR_GLSLC_CANDIDATES "$ENV{VULKAN_SDK}/Bin/glslc.exe" "$ENV{VULKAN_SDK}/bin/glslc")
+    endif()
+    set(_NRR_NDK_ROOTS "")
+    foreach(_ndk_env ANDROID_NDK_HOME ANDROID_NDK_ROOT)
+        if(DEFINED ENV{${_ndk_env}})
+            list(APPEND _NRR_NDK_ROOTS "$ENV{${_ndk_env}}")
+        endif()
+    endforeach()
+    # The NDK the Android build itself uses (build.ps1 passes it as the toolchain file), and the
+    # SDK's ndk/<version> directories where Android Studio keeps them - the same places
+    # tools/fetch_ndk.ps1 adopts from.
+    if(CMAKE_ANDROID_NDK)
+        list(APPEND _NRR_NDK_ROOTS "${CMAKE_ANDROID_NDK}")
+    endif()
+    foreach(_sdk_env ANDROID_SDK_ROOT ANDROID_HOME)
+        if(DEFINED ENV{${_sdk_env}})
+            file(GLOB _sdk_ndks "$ENV{${_sdk_env}}/ndk/*")
+            list(APPEND _NRR_NDK_ROOTS ${_sdk_ndks})
+        endif()
+    endforeach()
+    file(GLOB _NRR_NDK_FETCHED "${CMAKE_SOURCE_DIR}/third_party/android-ndk-*")
+    list(APPEND _NRR_NDK_ROOTS ${_NRR_NDK_FETCHED})
+    list(SORT _NRR_NDK_ROOTS ORDER DESCENDING)
+    foreach(_ndk IN LISTS _NRR_NDK_ROOTS)
+        file(GLOB _ndk_glslc "${_ndk}/shader-tools/*/glslc.exe" "${_ndk}/shader-tools/*/glslc")
+        list(APPEND _NRR_GLSLC_CANDIDATES ${_ndk_glslc})
+    endforeach()
+    find_program(_NRR_GLSLC_ON_PATH glslc)
+    if(_NRR_GLSLC_ON_PATH)
+        list(APPEND _NRR_GLSLC_CANDIDATES "${_NRR_GLSLC_ON_PATH}")
+    endif()
+
+    set(NRR_GLSLC "")
+    foreach(_candidate IN LISTS _NRR_GLSLC_CANDIDATES)
+        if(NOT NRR_GLSLC AND EXISTS "${_candidate}")
+            set(NRR_GLSLC "${_candidate}")
+        endif()
+    endforeach()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+
+    if(NRR_GLSLC AND Python3_EXECUTABLE)
+        set(_NRR_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
+        set(_NRR_SHADER_HEADER "${_NRR_SHADER_DIR}/vulkan_shaders_generated.h")
+        set(_NRR_SPIRV_FILES "")
+        foreach(_shader nchw_pack rgb8_unpack)
+            set(_source "${CMAKE_SOURCE_DIR}/runtime/vulkan/shaders/${_shader}.comp")
+            set(_spirv "${_NRR_SHADER_DIR}/${_shader}.spv")
+            add_custom_command(
+                OUTPUT "${_spirv}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${_NRR_SHADER_DIR}"
+                COMMAND "${NRR_GLSLC}" --target-env=vulkan1.0 -O "${_source}" -o "${_spirv}"
+                DEPENDS "${_source}"
+                COMMENT "glslc ${_shader}.comp")
+            list(APPEND _NRR_SPIRV_FILES "${_spirv}")
+        endforeach()
+        set(_NRR_EMBED_ARGS "")
+        foreach(_spirv IN LISTS _NRR_SPIRV_FILES)
+            get_filename_component(_shader_name "${_spirv}" NAME_WE)
+            list(APPEND _NRR_EMBED_ARGS "${_shader_name}=${_spirv}")
+        endforeach()
+        add_custom_command(
+            OUTPUT "${_NRR_SHADER_HEADER}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/embed_spirv.py"
+                    "${_NRR_SHADER_HEADER}" ${_NRR_EMBED_ARGS}
+            DEPENDS ${_NRR_SPIRV_FILES} "${CMAKE_SOURCE_DIR}/tools/embed_spirv.py"
+            COMMENT "embedding the SPIR-V kernels")
+        # Putting the generated header in the source list is what makes every target that compiles
+        # the runtime depend on the kernels being built: CMake knows the file comes from the command
+        # above, so there is no add_dependencies() ordering to forget.
+        list(APPEND NRR_RUNTIME_SOURCES "${_NRR_SHADER_HEADER}")
+        add_compile_definitions(NRR_VULKAN_SHADERS=1)
+        include_directories("${_NRR_SHADER_DIR}")
+        message(STATUS "Vulkan kernels: ${NRR_GLSLC} (glslc + embedded SPIR-V, SHA-256 recorded)")
+    else()
+        message(STATUS
+            "Vulkan kernels: not compiled (needs glslc and Python 3). Install the Vulkan SDK, pass "
+            "-DNRR_GLSLANG_ROOT=<dir>, use the NDK's shader-tools, or put glslc on PATH. The backend "
+            "builds without them and reports that the kernels are absent.")
     endif()
 elseif(NRR_ENABLE_VULKAN_STUB)
     # Same source, no SDK: the stub branch is what gets compiled, so the file is checked rather

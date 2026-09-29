@@ -20,6 +20,7 @@
 #include "unit/test_gpu_ep.cpp"
 #include "unit/test_vulkan_api.cpp"
 #include "unit/test_vulkan_resources.cpp"
+#include "unit/test_vulkan_compute.cpp"
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
@@ -98,6 +99,13 @@ void run_all_tests() {
     NRR_RUN_TEST(test_vulkan_image_round_trip_matches_the_bytes);
     NRR_RUN_TEST(test_vulkan_memory_accounting_and_budget_is_enforced);
     NRR_RUN_TEST(test_vulkan_transfers_reuse_the_command_ring);
+
+    std::cout << "\n--- Vulkan Compute Tests (V2: embedded SPIR-V kernels on the GPU) ---\n";
+    /* The plan is pure arithmetic and runs on every machine; the kernels run where the build had
+     * glslc and the machine has a device, and say so otherwise. */
+    NRR_RUN_TEST(test_vulkan_dispatch_plan_respects_device_limits);
+    NRR_RUN_TEST(test_vulkan_kernels_are_embedded_with_hashes);
+    NRR_RUN_TEST(test_vulkan_pack_and_unpack_match_the_cpu_reference);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);

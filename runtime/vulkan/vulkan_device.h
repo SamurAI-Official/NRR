@@ -110,6 +110,12 @@ public:
     /** The most recent reason a Vulkan call failed, in Vulkan's terms. Empty after success. */
     const std::string& last_error() const { return last_error_; }
 
+    /** The one place this device talks to the GPU, exposed for the pipeline layer (V2): record into
+     *  the ring's command buffer, submit on the compute queue, wait on its fence. */
+    bool record_and_submit(const std::function<void(VkCommandBuffer)>& record) {
+        return submit_and_wait(record);
+    }
+
     /* Device-local resources. Handles are owned here; the backend only passes them back. */
     struct Buffer;
     struct Image;

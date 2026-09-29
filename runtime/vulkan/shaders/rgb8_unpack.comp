@@ -1,0 +1,35 @@
+#version 450
+/*
+ * NRR kernel: NCHW fp32 -> RGBA8 (the tensor -> frame stage).
+ *
+ * Contract:
+ *   src : 3*width*height floats, plane-major (NCHW)
+ *   dst : width*height*4 bytes, RGBA8, written as one little-endian uint32 per pixel
+ *   dst[y][x][c] = clamp(round(src[c][y][x] * 255.0), 0, 255) for c < 3, and alpha = 255
+ *
+ * RGBA8 rather than a packed RGB8 because a 3-byte pixel has no aligned 32-bit store, and the
+ * caller's RGB8 view is the first three bytes of each pixel - which the test checks, alpha
+ * included, rather than assuming.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Source { float values[]; };
+layout(std430, binding = 1) writeonly buffer Dest { uint pixels[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+} params;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint count = params.width * params.height;
+    if (index >= count) return;
+
+    uint packed = 0xFF000000u; /* alpha */
+    for (uint c = 0u; c < 3u; ++c) {
+        const float scaled = clamp(values[c * count + index] * 255.0 + 0.5, 0.0, 255.0);
+        packed |= uint(scaled) << (c * 8u);
+    }
+    pixels[index] = packed;
+}

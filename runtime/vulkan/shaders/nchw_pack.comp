@@ -1,0 +1,33 @@
+#version 450
+/*
+ * NRR kernel: RGBA8 -> NCHW fp32 (the frame -> tensor stage).
+ *
+ * Contract, stated so the test can check it exactly rather than approximately:
+ *   src : width*height*4 bytes, RGBA8 rows, read as little-endian uint32 (byte 0 = R)
+ *   dst : channels*width*height floats, plane-major (NCHW)
+ *   dst[c][y][x] = float(src[y][x][c]) / 255.0
+ *
+ * One invocation per pixel, so local_size affects speed only, never the result - which is what
+ * makes a bit-exact comparison against a CPU reference meaningful.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
+layout(std430, binding = 1) writeonly buffer Dest { float values[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint channels;
+} params;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint count = params.width * params.height;
+    if (index >= count) return;
+
+    const uint packed = pixels[index];
+    for (uint c = 0u; c < params.channels && c < 4u; ++c) {
+        values[c * count + index] = float((packed >> (c * 8u)) & 0xFFu) / 255.0;
+    }
+}
