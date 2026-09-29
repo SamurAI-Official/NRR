@@ -426,6 +426,24 @@ jobs:
             throw "NRR_CONFIG_EXPECTS_VULKAN is missing, so the CMake/compiler tie has been undone (runtime/vulkan/vulkan_api.h)"
           }
           Write-Host "Vulkan branch enabled for the compiler: -DNRR_ENABLE_VULKAN=1 in the Ninja DEFINES"
+
+          # V2: this job is where the SPIR-V kernels are verified, because it is the job with a GLSL
+          # compiler - CMake finds the NDK's own shader-tools/glslc through the toolchain, so the
+          # kernels are compiled, hashed and embedded here on every push. A desktop job has no such
+          # compiler unless the SDK is installed, so asserting it there would assert the runner's
+          # cache rather than the repository.
+          if (-not ($log | Select-String '^-- Vulkan kernels: .*glslc')) {
+            throw "the SPIR-V kernels were not compiled here: CMake did not find the NDK's shader-tools/glslc"
+          }
+          if (-not (Test-Path build-android/shaders/vulkan_shaders_generated.h)) {
+            throw "the kernels were compiled but not embedded into a header"
+          }
+          $kernelNames = @(Select-String -Path build-android/shaders/vulkan_shaders_generated.h `
+              -Pattern 'sha256 ([0-9a-f]{64})' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+          if ($kernelNames.Count -lt 2) {
+            throw "expected both kernels embedded with their SHA-256, found $($kernelNames.Count)"
+          }
+          Write-Host "SPIR-V kernels compiled, embedded and hashed: $($kernelNames -join ', ')"
           if (-not ($log | Select-String '^-- ONNX Runtime: .*Android arm64-v8a')) {
             throw "the build did not pick up the Android ONNX Runtime - it compiled the placeholder path"
           }
@@ -554,16 +572,19 @@ jobs:
           }
           Write-Host "Vulkan branch enabled for the compiler in nrr.vcxproj"
 
-          # V2: the kernels have to be in this build, not merely in the repository. The build log
-          # names the glslc it used (from the NDK's shader-tools above), and the suite prints each
-          # kernel's SHA-256 - so "the SPIR-V kernels compiled here" is a checked fact rather than an
-          # assumption from the machine the change was written on.
+          # Informational here, asserted where it can be: this runner has no Vulkan SDK, so whether
+          # glslc turns up depends on the NDK cache being warm. The kernels are compiled and embedded
+          # by the android-ndk job, which has the NDK by construction - that is the job that verifies
+          # them (see its verify step).
           $log = Get-Content vulkan-build.log
-          if (-not ($log | Select-String '^-- Vulkan kernels: .*glslc')) {
-            throw "the SPIR-V kernels were not compiled in this build (no glslc): see the kernel status line in CMakeLists.txt"
-          }
-          if (-not (Test-Path build-vulkan/shaders/vulkan_shaders_generated.h)) {
-            throw "the kernels were compiled but not embedded into a header"
+          if ($log | Select-String '^-- Vulkan kernels: .*glslc') {
+            Write-Host "SPIR-V kernels compiled in this job too (glslc found)"
+            if (-not (Test-Path build-vulkan/shaders/vulkan_shaders_generated.h)) {
+              # This one is a real invariant, not a cache question: if glslc ran, the header exists.
+              throw "the kernels were compiled but not embedded into a header"
+            }
+          } else {
+            Write-Host "::notice::no glslc in this job, so the kernels are absent and the kernel tests say so; the android-ndk job verifies them"
           }
 
           ./build-vulkan/Release/nrr_tests.exe 2>&1 | Tee-Object -FilePath vulkan-tests.log
