@@ -21,6 +21,7 @@
 #include "unit/test_vulkan_api.cpp"
 #include "unit/test_vulkan_resources.cpp"
 #include "unit/test_vulkan_compute.cpp"
+#include "unit/test_vulkan_caps.cpp"
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
@@ -106,6 +107,12 @@ void run_all_tests() {
     NRR_RUN_TEST(test_vulkan_dispatch_plan_respects_device_limits);
     NRR_RUN_TEST(test_vulkan_kernels_are_embedded_with_hashes);
     NRR_RUN_TEST(test_vulkan_pack_and_unpack_match_the_cpu_reference);
+
+    std::cout << "\n--- Vulkan Capability Tests (V3: vendor map and measured states) ---\n";
+    /* Pure functions of what a device reported, so these run everywhere - including on the machines
+     * with no AMD or Intel hardware, which is the only way those paths can be verified here. */
+    NRR_RUN_TEST(test_vulkan_vendor_map_reads_the_id_not_the_name);
+    NRR_RUN_TEST(test_vulkan_capability_states_come_from_device_facts);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);

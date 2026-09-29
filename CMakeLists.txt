@@ -373,6 +373,7 @@ if(NRR_ENABLE_VULKAN)
         ${CMAKE_SOURCE_DIR}/runtime/backend_vulkan.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_api.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_device.cpp
+        ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_device_info.cpp
         ${CMAKE_SOURCE_DIR}/runtime/vulkan/vulkan_pipeline.cpp
     )
     if(NRR_PLATFORM_ANDROID)

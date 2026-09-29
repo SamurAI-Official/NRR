@@ -356,38 +356,23 @@ NRRResult BackendVulkan::query_capabilities() {
     if (physical_device_ == VK_NULL_HANDLE) return NRR_ERROR_STATE_INVALID;
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physical_device_, &props);
-
-    /* The documented enum is ABSENT/BASIC/OPTIMIZED/FULL/EXPERIMENTAL. This block used
-     * NRR_CAPABILITY_STATE_AVAILABLE/_UNAVAILABLE, which exist nowhere in the repository - it
-     * compiled only because the whole file sits behind NRR_ENABLE_VULKAN, which no configuration
-     * ever defined, so nothing ever type-checked this file. AVAILABLE maps to BASIC to keep the
-     * original intent.
-     *
-     * The feature query this block used to make read features.computeShader, and that is not a
-     * member of VkPhysicalDeviceFeatures: compute shaders are CORE Vulkan 1.0, so there is no
-     * feature bit for them to report. What is device-specific is the compute CAPACITY, which is
-     * what a dispatch has to fit inside, and that is what is measured here. */
-    const bool compute_capable = props.limits.maxComputeWorkGroupInvocations > 0 &&
-                                 props.limits.maxComputeSharedMemorySize > 0;
-    /* DELIBERATELY conservative: this says the device can dispatch, not that NRR does its
-     * work on the GPU. The frame's inference still runs through ONNX Runtime (no Vulkan
-     * execution provider exists), so neural_acceleration and fp32 stay at BASIC until the
-     * compute kernels in docs/roadmap.md M4 own that work and are measured. */
-    capabilities_.neural_acceleration = compute_capable ?
-        NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
-    capabilities_.compute_shader = compute_capable ?
-        NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
-    capabilities_.tensor_cores = NRR_CAPABILITY_ABSENT;
-    capabilities_.fp32 = NRR_CAPABILITY_BASIC;
-    /* fp16 is the EXECUTION claim and NRR has no fp16 path. Vulkan can expose
-     * shaderFloat16, but this backend neither enables nor uses it, so the hardware
-     * fact is not claimed either. */
-    set_fp16_capabilities(capabilities_, NRR_CAPABILITY_ABSENT);
-    capabilities_.int8 = NRR_CAPABILITY_BASIC;
     capabilities_.max_texture_size = props.limits.maxImageDimension2D;
-    /* A dedicated compute queue family is what would justify more, and that is measured in
-     * create_logical_device(); until it distinguishes one, this stays BASIC. */
-    capabilities_.async_compute = NRR_CAPABILITY_BASIC;
+
+    /* Everything else is filled from what the device reported, in one place that is testable without
+     * a device (runtime/vulkan/vulkan_device_info.cpp). That is what makes these claims measurable:
+     * an AMD device reports AMD because its vendor ID says so - not because a build option or a
+     * device name said it - and the tensor-core and int8 states come from the cooperative-matrix and
+     * integer-dot-product extensions the device actually exposes.
+     *
+     * Worth keeping in mind why this is worth doing carefully: this block used to read
+     * features.computeShader, which is not a member of VkPhysicalDeviceFeatures (compute shaders are
+     * core Vulkan 1.0, so there is no feature bit), and named NRR_CAPABILITY_STATE_AVAILABLE, which
+     * exists nowhere. Neither could be seen while no configuration defined NRR_ENABLE_VULKAN - which
+     * is why the branch is compiled and tested in CI now. */
+    if (device_ != nullptr) {
+        vk::apply_measured_capabilities(device_->info(), device_->has_dedicated_compute_family(),
+                                       capabilities_);
+    }
     std::strncpy(capabilities_.active_backend, "Vulkan",
                  sizeof(capabilities_.active_backend) - 1);
     std::strncpy(capabilities_.backend_version, "1.0",
