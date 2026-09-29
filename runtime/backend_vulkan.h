@@ -33,6 +33,7 @@
  * the headers and nothing else (see runtime/vulkan/vulkan_api.h). */
 #include "vulkan/vulkan_api.h"
 #include "vulkan/vulkan_device.h"
+#include "vulkan/vulkan_device_info.h"
 #endif
 
 namespace nrr {
