@@ -120,7 +120,12 @@ private:
     /* One entry per resource the caller created. Its bytes live in device-local memory (V1); this
      * is the bookkeeping that comes with the handle. The accelerator kernel still reads and writes
      * frames through download_texture()/upload_texture(), which are real GPU transfers now - the
-     * per-frame readback is the cost V2 removes when the pre/post stages move onto the GPU. */
+     * per-frame readback is the cost V2 removes when the pre/post stages move onto the GPU.
+     *
+     * Guarded, because the handle type is a Vulkan device type: in the no-SDK configuration there is
+     * no device to name, and a header that only compiles when the SDK is present is the mistake this
+     * milestone already fixed once. */
+#ifdef NRR_ENABLE_VULKAN
     struct TextureEntry {
         vk::VulkanDevice::Buffer* buffer = nullptr;
         uint32_t width = 0;
@@ -139,8 +144,10 @@ private:
      * no field for it yet), enforced by VulkanDevice::allocate_memory() before the driver is
      * asked, and reported by allocated_bytes()/peak_bytes() in the debug line. */
     VkDeviceSize memory_budget_ = 1024ull * 1024ull * 1024ull;
+#endif
     /* From NRRDeviceOptions.frames_in_flight: how many command buffers and fences the device's
-     * submission ring holds. 0 (the options' default) means one. */
+     * submission ring holds. 0 (the options' default) means one. Outside the guard because it is
+     * read before the device exists, in both configurations. */
     uint32_t frames_in_flight_ = 1;
     std::string vulkan_error_;
 

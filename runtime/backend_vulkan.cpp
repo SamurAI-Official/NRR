@@ -54,8 +54,11 @@ NRRResult BackendVulkan::initialize(const NRRDeviceOptions& options) {
 void BackendVulkan::shutdown() {
     if (!initialized_) return;
     shutdown_vulkan();
+#ifdef NRR_ENABLE_VULKAN
+    /* The resource maps only exist where a device could have created them (see backend_vulkan.h). */
     textures_.clear();
     buffers_.clear();
+#endif
     loaded_models_.clear();
     loaded_references_.clear();
     initialized_ = false;
@@ -522,20 +525,24 @@ NRRResult BackendVulkan::create_texture(const NRRTextureDesc& desc, void*& backe
 }
 
 void BackendVulkan::destroy_texture(void* backend_texture) {
+#ifdef NRR_ENABLE_VULKAN
     if (backend_texture == nullptr) return;
     auto it = textures_.find(backend_texture);
     if (it == textures_.end()) return;
-#ifdef NRR_ENABLE_VULKAN
     if (device_) device_->destroy_buffer(it->second->buffer);
-#endif
     delete it->second;
     textures_.erase(it);
+#else
+    /* Nothing to destroy: without the SDK there is no device the resource could have come from, and
+     * create_texture refused before it got here. */
+    (void)backend_texture;
+#endif
 }
 
 NRRResult BackendVulkan::upload_texture(void* backend_texture, const void* data, size_t size) {
+#ifdef NRR_ENABLE_VULKAN
     auto it = textures_.find(backend_texture);
     if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-#ifdef NRR_ENABLE_VULKAN
     TextureEntry* entry = it->second;
     if (size == 0 || size > entry->bytes) return NRR_ERROR_INVALID_ARGUMENT;
     if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -545,15 +552,15 @@ NRRResult BackendVulkan::upload_texture(void* backend_texture, const void* data,
     }
     return NRR_SUCCESS;
 #else
-    (void)size;
+    (void)backend_texture; (void)data; (void)size;
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
 }
 
 NRRResult BackendVulkan::download_texture(void* backend_texture, void* data, size_t size) {
+#ifdef NRR_ENABLE_VULKAN
     auto it = textures_.find(backend_texture);
     if (it == textures_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-#ifdef NRR_ENABLE_VULKAN
     TextureEntry* entry = it->second;
     if (size == 0 || size > entry->bytes) return NRR_ERROR_INVALID_ARGUMENT;
     if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -563,7 +570,7 @@ NRRResult BackendVulkan::download_texture(void* backend_texture, void* data, siz
     }
     return NRR_SUCCESS;
 #else
-    (void)size;
+    (void)backend_texture; (void)data; (void)size;
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
 }
@@ -591,21 +598,23 @@ NRRResult BackendVulkan::create_buffer(const NRRBufferDesc& desc, void*& backend
 }
 
 void BackendVulkan::destroy_buffer(void* backend_buffer) {
+#ifdef NRR_ENABLE_VULKAN
     if (backend_buffer == nullptr) return;
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end()) return;
-#ifdef NRR_ENABLE_VULKAN
     if (device_) device_->destroy_buffer(it->second->buffer);
-#endif
     delete it->second;
     buffers_.erase(it);
+#else
+    (void)backend_buffer;
+#endif
 }
 
 NRRResult BackendVulkan::upload_buffer(void* backend_buffer, const void* data, size_t size,
                                        size_t offset) {
+#ifdef NRR_ENABLE_VULKAN
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-#ifdef NRR_ENABLE_VULKAN
     BufferEntry* entry = it->second;
     if (size == 0 || offset + size > entry->size) return NRR_ERROR_INVALID_ARGUMENT;
     if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -615,16 +624,16 @@ NRRResult BackendVulkan::upload_buffer(void* backend_buffer, const void* data, s
     }
     return NRR_SUCCESS;
 #else
-    (void)size; (void)offset;
+    (void)backend_buffer; (void)data; (void)size; (void)offset;
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
 }
 
 NRRResult BackendVulkan::download_buffer(void* backend_buffer, void* data, size_t size,
                                          size_t offset) {
+#ifdef NRR_ENABLE_VULKAN
     auto it = buffers_.find(backend_buffer);
     if (it == buffers_.end() || data == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
-#ifdef NRR_ENABLE_VULKAN
     BufferEntry* entry = it->second;
     if (size == 0 || offset + size > entry->size) return NRR_ERROR_INVALID_ARGUMENT;
     if (device_ == nullptr) return NRR_ERROR_BACKEND_UNAVAILABLE;
@@ -634,7 +643,7 @@ NRRResult BackendVulkan::download_buffer(void* backend_buffer, void* data, size_
     }
     return NRR_SUCCESS;
 #else
-    (void)size; (void)offset;
+    (void)backend_buffer; (void)data; (void)size; (void)offset;
     return NRR_ERROR_BACKEND_UNAVAILABLE;
 #endif
 }
