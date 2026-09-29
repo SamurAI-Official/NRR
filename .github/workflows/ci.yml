@@ -484,6 +484,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore ONNX Runtime from cache
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ORT_DIR }}
+          key: ort-win-x64-${{ env.ORT_VERSION }}
+
+      - name: Fetch ONNX Runtime SDK
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./tools/fetch_ort.ps1 -Version $env:ORT_VERSION
+
       - name: Cache the Vulkan headers
         uses: actions/cache@v4
         with:
@@ -499,12 +511,23 @@ jobs:
         run: |
           ./tools/build.ps1 -Vulkan -Config Release -BuildDir build-vulkan *>&1 |
             Tee-Object -FilePath vulkan-build.log
+          if ($LASTEXITCODE -ne 0) {
+            # Surface the reason where a reader without log access can see it (the job log needs
+            # authentication; ::error:: lines do not).
+            Get-Content vulkan-build.log | Select-Object -Last 30 | ForEach-Object { Write-Host "::error::$_" }
+            throw "the Vulkan configuration did not build"
+          }
 
       # The option being ON is not evidence: the macro has to reach the compiler, and the gap
       # between the two is exactly what this job exists to close. The generated project file is
       # the compiler's own view of the definitions.
       - name: Verify the branch reached the compiler, then run the suite
         shell: pwsh
+        env:
+          # Deterministic on every runner: a runner that happens to expose a Vulkan device (the
+          # images ship Mesa's software ICD) must not decide which path this job exercises. The
+          # Vulkan tests instantiate the backend directly, so they still measure the loader.
+          NRR_TEST_BACKEND: cpu
         run: |
           $proj = Get-Content build-vulkan/nrr.vcxproj -Raw
           if ($proj -notmatch 'NRR_ENABLE_VULKAN=1') {
@@ -515,10 +538,13 @@ jobs:
           }
           Write-Host "Vulkan branch enabled for the compiler in nrr.vcxproj"
 
-          # The suite must stay green without a GPU: the Vulkan tests measure the loader and
-          # record the reason when there is no device, which is a result rather than a skip.
-          ./build-vulkan/Release/nrr_tests.exe
-          if ($LASTEXITCODE -ne 0) { throw "the suite failed in the Vulkan configuration" }
+          ./build-vulkan/Release/nrr_tests.exe 2>&1 | Tee-Object -FilePath vulkan-tests.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content vulkan-tests.log |
+              Select-String 'FAIL|Assertion failed|Passed:|Failed:' |
+              Select-Object -Last 30 | ForEach-Object { Write-Host "::error::$($_.Line.Trim())" }
+            throw "the suite failed in the Vulkan configuration"
+          }
 
       - name: Upload the Vulkan build log
         if: always()

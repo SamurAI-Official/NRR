@@ -158,6 +158,10 @@ NRRResult BackendVulkan::execute_model(ModelImpl* model, const NRRFrameInput& in
     if (!kernel->is_initialized())
         kernel->initialize(AccelEP::VULKAN, 1024ull * 1024ull * 1024ull,
                           true, false, true);
+    /* The kernel measures quality against the ground-truth image the frame's reference set
+     * carries, so the frame it is about to execute has to be told which references belong to
+     * it - the same forwarding every vendor backend does. */
+    kernel->set_frame_references(references);
     return kernel->execute_frame(
         model, input, output,
         [this](void* bt, void* data, size_t sz) { return download_texture(bt, data, sz); },
@@ -588,15 +592,36 @@ NRRResult BackendVulkan::download_buffer(void* backend_buffer, void* data, size_
 }
 
 NRRResult BackendVulkan::load_model(ModelImpl* model) {
+#ifdef NRR_ENABLE_VULKAN
     if (!initialized_ || model == nullptr) return NRR_ERROR_STATE_INVALID;
+    /* Frames run through the shared accelerator kernel - it owns the ONNX session and the
+     * temporal history (see reset_temporal_history below) - so a model that is "loaded" with
+     * no session behind it is the loadable-without-usable trap. This backend had exactly that:
+     * it recorded the pointer and reported success, which is invisible while the CPU backend
+     * is what gets selected and immediately visible in the ORT-less configuration, where the
+     * Vulkan backend IS selected (no execution provider to be misled about) and every test
+     * that reads a session's provider found none. backend_nvidia.cpp, backend_amd.cpp and
+     * backend_intel.cpp have always wired it this way; this one now does too. */
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (!kernel->is_initialized())
+        kernel->initialize(AccelEP::VULKAN, 1024ull * 1024ull * 1024ull, true, false, true);
+    if (!kernel->load_model(model)) return NRR_ERROR_MODEL_LOAD_FAILED;
     if (std::find(loaded_models_.begin(), loaded_models_.end(), model) == loaded_models_.end()) {
         loaded_models_.push_back(model);
     }
     return NRR_SUCCESS;
+#else
+    (void)model;
+    return NRR_ERROR_BACKEND_UNAVAILABLE;
+#endif
 }
 
 NRRResult BackendVulkan::unload_model(ModelImpl* model) {
     if (model == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+#ifdef NRR_ENABLE_VULKAN
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel) kernel->unload_model(model);
+#endif
     loaded_models_.erase(std::remove(loaded_models_.begin(), loaded_models_.end(), model),
                          loaded_models_.end());
     return NRR_SUCCESS;
