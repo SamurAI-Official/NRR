@@ -497,12 +497,16 @@ ONNX Runtime 1.30.0 `win-x64-gpu_cuda12`, CUDA runtime 12.9.79 / cuDNN 9.26.
       `SessionOptionsAppendExecutionProvider_DML` call exists. The route is the
       `Microsoft.ML.OnnxRuntime.DirectML` NuGet package, whose contents would need verifying
       before adopting it.
-- [ ] TensorRT `gated: SDK download` (`onnxruntime_providers_tensorrt.dll` ships in the same
-      package, but the TensorRT libraries are a separate SDK). Verified: `tensorrt` 11.3.0.99
-      and `tensorrt-libs` on PyPI have **zero `win_amd64` wheels**, so the PyPI route that
-      worked for the CUDA runtime (`tools/fetch_cuda_runtime.ps1`) does not exist here - it
-      needs NVIDIA's developer-account SDK download. `BackendNVIDIA` claims TensorRT only when
-      the linked ONNX Runtime really lists the provider.
+- [ ] TensorRT `gated: no TensorRT runtime on this machine`. The provider DLL *does* ship in the
+      same package, and `nrr_deploy_runtime_dlls` now deploys it - it was absent from the
+      hand-written provider list until commit `6bef1a7`. What is missing is `nvinfer_10.dll`, and
+      the attach states it: "Error loading .../build/Debug/onnxruntime_providers_tensorrt.dll
+      which depends on nvinfer_10.dll which is missing (Error 126)", with a survey confirming no
+      `nvinfer` DLL anywhere under `Program Files`. Verified earlier: `tensorrt` 11.3.0.99 and
+      `tensorrt-libs` on PyPI have **zero `win_amd64` wheels**, so the PyPI route that worked for
+      the CUDA runtime (`tools/fetch_cuda_runtime.ps1`) does not exist here - it needs NVIDIA's
+      developer-account SDK download. `BackendNVIDIA` claims TensorRT only when the linked ONNX
+      Runtime really lists the provider.
 - [ ] GPU-resident data path `gated: nvcc + host-memory engine boundary`. Keep
       textures/tensors on the device across frames instead of download -> CPU -> upload.
       **This is now the measured bottleneck, not a guess** (see the postmortem below): 85-88%

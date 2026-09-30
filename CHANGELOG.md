@@ -14,6 +14,50 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### Every provider DLL the package ships is deployed, and the TensorRT gate is now a measured one
+
+`nrr_deploy_runtime_dlls` deployed providers from a hand-written list naming
+`onnxruntime_providers_shared.dll` and `onnxruntime_providers_cuda.dll`. The TensorRT provider - the
+one this GPU package offers, and the one V5 attaches - was not on that list, so it was never copied
+next to `onnxruntime.dll`, and ONNX Runtime resolves providers relative to that DLL rather than through
+PATH. The attach said so in its own words:
+
+    Error loading ".../build/Debug/onnxruntime_providers_tensorrt.dll" which is missing
+    (Error 126: "The specified module could not be found.")
+
+The list is a glob of `onnxruntime_providers_*.dll` now (commit `6bef1a7`), so DirectML, OpenVINO or
+ROCm providers are picked up automatically by any package that ships them - which is the rule V5 is
+written around. After the fix the same attach reports the real remaining cause one level down: that DLL
+now loads and *depends on `nvinfer_10.dll`, which is missing* on this machine (a survey agrees - no
+`nvinfer` DLL exists anywhere under `Program Files`). The TensorRT fallback is therefore explained by
+the machine rather than by the build, which is what the roadmap item now records.
+
+Side effect, measured: the local CUDA provider was missing from the output directory too, so
+`test_cuda_ep_is_measurably_faster_than_cpu` had been **skipping**. With the providers deployed it runs
+again - 512x512 upscale, 213.877 ms/frame on the CPU provider against 10.833 ms/frame on CUDA, a
+19.74x speedup.
+
+### Training pairs: measure the difference a pair actually offers, not just that one exists
+
+`tools/gen_training_pairs.py` (commit `8871f30`) gated a single number: after a naive bilinear 2x
+upscale, mean absolute difference from the target had to exceed 0.01. It passed at 0.0112-0.0118 with
+almost no headroom, and the reason was bad in a way that mattered - the seeded noise (mean |noise| ~
+0.016) was *larger* than the resolution difference the gate was supposed to measure, so the pair
+offered denoising rather than upscaling and the gate would have certified it as super-resolution data.
+
+Three changes, all measurements rather than judgement calls (commit `c4007ad`): noise is 0.005 and the
+noise floor is reported; a pair is rejected when its margin does not exceed its own noise floor; and a
+detail ratio - high-frequency energy of the naive upscale over the target's - rejects a target that
+carries no more detail than the baseline. Noise can only inflate the input's detail and therefore only
+make the detail gate harder to pass, so both checks err against the generator.
+
+Running the new gates on the real data refused it: with the noise removed the margin fell to 0.0040,
+about one 8-bit level, which is the honest size of a 64x64 render against a supersampled 128x128 one.
+The fix was content, not a lower threshold - an analytic checkered ground plane, whose edges at grazing
+angles are exactly what low resolution loses. The batch now measures 0.0373-0.0408 against a 0.0040
+noise floor at detail ratio 0.534-0.538, and the manifest records margin, noise and detail ratio per
+pair so the next threshold is set from numbers.
+
 ### Vulkan: the branch no build ever compiled, and a way to reach a device without the SDK
 
 The Vulkan backend was the one part of the runtime with no compiled configuration at all, and the
