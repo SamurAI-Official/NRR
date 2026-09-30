@@ -14,6 +14,55 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### GPU training: activated, measured from the driver, and impossible to fake
+
+The first training runs were CPU-only because the installed wheel was `torch 2.3.1+cpu`, and a CPU-only
+wheel is the usual way a "GPU training" session never touches the GPU. Three things changed, and the
+wheel is the least interesting of them.
+
+- **The trainer chooses and reports the device.** `--device auto` (the default) uses CUDA whenever torch
+  can provide it, and `--device cuda` **refuses to run on the CPU** rather than falling back quietly,
+  printing the torch build in the refusal. Verified with the CPU-only wheel: it exits 1 with
+  `torch 2.3.1+cpu, built with CUDA: None, device_count: 0` - the same rule the C++ provider tests already
+  enforce on the runtime side.
+- **Utilization is sampled from the driver, not inferred.** A `GpuSampler` thread asks `nvidia-smi` for
+  `utilization.gpu,memory.used` every 0.4 s while training runs, and the report carries the sample count,
+  the mean, the max, the driver's memory figure and torch's own peak allocation. A launched kernel is not
+  a used GPU, and only the driver can say which one happened.
+- **Timing synchronises before it measures.** `torch.cuda.synchronize()` brackets the timed window, so the
+  wall clock times the GPU's work rather than the kernel launches.
+
+Measured on an RTX 4070 Ti (12 GB, sm_89, driver 610.88), same data, seed and hyperparameters:
+
+| workload | CPU | GPU | speedup | driver utilization | torch peak |
+| --- | --- | --- | --- | --- | --- |
+| width 48, batch 4, 45 epochs, 238k params | 98.2 s, 2182 ms/epoch | 8.4 s, 186.6 ms/epoch | **11.7x** | mean 28.0%, max 64.0% (17 samples) | 1628 MB |
+| width 64, batch 16, 200 epochs, 410k params | not run | 16.7 s, 83.6 ms/epoch | - | mean 72.3%, max 96.0% (35 samples) | 2897 MB |
+
+Utilization scales with work per step rather than with the presence of a card: the same data at batch 4
+leaves the GPU mostly idle at 28% mean, and batching all 30 training pairs raises it to 72.3% mean / 96%
+peak. The C++ inference path was sampled the same way while the suite ran its CUDA provider test:
+**mean 17.3%, max 97%, peak 3,239 MiB** - and the mean there is diluted by the sections of the suite that
+do not touch the GPU, so the max is the meaningful figure.
+
+Two things this exercise cost, recorded so they do not cost anyone else:
+
+- **Disk, not the wheel, was the real blocker.** `pip install torch==2.3.1+cu121` failed with "No space
+  left on device" because C: had 1.35 GB free and pip unpacks into C:'s temp directory - a wheel of
+  ~2.4 GB cannot land. Purging pip's own cache returned **19.79 GB** (10,630 cached files) and the install
+  moved to `G:` with `TEMP`, `TMP` and `PIP_CACHE_DIR` pointed there. The CUDA environment lives at
+  `G:\venvs\nrr-train` (torch 2.3.1+cu121, numpy 1.26.4, onnx, onnxruntime), outside the repository, so the
+  system Python keeps its CPU wheel and the two can be compared without reinstalling anything.
+- **`GpuSampler` originally named its event `_stop`**, which shadows `threading.Thread._stop()`, so
+  `join()` raised `TypeError: 'Event' object is not callable` and the first GPU run died *after* training
+  finished. Renamed to `_halt` with the reason written next to it.
+
+Honesty note on the quality numbers: the same seed and settings give val L1 0.02712, 0.03158 and 0.03319
+across runs - the CUDA path is a different numerical one (cuDNN algorithm selection, with
+`cudnn.benchmark` on), and at this data size those differences are not attributable to the device. The
+11.7x is real; a "the GPU also trains better" claim would not be. The conditioning finding is unchanged:
+zeroing motion still moves the output by 1e-06 to 2e-06, so the gates still refuse to export.
+
 ### The first trained model: gates that refuse, and a conditioning claim that does not survive measurement
 
 `tools/train_nrr.py` trains the in-house upscaler on the pairs `tools/gen_training_pairs.py` generates -

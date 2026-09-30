@@ -24,15 +24,28 @@ Usage:
     python tools/train_nrr.py --data models/training-data/v1 --out models/nrr_upscaler_trained.onnx
     python tools/train_nrr.py --self-test    # the gates must reject a model that is the baseline
 
-Requires: pip install torch (CPU is enough), numpy, onnx. onnxruntime is optional and used only to
-confirm that the exported graph agrees with PyTorch.
+Requires: pip install torch, numpy, onnx. onnxruntime is optional and used only to confirm that the
+exported graph agrees with PyTorch.
+
+GPU: `--device auto` (the default) uses the GPU whenever torch can provide one, `--device cuda` refuses
+to run on the CPU rather than pretend, and because a CPU-only torch wheel is the usual cause of a
+"GPU training" session that never touches the GPU, the run records the device, the driver's own
+utilization samples (nvidia-smi, sampled while training) and torch's peak allocation in its report. The
+CPU-only wheel used for the first runs lives in the system Python; the CUDA wheel used here is in a
+separate environment (G:\venvs\nrr-train, torch 2.3.1+cu121) so the two can be compared without
+reinstalling anything:
+
+    G:\venvs\nrr-train\Scripts\python.exe tools/train_nrr.py --data models/training-data/v1 \\
+        --out models/nrr_upscaler_trained.onnx --epochs 45 --channels 48 --device auto
 """
 
 import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -48,6 +61,78 @@ OUTPUT_NAME = "output"
 MIN_IMPROVEMENT = 0.05      # at least 5% below the bilinear baseline on held-out scenes
 BASELINE_FLOOR = 1e-3       # output must differ from the bilinear baseline by more than this
 CONDITIONING_FLOOR = 1e-4   # zeroing an input must change the output by more than this
+
+
+def resolve_device(requested, log):
+    """Chooses the device and refuses to pretend. Asking for cuda where torch cannot provide it is an
+    error, not a quiet CPU run: a silent fallback is how a GPU result gets reported that never touched a
+    GPU, which is the failure the C++ provider tests already forbid on the runtime side."""
+    available = torch.cuda.is_available()
+    if requested == "cuda" and not available:
+        raise SystemExit(
+            "--device cuda was requested but torch reports no usable CUDA device (torch %s, built with "
+            "CUDA: %s, device_count: %d). Install a CUDA wheel, for example torch==2.3.1+cu121 from "
+            "https://download.pytorch.org/whl/cu121, and re-run. Refusing to fall back to CPU silently."
+            % (torch.__version__, torch.version.cuda, torch.cuda.device_count()))
+    if not available:
+        log("  device: cpu (torch %s has no CUDA support; cuda build is %s)"
+            % (torch.__version__, torch.version.cuda))
+        return torch.device("cpu"), {"used": "cpu", "requested": requested, "cuda_available": False,
+                                     "torch": torch.__version__, "cuda_build": torch.version.cuda}
+    device = torch.device("cuda" if requested == "auto" else requested)
+    props = torch.cuda.get_device_properties(0)
+    facts = {"used": device.type, "requested": requested, "cuda_available": True,
+             "torch": torch.__version__, "cuda_build": torch.version.cuda,
+             "device_name": torch.cuda.get_device_name(0),
+             "capability": "sm_%d%d" % torch.cuda.get_device_capability(0),
+             "total_memory_mb": round(props.total_memory / (1 << 20))}
+    log("  device: %s (%s, %s, %d MB, torch %s built for CUDA %s)"
+        % (device.type, facts["device_name"], facts["capability"], facts["total_memory_mb"],
+           torch.__version__, torch.version.cuda))
+    return device, facts
+
+
+class GpuSampler(threading.Thread):
+    """Samples the driver while training runs. A launched CUDA kernel is not the same thing as a used
+    GPU: this asks nvidia-smi what the device was actually doing, so "the GPU was used" is a measurement
+    rather than an inference from the device's presence."""
+
+    def __init__(self, interval=0.4):
+        super().__init__(daemon=True)
+        self.interval = interval
+        # Not named _stop: threading.Thread has an internal _stop() method, and an attribute of that name
+        # shadows it, so Thread.join() fails with "TypeError: 'Event' object is not callable".
+        self._halt = threading.Event()
+        self.samples = []
+
+    def run(self):
+        while not self._halt.is_set():
+            try:
+                lines = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+                for line in lines:
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) == 2:
+                        self.samples.append((float(parts[0]), float(parts[1])))
+            except Exception:
+                pass  # a sampling gap is not a training failure
+            self._halt.wait(self.interval)
+
+    def stop(self):
+        self._halt.set()
+        self.join(timeout=5)
+
+    def summary(self):
+        if not self.samples:
+            return {"samples": 0,
+                    "note": "nvidia-smi produced no samples, so utilization was not measured"}
+        usage = [sample[0] for sample in self.samples]
+        memory = [sample[1] for sample in self.samples]
+        return {"samples": len(self.samples),
+                "utilization_percent": {"mean": round(sum(usage) / len(usage), 1), "max": max(usage)},
+                "memory_used_mb": {"mean": round(sum(memory) / len(memory)), "max": max(memory)}}
 
 
 def load_dataset(data_dir):
@@ -153,11 +238,33 @@ def run(args, log):
             dataset[split][zeroed] = torch.zeros_like(dataset[split][zeroed])
         log("  ablation: '%s' is zeroed for training and validation" % zeroed)
 
+    device, device_facts = resolve_device(args.device, log)
+    # The split is moved to the device once, not per batch: the dataset is small enough to live there
+    # whole, and a transfer per step would dominate a model this size.
+    for split in ("train", "val"):
+        dataset[split] = {key: value.to(device) for key, value in dataset[split].items()}
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    sampler = GpuSampler() if device.type == "cuda" else None
+    if sampler is not None:
+        sampler.start()
+        torch.cuda.synchronize()   # so the wall clock times the GPU's work, not the kernel launches
     started = time.time()
     model, parameters = train(dataset, args.epochs, args.batch_size, args.channels,
                               args.depth_channels, args.motion_channels, args.learning_rate,
-                              args.seed, log)
+                              args.seed, device, log)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     seconds = time.time() - started
+    gpu_usage = None
+    if sampler is not None:
+        sampler.stop()
+        gpu_usage = sampler.summary()
+        log("  gpu: %s over %d samples; peak allocated by torch %.1f MB"
+            % (gpu_usage.get("utilization_percent", "not measured"), gpu_usage["samples"],
+               torch.cuda.max_memory_allocated() / (1 << 20)))
+    log("  training: %.1f s total, %.1f ms/epoch" % (seconds, seconds / max(args.epochs, 1) * 1000.0))
 
     val = dataset["val"]
     full = measure(model, val)
@@ -178,6 +285,11 @@ def run(args, log):
               "epochs": args.epochs, "batch_size": args.batch_size,
               "learning_rate": args.learning_rate, "seed": args.seed,
               "zeroed_input": zeroed,
+              "device": device_facts,
+              "gpu": gpu_usage or {"samples": 0,
+                                   "note": "not a CUDA run, so utilization was not sampled"},
+              "gpu_torch_peak_memory_mb": (round(torch.cuda.max_memory_allocated() / (1 << 20))
+                                           if device.type == "cuda" else None),
               "train_seconds": round(seconds, 2),
               "dataset": {"dir": args.data, "manifest_sha256": _sha256(manifest_path),
                           "generator": manifest.get("generator"), "seed": manifest.get("seed"),
@@ -292,6 +404,9 @@ def main(argv):
     parser.add_argument("--seed", type=int, default=20260930)
     parser.add_argument("--size", type=int, default=64,
                         help="the input size the model was trained at, used for the export example")
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
+                        help="auto uses the GPU whenever torch can provide one; cuda refuses to run "
+                             "on the CPU instead of pretending")
     parser.add_argument("--zero-input", default="none", choices=("none", "depth", "motion"),
                         help="ablation run: zero this input for training and validation, to measure "
                              "what it is worth")
@@ -377,9 +492,9 @@ def measure(model, batch, zero=None):
 
 
 def train(dataset, epochs, batch_size, channels, depth_channels, motion_channels, learning_rate,
-          seed, log):
+          seed, device, log):
     torch.manual_seed(seed)
-    model = Upscaler(channels, depth_channels, motion_channels)
+    model = Upscaler(channels, depth_channels, motion_channels).to(device)
     parameters = sum(p.numel() for p in model.parameters())
     log("  model: %d parameters, channels=%d, batch=%d, epochs=%d, lr=%g"
         % (parameters, channels, batch_size, epochs, learning_rate))
