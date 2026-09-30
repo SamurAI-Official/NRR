@@ -286,12 +286,14 @@ if(NRR_HAVE_ONNXRUNTIME AND NRR_ORT_DLL)
     endif()
 
     set(_NRR_ORT_DEPLOY_FILES "${NRR_ORT_DLL}")
-    foreach(_provider onnxruntime_providers_shared.dll onnxruntime_providers_cuda.dll)
-        if(EXISTS "${NRR_ONNXRUNTIME_ROOT}/lib/${_provider}")
-            list(APPEND _NRR_ORT_DEPLOY_FILES "${NRR_ONNXRUNTIME_ROOT}/lib/${_provider}")
-        endif()
-    endforeach()
-    unset(_provider)
+    # Every provider DLL the package ships, rather than a hand-written list. That list named only
+    # onnxruntime_providers_shared.dll and onnxruntime_providers_cuda.dll, so the TensorRT provider -
+    # the one this GPU package actually offers and the one V5 attaches - was never deployed beside
+    # onnxruntime.dll. A glob also picks up DirectML/OpenVINO/ROCm providers automatically if a future
+    # package ships them, which is the point of V5's "offered by the package" rule.
+    file(GLOB _NRR_ORT_PROVIDER_DLLS "${NRR_ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_*.dll")
+    list(APPEND _NRR_ORT_DEPLOY_FILES ${_NRR_ORT_PROVIDER_DLLS})
+    unset(_NRR_ORT_PROVIDER_DLLS)
 
     add_custom_target(nrr_deploy_runtime_dlls ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_NRR_ORT_DEPLOY_DIR}"
