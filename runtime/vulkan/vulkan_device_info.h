@@ -48,6 +48,38 @@ bool vulkan_find_device_from_vendor(GpuVendor vendor, VulkanDeviceInfo& out);
 void apply_measured_capabilities(const VulkanDeviceInfo& info, bool has_dedicated_compute_family,
                                  NRRCapabilities& out);
 
+/** The shared engine opened on one vendor's device: instance, physical device and a VulkanDevice,
+ *  owned together because a VkPhysicalDevice is only valid for the life of its instance.
+ *
+ *  This is the execution half of the vendor front-doors (M4/V4). BackendVulkan, BackendAMD and
+ *  BackendIntel differ in which vendor they ask for and in nothing else, so the mechanism is proven
+ *  on the vendor this machine has and the calls for the others differ by a constant - which is the
+ *  only honest way to build for hardware nobody here can run. */
+class VulkanEngineForVendor {
+public:
+    VulkanEngineForVendor() = default;
+    ~VulkanEngineForVendor();
+    VulkanEngineForVendor(const VulkanEngineForVendor&) = delete;
+    VulkanEngineForVendor& operator=(const VulkanEngineForVendor&) = delete;
+
+    /** Opens the engine on a device from `vendor`. False with a reason when there is no such device -
+     *  never a half-open engine. */
+    bool open(GpuVendor vendor, VkDeviceSize memory_budget, uint32_t frames_in_flight,
+              std::string& why);
+    void close();
+    bool is_open() const { return device_.is_valid(); }
+    VulkanDevice& device() { return device_; }
+    const VulkanDeviceInfo& info() const { return info_; }
+    GpuVendor vendor() const { return vendor_; }
+
+private:
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+    VulkanDevice device_;
+    VulkanDeviceInfo info_{};
+    GpuVendor vendor_ = GpuVendor::Unknown;
+};
+
 } // namespace vk
 } // namespace nrr
 

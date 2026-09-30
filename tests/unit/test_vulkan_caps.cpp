@@ -174,5 +174,57 @@ NRR_TEST(test_vendor_probes_answer_from_the_enumerated_device) {
 #endif
 }
 
+NRR_TEST(test_vulkan_engine_opens_on_a_vendors_device) {
+#ifdef NRR_ENABLE_VULKAN
+    std::string why;
+    /* A vendor that is not here must fail with a reason and leave nothing open. That is the answer
+     * this machine gives for AMD and Intel, and it is a result rather than a skip. */
+    vk::VulkanEngineForVendor absent;
+    const bool opened_absent = absent.open(vk::GpuVendor::Amd, 32u << 20, 2, why);
+    NRR_EXPECT_TRUE(!opened_absent, "there is no AMD device here to open an engine on");
+    NRR_EXPECT_TRUE(!why.empty(), "and the refusal says why");
+    NRR_EXPECT_TRUE(!absent.is_open(), "a refused engine is not left half-open");
+    std::cout << "  engine for AMD: " << why << std::endl;
+    absent.close();
+
+    /* The vendor this machine does have: the whole mechanism end to end - instance, physical device,
+     * logical device, memory, and a transfer through it. The AMD and Intel front-doors call exactly
+     * this with a different constant, which is the only honest way to build for hardware nobody here
+     * can run. */
+    vk::VulkanEngineForVendor engine;
+    if (!engine.open(vk::GpuVendor::Nvidia, 64u << 20, 2, why)) {
+        std::cout << "  SKIP: no NVIDIA device here (" << why << ")" << std::endl;
+        engine.close();
+        return;
+    }
+    NRR_EXPECT_TRUE(engine.is_open(), "the engine reports itself open");
+    NRR_EXPECT_TRUE(engine.vendor() == vk::GpuVendor::Nvidia, "and remembers the vendor it opened on");
+    NRR_EXPECT_TRUE(vk::gpu_vendor_from_id(engine.info().vendor_id) == vk::GpuVendor::Nvidia,
+                    "the device it opened is the one that was asked for");
+    std::cout << "  engine for NVIDIA: " << engine.info().device_name << " ("
+              << engine.device().allocated_bytes() << " bytes held, dedicated_compute="
+              << (engine.device().has_dedicated_compute_family() ? "yes" : "no") << ")" << std::endl;
+
+    vk::VulkanDevice::Buffer* buffer = engine.device().create_buffer(4096);
+    NRR_ASSERT(buffer != nullptr, "the engine's device allocates for its front-door");
+    std::vector<uint8_t> source(4096);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<uint8_t>((i * 31) & 0xFF);
+    NRR_EXPECT_TRUE(engine.device().upload_buffer(buffer, source.data(), source.size(), 0),
+                    "a transfer through the engine succeeds");
+    std::vector<uint8_t> back(4096, 0);
+    NRR_EXPECT_TRUE(engine.device().download_buffer(buffer, back.data(), back.size(), 0),
+                    "and the data comes back");
+    NRR_EXPECT_TRUE(std::memcmp(source.data(), back.data(), source.size()) == 0,
+                    "the engine's transfer path round-trips exactly");
+    engine.device().destroy_buffer(buffer);
+
+    engine.close();
+    NRR_EXPECT_TRUE(!engine.is_open(), "closing the engine closes it");
+    NRR_EXPECT_TRUE(!vk::available(), "and it releases the loader reference with it");
+#else
+    std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;
+#endif
+}
+
 } // namespace test
 } // namespace nrr

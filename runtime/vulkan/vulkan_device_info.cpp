@@ -145,5 +145,83 @@ bool vulkan_find_device_from_vendor(GpuVendor vendor, VulkanDeviceInfo& out) {
     return found;
 }
 
+VulkanEngineForVendor::~VulkanEngineForVendor() { close(); }
+
+bool VulkanEngineForVendor::open(GpuVendor wanted, VkDeviceSize memory_budget,
+                                 uint32_t frames_in_flight, std::string& why) {
+    if (is_open()) {
+        why = "this engine is already open";
+        return false;
+    }
+    if (wanted == GpuVendor::Unknown) {
+        why = "Unknown is not a vendor to open an engine on";
+        return false;
+    }
+    if (!load()) {
+        why = unavailable_reason();
+        return false;
+    }
+
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "NRR";
+    app_info.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
+    if (vkCreateInstance(&create_info, nullptr, &instance_) != VK_SUCCESS) {
+        why = "vkCreateInstance failed";
+        close();
+        return false;
+    }
+    if (!load_instance(instance_)) {
+        why = "load_instance: " + unavailable_reason();
+        close();
+        return false;
+    }
+
+    uint32_t count = 0;
+    if (vkEnumeratePhysicalDevices(instance_, &count, nullptr) != VK_SUCCESS || count == 0) {
+        why = "no physical device enumerates";
+        close();
+        return false;
+    }
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(instance_, &count, devices.data());
+    for (uint32_t i = 0; i < count; ++i) {
+        VkPhysicalDeviceProperties props = {};
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+        if (gpu_vendor_from_id(props.vendorID) != wanted) continue;
+        physical_device_ = devices[i];
+        break;
+    }
+    if (physical_device_ == VK_NULL_HANDLE) {
+        why = std::string("no device from ") + gpu_vendor_name(wanted) + " is enumerated here";
+        close();
+        return false;
+    }
+    if (!device_.create(instance_, physical_device_, memory_budget, frames_in_flight, why)) {
+        close();
+        return false;
+    }
+    /* The device's own measurement, not a second query: one source for what the front-door reports. */
+    info_ = device_.info();
+    vendor_ = wanted;
+    return true;
+}
+
+void VulkanEngineForVendor::close() {
+    device_.destroy();
+    if (instance_ != VK_NULL_HANDLE && vkDestroyInstance != nullptr) {
+        vkDestroyInstance(instance_, nullptr);
+    }
+    instance_ = VK_NULL_HANDLE;
+    physical_device_ = VK_NULL_HANDLE;
+    vendor_ = GpuVendor::Unknown;
+    forget_device();
+    forget_instance();
+    unload();
+}
+
 } // namespace vk
 } // namespace nrr

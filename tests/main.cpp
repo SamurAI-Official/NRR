@@ -117,6 +117,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_vulkan_capability_states_come_from_device_facts);
     /* V4's detection half: the vendor back-ends answer from the device list, not from a define. */
     NRR_RUN_TEST(test_vendor_probes_answer_from_the_enumerated_device);
+    /* V4's execution half: the engine a vendor front-door opens on its own device. */
+    NRR_RUN_TEST(test_vulkan_engine_opens_on_a_vendors_device);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);
