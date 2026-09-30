@@ -113,6 +113,8 @@ void run_all_tests() {
      * with no AMD or Intel hardware, which is the only way those paths can be verified here. */
     NRR_RUN_TEST(test_vulkan_vendor_map_reads_the_id_not_the_name);
     NRR_RUN_TEST(test_vulkan_capability_states_come_from_device_facts);
+    /* V4's detection half: the vendor back-ends answer from the device list, not from a define. */
+    NRR_RUN_TEST(test_vendor_probes_answer_from_the_enumerated_device);
 
     std::cout << "\n--- Backend Tests ---\n";
     NRR_RUN_TEST(test_cpu_backend_selection);

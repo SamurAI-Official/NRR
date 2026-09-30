@@ -18,6 +18,8 @@
 
 #ifdef NRR_ENABLE_VULKAN
 #include "vulkan/vulkan_device_info.h"
+#include "backend_amd.h"
+#include "backend_intel.h"
 #endif
 
 namespace nrr {
@@ -122,6 +124,51 @@ NRR_TEST(test_vulkan_capability_states_come_from_device_facts) {
     NRR_EXPECT_TRUE(std::string(caps.device_type) == "integrated_gpu", "an integrated device says so");
     NRR_EXPECT_TRUE(caps.compute_shader == NRR_CAPABILITY_ABSENT, "no workgroups, no compute claim");
     NRR_EXPECT_TRUE(caps.neural_acceleration == NRR_CAPABILITY_ABSENT, "and no neural claim either");
+#else
+    std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;
+#endif
+}
+
+NRR_TEST(test_vendor_probes_answer_from_the_enumerated_device) {
+#ifdef NRR_ENABLE_VULKAN
+    vk::VulkanDeviceInfo nvidia{};
+    vk::VulkanDeviceInfo amd{};
+    vk::VulkanDeviceInfo intel{};
+    const bool has_nvidia = vk::vulkan_find_device_from_vendor(vk::GpuVendor::Nvidia, nvidia);
+    const bool has_amd = vk::vulkan_find_device_from_vendor(vk::GpuVendor::Amd, amd);
+    const bool has_intel = vk::vulkan_find_device_from_vendor(vk::GpuVendor::Intel, intel);
+    std::cout << "  probes: nvidia=" << has_nvidia << " amd=" << has_amd << " intel=" << has_intel
+              << (has_nvidia ? std::string(" | ") + nvidia.device_name : std::string()) << std::endl;
+
+    /* A probe may only report a device whose vendor ID is the one asked for. On this machine that is
+     * NVIDIA true and AMD/Intel false; on a machine with none of them all three are false. Neither
+     * case is special-cased - the device list decides, which is the whole point. */
+    if (has_nvidia) {
+        NRR_EXPECT_TRUE(vk::gpu_vendor_from_id(nvidia.vendor_id) == vk::GpuVendor::Nvidia,
+                        "the NVIDIA probe returned an NVIDIA device");
+    }
+    if (has_amd) {
+        NRR_EXPECT_TRUE(vk::gpu_vendor_from_id(amd.vendor_id) == vk::GpuVendor::Amd,
+                        "the AMD probe returned an AMD device");
+    }
+    if (has_intel) {
+        NRR_EXPECT_TRUE(vk::gpu_vendor_from_id(intel.vendor_id) == vk::GpuVendor::Intel,
+                        "the Intel probe returned an Intel device");
+    }
+    NRR_EXPECT_TRUE(!vk::vulkan_find_device_from_vendor(vk::GpuVendor::Unknown, amd),
+                    "Unknown is not a vendor to look for");
+    NRR_EXPECT_TRUE(!vk::available(), "the probes left no loader reference behind");
+
+    /* And the back-ends answer from the probe rather than from a build option: this is the claim
+     * that "AMD support" means an AMD device exists. The acceleration behind it is the execution
+     * provider work in M4/V5 - the probe is the detection half, and it is now measured. */
+    BackendAMD amd_backend;
+    BackendIntel intel_backend;
+    NRRDeviceOptions options = {};
+    NRR_EXPECT_TRUE(amd_backend.is_supported(options) == has_amd,
+                    "the AMD backend answers what the probe found");
+    NRR_EXPECT_TRUE(intel_backend.is_supported(options) == has_intel,
+                    "the Intel backend answers what the probe found");
 #else
     std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;
 #endif

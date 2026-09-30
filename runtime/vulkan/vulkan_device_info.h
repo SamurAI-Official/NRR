@@ -30,6 +30,14 @@ const char* gpu_vendor_name(GpuVendor vendor);
 /** The NRRCapabilities::device_type string for what the device reported about itself. */
 const char* gpu_device_type_name(const VulkanDeviceInfo& info);
 
+/** True when Vulkan enumerates a device from `vendor`, and fills `out` with what that device
+ *  reported (name, vendor id, type, and the compute limits the capability block reads).
+ *
+ *  This is the probe the vendor back-ends answer from: a vendor's support is a fact about the
+ *  machine, not about the build. It uses the same loader table and cleans up after itself, so asking
+ *  the question never leaves an instance or a device behind. */
+bool vulkan_find_device_from_vendor(GpuVendor vendor, VulkanDeviceInfo& out);
+
 /** Fills `out`'s measured fields from what the device reported.
  *
  *  The EXECUTION claims stay conservative on purpose: the frame's inference runs through ONNX

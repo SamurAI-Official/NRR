@@ -12,6 +12,10 @@
 #include "accel_kernel.h"
 #include "accel_texture.h"
 
+#ifdef NRR_ENABLE_VULKAN
+#include "vulkan/vulkan_device_info.h"
+#endif
+
 #include <algorithm>
 #include <cstring>
 
@@ -62,10 +66,18 @@ void BackendAMD::shutdown() {
 }
 
 bool BackendAMD::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_AMD
-    return true;
+    /* This used to be `return true` whenever the build had the HIP/ROCm toolkit: a statement about
+     * the build that says nothing about the machine, which is the claim-from-configuration defect
+     * this milestone removed everywhere else. AMD support is now a device fact - Vulkan is asked
+     * whether it enumerates a device carrying AMD's (or ATI's) vendor ID. */
+#ifdef NRR_ENABLE_VULKAN
+    vk::VulkanDeviceInfo info{};
+    return vk::vulkan_find_device_from_vendor(vk::GpuVendor::Amd, info);
 #else
-    return false; /* inert without the HIP/ROCm toolkit */
+    /* No Vulkan in this build, so only the HIP toolkit could answer "is there an AMD GPU here" -
+     * and whether it can is what initialize() establishes. A predicate that answers yes without
+     * asking is how a placeholder becomes a lie. */
+    return false;
 #endif
 }
 

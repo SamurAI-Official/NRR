@@ -11,6 +11,10 @@
 #include "backend_intel.h"
 #include "accel_kernel.h"
 
+#ifdef NRR_ENABLE_VULKAN
+#include "vulkan/vulkan_device_info.h"
+#endif
+
 #include <algorithm>
 #include <cstring>
 
@@ -62,10 +66,15 @@ void BackendIntel::shutdown() {
 }
 
 bool BackendIntel::is_supported(const NRRDeviceOptions&) const {
-#ifdef NRR_ENABLE_INTEL
-    return true;
+    /* Same correction as BackendAMD: `return true` under NRR_ENABLE_INTEL described the build, not
+     * the machine. Intel support means a device with Intel's vendor ID (0x8086, or the older
+     * 0x163C/0x1AE0) is enumerated - which is a measurement, and one that is false on this project's
+     * development machine, as it should be. */
+#ifdef NRR_ENABLE_VULKAN
+    vk::VulkanDeviceInfo info{};
+    return vk::vulkan_find_device_from_vendor(vk::GpuVendor::Intel, info);
 #else
-    return false; /* inert without the oneAPI/DirectML stack */
+    return false; /* nothing in this build can look for an Intel device */
 #endif
 }
 

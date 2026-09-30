@@ -89,5 +89,61 @@ void apply_measured_capabilities(const VulkanDeviceInfo& info, bool has_dedicate
      * already reads where it needs the properties for other reasons too. */
 }
 
+bool vulkan_find_device_from_vendor(GpuVendor vendor, VulkanDeviceInfo& out) {
+    /* "Unknown" is not a vendor anybody can look for: answering it from the first device that
+     * happens to be there would be worse than saying no. */
+    if (vendor == GpuVendor::Unknown) return false;
+    if (!load()) return false;
+
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "NRR vendor probe";
+    app_info.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) {
+        unload();
+        return false;
+    }
+
+    bool found = false;
+    if (load_instance(instance)) {
+        uint32_t count = 0;
+        if (vkEnumeratePhysicalDevices(instance, &count, nullptr) == VK_SUCCESS && count > 0) {
+            std::vector<VkPhysicalDevice> devices(count);
+            if (vkEnumeratePhysicalDevices(instance, &count, devices.data()) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    VkPhysicalDeviceProperties props = {};
+                    vkGetPhysicalDeviceProperties(devices[i], &props);
+                    if (gpu_vendor_from_id(props.vendorID) != vendor) continue;
+                    out = VulkanDeviceInfo();
+                    std::strncpy(out.device_name, props.deviceName, sizeof(out.device_name) - 1);
+                    out.vendor_id = props.vendorID;
+                    out.device_id = props.deviceID;
+                    out.driver_version = props.driverVersion;
+                    out.api_version = props.apiVersion;
+                    out.is_discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                    out.is_integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+                    out.is_cpu_device = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+                    out.workgroup_max_invocations = props.limits.maxComputeWorkGroupInvocations;
+                    out.shared_memory_bytes = props.limits.maxComputeSharedMemorySize;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* The probe is a question, so it leaves nothing open behind it - the same discipline as
+     * BackendVulkan::is_supported(), which this mirrors. */
+    if (vkDestroyInstance != nullptr) vkDestroyInstance(instance, nullptr);
+    forget_instance();
+    unload();
+    return found;
+}
+
 } // namespace vk
 } // namespace nrr
