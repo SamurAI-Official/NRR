@@ -747,9 +747,47 @@ bool ONNXRuntime::apply_provider(const std::string& preferred) {
         return true;
     }
 
-    provider_note_ = "requested '" + pl +
-                     "' execution provider; no such provider is wired up in this "
-                     "build -> using CPU EP";
+    /* Four providers the specification names are not attached by this build yet (M4/V5 attaches
+     * them). What matters here is that the note distinguishes the two situations, because the old
+     * wording ("no such provider is wired up in this build") conflated them and read as though the
+     * provider did not exist anywhere: a package that offers the provider and a build that does not
+     * use it is a different fact from a package that has none at all. The list comes from
+     * OrtApi::GetAvailableProviders - the loaded libraries, not a build flag - so it is measured. */
+    static const struct { const char* requested; const char* in_package; } kNamedProviders[] = {
+        {"rocm", "ROCMExecutionProvider"},
+        {"openvino", "OpenVINOExecutionProvider"},
+        {"directml", "DmlExecutionProvider"},
+        {"tensorrt", "TensorrtExecutionProvider"},
+    };
+    const char* package_name = nullptr;
+    for (const auto& entry : kNamedProviders) {
+        if (pl == entry.requested) package_name = entry.in_package;
+    }
+
+    const std::vector<std::string> offered = available_providers();
+    std::string offered_list = "none reported";
+    if (!offered.empty()) {
+        offered_list.clear();
+        for (size_t i = 0; i < offered.size(); ++i) {
+            if (i > 0) offered_list += ", ";
+            offered_list += offered[i];
+        }
+    }
+    bool present_in_package = false;
+    for (const std::string& name : offered) {
+        if (package_name != nullptr && name == package_name) present_in_package = true;
+    }
+
+    if (present_in_package) {
+        provider_note_ = "requested '" + pl + "' execution provider; this ONNX Runtime package "
+                         "offers it and this build does not attach it yet (docs/roadmap.md M4/V5) "
+                         "-> using the CPU EP";
+    } else {
+        provider_note_ = "requested '" + pl + "' execution provider; this ONNX Runtime package has "
+                         "no " + (package_name != nullptr ? std::string(package_name)
+                                                         : std::string("provider of that name"))
+                         + " (it offers: " + offered_list + ") -> using the CPU EP";
+    }
     use_cpu_ep_ = true;
     active_provider_ = "CPUExecutionProvider";
     return true;
