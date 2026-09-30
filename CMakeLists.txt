@@ -523,7 +523,7 @@ if(NRR_ENABLE_VULKAN)
         set(_NRR_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
         set(_NRR_SHADER_HEADER "${_NRR_SHADER_DIR}/vulkan_shaders_generated.h")
         set(_NRR_SPIRV_FILES "")
-        foreach(_shader nchw_pack rgb8_unpack)
+        foreach(_shader nchw_pack rgb8_unpack upscale_bilinear temporal_blend)
             set(_source "${CMAKE_SOURCE_DIR}/runtime/vulkan/shaders/${_shader}.comp")
             set(_spirv "${_NRR_SHADER_DIR}/${_shader}.spv")
             add_custom_command(

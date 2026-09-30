@@ -1,0 +1,65 @@
+#version 450
+/*
+ * NRR kernel: bilinear upscale, NCHW fp32 -> NCHW fp32.
+ *
+ * Contract (stated so the CPU reference is unambiguous):
+ *   src : channels*src_width*src_height floats, plane-major
+ *   dst : channels*dst_width*dst_height floats, plane-major
+ *   u = (dx + 0.5) * src_width / dst_width  - 0.5      (half-pixel centred, then clamped)
+ *   v = (dy + 0.5) * src_height / dst_height - 0.5
+ *   dst[c][dy][dx] = the bilinear interpolation of the four texels around (u, v)
+ *
+ * Half-pixel centring is the part a naive implementation gets wrong: sampling at dx * scale shifts
+ * the image by half a destination pixel per axis, which looks like a slight blur until it is
+ * compared against a reference - so this is the contract the test checks, formula and all.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Source { float values[]; };
+layout(std430, binding = 1) writeonly buffer Dest { float out_values[]; };
+
+layout(push_constant) uniform Params {
+    uint src_width;
+    uint src_height;
+    uint dst_width;
+    uint dst_height;
+    uint channels;
+} params;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint dst_count = params.dst_width * params.dst_height;
+    if (index >= dst_count) return;
+
+    const uint dx = index % params.dst_width;
+    const uint dy = index / params.dst_width;
+
+    const float scale_x = float(params.src_width) / float(params.dst_width);
+    const float scale_y = float(params.src_height) / float(params.dst_height);
+    /* -0.5 and clamped to [0, extent-1]: outside the source there is no texel to interpolate with. */
+    float u = (float(dx) + 0.5) * scale_x - 0.5;
+    float v = (float(dy) + 0.5) * scale_y - 0.5;
+    u = clamp(u, 0.0, float(params.src_width) - 1.0);
+    v = clamp(v, 0.0, float(params.src_height) - 1.0);
+
+    const uint x0 = uint(floor(u));
+    const uint y0 = uint(floor(v));
+    const uint x1 = min(x0 + 1u, params.src_width - 1u);
+    const uint y1 = min(y0 + 1u, params.src_height - 1u);
+    const float fx = u - float(x0);
+    const float fy = v - float(y0);
+
+    const uint src_count = params.src_width * params.src_height;
+    for (uint c = 0u; c < params.channels; ++c) {
+        /* TWO different plane strides, which is the defect the test caught: the source plane is
+         * src_count elements and the destination plane is dst_count. Reusing the source stride for the
+         * destination writes each plane at the wrong offset - a whole unit of error on a 3x upscale,
+         * which is what "worst |gpu - cpu| = 1" was saying. */
+        const uint src_plane = c * src_count;
+        const float top = mix(values[src_plane + y0 * params.src_width + x0],
+                              values[src_plane + y0 * params.src_width + x1], fx);
+        const float bottom = mix(values[src_plane + y1 * params.src_width + x0],
+                                 values[src_plane + y1 * params.src_width + x1], fx);
+        out_values[c * dst_count + index] = mix(top, bottom, fy);
+    }
+}

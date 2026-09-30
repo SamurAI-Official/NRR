@@ -74,7 +74,7 @@ NRR_TEST(test_vulkan_kernels_are_embedded_with_hashes) {
                   << std::endl;
         return;
     }
-    NRR_EXPECT_EQ(count, static_cast<uint32_t>(2), "both kernels are present");
+    NRR_EXPECT_EQ(count, static_cast<uint32_t>(4), "all four kernels are present");
     for (uint32_t i = 0; i < count; ++i) {
         const char* name = vk::embedded_shader_name(i);
         const char* sha = vk::embedded_shader_sha256(i);
@@ -222,6 +222,195 @@ NRR_TEST(test_vulkan_pack_and_unpack_match_the_cpu_reference) {
     device.destroy_buffer(rgba);
     device.destroy_buffer(tensor);
     device.destroy_buffer(returned_rgba);
+    release_test_device(device);
+#else
+    std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;
+#endif
+}
+
+NRR_TEST(test_vulkan_upscale_matches_the_cpu_reference) {
+#ifdef NRR_ENABLE_VULKAN
+    const uint32_t* words = nullptr;
+    uint32_t word_count = 0;
+    const char* sha = nullptr;
+    if (!vk::find_embedded_shader("upscale_bilinear", &words, &word_count, &sha)) {
+        std::cout << "  SKIP: this build has no embedded kernels (no glslc at build time)" << std::endl;
+        return;
+    }
+    vk::VulkanDevice device;
+    std::string why;
+    if (!make_test_device(device, why)) {
+        std::cout << "  SKIP: " << why << std::endl;
+        return;
+    }
+    const uint32_t src_w = 9, src_h = 5, dst_w = 27, dst_h = 15, channels = 3;
+    const size_t src_floats = static_cast<size_t>(channels) * src_w * src_h;
+    const size_t dst_floats = static_cast<size_t>(channels) * dst_w * dst_h;
+    auto sample = [](size_t i) { return static_cast<float>((i * 37 + 11) % 101) / 100.0f; };
+    std::vector<float> source(src_floats);
+    for (size_t i = 0; i < src_floats; ++i) source[i] = sample(i);
+
+    vk::ComputeKernel kernel;
+    NRR_ASSERT(kernel.create(device, words, word_count, 2, 5 * sizeof(uint32_t), why),
+               "the upscale kernel builds a pipeline");
+    vk::VulkanDevice::Buffer* in = device.create_buffer(src_floats * sizeof(float));
+    vk::VulkanDevice::Buffer* out = device.create_buffer(dst_floats * sizeof(float));
+    NRR_ASSERT(in != nullptr && out != nullptr, "the upscale buffers could be created");
+    NRR_ASSERT(device.upload_buffer(in, source.data(), src_floats * sizeof(float), 0), "the source uploads");
+
+    struct Params { uint32_t src_w, src_h, dst_w, dst_h, channels; };
+    const Params params = {src_w, src_h, dst_w, dst_h, channels};
+    vk::DispatchPlan plan;
+    NRR_ASSERT(vk::plan_dispatch(dst_w * dst_h, 64, device.info().workgroup_max_invocations, plan, why),
+               "the upscale dispatch plans");
+    vk::DispatchRequest request;
+    request.kernel = &kernel;
+    request.buffers = {in->buffer, out->buffer};
+    request.push_constants = &params;
+    request.push_constant_bytes = sizeof(params);
+    request.plan = plan;
+    const bool ran = vk::dispatch(device, request, why);
+    if (!ran) std::cout << "  dispatch refused: " << why << std::endl;
+    NRR_ASSERT(ran, "the upscale kernel dispatches");
+
+    std::vector<float> produced(dst_floats, 0.0f);
+    NRR_ASSERT(device.download_buffer(out, produced.data(), dst_floats * sizeof(float), 0),
+               "the upscaled planes come back");
+    /* The CPU reference implements the contract in upscale_bilinear.comp line for line, half-pixel
+     * centring included - which is the part a shifted implementation would fail. */
+    double worst = 0.0;
+    for (uint32_t dy = 0; dy < dst_h; ++dy) {
+        for (uint32_t dx = 0; dx < dst_w; ++dx) {
+            float u = (static_cast<float>(dx) + 0.5f) * src_w / dst_w - 0.5f;
+            float v = (static_cast<float>(dy) + 0.5f) * src_h / dst_h - 0.5f;
+            u = std::min(std::max(u, 0.0f), static_cast<float>(src_w - 1));
+            v = std::min(std::max(v, 0.0f), static_cast<float>(src_h - 1));
+            const uint32_t x0 = static_cast<uint32_t>(std::floor(u));
+            const uint32_t y0 = static_cast<uint32_t>(std::floor(v));
+            const uint32_t x1 = std::min(x0 + 1u, src_w - 1u);
+            const uint32_t y1 = std::min(y0 + 1u, src_h - 1u);
+            const float fx = u - static_cast<float>(x0);
+            const float fy = v - static_cast<float>(y0);
+            for (uint32_t c = 0; c < channels; ++c) {
+                const size_t plane = static_cast<size_t>(c) * src_w * src_h;
+                const float top = source[plane + y0 * src_w + x0] * (1.0f - fx) +
+                                  source[plane + y0 * src_w + x1] * fx;
+                const float bottom = source[plane + y1 * src_w + x0] * (1.0f - fx) +
+                                     source[plane + y1 * src_w + x1] * fx;
+                const float expected = top * (1.0f - fy) + bottom * fy;
+                const size_t at = static_cast<size_t>(c) * dst_w * dst_h +
+                                  static_cast<size_t>(dy) * dst_w + dx;
+                const double diff = std::fabs(static_cast<double>(produced[at] - expected));
+                if (diff > worst) worst = diff;
+            }
+        }
+    }
+    std::cout << "  upscale 9x5 -> 27x15: worst |gpu - cpu| = " << worst << std::endl;
+    NRR_EXPECT_TRUE(worst <= 1e-6, "the upscale kernel matches the CPU reference formula");
+
+    kernel.destroy();
+    device.destroy_buffer(in);
+    device.destroy_buffer(out);
+    release_test_device(device);
+#else
+    std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;
+#endif
+}
+
+NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
+#ifdef NRR_ENABLE_VULKAN
+    const uint32_t* words = nullptr;
+    uint32_t word_count = 0;
+    const char* sha = nullptr;
+    if (!vk::find_embedded_shader("temporal_blend", &words, &word_count, &sha)) {
+        std::cout << "  SKIP: this build has no embedded kernels (no glslc at build time)" << std::endl;
+        return;
+    }
+    vk::VulkanDevice device;
+    std::string why;
+    if (!make_test_device(device, why)) {
+        std::cout << "  SKIP: " << why << std::endl;
+        return;
+    }
+    const uint32_t w = 8, h = 6;
+    const size_t count = static_cast<size_t>(w) * h;
+    const float alpha_base = 0.6f;
+    const float threshold = 2.0f;
+    auto sample = [](size_t i) { return static_cast<float>((i * 37 + 11) % 101) / 100.0f; };
+    std::vector<float> current(count * 3), previous(count * 3), motion(count * 2);
+    for (size_t i = 0; i < count * 3; ++i) {
+        current[i] = sample(i);
+        previous[i] = sample(i + 1000);
+    }
+    /* Every other pixel is still; the rest sweeps past the threshold, so the alpha rule is exercised
+     * at both ends and in between rather than at one convenient value. */
+    for (size_t i = 0; i < count; ++i) {
+        motion[i] = (i % 2 == 0) ? 0.0f : static_cast<float>(i % 9);
+        motion[count + i] = 0.0f;
+    }
+
+    vk::ComputeKernel kernel;
+    NRR_ASSERT(kernel.create(device, words, word_count, 4, 4 * sizeof(uint32_t), why),
+               "the blend kernel builds a pipeline from its SPIR-V");
+    vk::VulkanDevice::Buffer* cur = device.create_buffer(count * 3 * sizeof(float));
+    vk::VulkanDevice::Buffer* prev = device.create_buffer(count * 3 * sizeof(float));
+    vk::VulkanDevice::Buffer* mot = device.create_buffer(count * 2 * sizeof(float));
+    vk::VulkanDevice::Buffer* out = device.create_buffer(count * 3 * sizeof(float));
+    NRR_ASSERT(cur != nullptr && prev != nullptr && mot != nullptr && out != nullptr,
+               "the blend buffers could be created");
+    NRR_ASSERT(device.upload_buffer(cur, current.data(), current.size() * sizeof(float), 0),
+               "the current frame uploads");
+    NRR_ASSERT(device.upload_buffer(prev, previous.data(), previous.size() * sizeof(float), 0),
+               "the previous frame uploads");
+    NRR_ASSERT(device.upload_buffer(mot, motion.data(), motion.size() * sizeof(float), 0),
+               "the motion field uploads");
+
+    struct Params { uint32_t width, height; float alpha_base, motion_threshold; };
+    const Params params = {w, h, alpha_base, threshold};
+    vk::DispatchPlan plan;
+    NRR_ASSERT(vk::plan_dispatch(static_cast<uint32_t>(count), 64,
+                                 device.info().workgroup_max_invocations, plan, why),
+               "the blend dispatch plans");
+    vk::DispatchRequest request;
+    request.kernel = &kernel;
+    request.buffers = {cur->buffer, prev->buffer, mot->buffer, out->buffer};
+    request.push_constants = &params;
+    request.push_constant_bytes = sizeof(params);
+    request.plan = plan;
+    const bool ran = vk::dispatch(device, request, why);
+    if (!ran) std::cout << "  dispatch refused: " << why << std::endl;
+    NRR_ASSERT(ran, "the blend kernel dispatches and completes");
+
+    std::vector<float> produced(count * 3, 0.0f);
+    NRR_ASSERT(device.download_buffer(out, produced.data(), produced.size() * sizeof(float), 0),
+               "the blended frame comes back");
+
+    double worst = 0.0;
+    double still_pixel_alpha = -1.0;
+    for (size_t i = 0; i < count; ++i) {
+        float magnitude = motion[i] / threshold;
+        if (magnitude < 0.0f) magnitude = 0.0f;
+        if (magnitude > 1.0f) magnitude = 1.0f;
+        const float alpha = alpha_base * (1.0f - magnitude);
+        if (i % 2 == 0) still_pixel_alpha = alpha;
+        for (uint32_t c = 0; c < 3; ++c) {
+            const size_t at = static_cast<size_t>(c) * count + i;
+            const float expected = current[at] * (1.0f - alpha) + previous[at] * alpha;
+            const double diff = std::fabs(static_cast<double>(produced[at] - expected));
+            if (diff > worst) worst = diff;
+        }
+    }
+    std::cout << "  blend 8x6: worst |gpu - cpu| = " << worst << " (alpha_base " << alpha_base
+              << ", still-pixel alpha " << still_pixel_alpha << ")" << std::endl;
+    NRR_EXPECT_TRUE(worst <= 1e-6, "the blend kernel matches the CPU reference alpha rule");
+    NRR_EXPECT_TRUE(still_pixel_alpha == alpha_base,
+                    "a pixel that did not move keeps the full history weight, by the rule");
+
+    kernel.destroy();
+    device.destroy_buffer(cur);
+    device.destroy_buffer(prev);
+    device.destroy_buffer(mot);
+    device.destroy_buffer(out);
     release_test_device(device);
 #else
     std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;

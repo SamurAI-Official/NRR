@@ -107,6 +107,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_vulkan_dispatch_plan_respects_device_limits);
     NRR_RUN_TEST(test_vulkan_kernels_are_embedded_with_hashes);
     NRR_RUN_TEST(test_vulkan_pack_and_unpack_match_the_cpu_reference);
+    NRR_RUN_TEST(test_vulkan_upscale_matches_the_cpu_reference);
+    NRR_RUN_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference);
 
     std::cout << "\n--- Vulkan Capability Tests (V3: vendor map and measured states) ---\n";
     /* Pure functions of what a device reported, so these run everywhere - including on the machines

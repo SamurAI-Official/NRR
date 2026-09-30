@@ -1,0 +1,53 @@
+#version 450
+/*
+ * NRR kernel: motion-adaptive temporal blend, NCHW fp32 + motion -> NCHW fp32.
+ *
+ * Contract:
+ *   current  : channels*width*height floats, plane-major
+ *   previous : the same shape, ALREADY warped by the caller (this kernel does not resample)
+ *   motion   : 2*width*height floats (x and y per pixel)
+ *   out[c][y][x] = mix(current[c][y][x], previous[c][y][x], alpha)
+ *   alpha = alpha_base * (1 - clamp(length(motion) / threshold, 0, 1))
+ *
+ * More motion means LESS history weight, which is the anti-ghosting direction: a pixel that moved
+ * cannot be trusted to be the same surface, so the current frame has to win there. The per-pixel
+ * alpha is why this is a kernel and not a copy.
+ *
+ * The frame path's own accumulator (nrr_temporal.h) decides alpha_base and the threshold - and
+ * whether a camera cut discards the history entirely - so this kernel is the GPU half of that rule,
+ * not a second definition of it: the test checks this contract, and the wiring that would have to
+ * agree with TemporalAccumulator's alpha rule is M4/V2's remaining item.
+ */
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Current { float current_values[]; };
+layout(std430, binding = 1) readonly buffer Previous { float previous_values[]; };
+layout(std430, binding = 2) readonly buffer Motion { float motion_values[]; };
+layout(std430, binding = 3) writeonly buffer Dest { float out_values[]; };
+
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    float alpha_base;
+    float motion_threshold;
+} params;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint count = params.width * params.height;
+    if (index >= count) return;
+
+    const float mx = motion_values[index];
+    const float my = motion_values[count + index];
+    float magnitude = sqrt(mx * mx + my * my) / max(params.motion_threshold, 1e-6);
+    magnitude = clamp(magnitude, 0.0, 1.0);
+    const float alpha = params.alpha_base * (1.0 - magnitude);
+
+    /* channels is fixed at 3 here because the frame path is RGB: a generic channel count would make
+     * the motion layout ambiguous (is it per plane or per pixel?) for no gain. */
+    for (uint c = 0u; c < 3u; ++c) {
+        const uint plane = c * count;
+        out_values[plane + index] = mix(current_values[plane + index],
+                                        previous_values[plane + index], alpha);
+    }
+}
