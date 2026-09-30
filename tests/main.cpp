@@ -79,6 +79,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_ep_available_providers_from_runtime);
     NRR_RUN_TEST(test_ep_active_provider_is_measured);
     NRR_RUN_TEST(test_ep_cuda_request_never_lies);
+    /* V5's first provider: present in this package, so the attach runs for real here. */
+    NRR_RUN_TEST(test_ep_tensorrt_request_never_lies);
 #ifdef NRR_HAVE_CUDA_EP
     NRR_RUN_TEST(test_cuda_ep_is_measurably_faster_than_cpu);
 #endif

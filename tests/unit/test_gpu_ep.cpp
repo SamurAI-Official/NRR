@@ -269,5 +269,42 @@ NRR_TEST(test_cuda_ep_is_measurably_faster_than_cpu) {
 }
 #endif
 
+NRR_TEST(test_ep_tensorrt_request_never_lies) {
+    /* The rule the CUDA test enforces, for the provider this package actually offers
+     * (TensorrtExecutionProvider is in the list the provider test prints) - which is why V5 starts
+     * with TensorRT: the attach runs for real here instead of being written blind. What it must
+     * never do is leave the provider named while the work runs on the CPU. */
+    ONNXRuntime rt;
+    if (!rt.initialize()) {
+        std::cout << "  SKIP: no ONNX Runtime linked" << std::endl;
+        return;
+    }
+    rt.set_execution_provider("tensorrt");
+    if (!rt.load_model(NRR_SAMPLE_MODEL)) {
+        std::cout << "  SKIP: the fixture model did not load (" << rt.provider_note() << ")"
+                  << std::endl;
+        return;
+    }
+    const std::string active = rt.active_provider();
+    std::cout << "  tensorrt requested, active=" << active << std::endl;
+    if (!rt.provider_note().empty()) std::cout << "  note: " << rt.provider_note() << std::endl;
+
+    NRR_EXPECT_TRUE(active == "TensorrtExecutionProvider" || active == "CPUExecutionProvider",
+                    "the active provider is the one requested or the documented fallback");
+    if (active == "TensorrtExecutionProvider") {
+        NRR_EXPECT_TRUE(rt.provider_note().empty(), "a provider that attached needs no excuse");
+    } else {
+        /* The fallback has to be explained in one of the three measured ways: no CUDA device, no
+         * TensorRT provider in this package, or ONNX Runtime's own reason for refusing the attach. */
+        NRR_EXPECT_TRUE(!rt.provider_note().empty(), "a fallback says why");
+        const std::string note = rt.provider_note();
+        const bool explained = note.find("no CUDA device") != std::string::npos ||
+                               note.find("offers no TensorrtExecutionProvider") != std::string::npos ||
+                               note.find("could not be attached") != std::string::npos ||
+                               note.find("options were rejected") != std::string::npos;
+        NRR_EXPECT_TRUE(explained, "and the explanation names one of the measured causes");
+    }
+}
+
 } // namespace test
 } // namespace nrr

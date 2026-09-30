@@ -701,6 +701,76 @@ bool ONNXRuntime::append_cuda_provider() {
 #endif
 }
 
+bool ONNXRuntime::append_tensorrt_provider() {
+#if defined(NRR_HAVE_ONNXRUNTIME)
+    if (api_ == nullptr || session_options_ == nullptr) {
+        /* Deferred, exactly as the CUDA path is: load_model() applies the provider again once the
+         * session options exist, so a note written here would shadow the real outcome. */
+        return false;
+    }
+    /* TensorRT runs on CUDA, so the CUDA driver is what decides whether there is anywhere to run -
+     * and claiming otherwise is the trap CI run #28 found for CUDA itself. */
+    const CudaDriverProbe& probe = probe_cuda_driver();
+    if (probe.device_count <= 0) {
+        provider_note_ =
+            std::string("TensorRT execution provider not attached: no CUDA device is present (") +
+            (probe.note.empty() ? std::string("the driver reports none") : probe.note) +
+            ") (falls back to the CPU execution provider)";
+        return false;
+    }
+    /* ... and this package has to offer it. A GPU package without the TensorRT provider is a real
+     * configuration; the C API call below would report that in its own words, and this says it
+     * earlier and more clearly. */
+    bool offered = false;
+    for (const std::string& name : available_providers()) {
+        if (name == "TensorrtExecutionProvider") offered = true;
+    }
+    if (!offered) {
+        provider_note_ =
+            "TensorRT execution provider not attached: this ONNX Runtime package offers no "
+            "TensorrtExecutionProvider (falls back to the CPU execution provider)";
+        return false;
+    }
+
+    OrtTensorRTProviderOptionsV2* options = nullptr;
+    OrtStatus* status = api_->CreateTensorRTProviderOptions(&options);
+    if (status != nullptr) {
+        provider_note_ = std::string("TensorRT execution provider could not be configured: ") +
+                         api_->GetErrorMessage(status) +
+                         " (falls back to the CPU execution provider)";
+        api_->ReleaseStatus(status);
+        return false;
+    }
+    /* Device 0, fp32: NRR's execution precision claim is fp32 (see set_fp16_capabilities in
+     * nrr_runtime.h), so the provider is not asked for an fp16 mode nothing here would verify. */
+    const char* keys[] = {"device_id", "trt_fp16_enable"};
+    const char* values[] = {"0", "0"};
+    status = api_->UpdateTensorRTProviderOptions(options, keys, values, 2);
+    if (status != nullptr) {
+        provider_note_ = std::string("TensorRT execution provider options were rejected: ") +
+                         api_->GetErrorMessage(status) +
+                         " (falls back to the CPU execution provider)";
+        api_->ReleaseStatus(status);
+        api_->ReleaseTensorRTProviderOptions(options);
+        return false;
+    }
+    status = api_->SessionOptionsAppendExecutionProvider_TensorRT_V2(session_options_, options);
+    api_->ReleaseTensorRTProviderOptions(options);
+    if (status != nullptr) {
+        provider_note_ = std::string("TensorRT execution provider could not be attached: ") +
+                         api_->GetErrorMessage(status) +
+                         " (falls back to the CPU execution provider)";
+        api_->ReleaseStatus(status);
+        return false;
+    }
+    return true;
+#else
+    provider_note_ =
+        "requested 'tensorrt' execution provider, but no ONNX Runtime is linked -> using CPU EP";
+    return false;
+#endif
+}
+
 bool ONNXRuntime::apply_provider(const std::string& preferred) {
     use_cpu_ep_ = use_cuda_ep_ = use_directml_ep_ = false;
     active_provider_.clear();
@@ -742,6 +812,24 @@ bool ONNXRuntime::apply_provider(const std::string& preferred) {
         }
         /* The attach attempt failed for a real reason, which
          * append_cuda_provider() recorded in provider_note_. */
+        use_cpu_ep_ = true;
+        active_provider_ = "CPUExecutionProvider";
+        return true;
+    }
+
+    if (pl == "tensorrt") {
+        /* The provider this package actually offers (TensorrtExecutionProvider is in the list the
+         * tests print), which is why V5 starts here: the attach can be verified on this machine
+         * rather than written blind. */
+        if (append_tensorrt_provider()) {
+            active_provider_ = "TensorrtExecutionProvider";
+            return true;
+        }
+        if (session_options_ == nullptr) {
+            /* Deferred: the attach happens for real in load_model(); active_provider_ stays empty
+             * because nothing has been measured yet. */
+            return true;
+        }
         use_cpu_ep_ = true;
         active_provider_ = "CPUExecutionProvider";
         return true;

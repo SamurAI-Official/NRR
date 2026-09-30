@@ -135,7 +135,12 @@ private:
      * Returns false and fills provider_note_ with ORT's own message when the
      * provider cannot be created - which is what happens when
      * onnxruntime_providers_cuda.dll or the CUDA runtime DLLs are missing. */
+    /* Attaches the provider the caller asked for, or records why it could not - never a claim from a
+     * request. Each returns true only when ONNX Runtime accepted the attach. */
     bool append_cuda_provider();
+    /* TensorRT (V5): runs on CUDA, so the same driver probe decides whether there is anywhere to run,
+     * and the package has to offer the provider - both measured, both reported in provider_note_. */
+    bool append_tensorrt_provider();
     void release_session_objects();
 #endif
 
