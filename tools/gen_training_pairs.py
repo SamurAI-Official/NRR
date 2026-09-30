@@ -16,10 +16,22 @@ What a pair is, and why each part is ground truth:
 
 The gates run on every pair, and they exist because of a specific failure this project already had:
 the shipped fixture is an untrained identity function, so a generator that accidentally produced
-input == target would train another identity and look like progress. The gates make that impossible -
-after a naive bilinear 2x upscale the input must still differ from the target by a stated margin, and
-depth and motion must be non-constant (a constant conditioning input trains a model that ignores
-conditioning, which is the gap the roadmap records).
+input == target would train another identity and look like progress. Three things are measured, and
+each one is printed and recorded in the manifest rather than assumed:
+
+    identity margin   after a naive bilinear 2x upscale the input must still differ from the target
+    detail ratio      high-frequency energy of that upscale over the target's - a super-resolution
+                      pair is only useful if the target really carries more detail than the baseline
+    conditioning      depth and motion must be non-constant, because a constant conditioning input
+                      trains a model that ignores conditioning, which is the gap the roadmap records
+
+The detail ratio exists because the first version of this generator measured only the identity margin,
+which sat at 0.011 against a 0.01 gate - it passed, with almost no headroom, because the seeded noise
+(mean |noise| ~ 0.016) was larger than the resolution difference it was supposed to be measuring. A
+margin that is mostly noise trains a denoiser, not an upscaler. Noise is now 0.005, the noise floor is
+reported separately, and the detail ratio is the gate that actually asks whether there is resolution
+to recover. Noise can only inflate the input's detail and therefore only make the gate harder to pass,
+so the measurement errs against the generator, which is the direction that matters.
 
 Usage:
     python tools/gen_training_pairs.py --out models/training-data/v1 --count 8 --size 64
@@ -39,6 +51,16 @@ import numpy as np
 # A pair whose input survives a naive 2x upscale to within this much of the target has nothing for a
 # model to learn. 0.01 in [0,1] colour units is about one 8-bit level of mean error.
 MIN_IDENTITY_MARGIN = 0.01
+
+# The naive upscale may keep at most this fraction of the target's high-frequency energy. At 1.0 the
+# target has no more detail than the baseline and the pair is a denoising exercise; 0.9 leaves room for
+# the pair to be worth training on without flattering it.
+MAX_DETAIL_RATIO = 0.9
+
+# Sensor-ish noise added to the input. 0.005 keeps mean |noise| (~0.004) well under the resolution
+# difference, so the pair tests upscaling rather than denoising - see the docstring.
+INPUT_NOISE_SIGMA = 0.005
+
 
 
 class Scene(object):
@@ -109,8 +131,26 @@ def _trace(scene, height, width, time_offset, supersample):
                 hit_id = np.where(closer, index, hit_id)
                 hit_point = np.where(closer[..., None], directions * t[..., None], hit_point)
 
+            # Ground plane at y = -1.2 with a checker pattern. Analytic, so it needs no texture, and its
+            # edges at grazing angles are precisely what a low-resolution render loses - which is the
+            # content the identity and detail gates were failing for want of. -2 marks the ground, so it
+            # contributes depth and colour but no motion.
+            ground_t = np.where(directions[..., 1] < -1e-6, -1.2 / directions[..., 1], np.inf)
+            ground_hit = (ground_t > 1e-4) & (ground_t < best_t)
+            best_t = np.where(ground_hit, ground_t, best_t)
+            hit_id = np.where(ground_hit, -2, hit_id)
+
             sky = np.linspace(0.0, 1.0, height)[:, None, None]
             frame = scene.sky_top * (1.0 - sky) + scene.sky_bottom * sky
+            if np.any(ground_hit):
+                # Sky rays never hit the ground: their t is infinite, so floor() of infinity is the nan
+                # and the RuntimeWarning that used to print here. Only ground hits are worth shading.
+                ground_point = directions * np.where(ground_hit, ground_t, 1.0)[..., None]
+                checker = ((np.floor(ground_point[..., 0] * 0.9) +
+                            np.floor(ground_point[..., 2] * 0.9)) % 2.0) == 0.0
+                frame = np.where(ground_hit[..., None],
+                                 np.where(checker[..., None], 0.82, 0.16), frame)
+
             for index in range(scene.centers.shape[0]):
                 mask = hit_id == index
                 if not np.any(mask):
@@ -137,7 +177,9 @@ def render_pair(scene, size):
     input_color, input_depth, input_ids = _trace(scene, size, size, 0.0, 1)
 
     rng = np.random.default_rng(scene.seed * 31 + 17)
-    input_color = np.clip(input_color + rng.normal(0.0, 0.02, size=input_color.shape), 0.0, 1.0)
+    clean_color = input_color.copy()
+    input_color = np.clip(input_color + rng.normal(0.0, INPUT_NOISE_SIGMA, size=input_color.shape),
+                          0.0, 1.0)
 
     # Motion: where each shaded point lands 50 ms later, in input-pixel units. Only the moving sphere
     # contributes, because neither the camera nor the other spheres move.
@@ -154,6 +196,7 @@ def render_pair(scene, size):
                        points[..., 1] / points[..., 2]) * scale
 
     return {"input": input_color.astype(np.float32),
+            "input_clean": clean_color.astype(np.float32),
             "target": np.clip(target_color, 0.0, 1.0).astype(np.float32),
             "depth": safe_depth.astype(np.float32), "motion": motion.astype(np.float32)}
 
@@ -185,22 +228,47 @@ def _upscale2x(image):
     return top * (1.0 - fy) + bottom * fy
 
 
+def _detail(image):
+    """High-frequency energy: mean absolute difference from an 8-neighbour 3x3 blur. A pair is only
+    useful for super-resolution if the target carries more of this than a naive upscale of the input."""
+    pad = np.pad(image, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    blur = (pad[:-2, 1:-1] + pad[2:, 1:-1] + pad[1:-1, :-2] + pad[1:-1, 2:] +
+            pad[:-2, :-2] + pad[:-2, 2:] + pad[2:, :-2] + pad[2:, 2:]) / 8.0
+    return float(np.mean(np.abs(image - blur)))
+
+
 def gate_pair(name, pair):
-    """Raises SystemExit when a pair would train an identity function or a conditioning-blind model;
-    returns the measured margin so the run can print it (a gate that does not say what it measured is
-    a gate nobody can tune)."""
-    margin = float(np.mean(np.abs(_upscale2x(pair["input"]) - pair["target"])))
+    """Raises SystemExit when a pair would train an identity function, a denoiser instead of an
+    upscaler, or a conditioning-blind model. Returns the measurements, because a gate that does not say
+    what it measured is a gate nobody can tune."""
+    upscaled = _upscale2x(pair["input"])
+    margin = float(np.mean(np.abs(upscaled - pair["target"])))
+    noise = float(np.mean(np.abs(pair["input"] - pair["input_clean"])))
+    detail_ratio = _detail(upscaled) / max(_detail(pair["target"]), 1e-9)
+    measured = {"margin": margin, "noise": noise, "detail_ratio": detail_ratio}
+
     if margin <= MIN_IDENTITY_MARGIN:
         raise SystemExit(
             "%s: after a bilinear 2x upscale the input is within %.6f of the target (needs > %.4f) - "
             "this pair has nothing to learn and would train another identity function"
             % (name, margin, MIN_IDENTITY_MARGIN))
+    if margin <= noise:
+        raise SystemExit(
+            "%s: the margin (%.6f) is no larger than the noise floor (%.6f), so the difference this "
+            "pair offers is noise rather than resolution - training on it would produce a denoiser"
+            % (name, margin, noise))
+    if detail_ratio > MAX_DETAIL_RATIO:
+        raise SystemExit(
+            "%s: a naive upscale already keeps %.3f of the target's high-frequency energy (needs "
+            "<= %.2f) - the target has too little detail left to recover" % (name, detail_ratio,
+                                                                           MAX_DETAIL_RATIO))
     for field in ("depth", "motion"):
         spread = float(np.std(pair[field]))
         if spread <= 1e-6:
             raise SystemExit("%s: %s is constant (std %.9f) - a model trained on this would ignore "
                              "its conditioning" % (name, field, spread))
-    return margin
+    return measured
+
 
 
 def _hash(path):
@@ -213,48 +281,73 @@ def _hash(path):
 
 def generate(out_dir, count, size, seed, val_every, style):
     os.makedirs(out_dir, exist_ok=True)
-    entries, margins = [], []
+    entries = []
     for index in range(count):
         pair_seed = seed + index * 101
         pair = render_pair(Scene(pair_seed, style), size)
         split = "val" if (val_every > 0 and index % val_every == 0) else "train"
         name = "%s_%03d.npz" % (split, index)
-        margin = gate_pair("pair %d (seed %d)" % (index, pair_seed), pair)
-        margins.append(margin)
+        stats = gate_pair("pair %d (seed %d)" % (index, pair_seed), pair)
         path = os.path.join(out_dir, name)
         np.savez_compressed(path, **pair)
         entries.append({"file": name, "split": split, "seed": pair_seed, "style": style,
-                        "size": size, "identity_margin": margin, "sha256": _hash(path)})
-        print("  %-14s split=%-5s seed=%-11d margin=%.4f depth_std=%.4f motion_std=%.4f"
-              % (name, split, pair_seed, margin, float(np.std(pair["depth"])),
-                 float(np.std(pair["motion"]))))
+                        "size": size, "margin": stats["margin"], "noise": stats["noise"],
+                        "detail_ratio": stats["detail_ratio"], "sha256": _hash(path)})
+        print("  %-14s %-5s seed=%-11d margin=%.4f noise=%.4f detail=%.3f depth_std=%.3f "
+              "motion_std=%.4f"
+              % (name, split, pair_seed, stats["margin"], stats["noise"], stats["detail_ratio"],
+                 float(np.std(pair["depth"])), float(np.std(pair["motion"]))))
+
+    def worst(key, pick=max):
+        return pick(entry[key] for entry in entries)
 
     manifest = {"generator": os.path.basename(__file__), "count": count, "size": size, "seed": seed,
                 "style": style, "min_identity_margin": MIN_IDENTITY_MARGIN,
-                "margins": {"min": min(margins), "mean": float(np.mean(margins))}, "pairs": entries}
+                "max_detail_ratio": MAX_DETAIL_RATIO, "input_noise_sigma": INPUT_NOISE_SIGMA,
+                "summary": {"margin": {"min": worst("margin", min), "max": worst("margin", max)},
+                            "noise": {"min": worst("noise", min), "max": worst("noise", max)},
+                            "detail_ratio": {"min": worst("detail_ratio", min),
+                                             "max": worst("detail_ratio", max)}},
+                "pairs": entries}
     manifest_path = os.path.join(out_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(manifest, handle, indent=2)
         handle.write("\n")
-    print("  manifest: %s (%d pairs, min margin %.4f, mean %.4f)"
-          % (manifest_path, count, manifest["margins"]["min"], manifest["margins"]["mean"]))
+    print("  margin %.4f-%.4f, noise %.4f-%.4f, detail ratio %.3f-%.3f (gate needs margin > %.2f "
+          "and > noise, detail <= %.2f)"
+          % (manifest["summary"]["margin"]["min"], manifest["summary"]["margin"]["max"],
+             manifest["summary"]["noise"]["min"], manifest["summary"]["noise"]["max"],
+             manifest["summary"]["detail_ratio"]["min"], manifest["summary"]["detail_ratio"]["max"],
+             MIN_IDENTITY_MARGIN, MAX_DETAIL_RATIO))
+    print("  manifest: %s (%d pairs)" % (manifest_path, count))
     return manifest
 
 
+
 def self_test():
-    """Proves the gates are not decorative: two degenerate pairs must be rejected. The first has an
-    input that a naive upscale reproduces exactly, which is the failure the shipped fixture represents;
-    the second has conditioning that cannot be conditioned on, which is the failure a scene without a
-    visible mover produces - an earlier revision of this generator produced exactly that, and the gate
-    caught it."""
+    """Proves the gates are not decorative: three degenerate pairs must be rejected, each by the gate it
+    is designed to exercise. The first is the failure the shipped fixture represents - an input a naive
+    upscale reproduces exactly, so the target carries no more detail than the baseline. The second is
+    the failure the first version of this generator had: a difference that is noise rather than
+    resolution. The third is a scene with no visible mover, which an earlier revision produced."""
     size = 16
     ramp = np.repeat((np.linspace(0.0, 1.0, size * 2)[:, None] *
                       np.ones((1, size * 2)))[..., None], 3, axis=-1)
+    # Every case carries non-constant depth and motion, so a rejection can only come from the gate the
+    # case is designed to exercise - otherwise an unrelated failure would look like a pass.
+    depth = np.linspace(1.0, 4.0, size)[:, None] * np.ones((1, size))
+    motion = np.zeros((size, size, 2))
+    motion[..., 0] = np.linspace(-1.0, 1.0, size)[None, :]
+    rng = np.random.default_rng(3)
+    noisy = np.clip(ramp[::2, ::2] + rng.normal(0.0, 0.05, size=(size, size, 3)), 0.0, 1.0)
+
     cases = [
-        ("identity input", {"input": ramp[::2, ::2].copy(), "target": ramp.copy(),
-                            "depth": np.linspace(1.0, 4.0, size)[:, None] * np.ones((1, size)),
-                            "motion": np.zeros((size, size, 2))}),
+        ("identity input", {"input": ramp[::2, ::2].copy(), "input_clean": ramp[::2, ::2].copy(),
+                            "target": ramp.copy(), "depth": depth, "motion": motion}),
+        ("noise, no resolution", {"input": noisy, "input_clean": ramp[::2, ::2].copy(),
+                                  "target": ramp.copy(), "depth": depth, "motion": motion}),
         ("constant conditioning", {"input": np.zeros((size, size, 3)),
+                                   "input_clean": np.zeros((size, size, 3)),
                                    "target": np.ones((size * 2, size * 2, 3)),
                                    "depth": np.ones((size, size)),
                                    "motion": np.zeros((size, size, 2))}),
@@ -262,11 +355,12 @@ def self_test():
     failures = 0
     for name, pair in cases:
         try:
-            margin = gate_pair(name, pair)
+            stats = gate_pair(name, pair)
         except SystemExit as rejected:
             print("  %-21s rejected as it must be: %s" % (name, rejected))
         else:
-            print("  %-21s NOT REJECTED (margin %.4f) - the gate is decorative" % (name, margin))
+            print("  %-21s NOT REJECTED (margin %.4f noise %.4f detail %.3f) - the gate is decorative"
+                  % (name, stats["margin"], stats["noise"], stats["detail_ratio"]))
             failures += 1
     return 1 if failures else 0
 
