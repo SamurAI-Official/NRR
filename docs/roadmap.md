@@ -1029,14 +1029,43 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
 - [ ] Wire pack/unpack into the frame path: the accelerator kernel still moves frames through host
       staging, so today the GPU does this work only when it is called directly.
 
-Next, in order:
+### M4/V5 - execution-provider bridges (the acceleration behind the vendor front-doors)
 
-- [ ] Per-device capability measurement: vendor ID to vendor name, cooperative matrix, integer dot
-      product, `VK_EXT_memory_budget`, and the fp16 question answered by measurement (ABSENT until a
-      real fp16 path exists and is measured).
-- [ ] Vendor front-doors over one engine (AMD, Intel, NVIDIA, and Adreno/Mali/PowerVR through the
-      same path), each probing for its own hardware instead of reporting support from a build option.
-- [ ] Enable Vulkan on desktop by default once this path is green there.
+The provider list this package reports on the development machine is `TensorrtExecutionProvider,
+CUDAExecutionProvider, CPUExecutionProvider`, and that decides the order below - a provider that can
+be attached *and verified* here first, the rest implemented and gated with an auditable skip.
+
+- [ ] `append_tensorrt_provider()` in `runtime/onnx_runtime.cpp`, gated on a CMake-detected
+      `NRR_HAVE_TRT_EP` (the `NRR_HAVE_CUDA_EP` pattern) and recording ONNX Runtime's own reason when
+      the attach fails. Verifiable here: the provider is in the package, so the test asserts either
+      that it attached or why it did not - the shape of `test_cuda_ep_is_measurably_faster_than_cpu`.
+- [ ] `append_directml_provider()` / `append_openvino_provider()` / `append_rocm_provider()`. Each
+      needs the provider's own header from a matching package and its runtime on the machine, so each
+      is gated the same way and each test is attach-or-skip-with-a-reason. **None of the three can be
+      verified on this machine**: the package does not offer them, and the note added in
+      `apply_provider()` says so from `GetAvailableProviders` - which is what makes the skip
+      auditable rather than a silent pass.
+- [ ] Route all four through `apply_provider()`, so "requested" and "attached" stay two different
+      facts and a vendor front-door can name a provider it really has.
+- [ ] Then V4's front-door ownership: `BackendAMD`/`BackendIntel` own an engine (the mechanism is
+      verified in V4) and run frames on their own device. That change also updates the vendor-backend
+      tests that currently assert an ORT fallback, which is why it has to be one commit - and why it
+      should be written where at least one of those paths can be executed, not on this machine.
+
+### M4/V6 - defaults and CI
+
+- [ ] `NRR_ENABLE_VULKAN` ON by default for desktop. That is one line, and it needs the CI work
+      first: without the headers the Vulkan arm is a `FATAL_ERROR` by design, so every host job that
+      does not fetch them would fail at configure. The order is: fetch and cache the headers in those
+      jobs, then flip the default.
+- [ ] A `glslc` for the desktop Vulkan job. Today that job reports the kernels as absent and skips
+      their tests - it has neither the SDK nor the NDK - while the Android job compiles and hashes
+      them. The options are to fetch glslc there (no small official Windows glslc exists outside the
+      SDK and the NDK, so the NDK cache is the pragmatic source, at the cost of a possible 745 MB
+      download on a cold cache) or to keep the split and say so, which is what this roadmap does now.
+- [ ] A software Vulkan ICD (lavapipe via `VK_ICD_FILENAMES`) so the kernel tests *run* on a GPU-less
+      runner instead of skipping. That is what turns "the kernels compile here" into "the kernels run
+      here" in CI.
 
 ## M5 - Unreal integration `gated: Unreal Engine install`
 
