@@ -36,19 +36,27 @@ CPU, no GPU):
   ablation exactly 0, so two gates failed at once.
 - **40 epochs: refused on one gate.** val L1 0.02911 against 0.03709, **21.52% better**, depth ablation
   0.01335 - and motion ablation 4e-06, i.e. the model correctly ignores motion.
-- **Ablation training settled why.** Re-training with motion zeroed *throughout* training and validation
-  gives **23.62% better** (0.02833) - removing the input **improves** held-out quality - and zeroing depth
-  gives 25.19%. On single-frame pairs whose target is a same-instant render, conditioning is not merely
-  unused, it is a cost: there is nothing motion can tell the network that the visible blur does not
-  already show it, and the extra channels cost a small network on 18 training pairs.
+- **Ablation training, first setting (shutter-averaged frames).** Re-training with motion zeroed
+  *throughout* training and validation gave **23.62% better** (0.02833) against 21.52% with it, and
+  zeroing depth gave 25.19%.
 
-The first attempt to fix this was a data change: both input and target are now exposed over a shutter
-interval (the average of the scene at t and t+SHUTTER), so a static reconstruction is wrong where the mover
-travelled. It improved the metric substantially and left motion unused, which is the honest result - the
-blur is *visible*, so motion remains unnecessary to invert it. Making motion necessary requires a frame
-it can be measured against, which the single-frame contract (`color`, `depth`, `motion` at one instant)
-does not have. That is a roadmap decision, not a threshold to lower, and until then the gate keeps
-refusing models that claim conditioning they do not use.
+- **Ablation training, second setting (sharp targets).** Same scale and seed, motion zeroed throughout:
+  **24.98% better** (0.02772) against **26.59%** (0.02712) with it. The sign of the effect flipped between
+  the two settings, so it is run-to-run variation rather than a property of conditioning, and the earlier
+  reading that motion is "a cost" was over-confident on one pair of runs. What reproduces in every run is
+  the within-run measurement: zeroing motion changes the output by 4e-06 to 5e-06, so the network is not
+  using it, and the gate refuses the model for that reason.
+
+Two data variants were tried, both honestly, and neither makes motion load-bearing. Accumulating input and
+target over a shutter interval (the average of the scene at t and t+SHUTTER) makes a static reconstruction
+wrong where the mover travelled - and it left motion unused, because a blur that is visible in the input can
+be inverted without being told what caused it. Reverting to a sharp target leaves sub-pixel ambiguity, which
+is the only signal that could make motion *necessary* inside a single-frame contract, and it improved quality
+further (26.59% against 21.52%) without making motion used. The measurement is consistent: with a single
+instant as the target, nothing the motion vector says is required to produce it. Making motion necessary
+means giving the network a frame to measure it against - a previous colour frame the model must reproject -
+which is a change to the model contract rather than to these tools, and it is recorded as the next decision
+rather than quietly worked around.
 
 ### Every provider DLL the package ships is deployed, and the TensorRT gate is now a measured one
 

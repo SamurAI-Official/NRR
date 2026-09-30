@@ -180,22 +180,20 @@ def _trace(scene, height, width, time_offset, supersample):
 
 
 def render_pair(scene, size):
-    """A degraded low-resolution input, a supersampled high-resolution target, and the depth and
-    motion that belong to the input's grid.
+    """A degraded low-resolution input, a supersampled high-resolution target, and the depth and motion
+    that belong to the input's grid.
 
-    Both frames are exposed over the same shutter interval, so each is the average of the scene at t and
-    t+SHUTTER. That is what makes the motion vector *necessary*: where the mover travelled, a static
-    reconstruction is simply wrong, and inverting that blur is only possible with the motion. The first
-    version of this generator rendered a single instant, and a training run measured the consequence - a
-    model that ignored motion entirely (ablation 0.000001) and was right to, because motion carried no
-    information about a single-instant target. The conditioning gate refused that model for a defect that
-    belonged to the data rather than to the network."""
-    target_now, _unused_depth, _unused_ids = _trace(scene, size * 2, size * 2, 0.0, 2)
-    target_later, _, _ = _trace(scene, size * 2, size * 2, SHUTTER, 2)
-    target_color = 0.5 * (target_now + target_later)
-    input_now, input_depth, input_ids = _trace(scene, size, size, 0.0, 1)
-    input_later, _, _ = _trace(scene, size, size, SHUTTER, 1)
-    input_color = 0.5 * (input_now + input_later)
+    The target is a *sharp* instant, and that is deliberate. An earlier version accumulated both frames
+    over the shutter interval, which raised the measured quality by a lot (21.52% better than the
+    bilinear baseline instead of 4.78%) and still left motion unused, because a motion blur that is
+    visible in the input can be inverted without being told what caused it. The remaining signal inside
+    this single-frame contract is sub-pixel: decimating to the input grid loses where edges sit inside
+    the high-resolution pixel, aliasing makes the low-resolution appearance genuinely ambiguous, and the
+    motion vector is the only input that says how that content moved. Whether that is enough to make
+    motion earn its place is measured by training one model with it and one without - not asserted here.
+    """
+    target_color, _unused_depth, _unused_ids = _trace(scene, size * 2, size * 2, 0.0, 2)
+    input_color, input_depth, input_ids = _trace(scene, size, size, 0.0, 1)
 
     rng = np.random.default_rng(scene.seed * 31 + 17)
     clean_color = input_color.copy()
