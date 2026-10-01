@@ -61,6 +61,10 @@ OUTPUT_NAME = "output"
 MIN_IMPROVEMENT = 0.05      # at least 5% below the bilinear baseline on held-out scenes
 BASELINE_FLOOR = 1e-3       # output must differ from the bilinear baseline by more than this
 CONDITIONING_FLOOR = 1e-4   # zeroing an input must change the output by more than this
+# The training loss must fall by at least this fraction from the first epoch to the last. Five of eight
+# stage-4 runs sat at exactly the untrained-model loss and would otherwise have been reported as results;
+# a run that does not learn is a fact about the run, and it belongs in the gate set rather than in prose.
+MIN_TRAIN_PROGRESS = 0.10
 
 
 def resolve_device(requested, log):
@@ -197,6 +201,15 @@ def check_gates(numbers, zeroed=None, inputs=("color", "depth", "motion")):
     because a colour-only model has no history weights to ignore and must not be failed for not using
     something it does not have."""
     failures = []
+    # Checked first, because every other number below is meaningless if the run never learned: a stalled
+    # model reports the untrained-model loss, and its held-out figure would otherwise be compared as if it
+    # were a result of a different input set.
+    if numbers.get("train_progress", 1.0) < MIN_TRAIN_PROGRESS:
+        failures.append(
+            "training made no progress: residual L1 went from %.5f to %.5f, a fall of %.1f%% (needs >= "
+            "%.0f%%) - this run is degenerate and its numbers are not a comparison result"
+            % (numbers.get("train_first_loss", 0.0), numbers.get("train_last_loss", 0.0),
+               numbers.get("train_progress", 0.0) * 100.0, MIN_TRAIN_PROGRESS * 100.0))
     if numbers["val_l1"] > numbers["val_baseline_l1"] * (1.0 - MIN_IMPROVEMENT):
         failures.append(
             "does not beat the baseline: val L1 %.5f against the bilinear baseline's %.5f, which is "
@@ -289,9 +302,10 @@ def run(args, log):
         sampler.start()
         torch.cuda.synchronize()   # so the wall clock times the GPU's work, not the kernel launches
     started = time.time()
-    model, parameters = train(dataset, requested, args.epochs, args.batch_size, args.channels,
-                              args.depth_channels, args.motion_channels, args.history_channels,
-                              args.learning_rate, args.seed, device, log)
+    model, parameters, first_loss, last_loss = train(dataset, requested, args.epochs, args.batch_size,
+                                                     args.channels, args.depth_channels,
+                                                     args.motion_channels, args.history_channels,
+                                                     args.learning_rate, args.seed, device, log)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -322,12 +336,16 @@ def run(args, log):
     numbers = {"val_l1": full["l1"], "val_baseline_l1": full["baseline_l1"], "drift": full["drift"],
                "depth_ablation": depth_ablation, "motion_ablation": motion_ablation,
                "history_ablation": history_ablation,
+               "train_first_loss": first_loss, "train_last_loss": last_loss,
+               "train_progress": (first_loss - last_loss) / max(first_loss, 1e-9),
                "improvement": 1.0 - full["l1"] / max(full["baseline_l1"], 1e-9)}
     log("  val L1 %.5f against the bilinear baseline's %.5f -> %.2f%% better; drift from baseline %.5f"
         % (numbers["val_l1"], numbers["val_baseline_l1"], numbers["improvement"] * 100.0,
            numbers["drift"]))
     log("  ablations (how much the output moves when the input is zeroed): depth %.5f, motion %.5f, "
         "history %.5f" % (depth_ablation, motion_ablation, history_ablation))
+    log("  training progress: residual L1 %.5f -> %.5f (%.1f%% lower)"
+        % (first_loss, last_loss, numbers["train_progress"] * 100.0))
 
     failures = check_gates(numbers, zeroed, model.inputs)
     report = {"model": "nrr_upscaler_trained", "parameters": parameters, "inputs": list(model.inputs),
@@ -425,21 +443,30 @@ def self_test():
     cases = [
         ("the baseline itself", {"val_l1": 0.02, "val_baseline_l1": 0.02, "drift": 0.0,
                                  "depth_ablation": 0.0, "motion_ablation": 0.0,
-                                 "history_ablation": 0.0}, ("color", "depth", "motion"), 4),
+                                 "history_ablation": 0.0, "train_progress": 0.5},
+         ("color", "depth", "motion"), 4),
         ("better but conditioning-blind", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
                                            "depth_ablation": 0.0, "motion_ablation": 0.0,
-                                           "history_ablation": 0.0}, ("color", "depth", "motion"), 2),
+                                           "history_ablation": 0.0, "train_progress": 0.5},
+         ("color", "depth", "motion"), 2),
         # This case only fails if the history gate is applied, which is why each case carries the input set
         # it is about: a model with no history weights cannot be failed for ignoring history, and a model
         # that has them must be.
         ("better but history-blind", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
                                       "depth_ablation": 0.001, "motion_ablation": 0.001,
-                                      "history_ablation": 0.0},
+                                      "history_ablation": 0.0, "train_progress": 0.5},
          ("color", "depth", "motion", "history"), 1),
         ("better and conditioning-aware", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
                                            "depth_ablation": 0.001, "motion_ablation": 0.001,
-                                           "history_ablation": 0.001},
+                                           "history_ablation": 0.001, "train_progress": 0.5},
          ("color", "depth", "motion", "history"), 0),
+        # A run that learned nothing must be rejected even when it happens to look acceptable on the other
+        # numbers, because a degenerate run is not a comparison result. This is the failure that hid in
+        # five of the eight stage-4 runs.
+        ("stalled run", {"val_l1": 0.01, "val_baseline_l1": 0.02, "drift": 0.002,
+                         "depth_ablation": 0.001, "motion_ablation": 0.001, "history_ablation": 0.001,
+                         "train_progress": 0.0, "train_first_loss": 0.0148, "train_last_loss": 0.0148},
+         ("color", "depth", "motion", "history"), 1),
     ]
     problems = 0
     for name, numbers, inputs, expected in cases:
@@ -493,15 +520,24 @@ def conv(in_channels, out_channels, kernel=3):
 
 
 class ResidualBlock(nn.Module):
-    """Two 3x3 convolutions and an add, which is the refinement stage architecture.md describes."""
+    """Two 3x3 convolutions and an add, which is the refinement stage architecture.md describes.
+
+    Leaky activations, not ReLU, and the reason is measured rather than stylistic. Five of eight stage-4
+    runs sat at exactly the untrained-model loss: the output convolution is zero-initialised (so the
+    untrained model is exactly the bilinear baseline), which means the gradient reaching every upstream
+    layer is W_out^T * grad and is exactly zero until that weight moves. A plain ReLU that an early Adam
+    step drives negative across a whole channel then zeroes the features feeding that convolution, so
+    grad_W_out = grad * features is zero too, and the network freezes in an absorbing state it cannot
+    leave. A leaking activation keeps those features non-zero, so the weight keeps moving and the rest of
+    the network keeps its gradient path."""
 
     def __init__(self, channels):
         super().__init__()
-        self.body = nn.Sequential(conv(channels, channels), nn.ReLU(inplace=True),
+        self.body = nn.Sequential(conv(channels, channels), nn.LeakyReLU(0.01, inplace=True),
                                   conv(channels, channels))
 
     def forward(self, x):
-        return torch.relu(x + self.body(x))
+        return torch.nn.functional.leaky_relu(x + self.body(x), 0.01)
 
 
 class Upscaler(nn.Module):
@@ -519,8 +555,11 @@ class Upscaler(nn.Module):
                  inputs=("color", "depth", "motion")):
         super().__init__()
         self.inputs = tuple(inputs)
-        self.feature = nn.Sequential(conv(3, channels), nn.ReLU(inplace=True),
-                                     conv(channels, channels), nn.ReLU(inplace=True))
+        # Leaky throughout, for the same measured reason as ResidualBlock: a feature map that is exactly
+        # zero anywhere upstream of the zero-initialised output convolution cuts the only gradient path the
+        # network has.
+        self.feature = nn.Sequential(conv(3, channels), nn.LeakyReLU(0.01, inplace=True),
+                                     conv(channels, channels), nn.LeakyReLU(0.01, inplace=True))
         fused = channels
         if "depth" in self.inputs:
             self.depth = conv(1, depth_channels)
@@ -533,7 +572,7 @@ class Upscaler(nn.Module):
             fused += history_channels
         self.fusion = conv(fused, channels * 4)
         self.shuffle = nn.PixelShuffle(2)
-        self.refine = nn.Sequential(conv(channels, channels), nn.ReLU(inplace=True))
+        self.refine = nn.Sequential(conv(channels, channels), nn.LeakyReLU(0.01, inplace=True))
         self.block1 = ResidualBlock(channels)
         self.block2 = ResidualBlock(channels)
         self.output = conv(channels, 3)
@@ -603,6 +642,7 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
     train_split = dataset["train"]
     count = dataset["sizes"]["train"]
     generator = torch.Generator().manual_seed(seed)
+    first_loss = last_loss = None
     for epoch in range(1, epochs + 1):
         order = torch.randperm(count, generator=generator)
         model.train()
@@ -621,10 +661,14 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             optimizer.step()
             total += float(loss)
             batches += 1
+        epoch_loss = total / max(batches, 1)
+        if first_loss is None:
+            first_loss = epoch_loss
+        last_loss = epoch_loss
         if epoch == 1 or epoch == epochs or epoch % max(1, epochs // 5) == 0:
-            log("  epoch %3d/%d  residual L1 %.5f" % (epoch, epochs, total / max(batches, 1)))
+            log("  epoch %3d/%d  residual L1 %.5f" % (epoch, epochs, epoch_loss))
     model.eval()
-    return model, parameters
+    return model, parameters, (first_loss or 0.0), (last_loss or 0.0)
 
 
 # The entry point belongs at the end of the file: this guard sat above conv()/Upscaler()/train() for a
