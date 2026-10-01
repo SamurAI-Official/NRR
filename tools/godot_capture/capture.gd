@@ -26,30 +26,30 @@ const SCENES := {
 		"camera_velocity": Vector3(0.02, 0.0, 0.0),
 		"checker": 8,
 		"objects": [
-			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.55,
+			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.95,
 				"orbit": 1.10, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.0, "spin": 0.0,
-				"position": Vector3(0.0, 0.0, -3.4)},
-			{"shape": "box", "color": Color(0.25, 0.55, 0.90), "scale": 0.65,
+				"position": Vector3(0.0, 0.0, -2.8)},
+			{"shape": "box", "color": Color(0.25, 0.55, 0.90), "scale": 1.05,
 				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 0.8,
-				"position": Vector3(-0.9, 0.15, -4.2)},
-			{"shape": "sphere", "color": Color(0.90, 0.85, 0.30), "scale": 0.30,
+				"position": Vector3(-1.10, 0.20, -3.4)},
+			{"shape": "sphere", "color": Color(0.90, 0.85, 0.30), "scale": 0.55,
 				"orbit": 0.65, "axis": Vector3(0.0, 0.0, 1.0), "phase": 1.7, "spin": 0.0,
-				"position": Vector3(0.8, -0.2, -2.8)},
+				"position": Vector3(0.95, -0.30, -2.4)},
 		],
 	},
 	"heldout": {
 		"camera_velocity": Vector3(-0.03, 0.0, -0.045),
 		"checker": 4,
 		"objects": [
-			{"shape": "torus", "color": Color(0.30, 0.80, 0.55), "scale": 0.55,
+			{"shape": "torus", "color": Color(0.30, 0.80, 0.55), "scale": 0.95,
 				"orbit": 0.35, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.4, "spin": 1.6,
-				"position": Vector3(0.4, 0.0, -3.0)},
-			{"shape": "box", "color": Color(0.95, 0.65, 0.20), "scale": 0.45,
+				"position": Vector3(0.45, 0.0, -2.6)},
+			{"shape": "box", "color": Color(0.95, 0.65, 0.20), "scale": 0.85,
 				"orbit": 0.0, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.0, "spin": 2.4,
-				"position": Vector3(-0.7, -0.25, -3.8)},
-			{"shape": "sphere", "color": Color(0.80, 0.80, 0.95), "scale": 0.25,
+				"position": Vector3(-0.85, -0.30, -3.2)},
+			{"shape": "sphere", "color": Color(0.80, 0.80, 0.95), "scale": 0.50,
 				"orbit": 1.60, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.6, "spin": 0.0,
-				"position": Vector3(0.0, 0.35, -4.6)},
+				"position": Vector3(0.0, 0.45, -3.8)},
 		],
 	},
 }
@@ -58,6 +58,12 @@ var _scene_id := "train"
 var _frames := 24
 var _size := 512
 var _out_dir := "user://capture"
+
+# How many times the checker tiles across a unit of surface. This exists because the first capture failed
+# the data gate for a reason worth writing down: a 64-pixel texture stretched over a 24-unit backdrop puts
+# each square about a fifth of the frame wide, which is not high-frequency content at all, and the pair
+# margin came out at 0.0063 against a 0.0100 bar. The gate refused it, correctly.
+const CHECKER_UV_SCALE := 12.0
 
 
 func _ready() -> void:
@@ -144,6 +150,7 @@ func _run() -> void:
 	var backdrop_material := StandardMaterial3D.new()
 	backdrop_material.albedo_texture = checker
 	backdrop_material.albedo_color = Color(0.9, 0.9, 0.95)
+	backdrop_material.uv1_scale = Vector3(CHECKER_UV_SCALE, CHECKER_UV_SCALE, 1.0)
 	backdrop.material_override = backdrop_material
 	color_view.add_child(backdrop)
 
@@ -155,6 +162,7 @@ func _run() -> void:
 		var material := StandardMaterial3D.new()
 		material.albedo_color = entry["color"]
 		material.albedo_texture = checker
+		material.uv1_scale = Vector3(CHECKER_UV_SCALE, CHECKER_UV_SCALE, 1.0)
 		node.material_override = material
 		color_view.add_child(node)
 
