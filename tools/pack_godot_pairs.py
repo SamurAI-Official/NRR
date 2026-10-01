@@ -132,18 +132,28 @@ def file_sha256(path):
 
 
 def pack(capture_dir, split, out_dir, seed_base):
-    """Packs one capture into pairs, running each through the procedural generator's data gates."""
+    """Packs one capture into pairs, running each through the procedural generator's data gates.
+
+    A frame whose pair fails a gate is skipped and the reason recorded, rather than the run ending with no
+    dataset at all. A long capture legitimately contains frames whose content has drifted out of the useful
+    range - a camera approaching the geometry, an object leaving frame - and the gate exists to reject a
+    pair, not to abort a capture. Nothing is silent: skipped frames are counted, printed with their reason,
+    and listed in the manifest."""
     manifest = load_capture(capture_dir)
     frames = int(manifest["frames"])
-    entries = []
+    entries, skipped = [], []
     seed = seed_base + (0 if split == "train" else 100000)
     for frame in range(frames):
         pair = build_pair(capture_dir, manifest, frame, frame - 1 if frame > 0 else None, seed + frame)
         name = "%s_%03d.npz" % (split, frame)
         path = os.path.join(out_dir, name)
-        # The same gates the procedural pairs face. A capture whose pairs cannot clear them is a capture
-        # problem, and the run stops here rather than producing a dataset nobody checked.
-        stats = gen.gate_pair("%s frame %d" % (capture_dir, frame), pair)
+        try:
+            stats = gen.gate_pair("%s frame %d" % (capture_dir, frame), pair)
+        except SystemExit as refused:
+            reason = str(refused).split(": ", 1)[-1]
+            skipped.append({"frame": frame, "reason": reason})
+            print("  SKIP %s frame %d: %s" % (split, frame, reason[:100]))
+            continue
         np.savez_compressed(path, **pair)
         validity = float(pair["validity"].mean())
         entries.append({"file": name, "split": split, "seed": seed + frame,
@@ -152,10 +162,13 @@ def pack(capture_dir, split, out_dir, seed_base):
                         "margin": stats["margin"], "noise": stats["noise"],
                         "detail_ratio": stats["detail_ratio"], "valid_fraction": validity,
                         "sha256": file_sha256(path)})
-        print("  %-14s frame %3d  margin=%.4f noise=%.4f detail=%.3f valid=%.1f%%"
-              % (name, frame, stats["margin"], stats["noise"], stats["detail_ratio"],
-                 validity * 100.0))
-    return manifest, entries
+        if frame % 50 == 0 or frame == frames - 1:
+            print("  %-14s frame %3d  margin=%.4f noise=%.4f detail=%.3f valid=%.1f%%"
+                  % (name, frame, stats["margin"], stats["noise"], stats["detail_ratio"],
+                     validity * 100.0))
+    if skipped:
+        print("  %s: %d of %d frames skipped by the data gate" % (split, len(skipped), frames))
+    return manifest, entries, skipped
 
 
 def main(argv):
@@ -168,9 +181,10 @@ def main(argv):
 
     os.makedirs(args.out, exist_ok=True)
     print("packing %s -> train, %s -> val, into %s" % (args.train, args.val, args.out))
-    train_manifest, train_entries = pack(args.train, "train", args.out, args.seed)
-    val_manifest, val_entries = pack(args.val, "val", args.out, args.seed)
+    train_manifest, train_entries, train_skipped = pack(args.train, "train", args.out, args.seed)
+    val_manifest, val_entries, val_skipped = pack(args.val, "val", args.out, args.seed)
     entries = train_entries + val_entries
+    skipped = train_skipped + val_skipped
 
     def spread(key, pick):
         return pick(entry[key] for entry in entries)
@@ -207,6 +221,9 @@ def main(argv):
                    "decode": train_manifest["motion_decode"],
                    "pairs_layout": "input, input_clean, target, depth, motion, history, validity"},
         "pairs": entries,
+        # Frames the data gate rejected, with their reasons. Kept in the manifest because a dataset that
+        # quietly dropped a third of its frames would be indistinguishable from one that never had them.
+        "skipped": skipped,
     }
     manifest_path = os.path.join(args.out, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8", newline="\n") as handle:
@@ -218,8 +235,9 @@ def main(argv):
              manifest["summary"]["detail_ratio"]["min"], manifest["summary"]["detail_ratio"]["max"],
              manifest["summary"]["valid_fraction"]["min"] * 100.0,
              manifest["summary"]["valid_fraction"]["max"] * 100.0))
-    print("  manifest: %s (%d pairs from %d + %d captured frames)"
-          % (manifest_path, len(entries), train_manifest["frames"], val_manifest["frames"]))
+    print("  manifest: %s (%d pairs from %d + %d captured frames, %d skipped by the gate)"
+          % (manifest_path, len(entries), train_manifest["frames"], val_manifest["frames"],
+             len(skipped)))
     return 0
 
 

@@ -23,7 +23,11 @@ const MOTION_SCALE := 8.0
 # regions with exactly zero motion - which is what the runtime sees over most of a real frame.
 const SCENES := {
 	"train": {
-		"camera_velocity": Vector3(0.02, 0.0, 0.0),
+		# Camera speed is per *frame* over a capture of hundreds of frames, so a value chosen by watching a
+		# ten-frame run is wrong: 0.02 per frame carried the camera 8 units past the objects by frame 400 and
+		# the data margin decayed from 0.020 to below the 0.0100 gate, which the packer then refused. This
+		# keeps the whole capture inside 1.6 units, where the scene stays as designed.
+		"camera_velocity": Vector3(0.004, 0.0, 0.0),
 		"checker": 8,
 		"objects": [
 			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.95,
@@ -38,18 +42,24 @@ const SCENES := {
 		],
 	},
 	"heldout": {
-		"camera_velocity": Vector3(-0.03, 0.0, -0.045),
+		# Same lesson, worse: -0.045 per frame for 200 frames is a 9-unit dolly straight into the objects, so
+		# the check found surfaces 0.54 units away and per-frame motion of 0.138 UV. Held-out content should
+		# be different from train, not degenerate.
+		# Held-out content has to differ from train, not degenerate. Its objects sat 2.6 to 3.8 units out while
+		# the camera dollied to z -2.0 over the capture, so it passed straight through them and the check found
+		# surfaces 0.72 units away with 0.066 UV per frame of motion. Geometry moved back, dolly halved.
+		"camera_velocity": Vector3(-0.006, 0.0, -0.004),
 		"checker": 4,
 		"objects": [
-			{"shape": "torus", "color": Color(0.30, 0.80, 0.55), "scale": 0.95,
+			{"shape": "torus", "color": Color(0.30, 0.80, 0.55), "scale": 1.60,
 				"orbit": 0.35, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.4, "spin": 1.6,
-				"position": Vector3(0.45, 0.0, -2.6)},
-			{"shape": "box", "color": Color(0.95, 0.65, 0.20), "scale": 0.85,
+				"position": Vector3(0.50, 0.0, -4.6)},
+			{"shape": "box", "color": Color(0.95, 0.65, 0.20), "scale": 1.40,
 				"orbit": 0.0, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.0, "spin": 2.4,
-				"position": Vector3(-0.85, -0.30, -3.2)},
-			{"shape": "sphere", "color": Color(0.80, 0.80, 0.95), "scale": 0.50,
+				"position": Vector3(-1.00, -0.35, -5.2)},
+			{"shape": "sphere", "color": Color(0.80, 0.80, 0.95), "scale": 0.85,
 				"orbit": 1.60, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.6, "spin": 0.0,
-				"position": Vector3(0.0, 0.45, -3.8)},
+				"position": Vector3(0.0, 0.50, -5.8)},
 		],
 	},
 }
