@@ -1,0 +1,24 @@
+; NRR capture project.
+;
+; Deliberately separate from engine_plugins/godot_verify and from any NRR addon: this project exists only
+; to produce motion-vector ground truth from the same matrices a renderer uses, so that training data can
+; be checked against the runtime's own input rather than against an optical-flow estimate. Nothing here
+; needs the runtime, which is why it can run without the addon (or the 2.3 GB CUDA copy the addon needs).
+;
+; Rendering is required (a SubViewport has to be read back), so these captures run windowed, not headless.
+config_version=5
+
+[application]
+
+config/name="NRR capture"
+run/main_scene="res://probe.tscn"
+
+[display]
+
+window/size/viewport_width=64
+window/size/viewport_height=64
+window/vsync/vsync_mode=0
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
