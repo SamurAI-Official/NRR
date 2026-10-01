@@ -147,11 +147,17 @@ def load_dataset(data_dir):
     for entry in manifest["pairs"]:
         path = os.path.join(data_dir, entry["file"])
         with np.load(path) as pair:
-            buckets[entry["split"]].append({
+            item = {
                 "color": torch.from_numpy(pair["input"].transpose(2, 0, 1)[None].copy()),
                 "depth": torch.from_numpy(pair["depth"][None, None].copy()),
                 "motion": torch.from_numpy(pair["motion"].transpose(2, 0, 1)[None].copy()),
-                "target": torch.from_numpy(pair["target"].transpose(2, 0, 1)[None].copy())})
+                "target": torch.from_numpy(pair["target"].transpose(2, 0, 1)[None].copy())}
+            # history and validity exist in captures (tools/pack_godot_pairs.py) but not in procedural
+            # pairs. Their absence is not an error - a run that does not ask for them must still work - and
+            # their presence is what makes the history comparison possible at all.
+            if "history" in pair:
+                item["history"] = torch.from_numpy(pair["history"].transpose(2, 0, 1)[None].copy())
+            buckets[entry["split"]].append(item)
 
     for split in ("train", "val"):
         if not buckets[split]:
@@ -159,25 +165,37 @@ def load_dataset(data_dir):
                 "the dataset has no %s pairs (train=%d, val=%d) - regenerate with a smaller "
                 "--val-every, or more pairs" % (split, len(buckets["train"]), len(buckets["val"])))
 
-    dataset = {}
+    keys = ["color", "depth", "motion", "target"]
+    # A dataset is either captured (every pair has history) or procedural (none does): a mixture would
+    # concatenate different channel counts together, so it is refused rather than half-supported.
+    history_counts = {("history" in item) for items in buckets.values() for item in items}
+    if len(history_counts) > 1:
+        raise SystemExit("the dataset mixes pairs with and without history; use one capture per dataset")
+    has_history = history_counts == {True}
+    if has_history:
+        keys.append("history")
+
+    dataset = {"has_history": has_history}
     for split, items in buckets.items():
-        dataset[split] = {key: torch.cat([item[key] for item in items], dim=0)
-                          for key in ("color", "depth", "motion", "target")}
+        dataset[split] = {key: torch.cat([item[key] for item in items], dim=0) for key in keys}
     dataset["sizes"] = {split: len(items) for split, items in buckets.items()}
     return manifest, dataset
 
 
-def take(batch, index):
-    """Slices a whole split down to one batch, keeping the key names the model and metrics use."""
-    return {key: batch[key][index] for key in ("color", "depth", "motion", "target")}
+def take(batch, index, keys):
+    """Slices a split down to one batch. `keys` comes from the dataset so a pair with history is sliced
+    with it and one without is not."""
+    return {key: batch[key][index] for key in keys}
 
 
-def check_gates(numbers, zeroed=None):
+def check_gates(numbers, zeroed=None, inputs=("color", "depth", "motion")):
     """Returns the reasons a model fails to qualify, as a list, so a run reports every failure rather
     than only the first. Called before anything is exported, and used by the self-test.
 
     `zeroed` names an input that this run deliberately ablated: a model cannot be blamed for ignoring an
-    input it was never given, so that one conditioning gate is skipped and the reason is recorded."""
+    input it was never given, so that one gate is skipped. `inputs` is what the model actually consumes,
+    because a colour-only model has no history weights to ignore and must not be failed for not using
+    something it does not have."""
     failures = []
     if numbers["val_l1"] > numbers["val_baseline_l1"] * (1.0 - MIN_IMPROVEMENT):
         failures.append(
@@ -188,25 +206,28 @@ def check_gates(numbers, zeroed=None):
         failures.append(
             "is the baseline: its output differs from the bilinear upscale by only %.6f (needs > "
             "%.4f), so nothing was learned" % (numbers["drift"], BASELINE_FLOOR))
-    for field in ("depth_ablation", "motion_ablation"):
-        if zeroed and field.startswith(zeroed):
+    for field in ("depth_ablation", "motion_ablation", "history_ablation"):
+        name = field.split("_")[0]
+        if name not in inputs or (zeroed and field.startswith(zeroed)):
             continue
         if numbers[field] <= CONDITIONING_FLOOR:
             failures.append(
                 "ignores %s: zeroing it changes the output by only %.6f (needs > %.4f)"
-                % (field.split("_")[0], numbers[field], CONDITIONING_FLOOR))
+                % (name, numbers[field], CONDITIONING_FLOOR))
     return failures
 
 
-def export_onnx(model, out_path, size, opset=17):
-    """Exports with the input and output names architecture.md specifies and dynamic H/W, so the
-    runtime is not tied to the size this model happened to be trained at."""
+def export_onnx(model, out_path, size, inputs, opset=17):
+    """Exports with the input names models/architecture.md specifies and dynamic H/W, so the runtime is not
+    tied to the size this model happened to be trained at. The tensor list follows the selected inputs,
+    because a colour-only model must not declare three inputs the runtime would have to invent."""
+    widths = {"color": 3, "depth": 1, "motion": 2, "history": 3}
+    ordered = [name for name in ("color", "depth", "motion", "history") if name in inputs]
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    example = (torch.zeros(1, 3, size, size), torch.zeros(1, 1, size, size),
-               torch.zeros(1, 2, size, size))
-    dynamic = {name: {2: "H", 3: "W"} for name in INPUT_NAMES}
+    example = tuple(torch.zeros(1, widths[name], size, size) for name in ordered)
+    dynamic = {name: {2: "H", 3: "W"} for name in ordered}
     dynamic[OUTPUT_NAME] = {2: "H2", 3: "W2"}
-    torch.onnx.export(model, example, out_path, opset_version=opset, input_names=list(INPUT_NAMES),
+    torch.onnx.export(model, example, out_path, opset_version=opset, input_names=ordered,
                       output_names=[OUTPUT_NAME], dynamic_axes=dynamic)
     return out_path
 
@@ -228,6 +249,18 @@ def run(args, log):
            summary.get("margin", {}).get("min", float("nan")),
            summary.get("noise", {}).get("max", float("nan")),
            summary.get("detail_ratio", {}).get("max", float("nan"))))
+
+    requested = ["color"] + [name.strip() for name in args.inputs.split(",") if name.strip()]
+    available = {"color"} | {key for key in ("depth", "motion", "history") if key in dataset["train"]}
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise SystemExit(
+            "this dataset has no %s (it has: %s). A model cannot be given an input the data does not "
+            "contain, and inventing zeros for it would measure nothing." % (", ".join(missing),
+                                                                           ", ".join(sorted(available))))
+    requested = [name for name in ("color", "depth", "motion", "history") if name in requested]
+    log("  inputs: %s%s" % (",".join(requested),
+                            " (history available)" if dataset["has_history"] else ""))
 
     zeroed = None if args.zero_input == "none" else args.zero_input
     if zeroed:
@@ -251,9 +284,9 @@ def run(args, log):
         sampler.start()
         torch.cuda.synchronize()   # so the wall clock times the GPU's work, not the kernel launches
     started = time.time()
-    model, parameters = train(dataset, args.epochs, args.batch_size, args.channels,
-                              args.depth_channels, args.motion_channels, args.learning_rate,
-                              args.seed, device, log)
+    model, parameters = train(dataset, requested, args.epochs, args.batch_size, args.channels,
+                              args.depth_channels, args.motion_channels, args.history_channels,
+                              args.learning_rate, args.seed, device, log)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -268,19 +301,32 @@ def run(args, log):
 
     val = dataset["val"]
     full = measure(model, val)
-    depth_ablation = float((full["output"] - measure(model, val, zero="depth")["output"]).abs().mean())
-    motion_ablation = float((full["output"] - measure(model, val, zero="motion")["output"]).abs().mean())
+    keys = list(val.keys())
+
+    def ablation(name):
+        """How much the output changes when `name` is zeroed. Only inputs the model actually consumes are
+        measured, so a colour-only model reports zeros for the others rather than numbers from weights it
+        does not have."""
+        if name not in model.inputs:
+            return 0.0
+        return float((full["output"] - measure(model, val, zero=name)["output"]).abs().mean())
+
+    depth_ablation = ablation("depth")
+    motion_ablation = ablation("motion")
+    history_ablation = ablation("history")
     numbers = {"val_l1": full["l1"], "val_baseline_l1": full["baseline_l1"], "drift": full["drift"],
                "depth_ablation": depth_ablation, "motion_ablation": motion_ablation,
+               "history_ablation": history_ablation,
                "improvement": 1.0 - full["l1"] / max(full["baseline_l1"], 1e-9)}
     log("  val L1 %.5f against the bilinear baseline's %.5f -> %.2f%% better; drift from baseline %.5f"
         % (numbers["val_l1"], numbers["val_baseline_l1"], numbers["improvement"] * 100.0,
            numbers["drift"]))
-    log("  conditioning: zeroing depth changes the output by %.5f, zeroing motion by %.5f"
-        % (depth_ablation, motion_ablation))
+    log("  ablations (how much the output moves when the input is zeroed): depth %.5f, motion %.5f, "
+        "history %.5f" % (depth_ablation, motion_ablation, history_ablation))
 
-    failures = check_gates(numbers, zeroed)
-    report = {"model": "nrr_upscaler_trained", "parameters": parameters, "channels": args.channels,
+    failures = check_gates(numbers, zeroed, model.inputs)
+    report = {"model": "nrr_upscaler_trained", "parameters": parameters, "inputs": list(model.inputs),
+              "channels": args.channels,
               "depth_channels": args.depth_channels, "motion_channels": args.motion_channels,
               "epochs": args.epochs, "batch_size": args.batch_size,
               "learning_rate": args.learning_rate, "seed": args.seed,
@@ -311,8 +357,8 @@ def run(args, log):
         log("  report: %s (the refusal is recorded, not swallowed)" % report_path)
         return 1
 
-    export_onnx(model, args.out, args.size)
-    verification = verify_export(model, args.out, take(val, slice(0, 1)))
+    export_onnx(model, args.out, args.size, model.inputs)
+    verification = verify_export(model, args.out, take(val, slice(0, 1), keys))
     report["export"] = {"path": args.out, "opset": 17, "sha256": _sha256(args.out),
                         "verify": verification}
     # Dynamic H/W is what makes the graph usable by the runtime at sizes it was not trained at, so it is
@@ -321,10 +367,10 @@ def run(args, log):
         import onnxruntime
         session = onnxruntime.InferenceSession(args.out, providers=["CPUExecutionProvider"])
         other = args.size + 32
+        widths = {"color": 3, "depth": 1, "motion": 2, "history": 3}
         produced = list(session.run([OUTPUT_NAME], {
-            "color": np.zeros((1, 3, other, other), np.float32),
-            "depth": np.zeros((1, 1, other, other), np.float32),
-            "motion": np.zeros((1, 2, other, other), np.float32)})[0].shape)
+            name: np.zeros((1, widths[name], other, other), np.float32)
+            for name in model.inputs})[0].shape)
         expected = [1, 3, other * 2, other * 2]
         report["export"]["dynamic_size_check"] = {"input_size": other, "output_shape": produced,
                                                   "expected": expected}
@@ -356,10 +402,10 @@ def verify_export(model, out_path, batch):
     import onnx
     onnx.checker.check_model(onnx.load(out_path))
     session = onnxruntime.InferenceSession(out_path, providers=["CPUExecutionProvider"])
-    feeds = {name: batch[key].numpy()
-             for name, key in zip(INPUT_NAMES, ("color", "depth", "motion"))}
+    keys = [name for name in ("color", "depth", "motion", "history") if name in model.inputs]
+    feeds = {name: batch[name].numpy() for name in keys}
     with torch.no_grad():
-        reference = model(batch["color"], batch["depth"], batch["motion"]).numpy()
+        reference = model(*[batch[name] for name in keys]).numpy()
     produced = session.run([OUTPUT_NAME], feeds)[0]
     return {"checked": True, "onnxruntime": onnxruntime.__version__,
             "max_abs_difference": float(np.max(np.abs(reference - produced)))}
@@ -370,15 +416,26 @@ def self_test():
     rejected, and so must a model that improves the image while ignoring its conditioning."""
     cases = [
         ("the baseline itself", {"val_l1": 0.02, "val_baseline_l1": 0.02, "drift": 0.0,
-                                 "depth_ablation": 0.0, "motion_ablation": 0.0}, 4),
+                                 "depth_ablation": 0.0, "motion_ablation": 0.0,
+                                 "history_ablation": 0.0}, ("color", "depth", "motion"), 4),
         ("better but conditioning-blind", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
-                                           "depth_ablation": 0.0, "motion_ablation": 0.0}, 2),
+                                           "depth_ablation": 0.0, "motion_ablation": 0.0,
+                                           "history_ablation": 0.0}, ("color", "depth", "motion"), 2),
+        # This case only fails if the history gate is applied, which is why each case carries the input set
+        # it is about: a model with no history weights cannot be failed for ignoring history, and a model
+        # that has them must be.
+        ("better but history-blind", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
+                                      "depth_ablation": 0.001, "motion_ablation": 0.001,
+                                      "history_ablation": 0.0},
+         ("color", "depth", "motion", "history"), 1),
         ("better and conditioning-aware", {"val_l1": 0.015, "val_baseline_l1": 0.02, "drift": 0.002,
-                                           "depth_ablation": 0.001, "motion_ablation": 0.001}, 0),
+                                           "depth_ablation": 0.001, "motion_ablation": 0.001,
+                                           "history_ablation": 0.001},
+         ("color", "depth", "motion", "history"), 0),
     ]
     problems = 0
-    for name, numbers, expected in cases:
-        found = check_gates(numbers)
+    for name, numbers, inputs, expected in cases:
+        found = check_gates(numbers, inputs=inputs)
         if len(found) == expected:
             print("  %-32s %d gate(s) failed, as expected" % (name, len(found)))
         else:
@@ -400,6 +457,11 @@ def main(argv):
                         help="network width; 64 gives roughly 0.27M parameters")
     parser.add_argument("--depth-channels", type=int, default=8)
     parser.add_argument("--motion-channels", type=int, default=8)
+    parser.add_argument("--history-channels", type=int, default=8)
+    parser.add_argument("--inputs", default="depth,motion",
+                        help="comma-separated inputs besides color, which is always first: a subset of "
+                             "depth,motion,history. This is the comparison - a model given history is a "
+                             "different model from one that is not, and the run reports which is better")
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--seed", type=int, default=20260930)
     parser.add_argument("--size", type=int, default=64,
@@ -407,7 +469,7 @@ def main(argv):
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                         help="auto uses the GPU whenever torch can provide one; cuda refuses to run "
                              "on the CPU instead of pretending")
-    parser.add_argument("--zero-input", default="none", choices=("none", "depth", "motion"),
+    parser.add_argument("--zero-input", default="none", choices=("none", "depth", "motion", "history"),
                         help="ablation run: zero this input for training and validation, to measure "
                              "what it is worth")
     parser.add_argument("--self-test", action="store_true")
@@ -437,15 +499,31 @@ class ResidualBlock(nn.Module):
 class Upscaler(nn.Module):
     """A reduced version of models/architecture.md - the same stages at smaller widths, because the
     pairs are 2x at these sizes and a 2.5M-parameter network would be neither trainable here nor
-    measurable against a fixture. `channels=64` gives roughly 0.27M parameters."""
+    measurable against a fixture. `channels=64` gives roughly 0.27M parameters.
 
-    def __init__(self, channels=32, depth_channels=8, motion_channels=8):
+    `inputs` names which tensors this model consumes, and it is a parameter rather than a constant because
+    that is the question: a model given history is a different model from one given only colour, and which
+    of them is better has to be run rather than assumed. A branch is built only for an input in the set, so
+    a colour-only model has no depth, motion or history weights at all - the comparison is between models,
+    not between a model and its own zeroed inputs."""
+
+    def __init__(self, channels=32, depth_channels=8, motion_channels=8, history_channels=8,
+                 inputs=("color", "depth", "motion")):
         super().__init__()
+        self.inputs = tuple(inputs)
         self.feature = nn.Sequential(conv(3, channels), nn.ReLU(inplace=True),
                                      conv(channels, channels), nn.ReLU(inplace=True))
-        self.depth = conv(1, depth_channels)
-        self.motion = conv(2, motion_channels)
-        self.fusion = conv(channels + depth_channels + motion_channels, channels * 4)
+        fused = channels
+        if "depth" in self.inputs:
+            self.depth = conv(1, depth_channels)
+            fused += depth_channels
+        if "motion" in self.inputs:
+            self.motion = conv(2, motion_channels)
+            fused += motion_channels
+        if "history" in self.inputs:
+            self.history = conv(3, history_channels)
+            fused += history_channels
+        self.fusion = conv(fused, channels * 4)
         self.shuffle = nn.PixelShuffle(2)
         self.refine = nn.Sequential(conv(channels, channels), nn.ReLU(inplace=True))
         self.block1 = ResidualBlock(channels)
@@ -457,15 +535,21 @@ class Upscaler(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def residual(self, color, depth, motion):
+    def residual(self, color, depth=None, motion=None, history=None):
         features = self.feature(color)
-        features = torch.cat([features, self.depth(depth), self.motion(motion)], dim=1)
-        features = self.refine(self.shuffle(self.fusion(features)))
+        parts = [features]
+        if "depth" in self.inputs:
+            parts.append(self.depth(depth))
+        if "motion" in self.inputs:
+            parts.append(self.motion(motion))
+        if "history" in self.inputs:
+            parts.append(self.history(history))
+        features = self.refine(self.shuffle(self.fusion(torch.cat(parts, dim=1))))
         features = self.block2(self.block1(features))
         return self.output(features)
 
-    def forward(self, color, depth, motion):
-        return self.skip(color) + self.residual(color, depth, motion)
+    def forward(self, color, depth=None, motion=None, history=None):
+        return self.skip(color) + self.residual(color, depth, motion, history)
 
 
 def baseline_upscale(color):
@@ -474,15 +558,21 @@ def baseline_upscale(color):
 
 
 def measure(model, batch, zero=None):
-    """The numbers the gates use. `zero` names an input to replace with zeros, which is how the use of
-    conditioning is measured rather than assumed."""
+    """The numbers the gates use. `zero` names an input to replace with zeros, which is how each input's
+    contribution is measured rather than assumed - including history, which is the whole point of the
+    comparison this exists to settle."""
     with torch.no_grad():
-        color, depth, motion = batch["color"], batch["depth"], batch["motion"]
-        if zero == "depth":
+        color = batch["color"]
+        depth = batch.get("depth")
+        motion = batch.get("motion")
+        history = batch.get("history")
+        if zero == "depth" and depth is not None:
             depth = torch.zeros_like(depth)
-        if zero == "motion":
+        if zero == "motion" and motion is not None:
             motion = torch.zeros_like(motion)
-        output = model(color, depth, motion)
+        if zero == "history" and history is not None:
+            history = torch.zeros_like(history)
+        output = model(color, depth, motion, history)
         baseline = baseline_upscale(color)
         return {"l1": float(torch.nn.functional.l1_loss(output, batch["target"])),
                 "baseline_l1": float(torch.nn.functional.l1_loss(baseline, batch["target"])),
@@ -491,14 +581,16 @@ def measure(model, batch, zero=None):
                 "baseline": baseline}
 
 
-def train(dataset, epochs, batch_size, channels, depth_channels, motion_channels, learning_rate,
-          seed, device, log):
+def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
+          history_channels, learning_rate, seed, device, log):
     torch.manual_seed(seed)
-    model = Upscaler(channels, depth_channels, motion_channels).to(device)
+    model = Upscaler(channels, depth_channels, motion_channels, history_channels,
+                     inputs=inputs).to(device)
     parameters = sum(p.numel() for p in model.parameters())
-    log("  model: %d parameters, channels=%d, batch=%d, epochs=%d, lr=%g"
-        % (parameters, channels, batch_size, epochs, learning_rate))
+    log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g"
+        % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate))
 
+    keys = list(dataset["train"].keys())
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     train_split = dataset["train"]
     count = dataset["sizes"]["train"]
@@ -508,12 +600,13 @@ def train(dataset, epochs, batch_size, channels, depth_channels, motion_channels
         model.train()
         total, batches = 0.0, 0
         for start in range(0, count, batch_size):
-            batch = take(train_split, order[start:start + batch_size])
+            batch = take(train_split, order[start:start + batch_size], keys)
             optimizer.zero_grad()
             # The loss is on the correction the skip cannot supply, not on the whole image: the skip
             # already carries the low frequencies, and weighting those equally would let the model coast
             # on the baseline and still report a small number.
-            prediction = model.residual(batch["color"], batch["depth"], batch["motion"])
+            prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
+                                        batch.get("history"))
             truth = batch["target"] - baseline_upscale(batch["color"])
             loss = torch.nn.functional.l1_loss(prediction, truth)
             loss.backward()
