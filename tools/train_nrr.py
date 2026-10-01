@@ -220,11 +220,16 @@ def check_gates(numbers, zeroed=None, inputs=("color", "depth", "motion")):
 def export_onnx(model, out_path, size, inputs, opset=17):
     """Exports with the input names models/architecture.md specifies and dynamic H/W, so the runtime is not
     tied to the size this model happened to be trained at. The tensor list follows the selected inputs,
-    because a colour-only model must not declare three inputs the runtime would have to invent."""
+    because a colour-only model must not declare three inputs the runtime would have to invent.
+
+    The example tensors are built on the model's own device. They were built on the CPU, which was
+    invisible while training ran on the CPU and became an immediate failure the moment it moved to the GPU:
+    "Input type (torch.FloatTensor) and weight type (torch.cuda.FloatTensor) should be the same"."""
     widths = {"color": 3, "depth": 1, "motion": 2, "history": 3}
     ordered = [name for name in ("color", "depth", "motion", "history") if name in inputs]
+    device = next(model.parameters()).device
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    example = tuple(torch.zeros(1, widths[name], size, size) for name in ordered)
+    example = tuple(torch.zeros(1, widths[name], size, size, device=device) for name in ordered)
     dynamic = {name: {2: "H", 3: "W"} for name in ordered}
     dynamic[OUTPUT_NAME] = {2: "H2", 3: "W2"}
     torch.onnx.export(model, example, out_path, opset_version=opset, input_names=ordered,
@@ -404,8 +409,11 @@ def verify_export(model, out_path, batch):
     session = onnxruntime.InferenceSession(out_path, providers=["CPUExecutionProvider"])
     keys = [name for name in ("color", "depth", "motion", "history") if name in model.inputs]
     feeds = {name: batch[name].numpy() for name in keys}
+    # The reference run uses the model's own device for the same reason export_onnx does: torch refuses to
+    # convolve a CPU tensor with a CUDA weight, and onnxruntime is happiest with plain CPU arrays.
+    device = next(model.parameters()).device
     with torch.no_grad():
-        reference = model(*[batch[name] for name in keys]).numpy()
+        reference = model(*[batch[name].to(device) for name in keys]).cpu().numpy()
     produced = session.run([OUTPUT_NAME], feeds)[0]
     return {"checked": True, "onnxruntime": onnxruntime.__version__,
             "max_abs_difference": float(np.max(np.abs(reference - produced)))}
