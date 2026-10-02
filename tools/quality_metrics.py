@@ -100,11 +100,28 @@ def ssim_rgb8(a, b):
     return total / 3.0
 
 
+def to_host_float(x):
+    """Accepts a numpy array or anything tensor-like (torch tensors on any device) and returns a host
+    float32 numpy array.
+
+    The trainer evaluates the model on the GPU, so its outputs and targets arrive as CUDA tensors and
+    np.asarray() on one raises "can't convert cuda:0 device type tensor to numpy". Duck-typed rather than a
+    torch import, so this module stays usable without torch installed - it is a metrics module, not a
+    training one."""
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "cpu"):
+        x = x.cpu()
+    if hasattr(x, "numpy"):
+        x = x.numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
 def evaluate(prediction, target):
     """Both metrics plus the mean absolute error the trainer already reports, for one pair of float images
     in [0,1] shaped (h, w, 3) or (1, 3, h, w). Returns a dict, so a caller can log or gate on any of it."""
-    pred = np.asarray(prediction, dtype=np.float32)
-    truth = np.asarray(target, dtype=np.float32)
+    pred = to_host_float(prediction)
+    truth = to_host_float(target)
     if pred.ndim == 4:
         pred, truth = pred[0], truth[0]
     if pred.ndim == 3 and pred.shape[0] == 3:

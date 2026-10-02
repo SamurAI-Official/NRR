@@ -52,6 +52,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import quality_metrics  # noqa: E402  (path set above; PSNR/SSIM mirror runtime/nrr_quality.cpp)
+
 # The names the C++ runtime reads out of the graph (runtime/onnx_runtime.cpp reads the session's own
 # input and output names, and these are the ones models/architecture.md specifies).
 INPUT_NAMES = ("color", "depth", "motion")
@@ -333,9 +336,16 @@ def run(args, log):
     depth_ablation = ablation("depth")
     motion_ablation = ablation("motion")
     history_ablation = ablation("history")
+    # The metrics a caller checks, not only L1. Computed for the model and for the bilinear baseline on the
+    # same held-out frames, so the comparison is like for like and the baseline's score is visible too.
+    model_quality = quality_metrics.evaluate(full["output"], val["target"])
+    baseline_quality = quality_metrics.evaluate(full["baseline"], val["target"])
     numbers = {"val_l1": full["l1"], "val_baseline_l1": full["baseline_l1"], "drift": full["drift"],
                "depth_ablation": depth_ablation, "motion_ablation": motion_ablation,
                "history_ablation": history_ablation,
+               "ssim": model_quality["ssim"], "psnr_db": model_quality["psnr_db"],
+               "baseline_ssim": baseline_quality["ssim"],
+               "baseline_psnr_db": baseline_quality["psnr_db"],
                "train_first_loss": first_loss, "train_last_loss": last_loss,
                "train_progress": (first_loss - last_loss) / max(first_loss, 1e-9),
                "improvement": 1.0 - full["l1"] / max(full["baseline_l1"], 1e-9)}
@@ -344,6 +354,9 @@ def run(args, log):
            numbers["drift"]))
     log("  ablations (how much the output moves when the input is zeroed): depth %.5f, motion %.5f, "
         "history %.5f" % (depth_ablation, motion_ablation, history_ablation))
+    log("  quality: ssim %.4f psnr %.2f dB against the bilinear baseline's ssim %.4f psnr %.2f dB"
+        % (numbers["ssim"], numbers["psnr_db"], numbers["baseline_ssim"],
+           numbers["baseline_psnr_db"]))
     log("  training progress: residual L1 %.5f -> %.5f (%.1f%% lower)"
         % (first_loss, last_loss, numbers["train_progress"] * 100.0))
 
@@ -426,7 +439,9 @@ def verify_export(model, out_path, batch):
     onnx.checker.check_model(onnx.load(out_path))
     session = onnxruntime.InferenceSession(out_path, providers=["CPUExecutionProvider"])
     keys = [name for name in ("color", "depth", "motion", "history") if name in model.inputs]
-    feeds = {name: batch[name].numpy() for name in keys}
+    # .cpu() because the batch lives on the model's device and numpy cannot read a CUDA tensor; onnxruntime
+    # is happiest with plain host arrays.
+    feeds = {name: batch[name].detach().cpu().numpy() for name in keys}
     # The reference run uses the model's own device for the same reason export_onnx does: torch refuses to
     # convolve a CPU tensor with a CUDA weight, and onnxruntime is happiest with plain CPU arrays.
     device = next(model.parameters()).device
