@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 99/99 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output), and the NVIDIA backend is now first-class - probed through the driver ABI, so it needs no CUDA toolkit - and auto-selected**. M2 follow-up also made capability reporting honest (nothing is claimed that was not measured), added `NRR.warmup()` so a cold frame is no longer published as the frame cost, and moved the temporal pass into one `TemporalAccumulator` shared by every backend. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 99/99 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output), and the NVIDIA backend is now first-class - probed through the driver ABI, so it needs no CUDA toolkit - and auto-selected**. M2 follow-up also made capability reporting honest (nothing is claimed that was not measured), added `NRR.warmup()` so a cold frame is no longer published as the frame cost, and moved the temporal pass into one `TemporalAccumulator` shared by every backend. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. **Model training now exists and is measured, and no trained model has passed its quality gates yet.** Pairs are generated (`tools/gen_training_pairs.py`) or captured from the engine with geometry-derived motion (`tools/godot_capture/`), packed into one dataset format (`tools/pack_godot_pairs.py`) and trained on the GPU (`tools/train_nrr.py`, 11.7x the CPU rate with driver-sampled utilization), refusing to export a model that does not beat bilinear by 5%, that learned nothing, or that ignores an input it was given. On real captured footage the colour-only model is ahead of the temporal one (12.1% against 9.5% better than bilinear over two seeds), and **the question is closed rather than pending**: identical configurations differ by up to 6.6 points between seeds, more than any difference between input sets, so the extra inputs do not earn their place and the single-frame model stands (see the stage-4 entry in [CHANGELOG.md](CHANGELOG.md)). Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -81,9 +81,9 @@ nrr/
 │   ├── mobile/                   # Phase 13: mobile kernel + vendor backends
 │   └── platform/                 # Phase 13: Android (NDK/JNI) + iOS (Obj-C++) bridges
 │
-├── models/                     # Phase 3: sample .onnx fixtures + architecture docs
+├── models/                     # Phase 3: sample .onnx fixtures + architecture docs + (generated, not committed) training pairs and trained models
 ├── engine_plugins/             # Phase 10-12: Unreal (headers only), Godot (addon + GDExtension, built & run), Unity (code)
-├── tools/                      # gen_sample_model.py, fetch_ort.ps1, build.ps1
+├── tools/                      # build/fetch scripts, gen_sample_model.py, gen_training_pairs.py, train_nrr.py, pack_godot_pairs.py, check_capture.py, godot_capture/ (engine motion-vector capture)
 ├── docs/                       # roadmap.md (authoritative status + plan)
 ├── tests/                      # unified suite (main.cpp) + standalone phase tests
 │   ├── unit/                   # API, device, model, reference, backend, inference, mobile
@@ -161,6 +161,32 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       identity 2x upscaler from tools/gen_sample_model.py; a test fixture, not the
       network described in models/architecture.md)
 - [x] Model execution test (real end-to-end inference in the unified suite)
+- [~] **Training pipeline (in progress; no trained model has passed its gates yet).** Four
+      tools, each gated by measurement: `tools/gen_training_pairs.py` generates pairs
+      (procedural scenes, ground-truth depth and motion, rejecting a pair with nothing to
+      learn, a difference that is only noise, or constant conditioning),
+      `tools/godot_capture/` captures motion vectors **from the same matrices a renderer
+      uses** rather than estimating them from pixels, with a numerical probe and a content
+      checker (`tools/check_capture.py`), `tools/pack_godot_pairs.py` packs a capture into
+      the same dataset format so the trainer is unchanged, and `tools/train_nrr.py` trains a
+      2x upscaler whose **inputs are chosen per run** (`--inputs`, including an optional
+      `history` input) with an ablation per input. Training runs on the GPU (**11.7x the CPU
+      rate**, driver-sampled utilization 28-96% depending on work per step) and **refuses to
+      export** a model that does not beat bilinear by 5%, that differs from bilinear by less
+      than 1e-3, that ignores an input it was given, or whose **training made no progress** -
+      that last gate exists because five of eight comparison runs silently froze in an
+      absorbing state and were briefly indistinguishable from results.
+- [x] **The input-set question is settled by measurement, and the answer is the single-frame
+      colour model.** Four configurations were trained twice each on 567 captured pairs (367
+      train, 200 held out) on the GPU, against a rule fixed before the runs: adopt the temporal
+      model only if it beats colour-only by 5% *and* beats the motion-zeroed control by more than
+      the seed spread. Neither held - colour-only reaches 12.12% better than bilinear against
+      9.48% for colour+depth+motion+history, and the control with motion zeroed averaged 11.75%,
+      beating the temporal model outright. Identical configurations differ by up to 6.6 points
+      between seeds, which is more than any difference between input sets, so the comparison does
+      not support the extra inputs. The model contract is therefore unchanged and the runtime keeps
+      temporal accumulation where it already is. Full numbers and both failures that nearly went
+      unreported: the stage-4 entry in CHANGELOG.md.
 - [ ] Trained model with a measured quality gate (PSNR/SSIM) - see M1
 
 ### Phase 4 - Temporal Neural Rendering (wired into the render path; untrained model)

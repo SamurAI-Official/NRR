@@ -203,25 +203,28 @@ measured, and temporal/reference data actually changes that image.
       plus domain weights, feed them to the model, prove the output changes
 - [ ] Provenance enforcement in the render path: a reference without the required
       permission is refused, not silently ignored
-- [~] Trained model with an explicit provenance/licence decision (small 3-input
-      upscaler with committed weights, or a licensed model if that is chosen). **Training now
-      exists and is measured; no model has passed its gates yet.** `tools/gen_training_pairs.py`
-      generates the pairs (procedural scenes, ground-truth depth and motion, gated so that a pair
-      with nothing to learn or with constant conditioning is rejected), and `tools/train_nrr.py`
-      trains a 2x upscaler on them, refusing to export a model that fails to beat the bilinear
-      baseline by 5%, that differs from it by less than 1e-3, or that ignores an input (measured
-      by zeroing it). Measured so far: **11-27% better than bilinear** at 112k-410k parameters,
-      trained on the GPU at **11.7x the CPU rate** with driver-sampled utilization of 28-96%
-      depending on work per step (RTX 4070 Ti, sm_89). Every run has been refused on one gate:
-      zeroing motion moves the output by 1e-06 to 2e-06, so the network does not use it. Two data
-      variants were tried to change that and both failed measurably - a shutter-averaged target
-      (the blur is visible, so it can be inverted without knowing its cause) and a sharp
-      sub-pixel target - so motion cannot be made load-bearing inside the single-frame contract.
-- [ ] **Decide the model contract:** add a previous colour frame so that motion must be used to
-      reproject it. This is the measured route to a model that passes the conditioning gate, and
-      it touches `models/architecture.md`, the ONNX input list, the generator and the C++ feed
-      path. Until it is decided, the gates keep refusing to export, which is their intended
-      behaviour rather than a blocker.
+- [~] Trained model with an explicit provenance/licence decision (small upscaler with
+      committed weights, or a licensed model if that is chosen). **Training exists, is measured, and
+      the model that has been chosen by measurement is the single-frame colour-only one; no trained
+      model is committed yet because none has passed every gate.** The pipeline is four gated tools:
+      `tools/gen_training_pairs.py` (procedural pairs with ground-truth depth and motion, rejecting a
+      pair with nothing to learn, one whose difference is only noise, or constant conditioning),
+      `tools/godot_capture/` (motion vectors **from the same matrices a renderer uses**, with a
+      numerical probe and a content checker, because estimating them from pixels measures a different
+      thing), `tools/pack_godot_pairs.py` (packs a capture into the trainer's existing format,
+      skipping - and recording - frames the data gate rejects), and `tools/train_nrr.py` (inputs
+      chosen per run, an ablation per input, GPU training at **11.7x the CPU rate**, and refusal to
+      export a model that does not beat bilinear by 5%, that differs from it by less than 1e-3, that
+      ignores an input it was given, or *whose training made no progress*).
+- [x] **Decide the model contract - decided against changing it, by measurement.** A previous colour
+      frame would have made motion load-bearing, so it was tested rather than argued: four
+      configurations x two seeds on 567 captured pairs (367 train, 200 held out) on the GPU, against a
+      rule fixed in advance. Neither condition for adoption held - colour-only averages 12.12% better
+      than bilinear against 9.48% for colour+depth+motion+history, and the control with motion zeroed
+      averages 11.75%, beating the temporal model - and identical configurations differ by up to 6.6
+      points between seeds, more than any difference between input sets. The single-frame model
+      stands, the ONNX input list and the C++ feed path are unchanged, and motion's role stays where
+      it already is: the runtime's `TemporalAccumulator`, measured by `TemporalBlendStats`.
 - [ ] Quality harness: PSNR/SSIM against bilinear for a fixed image set plus
       artifact/smoothness checks per `specification/`, wired as a CI gate
 - [~] Temporal stability metric: measured and asserted (`test_temporal_stability_*`), but

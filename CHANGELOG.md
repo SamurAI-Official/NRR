@@ -14,6 +14,50 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The motion question, answered by running it: the effect is smaller than the noise
+
+The decision this milestone existed to make was whether the model should take a previous frame so that
+motion vectors become load-bearing. It was run rather than argued, on 567 captured pairs (367 train, 200
+held out), four configurations, two seeds each, on the GPU, and the decision rule was fixed before the
+runs: adopt the temporal model only if it beats colour-only by at least 5% **and** beats the
+history-with-motion-zeroed control by more than the seed spread.
+
+| configuration | seed 20261001 | seed 20261002 | mean |
+| --- | --- | --- | --- |
+| colour only | **13.71%** | 10.53% | **12.12%** |
+| colour + depth + motion + history | 10.15% | 8.81% | 9.48% |
+| colour + depth + motion + history, **motion zeroed** | 8.44% | **15.05%** | 11.75% |
+| colour + depth + motion (no history) | 11.27% | 5.90% | 8.59% |
+
+(`%` better than the bilinear baseline on the held-out scene; every run trained healthily, 37-57% loss
+reduction, so none of these is a degenerate result.)
+
+Neither condition held. The temporal model is **worse** than colour-only (9.48% against 12.12%), and the
+control with motion zeroed **beats** it. The decisive number is the spread, not the means: identical
+configurations differ by up to 6.6 points between seeds, which is larger than every difference between
+configurations. On this data the choice of input set is indistinguishable from run-to-run variation, and
+the honest conclusion is that **the inputs do not earn their place** - so the single-frame colour model
+stands, the runtime keeps temporal accumulation where it already is (`TemporalAccumulator`, measured by
+`TemporalBlendStats`), and the model contract is not changed. Two earlier data designs had already failed
+to make motion necessary (shutter-averaged targets, then sharp sub-pixel ones); this closes the question
+with the engine-grade motion data instead of the estimated kind.
+
+Two things this cost, both recorded because both were nearly invisible:
+
+- **Five of the first eight comparison runs were degenerate and looked like results.** Each sat at exactly
+  `0.01484` residual L1 - the loss of a model that emits no residual at all - and seed 20261002 stalled in
+  *all four* configurations. A retry on an idle GPU reproduced it exactly, which ruled out the contention
+  theory; `tools/stall_diag.py` then measured the mechanism: the output convolution is zero-initialised (so
+  the untrained model is exactly the bilinear baseline), which makes it the only gradient path in the
+  network, and a large first Adam step drove the residual blocks' ReLU negative across whole channels,
+  zeroing the features feeding it and therefore every gradient. Permanently. Leaky activations throughout
+  remove the absorbing state (verified: the configuration that reproducibly froze now falls 53.2% and
+  reaches 9.25% better than baseline). Zero-initialisation is kept, because the untrained model being
+  exactly the baseline is what makes the drift gate mean anything.
+- **A training-progress gate now refuses a stalled run**, quoting its first and last loss, with a self-test
+  case that must reject one even when its held-out numbers would otherwise pass. A comparison harness can
+  report an untrained network as a result; that is what this gate exists to prevent.
+
 ### GPU training: activated, measured from the driver, and impossible to fake
 
 The first training runs were CPU-only because the installed wheel was `torch 2.3.1+cpu`, and a CPU-only
