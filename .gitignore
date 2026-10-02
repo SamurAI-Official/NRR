@@ -46,4 +46,6 @@ models/*.report.json
 # re-running the configurations; the numbers are recorded where they are read.
 models/stage4/
 models/stage4b/
+models/noise/
+models/noise-warmup/
 
