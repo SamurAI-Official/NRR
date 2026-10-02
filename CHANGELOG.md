@@ -14,6 +14,28 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### P2 frontier concluded: 4x capacity buys +2.75 points, below the 5-point bar, so ch32 stands
+
+The pre-registered rule is now applied to data it could not have been fitted to, because it was written
+first. ch64 (372,803 parameters, ~4× ch32's 94,243) trained on both seeds, and the comparison is:
+
+| config | seed 20261020 | seed 20261021 | mean |
+| --- | --- | --- | --- |
+| ch32 | 24.13% | 16.79% | 20.46% |
+| ch64 | 23.45% | 22.98% | 23.22% |
+
+ch64's mean is **+2.75 points** over ch32, below the pre-registered 5-point bar, so **ch32 stands** and P3
+proceeds on it. Two things the data shows that the rule did not require but are worth recording:
+
+* **ch64 is far more seed-stable** - its two seeds span 0.47 points against ch32's 7.34. The capacity does
+  something real, but it is a smoothing of the worst case, not a higher ceiling, and the rule was written to
+  judge *improvement*, not variance. A lower-variance 23.2% is not "better than ch32" by the fixed bar, so
+  the simpler model carries forward.
+* **ch64 regresses PSNR on one seed** (28.52 dB vs the baseline's 28.71, while SSIM is 0.9428 vs 0.9123),
+  which is the exact MSE-rewards-blur trap the protocol pre-registered as "PSNR is reported, not gated".
+
+P3 quality levers now run on ch32, each gated by the same bars and the same ≥ 5-point rule.
+
 ### The protocol is pre-registered, the harness is gated, and the capacity probe is unblocked
 
 Three pieces landed together because they are one discipline: fix the decision *rule* before the data,

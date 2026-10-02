@@ -237,6 +237,11 @@ measured, and temporal/reference data actually changes that image.
       the exported graph (5.2/20.2/41.0/166.5 ms against the fixture's 3.7/17.1/39.7/157.4), which
       shows an eight-times-larger model costing only 1.03-1.42x and the model is not the frame-budget
       bottleneck.
+- [x] **Capacity probe (P2) concluded: ch32 stands.** ch64 (372,803 params, ~4× ch32) scored 23.45%/22.98%
+      (mean 23.22%) against ch32's 24.13%/16.79% (mean 20.46%), a +2.75-point mean that is below the
+      5-point bar pre-registered in `docs/evaluation-protocol.md`. The capacity smooths the worst case -
+      ch64's two seeds span 0.47 points against ch32's 7.34 - but the rule judged *improvement*, not
+      variance, so the simpler model carries forward to P3.
 - [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
       retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to
