@@ -14,6 +14,35 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The protocol is pre-registered, the harness is gated, and the capacity probe is unblocked
+
+Three pieces landed together because they are one discipline: fix the decision *rule* before the data,
+make the *harness* itself fail loudly, and clear the memory blocker that was stopping the P2 probe.
+
+**The evaluation protocol is pre-registered** in `docs/evaluation-protocol.md`, committed before any of the
+ch64 data it now judges. It fixes the scenes (heldout/heldout2 as the claim, train/train2/train3 as the
+overfit check), the seeds (2 for the frontier, 10 for the final claim), the resolution tiers (128→256
+scored, 160→320 as a run-check, 256→512 / 540p→1080p / 1080p→4K as latency only), and a pass/fail bar per
+dimension. One decision is stated up front rather than discovered after the fact: **PSNR is reported, not
+gated**, because mean-squared error rewards the smooth bilinear baseline - the model already beat bilinear
+on every structural/perceptual/detail metric while PSNR was slightly lower on one scene. The frontier rule
+is fixed too: ch64 is adopted only if it beats ch32 by ≥ 5 points of held-out L1 improvement across both
+seeds *and* clears every bar, because σ ≈ 2.4 points means a smaller margin is noise and paying 4×
+parameters for noise is the trap the colour-only decision already refused.
+
+**The harness is now itself gated.** `tools/evaluate_model.py` imports torch lazily so its numpy-only metric
+core (accumulation, the detail proxy, sequence ordering, tensor normalisation) runs where torch, ffmpeg, the
+model and the dataset are all absent, and a new `--self-test` (18 checks) pins that core. A CI job
+`metrics-self-check` installs numpy and runs `tools/quality_metrics.py` plus `tools/evaluate_model.py
+--self-test`, so a wrong metric cannot silently corrupt every number built on top of it.
+
+**The P2 capacity probe was blocked, and the block is gone.** ch64 (372,803 parameters, ~4× ch32) trained 60
+epochs and then died in the held-out measurement: the val split is one concatenated 400-image tensor, and a
+single 400-image forward at 64 channels needs more than the 12 GB card has. `tools/train_nrr.py` now slices
+that forward with `--measure-batch`, which is exact - the model has no batch statistics, so the chunked
+output is bit-identical to the unchunked one and the ch32/ch64 comparison is unchanged. ch64 seed 20261020
+then ran to completion at **23.45%** better than bilinear, on the same seed where ch32 scored 24.13%.
+
 ### The evaluation stack: every dimension a commercial upscaler is compared on
 
 `tools/evaluate_model.py` turns an exported ONNX model and the held-out captures into one report that

@@ -237,13 +237,15 @@ measured, and temporal/reference data actually changes that image.
       the exported graph (5.2/20.2/41.0/166.5 ms against the fixture's 3.7/17.1/39.7/157.4), which
       shows an eight-times-larger model costing only 1.03-1.42x and the model is not the frame-budget
       bottleneck.
-- [~] Quality harness: `tools/evaluate_model.py` now reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
+- [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
       retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to
-      `runtime/nrr_quality.cpp`. A full run on `noise-warmup/w_20261018.onnx` already shows the model beats
-      bilinear on every perceptual/structural metric while PSNR alone would have said the opposite on one
-      scene. Still to do: make it a CI gate against a committed baseline, and wire a pre-registered
-      pass/fail bar per dimension rather than a single comparison.
+      `runtime/nrr_quality.cpp`. The pass/fail bars, scenes, seeds and resolution tiers are pre-registered
+      in `docs/evaluation-protocol.md`, and the numpy-only metric core is a CI gate (`metrics-self-check`).
+      A full run on `noise-warmup/w_20261018.onnx` already shows the model beats bilinear on every
+      perceptual/structural metric while PSNR alone would have said the opposite on one scene. Still to do:
+      gate the *full* stack (perceptual + VMAF) against a committed baseline model, which needs the training
+      machine, not the CI runner.
 - [~] Temporal stability metric: `tools/quality_metrics.py` now measures warping error, temporal PSNR and
       temporal SSIM with the capture's motion field, at the sign convention taken from
       `tools/godot_capture/shaders/motion.gdshader` and pinned by a self-check that includes an
