@@ -23,6 +23,7 @@
 #include "unit/test_vulkan_compute.cpp"
 #include "unit/test_vulkan_caps.cpp"
 #include "unit/test_quality_metric.cpp"
+#include "unit/test_quality_parity.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
@@ -240,6 +241,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_quality_is_unmeasured_when_the_target_resolution_differs);
     NRR_RUN_TEST(test_quality_measures_the_target_the_reference_carries);
     NRR_RUN_TEST(test_quality_reference_frame_is_decoded_from_the_reference_file);
+    NRR_RUN_TEST(test_quality_matches_the_python_mirror_on_a_pinned_fixture);
+    NRR_RUN_TEST(test_quality_identical_fixture_is_exactly_one_and_unbounded_psnr);
 
     std::cout << "\n--- Execution Path Coverage (NRR_TEST_BACKEND) ---\n";
     /* Both execution paths in one environment: the override decides what automatic selection
