@@ -34,7 +34,15 @@ import sys
 import tempfile
 
 import numpy as np
-import torch
+
+# torch is imported lazily as an optional dependency: the CI self-test and the metric core in
+# quality_metrics.py need only numpy, and importing torch (a multi-GB wheel) on a runner that will never
+# use it would make the harness ungateable. Anything that needs torch (bilinear_upscale, the perceptual
+# backbones, the --device auto choice) refuses with a clear message when it is absent.
+try:
+    import torch
+except ImportError:                                   # pragma: no cover - exercised on the CI runner
+    torch = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -141,6 +149,8 @@ def to_image(array):
 def bilinear_upscale(image, factor=2):
     """The baseline the model must beat, computed the way the model's own skip is
     (train_nrr.baseline_upscale: bilinear, align_corners=False)."""
+    if torch is None:
+        raise RuntimeError("bilinear_upscale needs torch, which is not installed on this machine")
     tensor = torch.from_numpy(image.transpose(2, 0, 1)[None].copy())
     up = torch.nn.functional.interpolate(tensor, scale_factor=factor, mode="bilinear", align_corners=False)
     return up[0].numpy().transpose(1, 2, 0)
@@ -407,9 +417,74 @@ def print_summary(report):
             # duplicating the frame would report perfect stability for a video nobody rendered.
             del scenes[name]
     return scenes
+def self_test():
+    """The numpy-only checks that gate the harness on CI, where torch, ffmpeg, the model and the dataset are
+    all absent. It pins the measurement *logic* - accumulation, the detail proxy, sequence ordering, tensor
+    normalisation - which is the part of a harness whose wrongness would silently corrupt every number above
+    it. The heavy metrics (perceptual, VMAF) are exercised on a machine that has them, not faked here."""
+    failures = 0
+    total = 0
+
+    def check(name, condition):
+        nonlocal failures, total
+        total += 1
+        print("%s: %s" % (name, "OK" if condition else "FAIL"))
+        failures += 0 if condition else 1
+
+    stats = accumulate([1.0, 2.0, 3.0, 4.0])
+    check("accumulate mean is exact", abs(stats["mean"] - 2.5) < 1e-12)
+    check("accumulate counts every value", stats["n"] == 4)
+    check("accumulate reports sigma, not just a mean", stats["std"] == 1.118033988749895)
+    empty = accumulate([])
+    check("accumulate of nothing reports n=0, not a fake zero", empty["n"] == 0 and empty["mean"] is None)
+    none_stats = accumulate([None, 1.0])
+    check("accumulate skips None rather than averaging it", none_stats["n"] == 1 and none_stats["mean"] == 1.0)
+
+    flat = np.full((16, 16, 3), 0.5, np.float32)
+    check("detail of a flat image is zero", high_frequency_energy(flat) == 0.0)
+    check("detail is strictly positive for a checkerboard",
+          high_frequency_energy((np.indices((16, 16)).sum(axis=0) % 2).astype(np.float32).repeat(3).reshape(16, 16, 3)) > 0.0)
+
+    manifest = {"pairs": [
+        {"file": "a.npz", "split": "val", "scene": "s1", "frame": 2},
+        {"file": "b.npz", "split": "val", "scene": "s1", "frame": 0},
+        {"file": "c.npz", "split": "val", "scene": "s1", "frame": 1},
+        {"file": "d.npz", "split": "val", "scene": "solo", "frame": 0},
+        {"file": "e.npz", "split": "train", "scene": "s1", "frame": 0},
+    ]}
+    scenes = group_sequences(manifest, "val", 0)
+    check("only the requested split is kept", set(scenes) == {"s1"})
+    check("frames are in capture order", [e["frame"] for e in scenes["s1"]] == [0, 1, 2])
+    check("a one-frame scene is dropped, not faked", "solo" not in scenes)
+    check("--limit caps frames per scene", len(group_sequences(manifest, "val", 2)["s1"]) == 2)
+
+    rng = np.random.RandomState(0)
+    chw = rng.rand(3, 4, 5).astype(np.float32)
+    check("to_image(NCHW) lands on (H,W,3)", to_image(chw[None]).shape == (4, 5, 3))
+    check("to_image(HWC) is unchanged", to_image(chw.transpose(1, 2, 0)).shape == (4, 5, 3))
+    check("to_image clips into [0,1]", float(to_image(np.array([2.0], np.float32))[0]) == 1.0)
+    check("to_image of (3,H,W) transposes to HWC", to_image(chw).shape == (4, 5, 3))
+
+    feed = build_feed({"input": rng.rand(8, 8, 3).astype(np.float32),
+                       "depth": rng.rand(8, 8).astype(np.float32),
+                       "motion": rng.rand(8, 8, 2).astype(np.float32),
+                       "history": rng.rand(8, 8, 3).astype(np.float32),
+                       "input_clean": rng.rand(8, 8, 3).astype(np.float32)},
+                      ["color", "depth", "motion", "history"], use_clean=False)
+    check("build_feed lays color out NCHW", feed["color"].shape == (1, 3, 8, 8))
+    check("build_feed keeps motion as two channels", feed["motion"].shape == (1, 2, 8, 8))
+    check("build_feed respects --use-clean",
+          build_feed({"input": np.zeros((8, 8, 3), np.float32),
+                      "input_clean": np.ones((8, 8, 3), np.float32)},
+                     ["color"], use_clean=True)["color"].min() == 1.0)
+
+    print("RESULT: %s (%d checks)" % ("PASS" if failures == 0 else "FAIL", total))
+    return 1 if failures else 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Evaluate an exported NRR upscaler across quality dimensions.")
-    parser.add_argument("--model", required=True, help="the exported .onnx to evaluate")
+    parser.add_argument("--model", default=None, help="the exported .onnx to evaluate (not needed for --self-test)")
     parser.add_argument("--data", default="models/training-data/godot-v2")
     parser.add_argument("--split", default="val", choices=("train", "val"))
     parser.add_argument("--limit", type=int, default=0, help="cap frames per scene (0 = all)")
@@ -422,11 +497,18 @@ def build_parser():
     parser.add_argument("--latency", action="store_true",
                         help="also run tools/measure_model.py and embed its per-tier latency")
     parser.add_argument("--out", default="", help="where to write the JSON report (default: beside the model)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the numpy-only metric-logic checks and exit (no model, dataset, torch, "
+                             "ffmpeg or GPU needed - this is what CI runs)")
     return parser
 
 
 def main(argv):
     args = build_parser().parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if not args.model:
+        raise SystemExit("--model is required (or run --self-test)")
     if not os.path.exists(args.model):
         raise SystemExit("model not found: %s" % args.model)
 

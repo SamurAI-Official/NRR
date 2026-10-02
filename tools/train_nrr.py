@@ -323,7 +323,7 @@ def run(args, log):
     log("  training: %.1f s total, %.1f ms/epoch" % (seconds, seconds / max(args.epochs, 1) * 1000.0))
 
     val = dataset["val"]
-    full = measure(model, val)
+    full = measure(model, val, chunk=args.measure_batch)
     keys = list(val.keys())
 
     def ablation(name):
@@ -332,7 +332,7 @@ def run(args, log):
         does not have."""
         if name not in model.inputs:
             return 0.0
-        return float((full["output"] - measure(model, val, zero=name)["output"]).abs().mean())
+        return float((full["output"] - measure(model, val, zero=name, chunk=args.measure_batch)["output"]).abs().mean())
 
     depth_ablation = ablation("depth")
     motion_ablation = ablation("motion")
@@ -513,6 +513,11 @@ def main(argv):
     parser.add_argument("--out", default="models/nrr_upscaler_trained.onnx")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--measure-batch", type=int, default=32,
+                        help="forward-pass batch size for the held-out measurement. The val split is one "
+                             "tensor, and a wide model (64 channels) can need more memory for one 400-image "
+                             "forward than the card has; slicing it is exact because the model has no batch "
+                             "statistics, so it is a memory fix and not a method change")
     parser.add_argument("--channels", type=int, default=32,
                         help="network width; 64 gives roughly 0.27M parameters")
     parser.add_argument("--depth-channels", type=int, default=8)
@@ -633,10 +638,16 @@ def baseline_upscale(color):
     return torch.nn.functional.interpolate(color, scale_factor=2, mode="bilinear", align_corners=False)
 
 
-def measure(model, batch, zero=None):
+def measure(model, batch, zero=None, chunk=32):
     """The numbers the gates use. `zero` names an input to replace with zeros, which is how each input's
     contribution is measured rather than assumed - including history, which is the whole point of the
-    comparison this exists to settle."""
+    comparison this exists to settle.
+
+    `chunk` caps the forward-pass batch size. The val split is one concatenated tensor, and a wide model
+    (64 channels) needs more memory for a 400-image forward than the card has, so it is measured in slices.
+    Slicing an inference-only forward over a model with no batch statistics is exact - the model is conv +
+    activations, no BatchNorm - so the chunked number is the same number as the unchunked one. It is a
+    memory fix, not a method change, and it is why a 64-channel run and a 32-channel run stay comparable."""
     with torch.no_grad():
         color = batch["color"]
         depth = batch.get("depth")
@@ -648,7 +659,14 @@ def measure(model, batch, zero=None):
             motion = torch.zeros_like(motion)
         if zero == "history" and history is not None:
             history = torch.zeros_like(history)
-        output = model(color, depth, motion, history)
+        pieces = []
+        for start in range(0, color.shape[0], chunk):
+            end = start + chunk
+            pieces.append(model(color[start:end],
+                                depth[start:end] if depth is not None else None,
+                                motion[start:end] if motion is not None else None,
+                                history[start:end] if history is not None else None))
+        output = torch.cat(pieces, dim=0)
         baseline = baseline_upscale(color)
         return {"l1": float(torch.nn.functional.l1_loss(output, batch["target"])),
                 "baseline_l1": float(torch.nn.functional.l1_loss(baseline, batch["target"])),

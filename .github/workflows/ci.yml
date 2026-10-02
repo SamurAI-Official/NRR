@@ -603,3 +603,35 @@ jobs:
           path: vulkan-build.log
           if-no-files-found: ignore
 
+
+  # ---------------------------------------------------------------------------
+  # Metric harness gate: the Python measurement code is itself tested, so a
+  # wrong metric cannot silently corrupt every number that depends on it. The
+  # heavy paths (perceptual backbones, VMAF, the GPU model run) need the
+  # training machine and are not faked here; this job gates the numpy-only core
+  # that both the trainer and the evaluation harness share.
+  # ---------------------------------------------------------------------------
+  metrics-self-check:
+    name: Metrics harness self-check (numpy-only core)
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install numpy (the only dependency the metric core has)
+        shell: pwsh
+        run: python -m pip install --quiet numpy
+
+      - name: Run the metric-core self-checks
+        shell: pwsh
+        run: |
+          python tools/quality_metrics.py
+          if ($LASTEXITCODE -ne 0) { throw "tools/quality_metrics.py self-check failed" }
+          python tools/evaluate_model.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "tools/evaluate_model.py --self-test failed" }
+
