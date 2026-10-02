@@ -26,6 +26,8 @@ Makefile
 _*
 *.tmp
 *.log
+# Scratch output from one-off tool runs (e.g. tools/evaluate_model.py --out work/...)
+work/
 
 
 # Runtime-generated reference fixtures (written by test_nrr_reference)

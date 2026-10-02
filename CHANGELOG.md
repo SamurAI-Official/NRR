@@ -14,6 +14,39 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The evaluation stack: every dimension a commercial upscaler is compared on
+
+`tools/evaluate_model.py` turns an exported ONNX model and the held-out captures into one report that
+covers, per scene and with mean/σ/min/max rather than a single number: PSNR, SSIM, MS-SSIM, LPIPS, DISTS,
+VMAF (with its motion feature), temporal warping error / temporal PSNR / temporal SSIM, a detail-retention
+ratio, and the bilinear baseline beside every image metric. The pieces it depends on are probed and reported
+with `available: false` and a reason when absent, so a short report cannot be mistaken for a clean one.
+
+The perceptual and video metrics were installed into the training venv - `torchvision==0.18.1` (matching
+torch 2.3.1+cu121), `lpips==0.1.4`, `dists-pytorch==0.1`, `scipy` - with numpy held at 1.26.4, and VMAF comes
+from the ffmpeg that is already present (9.0.1, `libvmaf` and `vmafmotion` filters). LPIPS and DISTS were
+checked against closed-form cases before use: identical images score exactly 0, and a small perturbation
+scores 0.0152 (LPIPS) and 0.0549 (DISTS).
+
+**The first full run already justified the stack.** On `models/noise-warmup/w_20261018.onnx` over the 400
+held-out frames (two scenes), the model beats bilinear on every structural, perceptual and temporal metric,
+often by a lot - SSIM 0.913/0.937 vs 0.888/0.907, MS-SSIM 0.991/0.994 vs 0.985/0.989, LPIPS 0.039/0.025 vs
+0.144/0.101, DISTS 0.161/0.100 vs 0.294/0.299, VMAF 77.5/83.4 vs 59.8/60.1, and detail retention 0.79/0.66
+vs 0.10/0.08 (bilinear erases high-frequency detail). And it surfaced exactly the trap a single metric
+would have hidden: on one scene the model's PSNR is *slightly lower* than bilinear's (27.30 vs 27.72 dB),
+because mean-squared error rewards the smooth, low-variance bilinear output. Every other metric says the
+sharper, higher-detail model is better; PSNR alone would have said the opposite, which is why the harness
+reports all of them and never just one.
+
+Temporal stability tracks the reference within a point on both scenes (warping error 0.0900/0.0802 vs the
+reference's 0.0896/0.0799), which is the honest result to want: a reconstruction that is *more* stable than
+the ground truth would be smoothing, not stability.
+
+The harness refuses the things a naive version would quietly do: temporal metrics use the capture order
+(shuffled frames measure nothing), the motion sign convention comes from the capture shader rather than
+assumption, off-screen history is reported as unverified rather than fabricated, and a one-frame scene is
+dropped rather than duplicated into a fake perfect-stability score.
+
 ### MS-SSIM and the temporal dimensions: measuring what a still image cannot
 
 The evaluation stack needs to cover the same dimensions a commercial upscaler is compared on, and two of
