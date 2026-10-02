@@ -48,4 +48,6 @@ models/stage4/
 models/stage4b/
 models/noise/
 models/noise-warmup/
+models/frontier/
+models/work/
 
