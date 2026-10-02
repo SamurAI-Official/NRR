@@ -42,12 +42,8 @@ const SCENES := {
 		],
 	},
 	"heldout": {
-		# Same lesson, worse: -0.045 per frame for 200 frames is a 9-unit dolly straight into the objects, so
-		# the check found surfaces 0.54 units away and per-frame motion of 0.138 UV. Held-out content should
-		# be different from train, not degenerate.
-		# Held-out content has to differ from train, not degenerate. Its objects sat 2.6 to 3.8 units out while
-		# the camera dollied to z -2.0 over the capture, so it passed straight through them and the check found
-		# surfaces 0.72 units away with 0.066 UV per frame of motion. Geometry moved back, dolly halved.
+		# Objects sit further out and the dolly is halved, because the earlier version passed straight through
+		# its own geometry: the check found surfaces 0.72 units away with 0.066 UV per frame of motion.
 		"camera_velocity": Vector3(-0.006, 0.0, -0.004),
 		"checker": 4,
 		"objects": [
@@ -60,6 +56,59 @@ const SCENES := {
 			{"shape": "sphere", "color": Color(0.80, 0.80, 0.95), "scale": 0.85,
 				"orbit": 1.60, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.6, "spin": 0.0,
 				"position": Vector3(0.0, 0.50, -5.8)},
+		],
+	},
+	# More training content. Capacity is measured to be cheap in latency (eight times the parameters cost
+	# 1.03-1.42x the time), so the frontier sweep will want a model with more room - and a model with more
+	# room needs more than 367 pairs. These are separate scenes rather than a longer capture of the same one,
+	# because camera speed is per frame and a long capture drifts out of the useful range, which the data
+	# gate then refuses.
+	"train2": {
+		"camera_velocity": Vector3(0.005, 0.002, 0.0),
+		"checker": 3,
+		"objects": [
+			{"shape": "box", "color": Color(0.70, 0.25, 0.65), "scale": 1.10,
+				"orbit": 0.90, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.9, "spin": 0.6,
+				"position": Vector3(-0.30, 0.10, -2.9)},
+			{"shape": "sphere", "color": Color(0.20, 0.75, 0.80), "scale": 0.70,
+				"orbit": 0.50, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.1, "spin": 0.0,
+				"position": Vector3(0.90, -0.10, -3.3)},
+			{"shape": "torus", "color": Color(0.90, 0.85, 0.35), "scale": 0.55,
+				"orbit": 1.30, "axis": Vector3(0.0, 0.0, 1.0), "phase": 1.3, "spin": 1.9,
+				"position": Vector3(-1.00, -0.40, -3.7)},
+		],
+	},
+	"train3": {
+		# Finer texture and a different palette, so the training set is not one look: the procedural pairs
+		# failed their detail gate for exactly this reason once, having almost no high-frequency content.
+		"camera_velocity": Vector3(-0.004, 0.0, 0.003),
+		"checker": 16,
+		"objects": [
+			{"shape": "torus", "color": Color(0.95, 0.45, 0.60), "scale": 1.30,
+				"orbit": 0.70, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.2, "spin": 0.0,
+				"position": Vector3(0.20, 0.20, -3.1)},
+			{"shape": "sphere", "color": Color(0.35, 0.40, 0.95), "scale": 0.60,
+				"orbit": 1.10, "axis": Vector3(0.0, 1.0, 0.0), "phase": 2.8, "spin": 1.2,
+				"position": Vector3(-0.85, 0.05, -2.6)},
+			{"shape": "box", "color": Color(0.55, 0.90, 0.45), "scale": 0.80,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 2.9,
+				"position": Vector3(0.75, -0.35, -3.9)},
+		],
+	},
+	"heldout2": {
+		# A second held-out scene, so validation is not a single shot's worth of content.
+		"camera_velocity": Vector3(0.004, -0.003, -0.003),
+		"checker": 6,
+		"objects": [
+			{"shape": "sphere", "color": Color(0.90, 0.75, 0.25), "scale": 1.20,
+				"orbit": 0.80, "axis": Vector3(0.0, 1.0, 0.0), "phase": 1.1, "spin": 2.1,
+				"position": Vector3(-0.40, 0.15, -4.4)},
+			{"shape": "box", "color": Color(0.45, 0.50, 0.85), "scale": 1.00,
+				"orbit": 0.45, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.6, "spin": 0.0,
+				"position": Vector3(0.95, -0.20, -4.9)},
+			{"shape": "torus", "color": Color(0.80, 0.35, 0.35), "scale": 0.90,
+				"orbit": 1.40, "axis": Vector3(0.0, 0.0, 1.0), "phase": 2.3, "spin": 1.5,
+				"position": Vector3(0.10, 0.55, -5.5)},
 		],
 	},
 }

@@ -131,8 +131,11 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def pack(capture_dir, split, out_dir, seed_base):
+def pack(capture_dir, split, out_dir, seed_base, offset=0):
     """Packs one capture into pairs, running each through the procedural generator's data gates.
+
+    `offset` shifts the output file numbering, so several captures can be packed into one split without
+    overwriting each other's pairs - which is how the training set grows to more than one scene's worth.
 
     A frame whose pair fails a gate is skipped and the reason recorded, rather than the run ending with no
     dataset at all. A long capture legitimately contains frames whose content has drifted out of the useful
@@ -145,7 +148,7 @@ def pack(capture_dir, split, out_dir, seed_base):
     seed = seed_base + (0 if split == "train" else 100000)
     for frame in range(frames):
         pair = build_pair(capture_dir, manifest, frame, frame - 1 if frame > 0 else None, seed + frame)
-        name = "%s_%03d.npz" % (split, frame)
+        name = "%s_%03d.npz" % (split, offset + frame)
         path = os.path.join(out_dir, name)
         try:
             stats = gen.gate_pair("%s frame %d" % (capture_dir, frame), pair)
@@ -173,16 +176,40 @@ def pack(capture_dir, split, out_dir, seed_base):
 
 def main(argv):
     parser = argparse.ArgumentParser(description="Pack an engine capture into training pairs.")
-    parser.add_argument("--train", required=True, help="capture directory for the train split")
-    parser.add_argument("--val", required=True, help="capture directory for the validation split")
+    parser.add_argument("--train", nargs="+", required=True,
+                        help="one or more capture directories for the train split")
+    parser.add_argument("--val", nargs="+", required=True,
+                        help="one or more capture directories for the validation split")
     parser.add_argument("--out", default="models/training-data/godot-v1")
     parser.add_argument("--seed", type=int, default=20261001)
     args = parser.parse_args(argv[1:])
 
     os.makedirs(args.out, exist_ok=True)
-    print("packing %s -> train, %s -> val, into %s" % (args.train, args.val, args.out))
-    train_manifest, train_entries, train_skipped = pack(args.train, "train", args.out, args.seed)
-    val_manifest, val_entries, val_skipped = pack(args.val, "val", args.out, args.seed)
+    print("packing %d train capture(s) and %d validation capture(s) into %s"
+          % (len(args.train), len(args.val), args.out))
+
+    captures = []
+    train_entries, train_skipped = [], []
+    offset = 0
+    for capture_dir in args.train:
+        manifest, entries, skipped = pack(capture_dir, "train", args.out, args.seed, offset)
+        train_entries += entries
+        train_skipped += skipped
+        captures.append({"split": "train", "dir": capture_dir, "scene": manifest["scene"],
+                         "frames": manifest["frames"],
+                         "manifest_sha256": file_sha256(os.path.join(capture_dir, "manifest.json"))})
+        offset += int(manifest["frames"])
+    val_entries, val_skipped = [], []
+    offset = 0
+    for capture_dir in args.val:
+        manifest, entries, skipped = pack(capture_dir, "val", args.out, args.seed, offset)
+        val_entries += entries
+        val_skipped += skipped
+        captures.append({"split": "val", "dir": capture_dir, "scene": manifest["scene"],
+                         "frames": manifest["frames"],
+                         "manifest_sha256": file_sha256(os.path.join(capture_dir, "manifest.json"))})
+        offset += int(manifest["frames"])
+
     entries = train_entries + val_entries
     skipped = train_skipped + val_skipped
 
@@ -203,22 +230,13 @@ def main(argv):
                                      "max": spread("detail_ratio", max)},
                     "valid_fraction": {"min": spread("valid_fraction", min),
                                        "max": spread("valid_fraction", max)}},
-        # Provenance: which capture, which scene, and the hash of the capture's own manifest. The frames
+        # Provenance: which captures, which scenes, and the hash of each capture's own manifest. The frames
         # themselves are not committed - they are reproducible from the capture project and these ids.
-        "captures": [
-            {"split": "train", "dir": args.train, "scene": train_manifest["scene"],
-             "frames": train_manifest["frames"],
-             "manifest_sha256": hashlib.sha256(
-                 open(os.path.join(args.train, "manifest.json"), "rb").read()).hexdigest()},
-            {"split": "val", "dir": args.val, "scene": val_manifest["scene"],
-             "frames": val_manifest["frames"],
-             "manifest_sha256": hashlib.sha256(
-                 open(os.path.join(args.val, "manifest.json"), "rb").read()).hexdigest()},
-        ],
+        "captures": captures,
         "motion": {"source": "the capture's motion pass: current and previous MVP matrices applied to the "
                              "model-space vertex, so the vector is derived from geometry, not estimated",
-                   "convention": train_manifest["motion_convention"],
-                   "decode": train_manifest["motion_decode"],
+                   "convention": load_capture(args.train[0])["motion_convention"],
+                   "decode": load_capture(args.train[0])["motion_decode"],
                    "pairs_layout": "input, input_clean, target, depth, motion, history, validity"},
         "pairs": entries,
         # Frames the data gate rejected, with their reasons. Kept in the manifest because a dataset that
@@ -235,9 +253,9 @@ def main(argv):
              manifest["summary"]["detail_ratio"]["min"], manifest["summary"]["detail_ratio"]["max"],
              manifest["summary"]["valid_fraction"]["min"] * 100.0,
              manifest["summary"]["valid_fraction"]["max"] * 100.0))
-    print("  manifest: %s (%d pairs from %d + %d captured frames, %d skipped by the gate)"
-          % (manifest_path, len(entries), train_manifest["frames"], val_manifest["frames"],
-             len(skipped)))
+    print("  manifest: %s (%d pairs from %d captured frames, %d skipped by the gate)"
+          % (manifest_path, len(entries),
+             sum(item["frames"] for item in captures), len(skipped)))
     return 0
 
 
