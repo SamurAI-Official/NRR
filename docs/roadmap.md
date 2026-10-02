@@ -224,7 +224,19 @@ measured, and temporal/reference data actually changes that image.
       averages 11.75%, beating the temporal model - and identical configurations differ by up to 6.6
       points between seeds, more than any difference between input sets. The single-frame model
       stands, the ONNX input list and the C++ feed path are unchanged, and motion's role stays where
-      it already is: the runtime's `TemporalAccumulator`, measured by `TemporalBlendStats`.
+      it already is: the runtime's `TemporalAccumulator`, measured by `TemporalBlendStats`. A ten-seed
+      noise floor later put that comparison on firmer ground still: σ ≈ 2.4 points, and the two-seed
+      12.12% was itself 2.2 points optimistic.
+- [x] **Training accuracy characterised, and a one-in-five run failure rate fixed.** Ten seeds of the
+      chosen configuration: mean 9.95% better than bilinear, σ ≈ 2.4 points, with two seeds failing
+      outright - one froze with its output at the bilinear baseline, one converged to 2.9%. Both are
+      early-training pathologies on a zero-initialised output head, and a five-epoch linear warmup
+      removes them: the same ten seeds then all train at a mean of **14.25%** (10.57-19.10%), about
+      five standard errors better. PSNR and SSIM are reported by the trainer through a Python mirror of
+      `runtime/nrr_quality.cpp` pinned from both sides, and inference latency is measured per tier on
+      the exported graph (5.2/20.2/41.0/166.5 ms against the fixture's 3.7/17.1/39.7/157.4), which
+      shows an eight-times-larger model costing only 1.03-1.42x and the model is not the frame-budget
+      bottleneck.
 - [ ] Quality harness: PSNR/SSIM against bilinear for a fixed image set plus
       artifact/smoothness checks per `specification/`, wired as a CI gate
 - [~] Temporal stability metric: measured and asserted (`test_temporal_stability_*`), but

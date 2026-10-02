@@ -14,6 +14,66 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The noise floor, a one-in-five failure rate, and the warmup that removed both
+
+P0 of the accuracy work was measurement before improvement, because every claim in this file that says a
+model is "x% better" rests on a number that had never been characterised. Ten seeds of the chosen
+configuration, 60 epochs each on 367 training pairs, gave two answers that changed the plan.
+
+**First, the noise floor is real and the published number was optimistic.** Over the eight seeds that
+trained: mean **9.95%** better than bilinear, minimum 7.40%, maximum 13.47%, a spread of 6.07 points and
+**σ ≈ 2.4 points**. The 12.12% quoted earlier in this file was the mean of *two* seeds and sits 2.2 points
+above the ten-seed mean - both of those two happened to land high. At σ ≈ 2.4 with n = 10 the standard
+error is ≈ 0.8, so a 2-point effect is detectable; with n = 2 it was not, which is why the earlier
+comparison between input sets concluded only that the differences were inside the noise.
+
+**Second, two of the ten seeds failed outright** - a 20% rate, and the failure had two distinct signatures,
+which is why one explanation was not enough:
+
+| seed | drift from baseline | training progress | what happened |
+| --- | --- | --- | --- |
+| 20261011 | 3.9e-05 | 5.2% | the output convolution stayed at zero: no residual at all |
+| 20261019 | 8.8e-03 | 3.8% | a real residual, but only 2.9% better than the baseline |
+
+The first is the absorbing state described further down; the second is a convergence failure, not a frozen
+model, so the leaky-activation fix that addressed the first did not address the second. Both are
+early-training pathologies, and both share a cause worth naming: the output convolution is initialised to
+zero - which is what makes the untrained model exactly the bilinear baseline - so the first Adam steps move
+a weight with no history, exactly where Adam's step size is largest.
+
+**Linear warmup over five epochs fixes it, measured the same way.** The identical ten seeds:
+
+| | without warmup | with warmup |
+| --- | --- | --- |
+| seeds that trained | 8 of 10 | **10 of 10** |
+| mean better than bilinear | 9.95% | **14.25%** |
+| minimum / maximum | 7.40% / 13.47% | **10.57% / 19.10%** |
+| σ | 2.44 | 2.59 |
+
+Every seed now trains (progress 50-61%), the mean rises 4.3 points - about five standard errors, so this is
+not noise - and the *worst* seed with warmup beats the mean without it. `--warmup-epochs` defaults to 5.
+
+**And the model is not the bottleneck.** Latency of the exported graph, measured through onnxruntime with
+the CUDA provider active, against the fixture figures the roadmap already publishes:
+
+| tier | this model (94k params) | fixture (~11k) | ratio |
+| --- | --- | --- | --- |
+| 256²→512² | 5.244 ms | 3.7 ms | 1.42x |
+| 512²→1024² | 20.178 ms | 17.1 ms | 1.18x |
+| 540p→1080p | 41.033 ms | 39.7 ms | 1.03x |
+| 1080p→4K | 166.517 ms | 157.4 ms | 1.06x |
+
+A model eight times larger costs 1.03-1.42 times as much: latency at these sizes is dominated by memory
+traffic rather than parameter count. Capacity therefore has more room than the plan assumed, and the 16 ms
+bar at 4K is still about 10x away in inference alone, with 866.8 ms of that frame host-side.
+
+**Also new in this stage:** PSNR and SSIM in the trainer, computed through `tools/quality_metrics.py`, a
+deliberate mirror of `runtime/nrr_quality.cpp` - same constants, same three-term decomposition, same
+identical-image shortcut - pinned from both sides so the two cannot silently disagree about a number used to
+claim model accuracy (`tests/unit/test_quality_parity.cpp` asserts the C++ side against five values the
+Python mirror also asserts). Measured at 20 epochs: ssim 0.9400 and psnr 30.15 dB against the bilinear
+baseline's ssim 0.9123 and psnr 28.71 dB.
+
 ### The motion question, answered by running it: the effect is smaller than the noise
 
 The decision this milestone existed to make was whether the model should take a previous frame so that

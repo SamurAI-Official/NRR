@@ -308,7 +308,8 @@ def run(args, log):
     model, parameters, first_loss, last_loss = train(dataset, requested, args.epochs, args.batch_size,
                                                      args.channels, args.depth_channels,
                                                      args.motion_channels, args.history_channels,
-                                                     args.learning_rate, args.seed, device, log)
+                                                     args.learning_rate, args.warmup_epochs,
+                                                     args.seed, device, log)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -513,6 +514,10 @@ def main(argv):
                              "depth,motion,history. This is the comparison - a model given history is a "
                              "different model from one that is not, and the run reports which is better")
     parser.add_argument("--learning-rate", type=float, default=2e-3)
+    parser.add_argument("--warmup-epochs", type=int, default=5,
+                        help="linear learning-rate warmup. Added because 2 of 10 seeds failed early - one "
+                             "froze with the output at the baseline, one learned only 2.9% better than it - "
+                             "and both are the pathology a warmup addresses on a zero-initialised head")
     parser.add_argument("--seed", type=int, default=20260930)
     parser.add_argument("--size", type=int, default=64,
                         help="the input size the model was trained at, used for the export example")
@@ -644,7 +649,7 @@ def measure(model, batch, zero=None):
 
 
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
-          history_channels, learning_rate, seed, device, log):
+          history_channels, learning_rate, warmup_epochs, seed, device, log):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      inputs=inputs).to(device)
@@ -659,6 +664,15 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
     generator = torch.Generator().manual_seed(seed)
     first_loss = last_loss = None
     for epoch in range(1, epochs + 1):
+        # Linear warmup. The output convolution starts at zero (which is what makes the untrained model
+        # exactly the bilinear baseline), so the first Adam steps move a weight that has no history and
+        # Adam's step size is largest exactly there. Ten seeds measured the consequence: two of them failed -
+        # one froze with the output at 4e-05 of the baseline, one learned a real residual but only 2.9%
+        # better than it - and both are early-training pathologies, which is what a warmup addresses.
+        if warmup_epochs > 0:
+            ramp = min(1.0, float(epoch) / float(warmup_epochs))
+            for group in optimizer.param_groups:
+                group["lr"] = learning_rate * ramp
         order = torch.randperm(count, generator=generator)
         model.train()
         total, batches = 0.0, 0
