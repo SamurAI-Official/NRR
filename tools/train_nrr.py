@@ -345,8 +345,10 @@ def run(args, log):
                "depth_ablation": depth_ablation, "motion_ablation": motion_ablation,
                "history_ablation": history_ablation,
                "ssim": model_quality["ssim"], "psnr_db": model_quality["psnr_db"],
+               "ms_ssim": model_quality["ms_ssim"],
                "baseline_ssim": baseline_quality["ssim"],
                "baseline_psnr_db": baseline_quality["psnr_db"],
+               "baseline_ms_ssim": baseline_quality["ms_ssim"],
                "train_first_loss": first_loss, "train_last_loss": last_loss,
                "train_progress": (first_loss - last_loss) / max(first_loss, 1e-9),
                "improvement": 1.0 - full["l1"] / max(full["baseline_l1"], 1e-9)}
@@ -358,6 +360,13 @@ def run(args, log):
     log("  quality: ssim %.4f psnr %.2f dB against the bilinear baseline's ssim %.4f psnr %.2f dB"
         % (numbers["ssim"], numbers["psnr_db"], numbers["baseline_ssim"],
            numbers["baseline_psnr_db"]))
+    # MS-SSIM beside SSIM, because the two disagree exactly where a still-image metric is weakest: SSIM at the
+    # pixel scale says nothing about whether the reconstruction is right at the scale the eye reads, and the
+    # multi-scale term is what a commercial upscaler's structure claims are usually quoted in.
+    scales = quality_metrics.ms_ssim_scales(val["target"].shape[-2:]
+                                           if val["target"].ndim >= 3 else (0, 0))
+    log("  ms-ssim: %.4f against the bilinear baseline's %.4f (%d of 5 scales at this resolution)"
+        % (numbers["ms_ssim"], numbers["baseline_ms_ssim"], scales))
     log("  training progress: residual L1 %.5f -> %.5f (%.1f%% lower)"
         % (first_loss, last_loss, numbers["train_progress"] * 100.0))
 

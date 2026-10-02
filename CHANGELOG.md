@@ -14,6 +14,48 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### MS-SSIM and the temporal dimensions: measuring what a still image cannot
+
+The evaluation stack needs to cover the same dimensions a commercial upscaler is compared on, and two of
+them were missing entirely: a structural metric that looks past the pixel scale, and any measurement of
+*temporal* behaviour at all. Both are now in `tools/quality_metrics.py`, and both were written to fail
+loudly rather than produce a plausible number.
+
+**MS-SSIM, and a defect found by refusing to trust the first output.** The multi-scale form (Wang,
+Simoncelli & Bovik 2003) was added at the published five-scale weights, an 11x11 Gaussian window and 2x2
+mean pooling. It is *not* a mirror of the runtime - `runtime/nrr_quality.cpp` has PSNR and SSIM but no
+MS-SSIM - so, unlike SSIM, it is pinned against nothing and is labelled a Python-side metric. The first
+version returned **0.0** for a 64x64 pair whose SSIM was **0.9987**: a 64x64 image cannot support five
+scales (the last would be 4 pixels across), and the code returned 0.0 for the whole metric when any scale
+did not fit, which reported "maximally different" for two nearly identical images. A missing measurement and
+a bad score are different things, so the metric now uses the scales that fit and renormalises the weights,
+and `ms_ssim_scales()` reports how many were used. At 256x256 it uses all five; at 64x64 it uses three and
+still measures, and the self-check asserts both.
+
+**Temporal stability, with the convention taken from the engine rather than assumed.** Warping error,
+temporal PSNR and temporal SSIM now compare a warp of the previous frame against the current one, using the
+capture's motion field. The sign convention is *not* guessed: `tools/godot_capture/shaders/motion.gdshader`
+computes `motion = cur_uv - prev_uv`, so the previous frame is sampled at `cur_uv - motion`. The first
+self-check had the sign backwards - it built a feature shifted one pixel *right* with a motion of *+1*
+pixel - and failed by exactly one pixel, which is what a correct test should do. The check is now built from
+the shader's own equation, covers both directions, and includes a deliberate inverted-sign case that must
+produce a large error so the test cannot pass vacuously. Average warping error over a nearly identical
+reconstruction is ~0.332 of full range, so the metric is not measuring quantisation noise.
+
+The warp is nearest-neighbour and does **not** invent values: pixels whose history falls off-screen are left
+at zero and reported through `verified_fraction`, because "no history there" is a fact to record, not a
+value to fabricate. `compare_temporal()` reports the reference's own warping error beside the
+reconstruction's, since a reconstruction that is *more* temporally stable than the ground truth is not
+better - it is smoother than reality, which is the flicker-versus-detail trade.
+
+**Both are wired into training.** `tools/train_nrr.py` now reports MS-SSIM against the bilinear baseline
+alongside SSIM and PSNR, with the scale count, so a validation number cannot quietly be a three-scale number
+presented as five. A four-epoch smoke run on `godot-v2` printed
+`ms-ssim: 0.9879 against the bilinear baseline's 0.9879 (5 of 5 scales)` and the export gate correctly
+refused the undertrained model, as intended. `tools/quality_metrics.py` is runnable alone and its sixteen
+self-checks - the two closed-form cases the C++ tests also assert, five pinned seed pairs that mirror the
+C++ parity test, six MS-SSIM cases and three temporal cases - all pass.
+
 ### The noise floor, a one-in-five failure rate, and the warmup that removed both
 
 P0 of the accuracy work was measurement before improvement, because every claim in this file that says a

@@ -237,10 +237,19 @@ measured, and temporal/reference data actually changes that image.
       the exported graph (5.2/20.2/41.0/166.5 ms against the fixture's 3.7/17.1/39.7/157.4), which
       shows an eight-times-larger model costing only 1.03-1.42x and the model is not the frame-budget
       bottleneck.
-- [ ] Quality harness: PSNR/SSIM against bilinear for a fixed image set plus
-      artifact/smoothness checks per `specification/`, wired as a CI gate
-- [~] Temporal stability metric: measured and asserted (`test_temporal_stability_*`), but
-      not yet a CI gate against a committed flicker baseline
+- [~] Quality harness: PSNR/SSIM/MS-SSIM against bilinear on the held-out captures, reported by the
+      trainer and runnable standalone (`tools/quality_metrics.py`, sixteen self-checks), pinned to
+      `runtime/nrr_quality.cpp` for PSNR and SSIM. MS-SSIM is Python-side only - the runtime has no
+      multi-scale metric - and reports how many of the five scales the resolution supports rather than
+      presenting a reduced-scale number as the full one. Still to do: make it a CI gate against a
+      committed baseline, and add the perceptual metrics (LPIPS/DISTS) and VMAF.
+- [~] Temporal stability metric: `tools/quality_metrics.py` now measures warping error, temporal PSNR and
+      temporal SSIM with the capture's motion field, at the sign convention taken from
+      `tools/godot_capture/shaders/motion.gdshader` and pinned by a self-check that includes an
+      inverted-sign control. Reported alongside the reference's own warping error, because a
+      reconstruction that is smoother than the ground truth is not more stable, only blurrier. The
+      runtime side (`TemporalBlendStats`, `test_temporal_stability_*`) is measured and asserted, but
+      neither is yet a CI gate against a committed flicker baseline.
 - [ ] Temporal accumulation that improves detail, and disocclusion rejection so history
       is not trusted through occlusion boundaries
 - [ ] Keep the identity fixture test-only; it must never be the product model

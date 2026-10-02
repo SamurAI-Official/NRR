@@ -27,6 +27,9 @@ C1 = (0.01 * 255.0) ** 2
 C2 = (0.03 * 255.0) ** 2
 WINDOW = 8
 
+# The published five-scale MS-SSIM weights (Wang, Simoncelli & Bovik 2003), normalised to sum to 1.
+MS_SSIM_WEIGHTS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
+
 
 def psnr_db(a, b):
     """PSNR of two RGB8 images, in dB, over every sample. Returns (psnr, identical).
@@ -117,9 +120,193 @@ def to_host_float(x):
     return np.asarray(x, dtype=np.float32)
 
 
+def ms_ssim_rgb8(a, b, scales=5, weights=None):
+    """Multi-scale SSIM of two RGB8 images, in [-1,1], averaged over the three colour channels.
+
+    Provenance matters here and is stated rather than implied: the runtime has **no** MS-SSIM, so unlike
+    ssim_rgb8 this is *not* a mirror of runtime/nrr_quality.cpp and is not pinned against anything. It is the
+    standard multi-scale formulation (Wang, Simoncelli & Bovik 2003) with the published five-scale weights,
+    an 11x11 Gaussian window (sigma 1.5), 2x2 mean pooling between scales, and the coarsest scale
+    contributing luminance as well as contrast-structure - the convention the widely used torch
+    implementation follows. A negative contrast-structure term (anti-correlated structure) is clamped to
+    zero before the fractional power, because x**0.1333 is not real for negative x; the standard suppresses
+    such structure rather than rewarding it. It is reported as a Python-side metric only.
+
+    Colour is handled per channel, not as a luminance image, so the number is comparable with ssim_rgb8's
+    convention rather than with implementations that convert to Y first."""
+    a = np.asarray(a, dtype=np.uint8)
+    b = np.asarray(b, dtype=np.uint8)
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    if np.array_equal(a, b):
+        return 1.0
+    if a.ndim == 1:
+        if a.size % 3 != 0:
+            return 0.0
+        a, b = a.reshape(-1, 3), b.reshape(-1, 3)
+    if a.ndim == 2:
+        a, b = a.reshape(1, -1, 3), b.reshape(1, -1, 3)
+    if weights is None:
+        weights = MS_SSIM_WEIGHTS
+    if len(weights) != scales:
+        raise ValueError("weights must have one entry per scale")
+
+    total = 0.0
+    for channel in range(3):
+        total += _ms_ssim_channel(a[..., channel].astype(np.float64),
+                                  b[..., channel].astype(np.float64), scales, weights)
+    return total / 3.0
+
+
+def _ms_ssim_channel(a, b, scales, weights):
+    """One channel of MS-SSIM.
+
+    Uses only the scales that fit an 11-pixel window and renormalises the weights over them. A 64x64 image
+    cannot support five scales - the last would be 4 pixels across - and the first version of this returned
+    0.0 for the whole metric in that case, which reported "maximally different" for two images whose SSIM was
+    0.9987. A missing measurement and a bad score are different things, so the metric is computed on the
+    scales that exist rather than abandoned."""
+    window = 11
+    usable = _usable_scales(a.shape, scales, window)
+    if usable == 0:
+        return 0.0
+    scaled_weights = np.asarray(weights[:usable], dtype=np.float64)
+    scaled_weights = scaled_weights / scaled_weights.sum()
+    kernel = _gaussian_kernel(window, 1.5)
+    product = 1.0
+    for scale in range(usable):
+        luminance, contrast_structure = _ssim_terms(a, b, kernel)
+        if scale == usable - 1:
+            # The coarsest scale carries luminance as well as contrast-structure.
+            product *= (max(luminance, 0.0) ** scaled_weights[scale]) * \
+                       (max(contrast_structure, 0.0) ** scaled_weights[scale])
+        else:
+            product *= max(contrast_structure, 0.0) ** scaled_weights[scale]
+        if scale != usable - 1:
+            a, b = _pool2(a), _pool2(b)
+    return product
+
+
+def _usable_scales(shape, scales, window):
+    """How many scales of the pyramid an image of this size can actually support."""
+    count = 0
+    while count < scales and min(shape[0], shape[1]) // (2 ** count) >= window:
+        count += 1
+    return count
+
+
+def ms_ssim_scales(shape, scales=5, window=11):
+    """The number of scales MS-SSIM will use for an image of this shape, so a report can say `3 of 5` rather
+    than presenting a reduced-scale number as the full one."""
+    return _usable_scales(shape, scales, window)
+
+
+def _gaussian_kernel(size, sigma):
+    coords = np.arange(size, dtype=np.float64) - (size - 1) / 2.0
+    line = np.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    line /= line.sum()
+    return np.outer(line, line)
+
+
+def _valid_conv(image, kernel):
+    """Same-size-out correlation with a small kernel, without scipy: a sliding window view and an einsum."""
+    k = kernel.shape[0]
+    windows = np.lib.stride_tricks.sliding_window_view(image, (k, k))
+    return np.einsum("ijkl,kl->ij", windows, kernel)
+
+
+def _pool2(image):
+    """2x2 mean pooling, dropping an odd trailing row/column rather than padding it - padding would invent
+    pixels the image does not have."""
+    height, width = image.shape
+    height -= height % 2
+    width -= width % 2
+    image = image[:height, :width]
+    return image.reshape(height // 2, 2, width // 2, 2).mean(axis=(1, 3))
+
+
+def _ssim_terms(a, b, kernel):
+    """Mean luminance and mean contrast-structure terms over the valid windows."""
+    mu_a = _valid_conv(a, kernel)
+    mu_b = _valid_conv(b, kernel)
+    mu_ab = mu_a * mu_b
+    var_a = _valid_conv(a * a, kernel) - mu_a * mu_a
+    var_b = _valid_conv(b * b, kernel) - mu_b * mu_b
+    covariance = _valid_conv(a * b, kernel) - mu_ab
+    luminance = (2.0 * mu_ab + C1) / (mu_a * mu_a + mu_b * mu_b + C1)
+    contrast_structure = (2.0 * covariance + C2) / (var_a + var_b + C2)
+    return float(luminance.mean()), float(contrast_structure.mean())
+
+
+def upscale_motion_nearest(motion, factor=2):
+    """Nearest-neighbour upscale of a motion field.
+
+    Deliberately not bilinear: interpolating across a motion discontinuity invents a vector belonging to
+    neither side, and the discontinuity is exactly where temporal metrics matter."""
+    return np.repeat(np.repeat(motion, factor, axis=0), factor, axis=1)
+
+
+def warp_previous(previous, motion):
+    """Samples `previous` at (cur_uv - motion), the convention tools/godot_capture writes and the packer
+    records. Returns (warped, inside).
+
+    Nearest-neighbour, for the same reason as the upscale: a bilinear history sample is a blend of pixels
+    that may belong to different surfaces, so it is not a sample of the previous frame. Pixels whose source
+    falls outside `previous` are left at zero and reported through `inside`, because "no history there" is a
+    fact to record rather than a value to invent."""
+    previous = np.asarray(previous, dtype=np.float32)
+    motion = np.asarray(motion, dtype=np.float32)
+    height, width = previous.shape[:2]
+    ys, xs = np.mgrid[0:height, 0:width]
+    cur_uv = np.stack([(xs + 0.5) / width, (ys + 0.5) / height], axis=-1)
+    prev_uv = cur_uv - motion
+    px = np.rint(prev_uv[..., 0] * width - 0.5).astype(np.int64)
+    py = np.rint(prev_uv[..., 1] * height - 0.5).astype(np.int64)
+    inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    warped = np.zeros_like(previous)
+    if np.any(inside):
+        warped[inside] = previous[py[inside], px[inside]]
+    return warped, inside
+
+
+def temporal_stability(previous, current, motion):
+    """Warping error and temporal fidelity between consecutive frames.
+
+    This is the dimension no still-image metric can see: a reconstruction can be excellent frame by frame
+    and still shimmer, because each frame's error is independent of the last one's. `previous` and `current`
+    are the frames under test at the same resolution (a model's output at t-1 and t, or the target's), and
+    `motion` is the current frame's field, in the capture's convention.
+
+    Reports `verified_fraction` and the caller decides what to do with it: when most pixels have no history,
+    the error is dominated by the zeros the warp filled in, and a number computed over them would describe
+    the fill rather than the reconstruction."""
+    current = np.asarray(current, dtype=np.float32)
+    warped, inside = warp_previous(previous, motion)
+    warping_error = float(np.mean(np.abs(warped - current)))
+    warped_bytes = np.clip(warped * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    current_bytes = np.clip(current * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    psnr, identical = psnr_db(warped_bytes, current_bytes)
+    return {"warping_error": warping_error,
+            "temporal_psnr_db": float(psnr),
+            "temporal_ssim": float(ssim_rgb8(warped_bytes, current_bytes)),
+            "identical": identical,
+            "verified_fraction": float(inside.mean())}
+
+
+def compare_temporal(reference_previous, reference_current, test_previous, test_current, motion):
+    """Temporal stability of a reconstruction against the reference's own.
+
+    A reconstruction that is *more* temporally stable than the ground truth is not better - it is smoother
+    than reality, which is the flicker-versus-detail trade. Reporting both sides is what makes the
+    comparison mean something."""
+    reference = temporal_stability(reference_previous, reference_current, motion)
+    test = temporal_stability(test_previous, test_current, motion)
+    return {"reference": reference, "test": test,
+            "warping_error_ratio": (test["warping_error"] / reference["warping_error"]
+                                    if reference["warping_error"] > 1e-9 else None)}
 def evaluate(prediction, target):
-    """Both metrics plus the mean absolute error the trainer already reports, for one pair of float images
-    in [0,1] shaped (h, w, 3) or (1, 3, h, w). Returns a dict, so a caller can log or gate on any of it."""
+    """The metrics for one pair of float images in [0,1] shaped (h, w, 3) or (1, 3, h, w): mean absolute
+    error, PSNR, SSIM and MS-SSIM, returned as a dict so a caller can log or gate on any of them."""
     pred = to_host_float(prediction)
     truth = to_host_float(target)
     if pred.ndim == 4:
@@ -131,6 +318,7 @@ def evaluate(prediction, target):
     psnr, identical = psnr_db(pred_bytes, truth_bytes)
     return {"l1": float(np.mean(np.abs(pred - truth))),
             "ssim": float(ssim_rgb8(pred_bytes, truth_bytes)),
+            "ms_ssim": float(ms_ssim_rgb8(pred_bytes, truth_bytes)),
             "psnr_db": float(psnr),
             "identical": identical}
 
@@ -162,6 +350,56 @@ def main(argv):
     same = ssim_rgb8(image, image)
     ok = same == 1.0
     print("identical images: ssim %.1f %s" % (same, "OK" if ok else "FAIL"))
+    failures += 0 if ok else 1
+
+    # MS-SSIM, on an image big enough for the full five scales and on one that is not. The second case is the
+    # one that caught a real defect: the first version returned 0.0 whenever a scale did not fit, which
+    # reported "maximally different" for a nearly identical pair.
+    rng = np.random.default_rng(7)
+    large = (rng.random((256, 256, 3)) * 255).astype(np.uint8)
+    noisy = np.clip(large.astype(np.int32) + rng.integers(-6, 7, large.shape), 0, 255).astype(np.uint8)
+    checks = [
+        ("ms_ssim identical is 1.0", ms_ssim_rgb8(large, large), 1.0, 0.0),
+        ("ms_ssim of a near-identical pair stays near 1",
+         ms_ssim_rgb8(large, noisy) > 0.95, True, None),
+        ("ms_ssim uses five scales at 256x256", ms_ssim_scales((256, 256)) == 5, True, None),
+        ("ms_ssim uses fewer scales at 64x64 and still measures",
+         ms_ssim_rgb8(large[:64, :64], noisy[:64, :64]) > 0.95, True, None),
+        ("ms_ssim of grey against black is low", ms_ssim_rgb8(
+            np.full((256, 256, 3), 128, np.uint8), np.zeros((256, 256, 3), np.uint8)) < 0.5, True, None),
+    ]
+    for name, got, expected, tolerance in checks:
+        ok = (got == expected) if tolerance is None else (abs(got - expected) <= tolerance)
+        print("%s: %s %s" % (name, got, "OK" if ok else "FAIL"))
+        failures += 0 if ok else 1
+
+    # Temporal metrics, on a synthetic case with a known answer. The motion convention is the capture
+    # shader's own, not an assumption: tools/godot_capture/shaders/motion.gdshader computes
+    # motion = cur_uv - prev_uv, so the previous frame is sampled at cur_uv - motion. Building this test
+    # from that equation is what catches a sign error - a feature one pixel to the RIGHT in the previous
+    # frame carries a motion of -1 pixel, not +1, and the first version of this test had it backwards and
+    # failed by exactly one pixel. Both directions are checked so a flip trips whichever way it flips.
+    current = (rng.random((32, 32, 3)) * 255).astype(np.float32) / 255.0
+    for label, pixel_shift in (("right", 1), ("left", -1)):
+        previous = np.roll(current, pixel_shift, axis=1)
+        motion = np.zeros((32, 32, 2), np.float32)
+        motion[:, :, 0] = -pixel_shift / 32.0
+        warped, inside = warp_previous(previous, motion)
+        error = float(np.mean(np.abs(warped[inside] - current[inside])))
+        ok = error < 1e-6 and inside.mean() > 0.9
+        print("temporal: a one-pixel %s shift warps back exactly, error %.8f (%.1f%% verified) %s"
+              % (label, error, inside.mean() * 100.0, "OK" if ok else "FAIL"))
+        failures += 0 if ok else 1
+
+    # A wrong sign must fail, so the check above cannot pass vacuously.
+    previous = np.roll(current, 1, axis=1)
+    motion = np.zeros((32, 32, 2), np.float32)
+    motion[:, :, 0] = +1.0 / 32.0          # deliberately inverted
+    warped, inside = warp_previous(previous, motion)
+    error = float(np.mean(np.abs(warped[inside] - current[inside])))
+    ok = error > 0.1
+    print("temporal: an inverted sign produces a large error %.8f %s"
+          % (error, "OK" if ok else "FAIL"))
     failures += 0 if ok else 1
 
     # The pinned fixture, asserted on both sides. tests/unit/test_quality_parity.cpp asserts these same
