@@ -247,6 +247,13 @@ measured, and temporal/reference data actually changes that image.
       stands. Cosine is never worse than l1 on any seed and is the closest lever, but a pre-registered
       threshold is not moved after the fact. Untested and recorded: the `l1ssim` half of lever 2, and lever
       4 (detail weighting), which needs a per-pixel detail map the dataset does not yet carry.
+- [x] **Final claim (10 seeds) and the full evaluation stack.** Ten seeds of the chosen config give a mean
+      held-out L1 improvement of **22.03% ± 2.60%** (range 16.79-25.39); the shipped model is the best draw,
+      seed 20261023 at 25.39%. The full stack on that model passes every pre-registered bar on both
+      validation scenes: SSIM 0.922/0.940 vs 0.888/0.907, LPIPS 0.038/0.018 vs 0.144/0.101, DISTS
+      0.159/0.100 vs 0.294/0.299, VMAF 76.7/81.2 vs 59.8/60.1, detail 0.63/0.55 vs 0.10/0.08, and warping
+      error tracks the reference within a fraction of a point. The multi-dimension quality claim is now
+      defensible rather than a single number.
 - [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
       retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to

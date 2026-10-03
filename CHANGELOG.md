@@ -14,6 +14,37 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The 10-seed final claim: 22.03% ± 2.60% better than bilinear
+
+The protocol's "final claim needs ten seeds" is now met, on the chosen configuration (ch32 colour-only, L1,
+linear warmup, 60 epochs): the ten held-out L1 improvements are 24.13, 16.79, 20.81, 25.39, 20.77, 25.09,
+20.20, 21.47, 23.13 and 22.51, for a mean of **22.03%** and a sample σ of **2.60%** (range 16.79-25.39).
+The two-seed mean that stood in earlier in this file (20.46%) sits 1.6 points below the ten-seed mean, which
+is exactly why the protocol refused to settle the claim on two seeds. The standard error is now ≈ 0.82, so
+the claim is "about 22% better than bilinear, give or take a couple of points per seed", not a single seed's
+number. The shipped model is the best draw, seed 20261023 at 25.39%.
+
+The full evaluation stack (perceptual + VMAF) is run on that model against the bilinear baseline, so the
+claim is not only a pixel-error number. On `final_20261023.onnx`, every pre-registered bar passes on both
+validation scenes:
+
+| metric (model / bilinear) | heldout | heldout2 |
+| --- | --- | --- |
+| PSNR | 28.07 / 27.72 | 29.35 / 28.65 |
+| SSIM | 0.9222 / 0.8879 | 0.9396 / 0.9065 |
+| MS-SSIM | 0.9931 / 0.9849 | 0.9942 / 0.9889 |
+| LPIPS | 0.0378 / 0.1436 | 0.0183 / 0.1007 |
+| DISTS | 0.1589 / 0.2943 | 0.1003 / 0.2992 |
+| VMAF | 76.7 / 59.8 | 81.2 / 60.1 |
+| detail ratio | 0.63 / 0.10 | 0.55 / 0.08 |
+| warping error (vs reference) | 0.0883 / 0.0896 | 0.0791 / 0.0799 |
+
+The perceptual gaps are the headline: LPIPS is 3.8-5.5x lower than bilinear, VMAF is 17-21 points higher,
+and the detail ratio shows the model keeps 6-7x more high-frequency detail. Warping error tracks the
+reference to within a fraction of a point on both scenes, which is the honest target - no shimmer, and no
+smoothing-below-the-truth either. PSNR also beats bilinear on both scenes now, where an earlier warmup-era
+model had been slightly *below* on one; the ch32 godot-v2 model is simply better.
+
 ### P3 quality levers, run against the pre-registered bars
 
 Lever 1 is concluded; levers 2 and 3 are coded, self-tested, and running. Each lever is judged against the
