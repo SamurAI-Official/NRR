@@ -521,11 +521,11 @@ def self_test():
         ("l1ssim of identical images is zero",
          abs(float(compute_loss("l1ssim", identical, identical, 0.1))) < 1e-9),
         ("cosine anneals to the floor by the last epoch",
-         abs(learning_rate(60, 60, 0.002, 5, "cosine") - 0.002 * 1e-3) < 1e-12),
+         abs(lr_for_epoch(60, 60, 0.002, 5, "cosine") - 0.002 * 1e-3) < 1e-12),
         ("linear warmup ramps to base at the warmup edge",
-         abs(learning_rate(5, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
+         abs(lr_for_epoch(5, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
         ("linear warmup holds after the warmup edge",
-         abs(learning_rate(6, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
+         abs(lr_for_epoch(6, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
     ]
     for name, ok in loss_cases:
         print("  %-44s %s" % (name, "OK" if ok else "FAIL"))
@@ -713,9 +713,11 @@ def compute_loss(name, prediction, truth, ssim_weight):
     return torch.nn.functional.l1_loss(prediction, truth)
 
 
-def learning_rate(epoch, epochs, base, warmup_epochs, schedule):
+def lr_for_epoch(epoch, epochs, base, warmup_epochs, schedule):
     """The learning rate for an epoch. The linear warmup is what removed the one-in-five early-failure rate;
-    cosine is the P3 lever that anneals to base * 1e-3 over the run instead of holding the warmup peak."""
+    cosine is the P3 lever that anneals to base * 1e-3 over the run instead of holding the warmup peak.
+    Named `lr_for_epoch` rather than `learning_rate` so the float parameter of the same name in train() does
+    not shadow it."""
     if schedule == "cosine":
         progress = (epoch - 1) / max(epochs - 1, 1)
         floor = 1e-3
@@ -786,10 +788,10 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
         # bilinear baseline), so the first Adam steps move a weight that has no history and Adam's step size
         # is largest exactly there. Ten seeds measured the consequence: two of them failed - one froze with
         # the output at 4e-05 of the baseline, one learned a real residual but only 2.9% better than it - and
-        # both are early-training pathologies, which is what a warmup addresses. `learning_rate()` carries the
+        # both are early-training pathologies, which is what a warmup addresses. `lr_for_epoch()` carries the
         # warmup for both schedules so the lever changes the decay, not the protection.
         for group in optimizer.param_groups:
-            group["lr"] = learning_rate(epoch, epochs, learning_rate, warmup_epochs, lr_schedule)
+            group["lr"] = lr_for_epoch(epoch, epochs, learning_rate, warmup_epochs, lr_schedule)
         order = torch.randperm(count, generator=generator)
         model.train()
         total, batches = 0.0, 0
