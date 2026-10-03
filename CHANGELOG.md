@@ -14,6 +14,40 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### P3 quality levers, run against the pre-registered bars
+
+Lever 1 is concluded; levers 2 and 3 are coded, self-tested, and running. Each lever is judged against the
+same rule as the frontier: adopt only if it clears the 5-point held-out L1 bar and every other bar.
+
+**Lever 1 (input set) - fails, colour-only stands.** Re-probing the colour-only decision at ch32 on the
+warmup-era godot-v2 dataset: colour+depth+motion scored 20.48%/18.15% (mean 19.32%) against colour-only's
+24.13%/16.79% (mean 20.46%). The model *does* use the extra inputs now - zeroing depth moves the output by
+0.0006 and motion by 0.0015, where the earlier probe saw them do nothing - but using them costs 1.1 points,
+not buys 5. The earlier decision holds on more data, for a sharper reason than before: the inputs are
+consumed, and they still hurt.
+
+**Levers 2 and 3 are implemented, not assumed.** `tools/train_nrr.py` gained `--loss {l1,charbonnier,l1ssim}`
+and `--lr-schedule {linear-warmup,cosine}`, each pinned by a self-test (charbonnier of identical images is
+its eps floor, the SSIM term of identical images is exactly zero, cosine anneals to the floor, linear warmup
+holds after its edge). A name collision that shadowed the `learning_rate` helper with the parameter of the
+same name was caught by a run dying with `'float' object is not callable` and fixed, which is the self-test
+and the run together doing their job.
+
+**Results - all three tested levers fail the 5-point bar, so the config is unchanged.**
+
+| lever | seed 20261020 | seed 20261021 | mean | vs l1 (20.46%) |
+| --- | --- | --- | --- | --- |
+| colour-only l1 (current) | 24.13% | 16.79% | 20.46% | - |
+| depth+motion | 20.48% | 18.15% | 19.31% | -1.15 |
+| charbonnier | 20.86% | 25.03% | 22.95% | +2.49 |
+| cosine | 25.55% | 23.66% | 24.61% | +4.15 |
+
+Cosine comes closest, and is the only lever that is never worse than l1 on any seed, but +4.15 points is
+still below the fixed 5-point bar, and a pre-registered threshold is not something the result gets to move.
+ch32 colour-only with L1 and linear warmup stands. Two items remain untested and are recorded rather than
+forgotten: the `l1ssim` half of lever 2, and lever 4 (detail weighting), which needs a per-pixel detail map
+the dataset does not yet carry.
+
 ### P2 frontier concluded: 4x capacity buys +2.75 points, below the 5-point bar, so ch32 stands
 
 The pre-registered rule is now applied to data it could not have been fitted to, because it was written

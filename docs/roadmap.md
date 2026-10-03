@@ -242,6 +242,11 @@ measured, and temporal/reference data actually changes that image.
       5-point bar pre-registered in `docs/evaluation-protocol.md`. The capacity smooths the worst case -
       ch64's two seeds span 0.47 points against ch32's 7.34 - but the rule judged *improvement*, not
       variance, so the simpler model carries forward to P3.
+- [x] **Quality levers (P3) concluded: the config is unchanged.** depth+motion (−1.15), charbonnier
+      (+2.49) and cosine (+4.15) all fall below the 5-point bar, so ch32 colour-only L1 linear-warmup
+      stands. Cosine is never worse than l1 on any seed and is the closest lever, but a pre-registered
+      threshold is not moved after the fact. Untested and recorded: the `l1ssim` half of lever 2, and lever
+      4 (detail weighting), which needs a per-pixel detail map the dataset does not yet carry.
 - [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
       retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to
