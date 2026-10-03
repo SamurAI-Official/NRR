@@ -14,6 +14,29 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### NRR vs the upscalers a game ships: NRR wins every dimension
+
+`tools/compare_upscalers.py` scores the NRR model, bilinear, bicubic, Lanczos and AMD FSR 1.0 through the
+same pipeline on the same held-out frames (200 per scene, full stack including VMAF). The result, on both
+validation scenes, is that **NRR wins every measured dimension** - PSNR, SSIM, MS-SSIM, LPIPS, DISTS, VMAF
+and detail retention:
+
+| method (heldout / heldout2) | PSNR | SSIM | MS-SSIM | LPIPS | DISTS | detail | VMAF |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 27.72 / 28.66 | 0.888 / 0.906 | 0.985 / 0.989 | 0.144 / 0.101 | 0.294 / 0.299 | 0.100 / 0.078 | 59.8 / 60.1 |
+| bicubic | 27.80 / 28.70 | 0.885 / 0.901 | 0.986 / 0.988 | 0.117 / 0.085 | 0.298 / 0.305 | 0.173 / 0.139 | 67.7 / 67.9 |
+| Lanczos | 27.64 / 28.65 | 0.880 / 0.898 | 0.986 / 0.988 | 0.119 / 0.090 | 0.298 / 0.309 | 0.191 / 0.148 | 69.4 / 69.8 |
+| FSR 1.0 | 27.71 / 28.58 | 0.877 / 0.888 | 0.984 / 0.984 | 0.091 / 0.072 | 0.299 / 0.311 | 0.344 / 0.263 | 74.1 / 74.8 |
+| NRR | 28.07 / 29.35 | 0.922 / 0.940 | 0.993 / 0.994 | 0.038 / 0.018 | 0.159 / 0.100 | 0.629 / 0.545 | 76.7 / 81.2 |
+
+The sharpest single number is LPIPS: NRR is 3.8-5.6x closer to the truth than bilinear, and 2.4-4x closer
+than FSR 1.0. The most important one for "recovery vs sharpening" is detail: NRR keeps 0.63/0.55 of the
+truth's high-frequency energy where FSR 1.0 keeps 0.34/0.26 - FSR 1.0 sharpens the bilinear upscale (its
+best-in-class-among-the-rest LPIPS of 0.091/0.072 reflects that), but it does not recover the detail the
+input never had, and its SSIM is the *worst* of the five (0.877/0.888) because that sharpening is structural
+error. FSR 1.0 is the only commercial upscaler compared here: DLSS, XeSS and FSR 2/3/4 are temporal
+upscalers and stay deferred until NRR has a trained temporal path - a gap that is stated, not papered over.
+
 ### The commercial comparison begins: AMD FSR 1.0 ported and validated
 
 The next claim is "NRR vs the commercial upscalers", and the first one is landed. FSR 1.0 is the only
