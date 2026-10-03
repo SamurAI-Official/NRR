@@ -42,6 +42,7 @@ reinstalling anything:
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -309,7 +310,10 @@ def run(args, log):
                                                      args.channels, args.depth_channels,
                                                      args.motion_channels, args.history_channels,
                                                      args.learning_rate, args.warmup_epochs,
-                                                     args.seed, device, log)
+                                                     args.seed, device, log,
+                                                     loss_name=args.loss,
+                                                     ssim_weight=args.ssim_weight,
+                                                     lr_schedule=args.lr_schedule)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -376,6 +380,7 @@ def run(args, log):
               "depth_channels": args.depth_channels, "motion_channels": args.motion_channels,
               "epochs": args.epochs, "batch_size": args.batch_size,
               "learning_rate": args.learning_rate, "seed": args.seed,
+              "loss": args.loss, "ssim_weight": args.ssim_weight, "lr_schedule": args.lr_schedule,
               "zeroed_input": zeroed,
               "device": device_facts,
               "gpu": gpu_usage or {"samples": 0,
@@ -504,6 +509,27 @@ def self_test():
             problems += 1
         for reason in found:
             print("      - %s" % reason)
+
+    # The P3 loss and schedule functions have closed forms, pinned here so a lever is not adopted on the
+    # strength of a loss that does not actually compute what its name claims.
+    identical = torch.zeros(1, 3, 32, 32)
+    loss_cases = [
+        ("l1 of identical images is zero", abs(float(compute_loss("l1", identical, identical, 0.1))) < 1e-9),
+        ("charbonnier of identical images is its eps floor (the smooth-L1 property)",
+         abs(float(compute_loss("charbonnier", identical, identical, 0.1)) - 1e-3) < 1e-9),
+        ("ssim term of identical images is zero", abs(float(ssim_loss(identical, identical))) < 1e-9),
+        ("l1ssim of identical images is zero",
+         abs(float(compute_loss("l1ssim", identical, identical, 0.1))) < 1e-9),
+        ("cosine anneals to the floor by the last epoch",
+         abs(learning_rate(60, 60, 0.002, 5, "cosine") - 0.002 * 1e-3) < 1e-12),
+        ("linear warmup ramps to base at the warmup edge",
+         abs(learning_rate(5, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
+        ("linear warmup holds after the warmup edge",
+         abs(learning_rate(6, 60, 0.002, 5, "linear-warmup") - 0.002) < 1e-12),
+    ]
+    for name, ok in loss_cases:
+        print("  %-44s %s" % (name, "OK" if ok else "FAIL"))
+        problems += 0 if ok else 1
     return 1 if problems else 0
 
 
@@ -528,6 +554,14 @@ def main(argv):
                              "depth,motion,history. This is the comparison - a model given history is a "
                              "different model from one that is not, and the run reports which is better")
     parser.add_argument("--learning-rate", type=float, default=2e-3)
+    parser.add_argument("--loss", default="l1", choices=("l1", "charbonnier", "l1ssim"),
+                        help="P3 lever 2: the training loss. l1 is the measured gate; charbonnier and "
+                             "l1ssim are tried against the same bars, never assumed better")
+    parser.add_argument("--ssim-weight", type=float, default=0.1,
+                        help="weight of the SSIM term in --loss l1ssim")
+    parser.add_argument("--lr-schedule", default="linear-warmup",
+                        choices=("linear-warmup", "cosine"),
+                        help="P3 lever 3: linear-warmup holds the warmup peak; cosine anneals to 1e-3 of it")
     parser.add_argument("--warmup-epochs", type=int, default=5,
                         help="linear learning-rate warmup. Added because 2 of 10 seeds failed early - one "
                              "froze with the output at the baseline, one learned only 2.9% better than it - "
@@ -638,6 +672,61 @@ def baseline_upscale(color):
     return torch.nn.functional.interpolate(color, scale_factor=2, mode="bilinear", align_corners=False)
 
 
+def _gaussian_line(window_size, sigma):
+    coords = torch.arange(window_size, dtype=torch.float32) - (window_size - 1) / 2.0
+    line = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    return line / line.sum()
+
+
+def ssim_loss(x, y, window_size=11):
+    """Differentiable (1 - SSIM), averaged over channels and pixels, for the `l1ssim` lever.
+
+    Uses the same C1/C2 as the numpy and C++ SSIM ((0.01*255)^2 and (0.03*255)^2 on [0,1] inputs are
+    0.0001 and 0.0009), so an identical pair scores exactly zero and two uniform images reduce to the same
+    luminance term quality_metrics.py reports. Pinned by the self-test, not by assertion alone."""
+    channels = x.shape[1]
+    line = _gaussian_line(window_size, 1.5).unsqueeze(1)
+    kernel = (line @ line.t()).float().unsqueeze(0).unsqueeze(0)
+    window = kernel.expand(channels, 1, window_size, window_size).contiguous().to(x.device)
+    pad = window_size // 2
+    mu_x = torch.nn.functional.conv2d(x, window, padding=pad, groups=channels)
+    mu_y = torch.nn.functional.conv2d(y, window, padding=pad, groups=channels)
+    mu_xy = mu_x * mu_y
+    var_x = torch.nn.functional.conv2d(x * x, window, padding=pad, groups=channels) - mu_x ** 2
+    var_y = torch.nn.functional.conv2d(y * y, window, padding=pad, groups=channels) - mu_y ** 2
+    cov = torch.nn.functional.conv2d(x * y, window, padding=pad, groups=channels) - mu_xy
+    c1 = 0.0001
+    c2 = 0.0009
+    ssim_map = ((2.0 * mu_xy + c1) * (2.0 * cov + c2)) / \
+               ((mu_x ** 2 + mu_y ** 2 + c1) * (var_x + var_y + c2))
+    return 1.0 - ssim_map.mean()
+
+
+def compute_loss(name, prediction, truth, ssim_weight):
+    """The training loss. L1 is the measured gate; Charbonnier and L1+SSIM are the P3 levers, each tried
+    against the same bars rather than assumed better."""
+    if name == "charbonnier":
+        eps = 1e-3
+        return torch.sqrt((prediction - truth) ** 2 + eps ** 2).mean()
+    if name == "l1ssim":
+        return torch.nn.functional.l1_loss(prediction, truth) + ssim_weight * ssim_loss(prediction, truth)
+    return torch.nn.functional.l1_loss(prediction, truth)
+
+
+def learning_rate(epoch, epochs, base, warmup_epochs, schedule):
+    """The learning rate for an epoch. The linear warmup is what removed the one-in-five early-failure rate;
+    cosine is the P3 lever that anneals to base * 1e-3 over the run instead of holding the warmup peak."""
+    if schedule == "cosine":
+        progress = (epoch - 1) / max(epochs - 1, 1)
+        floor = 1e-3
+        factor = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        if warmup_epochs > 0:
+            factor *= min(1.0, float(epoch) / float(warmup_epochs))
+        return base * factor
+    ramp = min(1.0, float(epoch) / float(warmup_epochs)) if warmup_epochs > 0 else 1.0
+    return base * ramp
+
+
 def measure(model, batch, zero=None, chunk=32):
     """The numbers the gates use. `zero` names an input to replace with zeros, which is how each input's
     contribution is measured rather than assumed - including history, which is the whole point of the
@@ -676,13 +765,15 @@ def measure(model, batch, zero=None, chunk=32):
 
 
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
-          history_channels, learning_rate, warmup_epochs, seed, device, log):
+          history_channels, learning_rate, warmup_epochs, seed, device, log,
+          loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup"):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      inputs=inputs).to(device)
     parameters = sum(p.numel() for p in model.parameters())
-    log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g"
-        % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate))
+    log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g, loss=%s, schedule=%s"
+        % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate,
+           loss_name, lr_schedule))
 
     keys = list(dataset["train"].keys())
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -691,15 +782,14 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
     generator = torch.Generator().manual_seed(seed)
     first_loss = last_loss = None
     for epoch in range(1, epochs + 1):
-        # Linear warmup. The output convolution starts at zero (which is what makes the untrained model
-        # exactly the bilinear baseline), so the first Adam steps move a weight that has no history and
-        # Adam's step size is largest exactly there. Ten seeds measured the consequence: two of them failed -
-        # one froze with the output at 4e-05 of the baseline, one learned a real residual but only 2.9%
-        # better than it - and both are early-training pathologies, which is what a warmup addresses.
-        if warmup_epochs > 0:
-            ramp = min(1.0, float(epoch) / float(warmup_epochs))
-            for group in optimizer.param_groups:
-                group["lr"] = learning_rate * ramp
+        # Warmup. The output convolution starts at zero (which is what makes the untrained model exactly the
+        # bilinear baseline), so the first Adam steps move a weight that has no history and Adam's step size
+        # is largest exactly there. Ten seeds measured the consequence: two of them failed - one froze with
+        # the output at 4e-05 of the baseline, one learned a real residual but only 2.9% better than it - and
+        # both are early-training pathologies, which is what a warmup addresses. `learning_rate()` carries the
+        # warmup for both schedules so the lever changes the decay, not the protection.
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate(epoch, epochs, learning_rate, warmup_epochs, lr_schedule)
         order = torch.randperm(count, generator=generator)
         model.train()
         total, batches = 0.0, 0
@@ -712,7 +802,7 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
                                         batch.get("history"))
             truth = batch["target"] - baseline_upscale(batch["color"])
-            loss = torch.nn.functional.l1_loss(prediction, truth)
+            loss = compute_loss(loss_name, prediction, truth, ssim_weight)
             loss.backward()
             optimizer.step()
             total += float(loss)
