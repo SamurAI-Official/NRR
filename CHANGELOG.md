@@ -14,6 +14,19 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The commercial comparison begins: AMD FSR 1.0 ported and validated
+
+The next claim is "NRR vs the commercial upscalers", and the first one is landed. FSR 1.0 is the only
+commercial upscaler that is a fair apples-to-apples comparison for NRR's single-frame spatial architecture -
+DLSS, XeSS and FSR 2/3/4 are all temporal and stay deferred until NRR has a trained temporal path - and it
+is MIT-licensed, so its exact algorithm is the spec. `tools/fsr1.py` ports AMD's `ffx_fsr1.h` (EASU
+edge-adaptive upsampling + RCAS robust contrast-adaptive sharpening) line-for-line, including the fast-math
+bit tricks (`APrxLoRcpF1`/`APrxMedRcpF1`/`APrxLoRsqF1`), with the GPU `gather4` bypassed by
+arithmetic-identical nearest taps. Defaults match the FSR 1.0 sample (RCAS attenuation 0.25). Six self-checks
+pass, and a real held-out frame shows the expected sharpening behaviour: 3.3x the bilinear high-frequency
+detail at a small PSNR cost - FSR 1.0 sharpens the bilinear upscale, it does not recover the detail the
+input never had.
+
 ### The 10-seed final claim: 22.03% ± 2.60% better than bilinear
 
 The protocol's "final claim needs ten seeds" is now met, on the chosen configuration (ch32 colour-only, L1,
