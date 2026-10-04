@@ -111,6 +111,40 @@ const SCENES := {
 				"position": Vector3(0.10, 0.55, -5.5)},
 		],
 	},
+	# More held-out variety for the commercial comparison: a third and fourth validation scene, so "held
+	# out" is not two shots. heldout3 uses a finer texture and a cool/vibrant palette; heldout4 uses a
+	# coarser texture and a warm/earth palette. Both keep the objects past z = -4.4 and a dolly whose whole
+	# 400-frame span stays well short of the geometry, for the same reason the first held-out did.
+	"heldout3": {
+		"camera_velocity": Vector3(0.005, -0.004, -0.002),
+		"checker": 5,
+		"objects": [
+			{"shape": "torus", "color": Color(0.35, 0.85, 0.95), "scale": 1.10,
+				"orbit": 0.60, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.8, "spin": 0.9,
+				"position": Vector3(0.40, 0.20, -4.5)},
+			{"shape": "sphere", "color": Color(0.95, 0.30, 0.30), "scale": 0.75,
+				"orbit": 1.20, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.9, "spin": 0.0,
+				"position": Vector3(-0.70, -0.25, -5.0)},
+			{"shape": "box", "color": Color(0.25, 0.90, 0.55), "scale": 0.90,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 2.6,
+				"position": Vector3(0.85, -0.45, -5.6)},
+		],
+	},
+	"heldout4": {
+		"camera_velocity": Vector3(-0.004, 0.003, -0.003),
+		"checker": 7,
+		"objects": [
+			{"shape": "sphere", "color": Color(0.95, 0.95, 0.90), "scale": 1.35,
+				"orbit": 0.45, "axis": Vector3(0.0, 0.0, 1.0), "phase": 2.4, "spin": 1.4,
+				"position": Vector3(-0.50, 0.30, -4.7)},
+			{"shape": "box", "color": Color(0.55, 0.35, 0.25), "scale": 1.15,
+				"orbit": 0.90, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.3, "spin": 0.0,
+				"position": Vector3(0.70, -0.15, -5.2)},
+			{"shape": "torus", "color": Color(0.40, 0.55, 0.75), "scale": 0.65,
+				"orbit": 1.50, "axis": Vector3(1.0, 0.0, 0.0), "phase": 3.5, "spin": 1.8,
+				"position": Vector3(0.05, -0.55, -5.9)},
+		],
+	},
 }
 
 var _scene_id := "train"
