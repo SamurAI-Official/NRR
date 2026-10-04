@@ -254,11 +254,13 @@ measured, and temporal/reference data actually changes that image.
       0.159/0.100 vs 0.294/0.299, VMAF 76.7/81.2 vs 59.8/60.1, detail 0.63/0.55 vs 0.10/0.08, and warping
       error tracks the reference within a fraction of a point. The multi-dimension quality claim is now
       defensible rather than a single number.
-- [x] **Commercial comparison (FSR 1.0) - NRR wins every dimension.** `tools/compare_upscalers.py` scores
-      NRR against bilinear, bicubic, Lanczos and AMD FSR 1.0 (ported in `tools/fsr1.py`) on the same frames:
-      NRR beats all four on PSNR, SSIM, MS-SSIM, LPIPS, DISTS, VMAF and detail (LPIPS 0.038/0.018 vs FSR's
-      0.091/0.072; detail 0.63/0.55 vs FSR's 0.34/0.26 - FSR sharpens, NRR recovers). DLSS/XeSS/FSR 2/3/4
-      remain deferred: they are temporal upscalers, so a fair comparison needs NRR's trained temporal path.
+- [x] **Commercial comparison (FSR 1.0) - NRR wins every structural/perceptual metric.** On four held-out
+      scenes (heldout, heldout2, heldout3, heldout4 in `godot-v3`), NRR beats bilinear, bicubic, Lanczos and
+      AMD FSR 1.0 (ported in `tools/fsr1.py`) on SSIM, MS-SSIM, LPIPS, DISTS and detail; LPIPS is 2.4-5.6x
+      closer to the truth than bilinear and 2.4-4x closer than FSR 1.0. PSNR is content-dependent: NRR wins
+      it on two scenes and is slightly below bilinear on the other two - the MSE-rewards-blur divergence the
+      protocol pre-registered as "PSNR is reported, not gated". DLSS/XeSS/FSR 2/3/4 remain deferred: they are
+      temporal upscalers, so a fair comparison needs NRR's trained temporal path.
 - [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
       retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to

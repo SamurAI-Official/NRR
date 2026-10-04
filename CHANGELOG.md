@@ -14,6 +14,25 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### Two more held-out scenes, and the comparison now spans four validation scenes
+
+`heldout3` and `heldout4` were added to `tools/godot_capture/capture.gd` (a finer cool-palette scene and a
+coarser warm-palette scene), captured at 200 frames each, and packed into a new `godot-v3` dataset: 1708
+pairs (909 train, 799 val across heldout/heldout2/heldout3/heldout4). The first `heldout3` design was
+refused by the packer's own gate - its objects were too small (4-7% of the frame), so bilinear already
+reproduced the scene and every frame failed the margin bar - and the fix (larger, nearer objects, 8-15%
+coverage) is what the data gate exists to catch.
+
+The four-scene comparison (image + perceptual metrics) extends the earlier two-scene result without
+changing its conclusion: **NRR wins SSIM, MS-SSIM, LPIPS, DISTS and detail on all four scenes**. LPIPS is
+2.4-5.6x closer to the truth than bilinear and 2.4-4x closer than FSR 1.0 on every scene. The one nuance the
+extra scenes surface is PSNR: NRR beats bilinear on heldout/holdout2 (28.07/29.35 vs 27.72/28.65) but sits
+*slightly below* it on heldout3/holdout4 (27.69/28.09 vs 28.33/28.27) - the same MSE-rewards-blur divergence
+the protocol pre-registered as "PSNR is reported, not gated", now seen to be content-dependent rather than a
+one-scene fluke. The defensible claim is unchanged and broadened: on four held-out scenes the model never
+trained on, NRR beats bilinear, bicubic, Lanczos and AMD FSR 1.0 on every structural, perceptual and
+detail-retention metric.
+
 ### NRR vs the upscalers a game ships: NRR wins every dimension
 
 `tools/compare_upscalers.py` scores the NRR model, bilinear, bicubic, Lanczos and AMD FSR 1.0 through the
