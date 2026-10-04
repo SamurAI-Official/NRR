@@ -313,7 +313,8 @@ def run(args, log):
                                                      args.seed, device, log,
                                                      loss_name=args.loss,
                                                      ssim_weight=args.ssim_weight,
-                                                     lr_schedule=args.lr_schedule)
+                                                     lr_schedule=args.lr_schedule,
+                                                     detail_weight=args.detail_weight)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -381,6 +382,7 @@ def run(args, log):
               "epochs": args.epochs, "batch_size": args.batch_size,
               "learning_rate": args.learning_rate, "seed": args.seed,
               "loss": args.loss, "ssim_weight": args.ssim_weight, "lr_schedule": args.lr_schedule,
+              "detail_weight": args.detail_weight,
               "zeroed_input": zeroed,
               "device": device_facts,
               "gpu": gpu_usage or {"samples": 0,
@@ -530,6 +532,28 @@ def self_test():
     for name, ok in loss_cases:
         print("  %-44s %s" % (name, "OK" if ok else "FAIL"))
         problems += 0 if ok else 1
+
+    # Detail weighting: a flat target has no detail, so the weight must be uniform (no rebalancing); a
+    # textured target concentrates weight on edges; and the weight always has mean ~1 so it rebalances, not
+    # rescales.
+    flat_target = torch.full((2, 3, 16, 16), 0.4)
+    w_flat = detail_weight_map(flat_target, 0.5)
+    check_ok = abs(float(w_flat.max() - w_flat.min())) < 1e-6
+    print("  %-44s %s" % ("detail weight of a flat target is uniform (no detail to rebalance)", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    xx, yy = torch.meshgrid(torch.arange(16), torch.arange(16), indexing="ij")
+    checker = ((xx + yy) % 2).float().repeat(2, 3, 1, 1)
+    w_checker = detail_weight_map(checker, 0.5)
+    check_ok = float(w_checker.max()) > float(w_checker.min())
+    print("  %-44s %s" % ("detail weight concentrates on edges of a textured target", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    rng_t = torch.rand(2, 3, 32, 32)
+    w_rng = detail_weight_map(rng_t, 0.5)
+    check_ok = abs(float(w_rng.mean()) - 1.0) < 0.01
+    print("  %-44s %s" % ("detail weight has mean ~1 on a textured target", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
     return 1 if problems else 0
 
 
@@ -559,6 +583,9 @@ def main(argv):
                              "l1ssim are tried against the same bars, never assumed better")
     parser.add_argument("--ssim-weight", type=float, default=0.1,
                         help="weight of the SSIM term in --loss l1ssim")
+    parser.add_argument("--detail-weight", type=float, default=0.0,
+                        help="P3 lever 4: strength of the per-pixel detail weighting, which rebalances the "
+                             "loss toward high-frequency regions of the target (0 = off)")
     parser.add_argument("--lr-schedule", default="linear-warmup",
                         choices=("linear-warmup", "cosine"),
                         help="P3 lever 3: linear-warmup holds the warmup peak; cosine anneals to 1e-3 of it")
@@ -702,15 +729,40 @@ def ssim_loss(x, y, window_size=11):
     return 1.0 - ssim_map.mean()
 
 
-def compute_loss(name, prediction, truth, ssim_weight):
+def compute_loss(name, prediction, truth, ssim_weight, weight=None):
     """The training loss. L1 is the measured gate; Charbonnier and L1+SSIM are the P3 levers, each tried
-    against the same bars rather than assumed better."""
+    against the same bars rather than assumed better. `weight`, when given, is a per-pixel (B,1,H,W) map
+    with mean 1 that rebalances the loss toward high-frequency regions (the detail-weighting lever)."""
+    if weight is not None:
+        diff = (prediction - truth).abs()
+        if name == "charbonnier":
+            eps = 1e-3
+            return (weight * torch.sqrt((prediction - truth) ** 2 + eps ** 2)).mean()
+        if name == "l1ssim":
+            return (weight * diff).mean() + ssim_weight * ssim_loss(prediction, truth)
+        return (weight * diff).mean()
     if name == "charbonnier":
         eps = 1e-3
         return torch.sqrt((prediction - truth) ** 2 + eps ** 2).mean()
     if name == "l1ssim":
         return torch.nn.functional.l1_loss(prediction, truth) + ssim_weight * ssim_loss(prediction, truth)
     return torch.nn.functional.l1_loss(prediction, truth)
+
+
+def detail_weight_map(target, strength):
+    """Per-pixel loss weight emphasising high-frequency regions of the target, for the detail-weighting lever.
+
+    The weight is 1 + strength * (laplacian / mean(laplacian) - 1), so it has mean exactly 1.0 - the lever
+    rebalances the loss toward where the target has detail (foliage, edges) rather than rescaling it. The
+    Laplacian is the same 3x3 high-pass the packer's `_detail()` uses as a per-image scalar, here applied
+    per pixel so the loss can care about *where* the detail is, not just how much of it there is."""
+    grey = target[:, 0] * np.float32(0.299) + target[:, 1] * np.float32(0.587) + target[:, 2] * np.float32(0.114)
+    kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+                          dtype=target.dtype, device=target.device).view(1, 1, 3, 3)
+    grey_padded = torch.nn.functional.pad(grey.unsqueeze(1), (1, 1, 1, 1), mode="replicate")
+    lap = torch.abs(torch.nn.functional.conv2d(grey_padded, kernel))
+    lap_mean = lap.mean(dim=(1, 2), keepdim=True) + 1e-6
+    return 1.0 + strength * (lap / lap_mean - 1.0)
 
 
 def lr_for_epoch(epoch, epochs, base, warmup_epochs, schedule):
@@ -768,7 +820,7 @@ def measure(model, batch, zero=None, chunk=32):
 
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
           history_channels, learning_rate, warmup_epochs, seed, device, log,
-          loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup"):
+          loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup", detail_weight=0.0):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      inputs=inputs).to(device)
@@ -804,7 +856,8 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
                                         batch.get("history"))
             truth = batch["target"] - baseline_upscale(batch["color"])
-            loss = compute_loss(loss_name, prediction, truth, ssim_weight)
+            weight = detail_weight_map(batch["target"], detail_weight) if detail_weight > 0.0 else None
+            loss = compute_loss(loss_name, prediction, truth, ssim_weight, weight=weight)
             loss.backward()
             optimizer.step()
             total += float(loss)
