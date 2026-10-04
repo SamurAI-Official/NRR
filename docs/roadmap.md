@@ -242,11 +242,11 @@ measured, and temporal/reference data actually changes that image.
       5-point bar pre-registered in `docs/evaluation-protocol.md`. The capacity smooths the worst case -
       ch64's two seeds span 0.47 points against ch32's 7.34 - but the rule judged *improvement*, not
       variance, so the simpler model carries forward to P3.
-- [x] **Quality levers (P3) concluded: the config is unchanged.** depth+motion (−1.15), charbonnier
-      (+2.49) and cosine (+4.15) all fall below the 5-point bar, so ch32 colour-only L1 linear-warmup
-      stands. Cosine is never worse than l1 on any seed and is the closest lever, but a pre-registered
-      threshold is not moved after the fact. Untested and recorded: the `l1ssim` half of lever 2, and lever
-      4 (detail weighting), which needs a per-pixel detail map the dataset does not yet carry.
+- [x] **Quality levers (P3) concluded: the config is unchanged.** All five levers fall below the 5-point
+      bar against the 10-seed mean of 22.03%: depth+motion (−2.72), charbonnier (+0.92), cosine (+2.58),
+      l1ssim (+1.65) and detail-weight 0.5 (−2.38). Cosine is never worse than l1 on any seed and l1ssim is
+      the most seed-stable, but none clears the bar, and a pre-registered threshold is not moved after the
+      fact. ch32 colour-only L1 linear-warmup stands; the accuracy phase is done.
 - [x] **Final claim (10 seeds) and the full evaluation stack.** Ten seeds of the chosen config give a mean
       held-out L1 improvement of **22.03% ± 2.60%** (range 16.79-25.39); the shipped model is the best draw,
       seed 20261023 at 25.39%. The full stack on that model passes every pre-registered bar on both

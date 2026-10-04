@@ -100,20 +100,25 @@ holds after its edge). A name collision that shadowed the `learning_rate` helper
 same name was caught by a run dying with `'float' object is not callable` and fixed, which is the self-test
 and the run together doing their job.
 
-**Results - all three tested levers fail the 5-point bar, so the config is unchanged.**
+**Results - all five levers fail the 5-point bar, so the config is unchanged.** The bar is 5 points over the
+current config, whose best estimate is the ten-seed mean of 22.03%.
 
-| lever | seed 20261020 | seed 20261021 | mean | vs l1 (20.46%) |
+| lever | seed 20261020 | seed 20261021 | mean | vs l1 (22.03%) |
 | --- | --- | --- | --- | --- |
-| colour-only l1 (current) | 24.13% | 16.79% | 20.46% | - |
-| depth+motion | 20.48% | 18.15% | 19.31% | -1.15 |
-| charbonnier | 20.86% | 25.03% | 22.95% | +2.49 |
-| cosine | 25.55% | 23.66% | 24.61% | +4.15 |
+| colour-only l1 (current) | 24.13% | 16.79% | 22.03% (10 seeds) | - |
+| depth+motion | 20.48% | 18.15% | 19.31% | -2.72 |
+| charbonnier | 20.86% | 25.03% | 22.95% | +0.92 |
+| cosine | 25.55% | 23.66% | 24.61% | +2.58 |
+| l1ssim | 23.78% | 23.58% | 23.68% | +1.65 |
+| detail-weight 0.5 | 20.80% | 18.49% | 19.65% | -2.38 |
 
-Cosine comes closest, and is the only lever that is never worse than l1 on any seed, but +4.15 points is
-still below the fixed 5-point bar, and a pre-registered threshold is not something the result gets to move.
-ch32 colour-only with L1 and linear warmup stands. Two items remain untested and are recorded rather than
-forgotten: the `l1ssim` half of lever 2, and lever 4 (detail weighting), which needs a per-pixel detail map
-the dataset does not yet carry.
+Cosine remains the closest and the only lever never worse than l1 on any seed; l1ssim is the most
+seed-stable (0.20-point spread against l1's 7.34) but its +1.65 is still below the bar. The `l1ssim` lever
+exposed a real bug along the way: the SSIM term was first computed on the *residual*, not the full image,
+and the model learned nothing (2.9% progress, still at the baseline) - a measurement of the bug, not the
+lever - and the fix (SSIM on skip+residual vs target) is what produced the 23.68%. Detail weighting was
+implemented as a per-pixel Laplacian map (mean 1, replicate-padded) and is the only lever that is actively
+*worse* than l1. ch32 colour-only with L1 and linear warmup stands, and the accuracy phase is done.
 
 ### P2 frontier concluded: 4x capacity buys +2.75 points, below the 5-point bar, so ch32 stands
 
