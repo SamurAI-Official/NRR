@@ -49,8 +49,17 @@ const uint32_t kIgnoredInputHistory = 7u;
 const float kOffsetA = 0.1f;
 const float kOffsetB = kOffsetA + kFlicker;
 const float kOffsetC = kOffsetB + kFlicker;
-/* Motion magnitude 1.0 is where the history weight reaches exactly zero. */
+/* The engine declares scene motion as a *fraction of the frame width* (include/nrr.h), while the runtime's
+ * thresholds are in frame pixels - so this fixture, whose input grid is 4 pixels wide, can express at most
+ * 4 px of motion per frame: a fraction of 1.0 means "one whole frame width per frame". These constants say
+ * what that largest expressible fraction means to the history weight, computed from the runtime's own
+ * numbers rather than hard-coded, so the tests track the policy instead of keeping a second copy of it. */
 const float kFullMotion = 1.0f;
+const float kFullMotionPx = kFullMotion * static_cast<float>(kInW);
+const float kFullMotionAlpha =
+    nrr::TEMPORAL_BASE_ALPHA *
+    (1.0f - (kFullMotionPx - nrr::TEMPORAL_ALPHA_MOTION_GATE_PX) /
+                (nrr::TEMPORAL_ALPHA_MOTION_FULL_PX - nrr::TEMPORAL_ALPHA_MOTION_GATE_PX));
 
 uint16_t float_to_half(float value) {
     uint32_t bits = 0;
@@ -278,13 +287,17 @@ NRR_TEST(test_temporal_state_reported_from_pipeline) {
                   "second frame sees exactly one recorded history frame");
     NRR_EXPECT_EQ(f2.temporal.frame_index, 2u, "frame index is carried through");
 
-    /* Above the threshold the history weight decays linearly from the base weight
-     * down to zero at full motion; it is a ramp, not a hard cutoff. */
-    const float kHighMotion = nrr::TEMPORAL_MOTION_THRESHOLD + 0.4f;
+    /* The decay band, expressed in this fixture's units: a pixel motion inside the two thresholds, whose
+     * fraction is what the engine would declare for it. It is a ramp, not a hard cutoff. */
+    const float kMidPx = 2.5f;
+    NRR_ASSERT(kMidPx > nrr::TEMPORAL_ALPHA_MOTION_GATE_PX &&
+               kMidPx < nrr::TEMPORAL_ALPHA_MOTION_FULL_PX,
+               "the mid motion has to sit inside the decay band, or this proves nothing");
+    const float kHighMotion = kMidPx / static_cast<float>(kInW);
     const float kDecayedAlpha =
         nrr::TEMPORAL_BASE_ALPHA *
-        (1.0f - (kHighMotion - nrr::TEMPORAL_MOTION_THRESHOLD) /
-                    (1.0f - nrr::TEMPORAL_MOTION_THRESHOLD));
+        (1.0f - (kMidPx - nrr::TEMPORAL_ALPHA_MOTION_GATE_PX) /
+                    (nrr::TEMPORAL_ALPHA_MOTION_FULL_PX - nrr::TEMPORAL_ALPHA_MOTION_GATE_PX));
     const NRRFrameOutput f3 = render_frame(fx, 3, kHighMotion);
     NRR_EXPECT_NEAR(f3.temporal.temporal_alpha, kDecayedAlpha, 1e-5,
                     "alpha decays linearly from the base weight to zero at full motion");
@@ -375,17 +388,23 @@ NRR_TEST(test_temporal_motion_above_threshold_bypasses_history) {
     const NRRFrameOutput f1 = render_frame(fx, 1, 0.0f);
     const std::vector<uint8_t> raw_a = download_rgb(fx, f1.color);
 
-    /* Full motion (magnitude 1.0): the history weight reaches zero, so the displayed
-     * frame must be the model output with nothing blended in. */
+    /* The largest motion this fixture can express - one whole frame width per frame, i.e. 4 px on its 4-pixel
+     * input grid - sits inside the decay band but past the gate, so the history weight is the decayed value
+     * and *not* zero: the displayed frame must be accumulated by exactly that weight rather than passed
+     * through raw. Zero is unreachable here (the full-scale threshold is 7 px, wider than this fixture's
+     * whole grid), which is the visible consequence of the unit: the same declared 1.0 means "a whole frame
+     * width per frame" on any grid, so on a narrow frame it is a smaller pixel motion than on a wide one. The
+     * zero case is pinned in test_multi_frame.cpp's policy test, where the pixel value is passed directly. */
     upload_ramp(fx, kOffsetB);
     const NRRFrameOutput f2 = render_frame(fx, 2, kFullMotion);
-    NRR_EXPECT_NEAR(f2.temporal.temporal_alpha, 0.0f, 1e-6,
-                    "full motion removes the history weight");
+    NRR_EXPECT_NEAR(f2.temporal.temporal_alpha, kFullMotionAlpha, 1e-6,
+                    "the largest expressible motion decays the weight without zeroing it");
     const std::vector<uint8_t> high_motion = download_rgb(fx, f2.color);
     const std::vector<uint8_t> raw_b = raw_ramp_render(kOffsetB);
     const double bypass_delta = mean_abs_delta(high_motion, raw_b, 0, raw_b.size());
-    NRR_EXPECT_TRUE(bypass_delta < 1.0 / 255.0,
-                    "high-motion frame is the raw model output, not accumulated");
+    const double raw_change_ab = mean_abs_delta(raw_a, raw_b, 0, raw_b.size());
+    NRR_EXPECT_NEAR(bypass_delta, static_cast<double>(kFullMotionAlpha) * raw_change_ab, 3.0 / 255.0,
+                    "the frame is accumulated by the decayed history weight, not passed through raw");
 
     /* Low motion with the same kind of scene change: the history is blended in,
      * so the displayed frame must move away from the raw output by the history
@@ -415,9 +434,9 @@ NRR_TEST(test_temporal_stability_reported_from_displayed_frames) {
     TemporalFixture fx;
     make_fixture(fx);
     upload_constant_motion(fx, 0.0f, 0.0f);
-    /* Full motion for every frame, so the history weight is zero and the displayed
-     * images are exactly the model outputs, letting the stability number be
-     * cross-checked against the downloaded pixels. */
+    /* The largest motion this fixture can express (fraction 1.0 = a whole frame width per frame), so the
+     * history weight is small; the stability number is cross-checked against the downloaded pixels below
+     * either way, since it is measured from what was displayed, not from the weight. */
     const float kMotion = kFullMotion;
 
     upload_ramp(fx, kOffsetA);

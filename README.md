@@ -236,8 +236,10 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
 - [x] Temporal history buffer (ring buffer; depth 2 - only the previous displayed frame
       is ever reprojected)
 - [x] Motion vector warping (backward mapping + bilinear, in output texels)
-- [x] Temporal state manager (motion-adaptive alpha: 0.7 below the 0.3 motion threshold,
-      decaying to 0 at full motion)
+- [x] Temporal state manager (motion-adaptive alpha: 0.7 while the scene moves under 1.0
+      frame-grid px/frame, decaying linearly to 0 at 7.0 - `TEMPORAL_ALPHA_MOTION_GATE_PX` /
+      `_FULL_PX`, both measured; the declared motion is a fraction of the frame width and is
+      converted once, so the same number drives the phase-aligned gate too)
 - [x] Temporal stability metric (measured frame-over-frame change of the displayed image,
       reported in `NRRRenderStats::temporal_stability`)
 - [x] Scene reset handling, in two halves. A sequence that restarts (frame index does not

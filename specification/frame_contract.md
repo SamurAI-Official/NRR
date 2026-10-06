@@ -40,7 +40,7 @@ struct NRRFrameInput {
 |-------|----------|-------------------|-------|
 | `color` | Yes | Any RGB/A format | Input frame from game renderer |
 | `depth` | Yes | R32F or D24S8 | Metric or normalized depth |
-| `motion_vectors` | Yes | RG16F or RG8 (packed) | Pixel motion since previous frame |
+| `motion_vectors` | Yes | RG16F (two float16 channels) | Pixel motion since previous frame, on the input grid; resampled to the output grid with its vectors scaled by the resolution ratio |
 | `normals` | No | RGB32F or RGB16F | Must be in world or view space |
 | `camera` | Yes | See CameraData spec | Complete camera parameters |
 | `temporal` | Yes | See TemporalState spec | Must be maintained across frames |
@@ -87,7 +87,19 @@ Must be monotonically increasing across the NRR session lifetime.
 
 ### 4.3 Motion Magnitude
 
-Scalar [0, 1] representing overall camera/object motion.
+Scene motion for this frame, as a fraction of the frame width (`pixels per frame / frame_width`). One value
+per frame, not a per-pixel field: the per-pixel field is `motion_vectors`.
+
+It is a real measurement, and it has two consumers inside the runtime - the reprojection blend's history
+weight (which compares it, converted, against 1.0 and 7.0 frame-grid px/frame) and the phase-aligned
+accumulation's stillness gate (0.2 px/frame). Both read the conversion in
+`runtime/nrr_temporal.h::motion_magnitude_px()`, so they cannot disagree about what the number means; the
+converted quantity is frame-grid pixels, and the frame's own render width is the grid - on a 2x pipeline that
+is not the output width.
+
+A caller that has no measurement should pass 0 rather than a guess: the phase-aligned gate fails closed on
+anything large, so a placeholder disables the feature instead of misusing it. Values above 1 (a whole frame
+width per frame) are clamped.
 
 ### 4.4 Previous Output
 

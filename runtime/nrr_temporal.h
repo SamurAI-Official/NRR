@@ -21,8 +21,26 @@ namespace nrr {
 /* Temporal accumulation policy, shared by the implementation and its tests so
  * there is exactly one definition of each number. */
 constexpr float TEMPORAL_BASE_ALPHA = 0.7f;       /* history weight for low motion */
-constexpr float TEMPORAL_MOTION_THRESHOLD = 0.3f; /* motion magnitude above which
-                                                   * the history weight decays to 0 */
+
+/* The scene motion at which the history blend's weight starts to decay, and the motion at which it is given
+ * up entirely - both in *frame-grid pixels per frame*, which is the unit both engine bindings can measure.
+ *
+ * These replaced one threshold (0.3) on a motion "level" in [0,1], a unit no engine produces: Unity measures
+ * the camera's screen-space displacement and divides it by the frame width, so a real measurement is a
+ * fraction of the width, and 0.3 of a *level* is 576 px/frame on a 1920-wide frame - a value no measurement
+ * reaches. So the decay was dead code for callers that measured, while the same caller value drove the
+ * phase-aligned gate (0.2 px) to refuse every frame: two consumers of one field, disagreeing about what it
+ * meant. One unit now, and both thresholds measured.
+ *
+ * Measured by tools/aa_resolve_probe.py's blend_sweep, with the calibration and whole-pixel translations that
+ * make the rows comparable: the warped blend beats a single frame by ratio 0.70-0.76 at *every* motion from 0
+ * to 7 px/frame, while the same recursion with the warp removed degrades from ratio 0.70 at 0 to 1.50 at 7.
+ * So the blend does not stop paying inside the measured range - what these two numbers encode is where the
+ * warp becomes the whole benefit (1.0: dropping it costs 1.00x at 0 and 1.44x there), and where the
+ * measurement itself ends (7.0: the warp is worth 2.42x and the field is trusted less than the frame, which
+ * is the safe direction, since a wrong field smears a blend and nothing was measured past that point). */
+constexpr float TEMPORAL_ALPHA_MOTION_GATE_PX = 1.0f;
+constexpr float TEMPORAL_ALPHA_MOTION_FULL_PX = 7.0f;
 
 /* Reporting convention for NRRRenderStats::temporal_stability: the mean
  * per-channel change between consecutive displayed frames, as a fraction of the
@@ -31,13 +49,16 @@ constexpr float TEMPORAL_STABILITY_FULL_DELTA = 0.25f;
 
 /* How much scene motion the phase-aligned accumulation tolerates, in *frame-grid pixels per frame*.
  *
- * This is a different question from TEMPORAL_MOTION_THRESHOLD above, and a much stricter one: the
- * reprojection blend can follow motion, so it only has to know when to give up, whereas an integration
- * of distinct sub-pixel samples is only valid while the scene has not moved. Measured on the static
- * capture's frames by translating them a known amount per frame while the placement still uses the
- * recorded jitter (tools/aa_resolve_probe.py): the edge error's gain is gone by 0.2 px/frame
- * (-3.0% at 0.0, -1.1% at 0.1, +0.5% at 0.2) and the plain error's by about 0.5. 0.2 is therefore the
- * point past which the AA claim itself does not hold, against jitter steps of up to 0.5 px.
+ * This is a different question from TEMPORAL_ALPHA_MOTION_GATE_PX above, and a much stricter one: the
+ * reprojection blend can follow motion, so it only has to know when to trust the field less, whereas an
+ * integration of distinct sub-pixel samples is only valid while the scene has not moved. Measured on the
+ * static capture's frames by translating them a whole number of pixels per frame while the placement still
+ * uses the recorded jitter (tools/aa_resolve_probe.py, gate_sweep): the integration beats a single frame by
+ * -12.5% edge error at 0.143 px/frame and loses by +9.6% at 0.286, so the crossover sits between 0.2 and
+ * 0.25 and 0.2 is the point past which the AA claim itself does not hold, against jitter steps of up to
+ * 0.5 px. (The table's translations are whole pixels in both grids and its reference carries the capture's
+ * measured grid offset; without those two things the rows of that table are noise, which is what its first
+ * version was - see calibrate_reference and integer_motion_sweep in that tool.)
  *
  * It is compared in pixels, so a caller's motion has to be a real measurement: on the capture this was
  * validated against, the motion *field* reads mean |motion| 0.10998 on every frame - byte-identical
@@ -62,6 +83,34 @@ inline uint32_t quantify_stability(float displayed_delta) {
     float change = displayed_delta / TEMPORAL_STABILITY_FULL_DELTA;
     change = change < 0.0f ? 0.0f : (change > 1.0f ? 1.0f : change);
     return static_cast<uint32_t>(100.0f * (1.0f - change) + 0.5f);
+}
+
+inline uint32_t motion_grid(const NRRFrameInput& input,
+                            uint32_t frame_width, uint32_t output_width) {
+    return frame_width > 0 ? frame_width
+         : input.temporal.resolution_x > 0 ? input.temporal.resolution_x
+         : output_width;
+}
+
+/* Converts a caller's motion magnitude - a *fraction of the frame width*, the unit both engine bindings
+ * measure and the one NRRFrameInput::temporal.motion_magnitude is documented in - into the frame-grid pixels
+ * per frame that every motion threshold in this file is expressed in.
+ *
+ * One definition, because two consumers read that field: the reprojection blend's history weight and the
+ * phase-aligned gate. They disagreed about what the number meant - the gate multiplied it by the frame width
+ * while the blend compared the raw fraction against 0.3 - so a Unity measurement (6 px of camera motion at
+ * 1920 = 0.0031) left the blend holding 0.7 of its history while the gate refused the frame, in the same
+ * frame. Both now read this function's output.
+ *
+ * The grid is the one the thresholds were measured on, the frame's own render width, which on an upscaling
+ * pipeline is *not* the output width: `frame_width` is what the backend knows from the input render,
+ * `resolution_x` is what the caller declares, and the output width is the last resort for a caller that
+ * declares neither. */
+inline float motion_magnitude_px(const NRRFrameInput& input,
+                                 uint32_t frame_width, uint32_t output_width) {
+    const float magnitude = input.temporal.motion_magnitude;
+    const float clamped = magnitude < 0.0f ? 0.0f : (magnitude > 1.0f ? 1.0f : magnitude);
+    return clamped * static_cast<float>(motion_grid(input, frame_width, output_width));
 }
 
 /* A frame index that does not advance past the last recorded frame, or a change of
@@ -185,6 +234,13 @@ public:
      * parameterless predicate could disagree with the retrieval it guards. */
     bool has_previous_frame(uint64_t current_frame_index) const;
 
+    /* The mean displacement in a motion field, as a fraction of the frame width - the same unit
+     * NRRFrameInput::temporal.motion_magnitude is declared in, so the two ways of reporting motion in this
+     * file cannot drift into different scales. `current_motion` is interleaved RG pixels per frame and
+     * `width` is the grid those pixels are on. Returns 0 for an absent or empty field.
+     *
+     * (This used to divide by a hard-coded 10 and saturate at 1, which is a third scale for the same
+     * quantity: nothing outside the tests read it, and nothing could have used it alongside the ABI field.) */
     float calculate_motion_magnitude(uint64_t frame_index,
                                      const std::vector<float>& current_motion,
                                      uint32_t width, uint32_t height) const;
@@ -247,9 +303,15 @@ public:
     void shutdown();
     /* Computes this frame's temporal state (motion magnitude, history weight
      * alpha, history depth) without recording anything. Call once per frame,
-     * before rendering. */
+     * before rendering.
+     *
+     * `motion_px` is the frame's declared motion in frame-grid pixels per frame - the caller converts with
+     * motion_magnitude_px(), because only it knows the frame's render width. It is required rather than
+     * defaulted: a default would let a call site keep the old reading (a fraction compared against a pixel
+     * threshold) silently, which is the incoherence this parameter exists to remove. */
     NRRTemporalState compute_state(const NRRFrameInput& input,
-                                   const TemporalHistory& history);
+                                   const TemporalHistory& history,
+                                   float motion_px);
 
     /* Records a rendered frame so the next frame can warp and blend against it.
      * An instance without an image records an empty placeholder entry, which the
@@ -271,16 +333,23 @@ public:
     float get_temporal_alpha() const { return temporal_alpha_; }
     void set_temporal_alpha(float alpha) { temporal_alpha_ = alpha; }
     float get_motion_magnitude() const { return current_motion_magnitude_; }
-    void set_motion_threshold(float threshold) { motion_threshold_ = threshold; }
+    /* The two ends of the history weight's decay, in frame-grid pixels per frame; see
+     * TEMPORAL_ALPHA_MOTION_GATE_PX / _FULL_PX for the measurement behind the defaults. Settable so a test
+     * can pin the shape without depending on the constants. */
+    void set_alpha_motion_gate_px(float px) { alpha_motion_gate_px_ = px; }
+    void set_alpha_motion_full_px(float px) { alpha_motion_full_px_ = px; }
 
 private:
     NRRDevice* device_;
     bool initialized_;
     uint64_t frame_index_;
     float temporal_alpha_;
-    float motion_threshold_;
+    float alpha_motion_gate_px_;
+    float alpha_motion_full_px_;
     float current_motion_magnitude_;
     bool first_frame_;
+    /* The magnitude as declared - a fraction of the frame width, clamped to [0,1]. Kept only to echo back in
+     * NRRTemporalState::motion_magnitude; the policy works in pixels (motion_magnitude_px). */
     float analyze_motion(const NRRFrameInput& input, uint32_t width, uint32_t height) const;
 };
 
@@ -346,11 +415,12 @@ public:
         bool eligible = false;
         float offset_x = 0.0f;  /* the content displacement, in OUTPUT pixels */
         float offset_y = 0.0f;
-        /* The width of the grid the frame was sampled on. The gate constant is in *frame-grid* pixels
-         * (that is the grid it was measured on), so the declared magnitude - a fraction of the frame -
-         * has to be converted with this rather than with the output width: on a 2x pipeline the two differ
-         * by a factor of two, which would make the gate twice as strict as the measurement behind it.
-         * Zero means "the output grid", which is what a caller integrating at native resolution means. */
+        /* The width of the grid the frame was sampled on. Both motion thresholds in this file are in
+         * *frame-grid* pixels per frame (that is the grid they were measured on), so the declared magnitude -
+         * a fraction of the frame - is converted with this, once, by motion_magnitude_px(), and the result
+         * feeds both the history weight and the gate below. On a 2x pipeline this grid and the output grid
+         * differ by a factor of two, which would make the thresholds twice as strict as the measurements
+         * behind them. Zero means "whatever the caller declared as its render resolution". */
         uint32_t frame_width = 0;
     };
 
@@ -360,6 +430,10 @@ public:
         float displayed_delta = 0.0f;   /* frame-to-frame change of what was displayed */
         bool blended = false;
         TemporalBlendStats blend_stats;
+        /* The frame's motion in the unit every threshold is expressed in - frame-grid pixels per frame,
+         * from motion_magnitude_px(). Public because it is what both consumers used, in one number: the
+         * history weight above and the phase-aligned gate below. */
+        float motion_px = 0.0f;
         /* Frames in the phase-aligned accumulation after this frame, and what happened to it. */
         uint32_t phase_aligned_frames = 0;
         /* Why the blend did or did not happen: "no previous frame",

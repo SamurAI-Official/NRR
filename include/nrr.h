@@ -241,7 +241,7 @@ typedef struct {
     float delta_time;
     uint32_t resolution_x;
     uint32_t resolution_y;
-    float motion_magnitude;      /* [0,1] */
+    float motion_magnitude;      /* scene motion per frame, as a fraction of the frame width */
     NRRTexture* previous_output; /* may be NULL */
     float temporal_alpha;        /* [0,1] */
     uint32_t history_frames;
@@ -418,14 +418,27 @@ NRR_API NRRResult nrr_device_reset_temporal_history(NRRDevice* device);
  * not initialized or whose backend cannot integrate (nothing is enabled in that case, and the caller is
  * told rather than silently given an off switch).
  *
+ * `motion_magnitude` has *two* consumers - this gate and the reprojection blend's history weight - and they
+ * used to read it as two different quantities (the gate multiplied it by the frame width, the blend compared
+ * the raw fraction against 0.3), so one measured value could refuse the frame here while keeping 0.7 of the
+ * history there, in the same frame. It is now defined as a fraction of the frame width, converted once by
+ * runtime/nrr_temporal.h's motion_magnitude_px(), and both thresholds are expressed in the result: this one
+ * at 0.2 px, the blend's decay from 1 to 7 px.
+ *
  * Motion: the runtime restarts the pixels a supplied motion field reports as moved and keeps integrating
- * the rest, so a partly moving scene keeps the still region's accumulation. It does *not* warp the
- * accumulation - measured, warping is worse than not warping on both the edge and the plain metrics,
- * because it spreads each sample over its neighbours every frame. Without a field, the declared
- * `motion_magnitude` decides for the frame as a whole, and a value past 0.2 px per frame drops the
- * accumulation. That magnitude cannot be derived by the runtime: three measurements of the frames it
- * already holds (a sub-pixel fit, and two residual comparisons) found no usable alignment signal at these
- * scales, so it has to come from the caller - see PHASE_ALIGNED_MOTION_GATE_PX in runtime/nrr_temporal.h.
+ * the rest, so a partly moving scene keeps the still region's accumulation - measured, that region keeps
+ * exactly the gain it has on a fully still scene (edge error 0.0277 at eight frames against 0.0439 for a
+ * single frame) where the global gate, which drops the whole accumulation, loses all of it. It does *not*
+ * warp the accumulation. That was originally justified by a measurement with two instrument faults (the warp
+ * applied at half magnitude on a 2x capture, and the accumulation scored against a target that never moved);
+ * corrected, a *reprojected whole-frame* mean does win on a scene that translates (0.030 against 0.046 for a
+ * single frame), so "never warp" is not a general result - but restarting beats every whole-frame arrangement
+ * on the partly-moving content the two were measured on, and the two have not been compared head to head.
+ * See reproject_successive and per_pixel_gate_check in tools/aa_resolve_probe.py.
+ *
+ * That magnitude cannot be derived by the runtime: three measurements of the frames it already holds (a
+ * sub-pixel fit, and two residual comparisons) found no usable alignment signal at these scales, so it has
+ * to come from the caller - see PHASE_ALIGNED_MOTION_GATE_PX in runtime/nrr_temporal.h.
  */
 NRR_API NRRResult nrr_device_set_phase_aligned_accumulation(NRRDevice* device, int enabled);
 

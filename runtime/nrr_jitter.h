@@ -129,19 +129,28 @@ bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
  * Only frames of one scene may be accumulated: this integrates samples, it does
  * not reproject them, so a moving camera or object has to be excluded by the
  * caller (or reprojected first) or the average blurs the motion. That gate is the
- * caller's policy, and the probe measures what it should be: on the static
- * capture's frames the edge error's gain is gone by 0.2 px of scene motion per
- * frame and the plain error's by 0.5, against a jitter whose steps are up to 0.5 px.
+ * caller's policy, and it is measured: with the probe's reference calibrated to
+ * the capture's own grid and whole-pixel translations, the integration beats a
+ * single frame by -12.5% edge error at 0.143 px/frame and loses by +9.6% at 0.286,
+ * so the crossover is between 0.2 and 0.25 and PHASE_ALIGNED_MOTION_GATE_PX is 0.2,
+ * against a jitter whose steps are up to 0.5 px.
  *
- * Restarting a pixel is how a *partly* moving scene is handled, and warping was
- * measured and refused: bilinear-warping the accumulated samples by the exact field
- * that describes a 0.5 px/frame move leaves the mean at +9.5% of a single frame's
- * edge error against -0.6% for leaving it alone (the plain error moves the same
- * way), because the warp spreads each sample over its neighbours and does it again
- * every frame - it destroys the sub-pixel diversity this class exists to integrate.
- * Marking the pixels a motion field reports as moved, and letting them start again
- * while their neighbours keep averaging, keeps the still region's -9.8% plain-error
- * gain and leaves the moving region no worse than a single frame.
+ * Restarting a pixel is how a *partly* moving scene is handled, and it keeps the
+ * still region's gain exactly: measured, that region's edge error at 8 frames is
+ * 0.0277 - the same number the fully still integration reports - against 0.0439 for
+ * a single frame, where the global gate (which drops the whole accumulation because
+ * one part of the frame moved) loses all of it.
+ *
+ * Warping is *not* what this class does, and the measurement that once justified
+ * that refusal was faulty: "+9.5% against -0.6% for leaving it alone" was taken with
+ * the warp applied at half magnitude on a 2x capture and the accumulation scored
+ * against a target that never moved, which rewards a history for lagging behind the
+ * content. Corrected, a reprojected *whole-frame* mean does win on a scene that
+ * translates (0.0300 at 0.14-1.0 px/frame against 0.0463 for one frame and 0.0797 for
+ * an unwarped mean), so "never warp" is not a general conclusion - but restarting
+ * beats every whole-frame arrangement on the partly-moving content each was measured
+ * on, and the two have not been compared head to head. That comparison is open, and
+ * it is a design decision rather than an overdue fix.
  *
  * Memory: the resolved frame plus one scratch frame at the output resolution
  * (~25 MB at 1920x1080 RGB). An instance is not thread-safe; give each thread its

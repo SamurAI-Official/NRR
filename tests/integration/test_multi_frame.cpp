@@ -112,14 +112,18 @@ NRR_TEST(test_motion_magnitude_calculation) {
         motion[i * 2] = 2.0f;
     }
 
+    /* A fraction of the frame width - the same unit NRRFrameInput::temporal.motion_magnitude is declared
+     * in, so this helper and the ABI field cannot drift into different scales. It used to divide by a
+     * hard-coded 10. */
     const float slow = history.calculate_motion_magnitude(1, motion, kW, kH);
-    NRR_EXPECT_NEAR(slow, 0.2f, 0.01f, "mean |motion| / 10 is the magnitude");
+    NRR_EXPECT_NEAR(slow, 2.0f / static_cast<float>(kW), 1e-6,
+                    "mean |motion| over the frame width is the magnitude");
 
     for (size_t i = 0; i < motion.size() / 2; ++i) {
         motion[i * 2] = 40.0f;
     }
     const float fast = history.calculate_motion_magnitude(1, motion, kW, kH);
-    NRR_EXPECT_NEAR(fast, 1.0f, 1e-6, "the magnitude saturates at 1");
+    NRR_EXPECT_NEAR(fast, 1.0f, 1e-6, "the magnitude saturates at one frame width per frame");
     NRR_EXPECT_TRUE(fast > slow, "larger motion vectors report a larger magnitude");
 
     NRR_EXPECT_NEAR(history.calculate_motion_magnitude(1, std::vector<float>(), kW, kH),
@@ -131,42 +135,75 @@ NRR_TEST(test_temporal_state_manager_policy) {
     TemporalHistory history;
     NRR_EXPECT_TRUE(mgr.initialize(nullptr), "state manager initialization");
 
+    /* Motion is handed to compute_state() in frame-grid pixels per frame, which is what every threshold in
+     * the runtime is expressed in and what the caller's declared fraction is converted into by
+     * motion_magnitude_px(). Passing it in directly is the point: the two consumers of the ABI field - this
+     * weight and the phase-aligned gate - read one converted number, so a test cannot accidentally pin a
+     * second interpretation of the same field (which is what the old constant did: 0.3 of a [0,1] "level"). */
+    const float kGatePx = TEMPORAL_ALPHA_MOTION_GATE_PX;
+    const float kFullPx = TEMPORAL_ALPHA_MOTION_FULL_PX;
+    NRR_ASSERT(kFullPx > kGatePx, "the decay band has to be non-empty, or this proves nothing");
+
     /* First frame: no history exists yet, so there is nothing to blend with. */
-    const NRRTemporalState first = mgr.compute_state(make_input(1, 0.0f), history);
+    const NRRTemporalState first = mgr.compute_state(make_input(1, 0.0f), history, 0.0f);
     NRR_EXPECT_NEAR(first.temporal_alpha, 0.0f, 1e-6, "first frame has no history weight");
     NRR_EXPECT_EQ(first.history_frames, 0u, "first frame reports no available history");
 
-    /* Second frame, low motion: the base history weight applies. */
+    /* Second frame, no motion: the base history weight applies - the blend's job is exactly this. */
     mgr.record_frame(make_input(1, 0.0f), make_frame(0.5f), history);
-    const NRRTemporalState low = mgr.compute_state(make_input(2, 0.0f), history);
+    const NRRTemporalState low = mgr.compute_state(make_input(2, 0.0f), history, 0.0f);
     NRR_EXPECT_NEAR(low.temporal_alpha, TEMPORAL_BASE_ALPHA, 1e-6,
-                    "low motion uses the base history weight");
+                    "a still scene uses the base history weight");
     NRR_EXPECT_EQ(low.history_frames, 1u, "one previous frame is available");
 
-    /* Above the motion threshold the history weight decays linearly to zero. */
-    const float mid_motion = 0.65f;
+    /* Off by a hair past the gate the weight is still the base one: the decay is a ramp, not a cutoff. */
+    const NRRTemporalState at_gate =
+        mgr.compute_state(make_input(9, 0.0f), history, kGatePx);
+    NRR_EXPECT_NEAR(at_gate.temporal_alpha, TEMPORAL_BASE_ALPHA, 1e-6,
+                    "at the gate the weight is undecayed");
+
+    /* Between the two constants it decays linearly, and it reaches zero at the full-scale motion. */
+    const float mid_px = 0.5f * (kGatePx + kFullPx);
     const float expected_mid =
-        TEMPORAL_BASE_ALPHA * (1.0f - (mid_motion - TEMPORAL_MOTION_THRESHOLD) /
-                                          (1.0f - TEMPORAL_MOTION_THRESHOLD));
-    const NRRTemporalState mid = mgr.compute_state(make_input(3, mid_motion), history);
+        TEMPORAL_BASE_ALPHA * (1.0f - (mid_px - kGatePx) / (kFullPx - kGatePx));
+    const NRRTemporalState mid = mgr.compute_state(make_input(3, 0.0f), history, mid_px);
     NRR_EXPECT_NEAR(mid.temporal_alpha, expected_mid, 1e-6,
-                    "high motion decays the history weight linearly");
-    NRR_EXPECT_TRUE(mid.temporal_alpha < low.temporal_alpha,
-                    "more motion means less history");
+                    "the weight decays linearly across the band");
+    NRR_EXPECT_TRUE(mid.temporal_alpha < low.temporal_alpha, "more motion means less history");
 
-    const NRRTemporalState full = mgr.compute_state(make_input(4, 1.0f), history);
+    const NRRTemporalState full = mgr.compute_state(make_input(4, 0.0f), history, kFullPx);
     NRR_EXPECT_NEAR(full.temporal_alpha, 0.0f, 1e-6,
-                    "maximum motion rejects the history entirely");
+                    "at the full-scale motion the history is rejected entirely");
+    const NRRTemporalState beyond = mgr.compute_state(make_input(10, 0.0f), history, 1000.0f);
+    NRR_EXPECT_NEAR(beyond.temporal_alpha, 0.0f, 1e-6, "past it the history stays rejected");
 
-    /* The reported magnitude is the engine-supplied value, clamped to [0,1]. */
-    NRR_EXPECT_NEAR(mgr.compute_state(make_input(5, 0.4f), history).motion_magnitude,
+    /* The reported magnitude is the engine-supplied value, clamped to [0,1] - the *fraction*, echoed back
+     * for the caller, not the converted pixels the policy works in. */
+    NRR_EXPECT_NEAR(mgr.compute_state(make_input(5, 0.4f), history, 0.0f).motion_magnitude,
                     0.4f, 1e-6, "reported magnitude is the clamped engine input");
-    NRR_EXPECT_NEAR(mgr.compute_state(make_input(6, 5.0f), history).motion_magnitude,
+    NRR_EXPECT_NEAR(mgr.compute_state(make_input(6, 5.0f), history, 0.0f).motion_magnitude,
                     1.0f, 1e-6, "magnitudes above 1 are clamped");
+    NRR_EXPECT_NEAR(mgr.compute_state(make_input(7, -3.0f), history, 0.0f).motion_magnitude,
+                    0.0f, 1e-6, "negative magnitudes are clamped too");
+
+    /* And the conversion itself: the same declared value means different pixel motions on different grids,
+     * which is the whole reason the thresholds are not expressed in the declared unit. */
+    const NRRFrameInput small = make_input(8, 0.5f);
+    const NRRFrameInput wide = make_input(8, 0.5f);
+    NRRFrameInput wide_input = wide;
+    wide_input.temporal.resolution_x = 8 * kW;
+    NRR_EXPECT_NEAR(motion_magnitude_px(small, 0, kW), 0.5f * static_cast<float>(kW), 1e-6,
+                    "half the frame width on an 8px grid is 4 px");
+    NRR_EXPECT_NEAR(motion_magnitude_px(wide_input, 0, 8 * kW), 0.5f * static_cast<float>(8 * kW),
+                    1e-6, "the same declared value on a 64px grid is 32 px");
+    /* The frame's own render width wins over what the caller declares, and the output width is the last
+     * resort: on a 2x pipeline the first two differ by a factor of two. */
+    NRR_EXPECT_NEAR(motion_magnitude_px(wide_input, kW, 8 * kW), 0.5f * static_cast<float>(kW), 1e-6,
+                    "the frame grid the gate was measured on wins over the declared resolution");
 
     /* reset() forgets the history context. */
     mgr.reset();
-    const NRRTemporalState after_reset = mgr.compute_state(make_input(7, 0.0f), history);
+    const NRRTemporalState after_reset = mgr.compute_state(make_input(11, 0.0f), history, 0.0f);
     NRR_EXPECT_NEAR(after_reset.temporal_alpha, 0.0f, 1e-6,
                     "reset restores first-frame behaviour");
 

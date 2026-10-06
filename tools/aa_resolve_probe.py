@@ -41,6 +41,18 @@ integration as the reference.
   5. PER-PIXEL RESTARTS. The cheaper alternative to warping: the field marks the pixels whose content
      moved, those are restarted, their neighbours keep integrating.
 
+  6. THE BLEND'S OWN THRESHOLD, in the unit a caller can produce. The reprojection blend is the default
+     temporal path, and the constant that decides when it decays was expressed as a motion "level" in
+     [0,1] while both engines can only measure a displacement over the frame width. This sweeps the blend
+     against scene motion in frame pixels per frame, with the warp and without it, which is where the
+     threshold's scale - and the point past which the blend stops paying - comes from.
+
+  7. COMPOSITION. Every AA number above measures the integration *alone*. The runtime blends first, then
+     integrates the blended frame, and records the resolve as the next frame's history - so the samples
+     being integrated are already a mix of this frame's reconstruction and the previous resolve. Five
+     arms at a fixed motion, including the other ordering, because "the pass still pays once the blend is
+     in front of it" is the claim, and nothing had measured it.
+
 Usage:
     python tools/aa_resolve_probe.py
     python tools/aa_resolve_probe.py --frames 8 --data models/training-data/godot-static
@@ -58,6 +70,15 @@ if HERE not in sys.path:
 # definition rather than two that can drift: this tool asks a different question about the same
 # operation.
 import aa_samples_probe as samples  # noqa: E402
+
+# The two constants the runtime's temporal policy is expressed in, mirrored here so the probe measures the
+# arrangement the runtime actually runs. BLEND_ALPHA_AT_REST is nrr_temporal.h's TEMPORAL_BASE_ALPHA (the
+# history weight when nothing is moving) and INTEGRATION_GATE_PX is PHASE_ALIGNED_MOTION_GATE_PX (how still
+# the scene has to be for an *integration* of distinct samples to mean anything). They answer different
+# questions - the blend follows motion, the integration requires its absence - and the tables below are
+# where the second number comes from.
+BLEND_ALPHA_AT_REST = 0.7
+INTEGRATION_GATE_PX = 0.2
 
 
 def load_frames(data_dir, split, count):
@@ -184,13 +205,41 @@ def run_model(session, frames):
 def placed(image, jitter, scale, mirrored=False):
     """The frame's content moved by -scale*j - the placement `PhaseAlignedAccumulator::add_frame`
     performs - or by +scale*j when `mirrored`, which is the direction nrr_jitter.h records as the one
-    that scatters the samples instead of resolving them."""
+    that scatters the samples instead of resolving them.
+
+    Which branch the *code* produces is worth stating, because the two read as opposites:
+
+      * `mirrored=True` reads the image at `x + scale*j`, i.e. content moved by -scale*j, which is
+        `add_frame`'s direction (it reads at `x + shift`, nrr_jitter.cpp) and the capture's own
+        (`input(x) = scene(x - j)`). Every number quoted in the runtime - the -27.8% at 4 frames and
+        -28.7% at 8 in nrr_temporal.h, the -27.8%/-18.0% pair - is this branch.
+      * `mirrored=False` reads at `x - scale*j`, the direction nrr_jitter.h records as scattering the
+        samples rather than resolving them, and the one `samples.align_sample` models.
+
+    So the default is the mirrored direction and the numbers above use the non-default; the parameter
+    selects a branch rather than describing the sign, and `samples.align_sample`'s docstring is the one
+    to read for which of the two reconstructs.
+    """
     factor = scale if mirrored else -scale
     height, width = image.shape[:2]
     xs = np.arange(width, dtype=np.float32) + factor * float(jitter[0])
     ys = np.arange(height, dtype=np.float32) + factor * float(jitter[1])
     grid_x, grid_y = np.meshgrid(xs, ys)
     return samples._bilinear(image, grid_x, grid_y)
+
+
+def placed_sample(frame, jitter, target_size, scale):
+    """A low-resolution frame's samples placed where they were taken, in the *capture's* direction.
+
+    `samples.align_sample` models the surrogate (plate) convention, which its own docstring says is the
+    mirror of the capture's: against the capture's un-jittered targets the capture's direction improves a
+    frame by 0.4% where the plate direction degrades it by 1.6%. The runtime performs the capture's
+    direction - `PhaseAlignedAccumulator::add_frame` reads at `x + offset`, nrr_jitter.cpp - so the tables
+    asking what the integration the runtime performs is worth use this one. Mixing the two directions
+    inside a moving-reference table produces numbers that swing by a factor of two with the motion, since
+    the mirror error and the reference's own displacement partially cancel at some motions and not others.
+    """
+    return placed(samples.upsample(frame, target_size), jitter, scale, mirrored=True)
 
 
 def row(label, count, image, target, weights, single_edge, single_plain):
@@ -246,14 +295,16 @@ def input_side(frames, target, weights, counts):
     """The reference: the same frames with no model in between, placed where they were taken - the
     operation the sample-side probe measured."""
     print("\nsamples, no model (reference)")
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
     single = samples.upsample(frames[0]["input"], target.shape[:2])
     single_edge = samples.edge_error(single, target, weights)
     single_plain = float(np.abs(single - target).mean())
     print("  1 frame                              edge %.6f   plain %.6f"
           % (single_edge, single_plain))
     for count in counts:
-        placed_mean = np.mean([samples.align_sample(frame["input"], frame["jitter"],
-                                                    target.shape[:2])
+        # The placement the runtime performs (placed_sample), not align_sample's plate direction: this is
+        # the reference the model-side numbers are compared against.
+        placed_mean = np.mean([placed_sample(frame["input"], frame["jitter"], target.shape[:2], scale)
                                for frame in frames[:count]], axis=0)
         row("integration", count, placed_mean, target, weights, single_edge, single_plain)
 
@@ -403,51 +454,131 @@ def motion_estimator_check(frames, motions, scale, count=4):
 
 
 
+def moved_target(reference, motion, scale, index):
+    """The reference for frame `index` of a scene moving `motion` frame pixels per frame.
+
+    Scoring a translated frame against a reference that never moved measures the translation rather than
+    the temporal path: every extra frame's content sits further from the reference, so an *aligned*
+    history is penalised for following the content while an un-warped one is rewarded for lagging behind
+    it. That is a property of the metric, not of reprojection - and it is why every warp used to measure
+    worse than no warp here, including an exactly-integer one that costs no interpolation at all. A
+    renderer scores against the frame it is drawing, so the reference moves with the content.
+
+    `reference` is expected to be the *calibrated* target (main() shifts it once by REFERENCE_OFFSET), so
+    this only applies the motion. Applying the calibration here as well would double it.
+    """
+    return translated(reference, (motion * index * scale, motion * index * scale))
+
+
+# The capture's own geometry: the offset between the un-jittered target's grid and the grid a frame's
+# samples land on when they are placed. Measured on the samples (never on a model, so it is the capture's
+# and not the model's bias) by calibrate_reference(), and applied by moved_target() to every reference.
+# Zero until set, so a table run without calibration behaves as it did before.
+REFERENCE_OFFSET = (0.0, 0.0)
+
+
+def calibrate_reference(target, reference_image):
+    """Measures that offset and returns (dx, dy, error), coarse then fine so it stays cheap.
+
+    It matters more than it sounds: on this capture, shifting the reference by half a target pixel lowers
+    an aligned accumulation's edge error from 0.087 to 0.030 - a factor of three, larger than any effect
+    the temporal path has. Left in, it dominates every row, the arrangements stop being distinguishable,
+    and the rows are not comparable to each other (each motion translates the reference by a different
+    amount, so the residual offset beats against it: that is why the first motion tables read as noise).
+    """
+    def search(centre_x, centre_y, span, step):
+        best = None
+        for dy in np.arange(-span, span + 1e-6, step):
+            for dx in np.arange(-span, span + 1e-6, step):
+                moved = translated(target, (float(centre_x + dx), float(centre_y + dy)))
+                error = samples.edge_error(reference_image, moved, samples.edge_weights(moved))
+                if best is None or error < best[2]:
+                    best = (float(centre_x + dx), float(centre_y + dy), error)
+        return best
+
+    coarse = search(0.0, 0.0, 1.0, 0.25)
+    return search(coarse[0], coarse[1], 0.25, 0.05)
+
+
+def integer_motion_sweep(count, scale, maximum, stride=1):
+    """Motions in frame pixels per frame whose translations land on whole pixels - in *both* grids.
+
+    A synthetic translation is a resampling, and a resampling blurs. Translating the reference by a
+    fractional amount blurs the reference; translating the input by a fractional amount blurs the input. Both
+    change the edge-error metric's own scale by more than the effects being compared - which is why the
+    first version of these tables jumped by a factor of two between adjacent motions. Choosing `j / (count-1)`
+    for integer j means the input moves exactly j frame pixels over the sweep and the reference exactly
+    `j * scale` output pixels: whole numbers, so nothing in the comparison is blurred by the harness.
+
+    `stride` steps the integer j, which is how a sweep reaches large motions without a row per frame pixel.
+    """
+    span = float(count - 1)
+    return [j / span for j in range(0, int(maximum * span) + 1, stride)]
+
+
+def set_reference_offset(dx, dy):
+    """Installs the calibration for moved_target(), so the tables read it from one place."""
+    global REFERENCE_OFFSET
+    REFERENCE_OFFSET = (float(dx), float(dy))
+
+
 def reproject_successive(frames, target, weights, motions, count):
 
     """Does reprojecting the accumulation keep the integration's gain while the scene moves?
 
     Each frame is translated by its own distance from the first - a scene moving m pixels per frame - and
     one accumulator is warped by that same amount before each new frame is added, which is what the runtime
-    would do with the frame's motion field. Three columns, because the interesting question is not whether
-    reprojection helps but what it costs: the *unwarped* mean is what happens if the accumulation is simply
-    left running across a move (the smearing the gate exists to prevent), and the *warped* mean is the
-    reprojected one. The warp is bilinear and happens once per frame, so its blur compounds - which is why
-    the m=0 row matters: warping by a whole number of pixels is exactly the identity, so the cost there
-    should be nil and any cost in the other rows is real.
+    does with the frame's motion field, in output pixels: the runtime scales an input-grid field by the
+    resolution ratio when it resamples it (resample_motion_field_nchw). Both accumulators are then scored
+    against the reference at the position the last frame's content is at, so the columns compare like with
+    like - one frame, the plain mean (what "leave the accumulation running across a move" buys) and the
+    reprojected mean (what following the move buys).
+
+    The m=0 row is the control: the warp is exactly the identity there, so any cost in the other rows is
+    the warp's and not the table's.
     """
     print("\nreprojection: scene motion per frame vs the integration's error (K=%d)" % count)
-    single_edge = samples.edge_error(
-        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
-    single_plain = float(np.abs(samples.upsample(frames[0]["input"], target.shape[:2])
-                                - target).mean())
-    print("  %-11s %-22s %-22s %s"
-          % ("motion px/f", "unwarped mean (edge/plain)", "reprojected (edge/plain)", "reprojected/single edge"))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    print("  %-11s %-11s %-22s %-22s %s"
+          % ("motion px/f", "one frame", "unwarped mean (edge/plain)", "reprojected (edge/plain)",
+             "reprojected/one frame"))
     for motion in motions:
         unwarped = np.zeros_like(target)
         warped = np.zeros_like(target)
+        one_frame = None
         for index in range(count):
             moved = translated(frames[index]["input"], (motion * index, motion * index))
-            placed = samples.align_sample(moved, frames[index]["jitter"], target.shape[:2])
+            placed = placed_sample(moved, frames[index]["jitter"], target.shape[:2], scale)
             if index > 0:
-                # The history was built in the previous frame's coordinates and the scene has moved by
-                # `motion` since, so it is read back from where it was taken. The runtime's reprojection
-                # convention is `source = x - motion * scale` (nrr_temporal.h), which is a gather at
-                # X + motion here.
-                warped = translated(warped, (motion, motion))
+                # The history was built in the previous frame's coordinates and the scene has moved
+                # `motion` *frame* pixels since - `motion * scale` output pixels - so it is read back from
+                # where it was taken. The runtime's reprojection convention is `source = x - motion *
+                # scale` (nrr_temporal.h), which is a gather at X + motion * scale here; the runtime
+                # applies exactly that factor when it resamples an input-grid field onto the output grid
+                # (resample_motion_field_nchw multiplies by the resolution ratio). Warping by `motion`
+                # instead applied half the field on this 2x capture - the same unit slip the
+                # phase-aligned gate had once (frame vs output width) - and that is the direction that
+                # biases a reprojection measurement *against* reprojection: the warp's blur is paid in
+                # full while its alignment is halved.
+                warped = translated(warped, (motion * scale, motion * scale))
+            one_frame = placed
             unwarped += placed
             warped += placed
         unwarped /= float(count)
         warped /= float(count)
-        unwarped_edge = samples.edge_error(unwarped, target, weights)
-        reprojected_edge = samples.edge_error(warped, target, weights)
-        print("  %-11.3f %-22s %-22s %.4f"
-              % (motion,
-                 "%.6f / %.6f" % (unwarped_edge, float(np.abs(unwarped - target).mean())),
-                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
-                 reprojected_edge / single_edge))
-    print("  one frame: edge %.6f  plain %.6f" % (single_edge, single_plain))
-def per_pixel_gate_check(frames, target, weights, motion, count=8, gate=0.2):
+        # The reference moves with the content (moved_target): the accumulation's latest state is scored
+        # where the scene is now, which is the frame a renderer is drawing.
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        one_edge = samples.edge_error(one_frame, reference, ref_weights)
+        unwarped_edge = samples.edge_error(unwarped, reference, ref_weights)
+        reprojected_edge = samples.edge_error(warped, reference, ref_weights)
+        print("  %-11.3f %-11.6f %-22s %-22s %.4f"
+              % (motion, one_edge,
+                 "%.6f / %.6f" % (unwarped_edge, float(np.abs(unwarped - reference).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - reference).mean())),
+                 reprojected_edge / one_edge))
+def per_pixel_gate_check(frames, target, weights, motion, count=8, gate=INTEGRATION_GATE_PX):
     """Per-pixel gating: use the motion field to decide *where* to integrate instead of warping anything.
 
     The measurement above says warping the accumulation is worse than leaving it alone on both metrics,
@@ -482,7 +613,8 @@ def per_pixel_gate_check(frames, target, weights, motion, count=8, gate=0.2):
         shifted = translated(source, (motion * index, motion * index))
         moved = source.copy()
         moved[rows:columns, block[2]:block[3]] = shifted[rows:columns, block[2]:block[3]]
-        placed = samples.align_sample(moved, frames[index]["jitter"], target.shape[:2])
+        placed = placed_sample(moved, frames[index]["jitter"], target.shape[:2],
+                               height / float(source.shape[0]))
         field = np.zeros((height, width, 1), dtype=np.float32)
         scale = height / float(source.shape[0])
         field[rows * 2:columns * 2, block[2] * 2:block[3] * 2] = motion * scale
@@ -510,34 +642,39 @@ def reconstruction_accumulation_check(frames, target, weights, motions, count=8)
     the de-jittered frames, and that mean reprojected frame by frame with the exact field.
     """
     print("\nreconstruction accumulation (de-jittered frames), scene motion per frame, K=%d" % count)
-    single_edge = samples.edge_error(
-        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
-    single_plain = float(np.abs(samples.upsample(frames[0]["input"], target.shape[:2])
-                                - target).mean())
-    print("  %-11s %-22s %-22s %s"
-          % ("motion px/f", "mean (edge/plain)", "mean reprojected (edge/plain)", "reprojected/single edge"))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    print("  %-11s %-11s %-22s %-22s %s"
+          % ("motion px/f", "one frame", "mean (edge/plain)", "mean reprojected (edge/plain)",
+             "reprojected/one frame"))
     for motion in motions:
         unwarped = np.zeros_like(target)
         warped = np.zeros_like(target)
+        one_frame = None
         for index in range(count):
             moved = translated(frames[index]["input"], (motion * index, motion * index))
             # The reconstruction this frame's model would produce: corrected onto the nominal grid.
             reconstructed = np.clip(samples.de_jitter(moved, frames[index]["jitter"]), 0.0, 1.0)
             placed = samples.upsample(reconstructed, target.shape[:2])
             if index > 0:
-                warped = translated(warped, (motion, motion))
+                # Output pixels, not frame pixels: the accumulation is at target resolution. See
+                # reproject_successive() for why the factor matters and where the runtime applies it.
+                warped = translated(warped, (motion * scale, motion * scale))
+            one_frame = placed
             unwarped += placed
             warped += placed
         unwarped /= float(count)
         warped /= float(count)
-        reprojected_edge = samples.edge_error(warped, target, weights)
-        print("  %-11.3f %-22s %-22s %.4f"
-              % (motion,
-                 "%.6f / %.6f" % (samples.edge_error(unwarped, target, weights),
-                                  float(np.abs(unwarped - target).mean())),
-                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
-                 reprojected_edge / single_edge))
-    print("  one frame: edge %.6f  plain %.6f" % (single_edge, single_plain))
+        # Reference moved with the content, as in reproject_successive().
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        one_edge = samples.edge_error(one_frame, reference, ref_weights)
+        reprojected_edge = samples.edge_error(warped, reference, ref_weights)
+        print("  %-11.3f %-11.6f %-22s %-22s %.4f"
+              % (motion, one_edge,
+                 "%.6f / %.6f" % (samples.edge_error(unwarped, reference, ref_weights),
+                                  float(np.abs(unwarped - reference).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - reference).mean())),
+                 reprojected_edge / one_edge))
 
 def model_reconstruction_check(label, session, frames, target, weights, motions, count=8):
     """The same question about a *model's* reconstructions, which is the arrangement the item was about.
@@ -550,33 +687,191 @@ def model_reconstruction_check(label, session, frames, target, weights, motions,
     output as the frame.
     """
     print("\nmodel reconstructions (%s), scene motion per frame, K=%d" % (label, count))
-    single_edge = samples.edge_error(
-        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
-    print("  %-11s %-22s %-22s %s"
-          % ("motion px/f", "mean (edge/plain)", "mean reprojected (edge/plain)", "reprojected/single edge"))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    print("  %-11s %-11s %-22s %-22s %s"
+          % ("motion px/f", "one frame", "mean (edge/plain)", "mean reprojected (edge/plain)",
+             "reprojected/one frame"))
     for motion in motions:
         unwarped = np.zeros_like(target)
         warped = np.zeros_like(target)
+        one_frame = None
         for index in range(count):
             moved = dict(frames[index])
             moved["input"] = translated(frames[index]["input"],
                                         (motion * index, motion * index)).astype(np.float32)
             output = session.run(None, build_feeds(session, moved))[0][0].transpose(1, 2, 0)
             if index > 0:
-                warped = translated(warped, (motion, motion))
+                # Output pixels, not frame pixels; see reproject_successive().
+                warped = translated(warped, (motion * scale, motion * scale))
+            one_frame = output
             unwarped += output
             warped += output
         unwarped /= float(count)
         warped /= float(count)
-        reprojected_edge = samples.edge_error(warped, target, weights)
-        print("  %-11.3f %-22s %-22s %.4f"
-              % (motion,
-                 "%.6f / %.6f" % (samples.edge_error(unwarped, target, weights),
-                                  float(np.abs(unwarped - target).mean())),
-                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
-                 reprojected_edge / single_edge))
-    print("  one frame: edge %.6f" % single_edge)
+        # Reference moved with the content, as in reproject_successive().
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        one_edge = samples.edge_error(one_frame, reference, ref_weights)
+        reprojected_edge = samples.edge_error(warped, reference, ref_weights)
+        print("  %-11.3f %-11.6f %-22s %-22s %.4f"
+              % (motion, one_edge,
+                 "%.6f / %.6f" % (samples.edge_error(unwarped, reference, ref_weights),
+                                  float(np.abs(unwarped - reference).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - reference).mean())),
+                 reprojected_edge / one_edge))
 
+
+
+def translated_outputs(session, frames, motion, count):
+    """The model's output for each of `count` frames of a scene moving `motion` frame pixels per frame.
+
+    The one place the translated-scene arrangement is built, so the tables that need it cannot drift into
+    measuring subtly different scenes. `motion` is in *frame* pixels - the unit both engines can measure
+    and the unit the runtime's gate constants are expressed in - and the callers of this scale it by the
+    resolution ratio when they warp something that lives on the output grid.
+    """
+    outputs = []
+    for index in range(count):
+        moved = dict(frames[index])
+        moved["input"] = translated(frames[index]["input"],
+                                    (motion * index, motion * index)).astype(np.float32)
+        outputs.append(session.run(None, build_feeds(session, moved))[0][0].transpose(1, 2, 0))
+    return outputs
+
+
+def blend_sweep(label, session, frames, target, weights, motions, count):
+    """How much scene motion the reprojection blend follows, in frame pixels per frame.
+
+    The blend is the *default* temporal path - the phase-aligned pass is opt-in - so the constant that
+    decides when it decays is load-bearing for every caller. It has been expressed as a motion *level* in
+    [0,1] (TEMPORAL_MOTION_THRESHOLD = 0.3) and compared against a number the engines can only produce as
+    a displacement over the frame width, so no measured value could ever cross it. This measures the
+    constant in the unit that exists.
+
+    Three arms, on the model's own reconstructions because those are what the blend consumes:
+
+      * one frame            - what alpha = 0 falls back to;
+      * blend, exact field   - the recursion the runtime runs, h = (1-a)*out + a*warp(h), with the field
+                               that exactly describes the translation: the best case any caller's field
+                               could be, given that the runtime cannot derive one itself;
+      * blend, warp dropped  - the same recursion with the reprojection removed, which is what a constant
+                               that never decays buys on a moving scene: smearing.
+
+    Every arm is scored against the reference at the last frame's content position (moved_target), so the
+    columns compare like with like: scoring a translated frame against a target that never moved measures
+    the translation, and it rewards an un-warped history for lagging behind the content.
+    """
+    print("\nthe reprojection blend's tolerance (%s), scene motion per frame, K=%d" % (label, count))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    print("  %-11s %-11s %-22s %-22s %s"
+          % ("motion px/f", "one frame", "blend, exact field", "blend, warp dropped",
+             "warped / one frame"))
+    for motion in motions:
+        outputs = translated_outputs(session, frames, motion, count)
+        step = (motion * scale, motion * scale)
+        warped = outputs[0]
+        unwarped = outputs[0]
+        for index in range(1, count):
+            warped = (1.0 - BLEND_ALPHA_AT_REST) * outputs[index] \
+                + BLEND_ALPHA_AT_REST * translated(warped, step)
+            unwarped = (1.0 - BLEND_ALPHA_AT_REST) * outputs[index] \
+                + BLEND_ALPHA_AT_REST * unwarped
+        # Reference moved with the content (moved_target): the blend is scored where the scene is now.
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        single_edge = samples.edge_error(outputs[count - 1], reference, ref_weights)
+        warped_edge = samples.edge_error(warped, reference, ref_weights)
+        print("  %-11.3f %-11.6f %-22s %-22s %.4f"
+              % (motion, single_edge,
+                 "%.6f / %.6f" % (warped_edge, float(np.abs(warped - reference).mean())),
+                 "%.6f / %.6f" % (samples.edge_error(unwarped, reference, ref_weights),
+                                  float(np.abs(unwarped - reference).mean())),
+                 warped_edge / single_edge))
+
+
+def composition_check(label, session, frames, target, weights, motions, count, model_uses_jitter):
+    """Both accumulators, in the order the runtime runs them - does the second one still pay?
+
+    Every AA number this tool has printed so far measured the integration *alone* ("mean, placed at
+    X + j*scale"), which is not the arrangement the runtime runs. TemporalAccumulator::apply() blends the
+    reprojection history into the displayed frame *first*, integrates that into the phase-aligned
+    accumulator, and records the resolve as the history the next frame blends against. So the samples
+    being integrated are already a mix of this frame's reconstruction and the previous frame's resolve,
+    and at alpha = 0.7 only (1-alpha) of each sample is fresh phase information - which is the
+    composition the AA claim depends on and which nothing had measured.
+
+    Five arms, same frames, same field, only the arrangement differs:
+
+      * one frame       - no temporal path at all;
+      * blend only      - the default path, for reference;
+      * AA only         - the arrangement the -27.8%/-18.0% numbers were measured on;
+      * blend then AA   - the runtime's order (nrr_temporal.cpp: blend, then integrate the blend);
+      * AA then blend   - the other order: resolve the frames as produced, then blend the resolve.
+
+    The placement is the one the runtime derives for *this* model: phase_aligned_frame_for() sets the
+    offset to zero when the model declares a `jitter` input (its de-jitter stage already spent the phase,
+    so placing it again moves it away) and to the capture's offset scaled into output pixels otherwise.
+    Using one placement for both models would measure an arrangement the runtime never runs for one of
+    them. The error is reported for the frame the caller would display last, against the reference at that
+    frame's content position, so an early-frame advantage is not mistaken for a steady-state one - and
+    every arm is quoted against the AA-only arm, the question being whether the blend preserves the
+    integration's gain or spends it.
+    """
+    print("\ncomposition (%s): both accumulators together, scene motion per frame, K=%d"
+          % (label, count))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+
+    def placement(image, jitter):
+        """The pixel placement this model's frames get, per phase_aligned_frame_for()."""
+        return image if model_uses_jitter else placed(image, jitter, scale, mirrored=True)
+
+    for motion in motions:
+        outputs = translated_outputs(session, frames, motion, count)
+        jitters = [frame["jitter"] for frame in frames[:count]]
+        step = (motion * scale, motion * scale)
+
+        blended = outputs[0]
+        for index in range(1, count):
+            blended = (1.0 - BLEND_ALPHA_AT_REST) * outputs[index] \
+                + BLEND_ALPHA_AT_REST * translated(blended, step)
+
+        # AA only: the placement the runtime performs, then the mean of the placed frames.
+        integrated = np.mean([placement(output, jitter)
+                              for output, jitter in zip(outputs, jitters)], axis=0)
+
+        # The runtime's order: blend first - the resolve is the history the next frame blends against -
+        # then integrate the blended frame.
+        summed = np.zeros_like(target)
+        runtime_displayed = None
+        for index, output in enumerate(outputs):
+            current = output if runtime_displayed is None else (
+                (1.0 - BLEND_ALPHA_AT_REST) * output
+                + BLEND_ALPHA_AT_REST * translated(runtime_displayed, step))
+            summed = summed + placement(current, jitters[index])
+            runtime_displayed = summed / float(index + 1)
+
+        # The other order: integrate the frames as the model produced them, then blend the resolve.
+        summed = np.zeros_like(target)
+        other_displayed = None
+        for index, output in enumerate(outputs):
+            summed = summed + placement(output, jitters[index])
+            resolved = summed / float(index + 1)
+            other_displayed = resolved if other_displayed is None else (
+                (1.0 - BLEND_ALPHA_AT_REST) * resolved
+                + BLEND_ALPHA_AT_REST * translated(other_displayed, step))
+
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        single_edge = samples.edge_error(outputs[count - 1], reference, ref_weights)
+        integrated_edge = samples.edge_error(integrated, reference, ref_weights)
+        print("  motion %.3f px/frame (K=%d)" % (motion, count))
+        for name, image in (("one frame", outputs[count - 1]), ("blend only", blended),
+                            ("AA only", integrated), ("blend then AA", runtime_displayed),
+                            ("AA then blend", other_displayed)):
+            edge = samples.edge_error(image, reference, ref_weights)
+            print("    %-13s edge %.6f  plain %.6f   -> %.3f of one frame, %.3f of AA only"
+                  % (name, edge, float(np.abs(image - reference).mean()),
+                     edge / single_edge, edge / integrated_edge))
 
 
 def gate_sweep(frames, target, weights, motions, count):
@@ -589,23 +884,31 @@ def gate_sweep(frames, target, weights, motions, count):
     the point past which integrating stops being worth anything, and the gate has to sit below it.
     """
     print("\ngate: scene motion per frame vs the integration's edge error (K=%d)" % count)
-    single_edge = samples.edge_error(
-        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
-    print("  %-11s %-11s %-12s %s" % ("motion px/f", "edge", "vs still", "vs one frame"))
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    print("  %-11s %-11s %-11s %-12s %s"
+          % ("motion px/f", "integration", "one frame", "vs still", "vs one frame"))
     still_edge = None
     for motion in motions:
         combined = np.zeros_like(target)
+        one_frame = None
         for index in range(count):
             moved = translated(frames[index]["input"], (motion * index, motion * index))
-            combined += samples.align_sample(moved, frames[index]["jitter"], target.shape[:2])
+            placed = placed_sample(moved, frames[index]["jitter"], target.shape[:2], scale)
+            combined += placed
+            one_frame = placed
         combined /= count
-        edge = samples.edge_error(combined, target, weights)
+        # The reference moves with the content, as in reproject_successive(), so the "vs still" column is
+        # the cost of the move itself rather than of the metric.
+        reference = moved_target(target, motion, scale, count - 1)
+        ref_weights = samples.edge_weights(reference)
+        edge = samples.edge_error(combined, reference, ref_weights)
+        single_edge = samples.edge_error(one_frame, reference, ref_weights)
         if still_edge is None:
             still_edge = edge
-        print("  %-11.3f %-11.6f %+11.1f%% %+11.1f%%"
-              % (motion, edge, 100.0 * (edge - still_edge) / still_edge,
+        print("  %-11.3f %-11.6f %-11.6f %+11.1f%% %+11.1f%%"
+              % (motion, edge, single_edge, 100.0 * (edge - still_edge) / still_edge,
                  100.0 * (edge - single_edge) / single_edge))
-    return single_edge
+    return still_edge
 
 
 def main(argv):
@@ -624,17 +927,35 @@ def main(argv):
                         default=os.path.join(HERE, os.pardir, "models", "p5",
                                              "p4v2_colour_20261029.onnx"),
                         help="a model that does not")
-    parser.add_argument("--motion", default="0,0.05,0.1,0.2,0.35,0.5,0.75,1.0",
-                        help="scene motion per frame, in frame pixels, for the gate sweep")
+    parser.add_argument("--motion", type=float, default=1.5,
+                        help="the largest scene motion per frame the sweeps reach, in frame pixels; the "
+                             "sweeps round to whole-pixel translations (see integer_motion_sweep)")
     args = parser.parse_args(argv[1:])
 
     counts = [count for count in (1, 2, 4, 8, 16) if count <= args.frames]
     _, frames = load_frames(args.data, args.split, args.frames)
-    target = frames[0]["target"]
+    raw_target = frames[0]["target"]
+    scale = raw_target.shape[0] / float(frames[0]["input"].shape[0])
+
+    # The capture's own geometry, measured once on the *samples* (never on a model, so it is the capture's
+    # offset and not a model's bias) and applied to every reference below. It is larger than any effect
+    # being measured here, so leaving it in makes the rows incomparable rather than merely noisy.
+    placed_first = placed_sample(frames[0]["input"], frames[0]["jitter"], raw_target.shape[:2], scale)
+    offset = calibrate_reference(raw_target, placed_first)
+    set_reference_offset(offset[0], offset[1])
+    # Every table below scores against the calibrated reference: the un-jittered target shifted once by the
+    # capture's own grid offset. `frames[*]["target"]` is still the raw capture target, used only for sizes.
+    target = translated(raw_target, REFERENCE_OFFSET)
     weights = samples.edge_weights(target)
+
     print("data %s, split %s, %d frames, input %s target %s"
           % (os.path.basename(args.data), args.split, len(frames),
              frames[0]["input"].shape, target.shape))
+    print("reference calibration: the target's grid sits (%+.2f, %+.2f) px from the grid a placed frame"
+          " lands on;\n  a placed frame scores %.6f there against %.6f unshifted - so every reference"
+          " below carries the offset"
+          % (offset[0], offset[1], offset[2],
+             samples.edge_error(placed_first, raw_target, samples.edge_weights(raw_target))))
 
     # The static check comes first: if the scene is not still, every integration number below is a
     # measurement of motion blur reported as an antialiasing gain. Which is exactly the mistake the
@@ -664,19 +985,40 @@ def main(argv):
         # one is an inference.
         model_reconstruction_check(label, session, frames, target, weights,
                                    [0.0, 0.25, 0.5, 0.75, 1.0], min(4, args.frames))
+        # The two questions the blend-and-integration composition raises, which no table answered before:
+        # what the blend's own decay threshold is in pixels (the unit both engines produce, and the one the
+        # gate is already measured in), and whether integrating *after* the blend keeps the gain the AA
+        # numbers quote.
+        # The blend's range is wider than the integration's: the measured question is where the *warped*
+        # blend stops beating a single frame, and the answer has to include motions an order of magnitude
+        # past the integration's gate before a decay constant can be read off it.
+        blend_sweep(label, session, frames, target, weights,
+                    integer_motion_sweep(min(8, args.frames), scale, 5.0 * args.motion, stride=7),
+                    min(8, args.frames))
+        composition_check(label, session, frames, target, weights,
+                          integer_motion_sweep(min(4, args.frames), scale, min(1.0, args.motion)),
+                          min(4, args.frames), model_uses_jitter=("jitter" in declared))
 
     input_side(frames, target, weights, counts)
-    motions = [float(value) for value in args.motion.split(",")]
-    gate_sweep(frames, target, weights, motions, min(8, args.frames))
+    # Every sweep uses whole-pixel translations (integer_motion_sweep): a fractional one blurs the
+    # reference and the metric along with it, which is larger than the effects being compared.
+    gate_sweep(frames, target, weights,
+               integer_motion_sweep(min(8, args.frames), scale, args.motion), min(8, args.frames))
 
     # The two questions the runtime still has to answer for itself: how far the scene moved (which the
     # caller's motion field cannot be trusted to say), and whether reprojecting the accumulation can keep
     # it integrating through that motion instead of dropping it.
-    scale = target.shape[0] / float(frames[0]["input"].shape[0])
     motion_estimator_check(frames, [0.0, 0.25, 0.5], scale)
-    reproject_successive(frames, target, weights, [0.0, 0.25, 0.5, 1.0], min(8, args.frames))
-    per_pixel_gate_check(frames, target, weights, 0.5, min(8, args.frames))
-    reconstruction_accumulation_check(frames, target, weights, [0.0, 0.25, 0.5, 1.0], min(8, args.frames))
+    reproject_successive(frames, target, weights,
+                         integer_motion_sweep(min(8, args.frames), scale, min(1.0, args.motion)),
+                         min(8, args.frames))
+    per_pixel_gate_check(frames, target, weights,
+                         integer_motion_sweep(min(8, args.frames), scale, 0.5)[-1],
+                         min(8, args.frames))
+    reconstruction_accumulation_check(frames, target, weights,
+                                      integer_motion_sweep(min(8, args.frames), scale,
+                                                           min(1.0, args.motion)),
+                                      min(8, args.frames))
     return 0
 
 

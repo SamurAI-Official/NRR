@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace nrr {
@@ -865,10 +866,17 @@ NRR_TEST(test_aa_upsample_is_the_identity_at_native_resolution) {
 // runtime/nrr_temporal.h holds it, not runtime/nrr_jitter.cpp, because it is a
 // frame-level policy rather than an image operation: which frames may be
 // integrated, when the scene has moved too far to keep integrating, and what the
-// caller has to say about the frame's own phase. Its numbers are measured in
-// tools/aa_resolve_probe.py (-27.8% edge error at 4 frames for a frame that
-// carries its phase, -18.0% at 8 for one that does not), and these tests pin the
-// policy that decides which of the two a frame is, plus the gate.
+// caller has to say about the frame's own phase. These tests pin that policy plus
+// the gate, and the composition of the pass with the reprojection blend - which
+// nothing did before this revision, because every phase-aligned test passed an
+// empty motion provider and the blend therefore never ran.
+//
+// What the pass is worth is measured in tools/aa_resolve_probe.py, and the
+// numbers quoted here are from that tool with the two instrument faults it used to
+// have fixed (the warp applied at half magnitude on a 2x capture, and the metric
+// scoring against a target that never moved): with the reference calibrated to the
+// capture's own grid, the sample-side prize is -36.9% edge error at 8 frames, and
+// the blend in front of the integration costs 4-11% of it.
 // ---------------------------------------------------------------------------
 
 namespace phase_fixture {
@@ -913,6 +921,50 @@ inline uint8_t pf_pixel(const std::vector<uint8_t>& rgb8, uint32_t x, uint32_t y
 }
 
 TemporalAccumulator::MotionImage pf_no_field() { return TemporalAccumulator::MotionImage(); }
+
+/* float -> half, so a motion field can be built here in the format the accumulator's MotionImage declares
+ * (RG16F; there is no RG8 in NRRTextureFormat, whatever the specification's table said). */
+uint16_t pf_half(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+    const uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent <= 0) return static_cast<uint16_t>(sign);
+    if (exponent >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+/* A valid motion field, constant across the frame: the shape an engine's camera-only field has. `dx`/`dy`
+ * are in output pixels per frame, which is the unit the per-pixel restart threshold is in. Held in a
+ * function-local static so the MotionImage's raw pointer stays valid for the call. */
+TemporalAccumulator::MotionImage pf_field(float dx, float dy) {
+    static std::vector<uint8_t> storage;
+    storage.assign(static_cast<size_t>(pf_w) * pf_h * 4, 0);
+    const uint16_t hx = pf_half(dx);
+    const uint16_t hy = pf_half(dy);
+    for (size_t i = 0; i < static_cast<size_t>(pf_w) * pf_h; ++i) {
+        std::memcpy(&storage[i * 4], &hx, 2);
+        std::memcpy(&storage[i * 4 + 2], &hy, 2);
+    }
+    TemporalAccumulator::MotionImage image;
+    image.pixels = storage.data();
+    image.width = pf_w;
+    image.height = pf_h;
+    image.format = NRR_TEXTURE_FORMAT_RG16F;
+    return image;
+}
+
+/* The ramp with every value raised by `levels`, clamped: a frame whose content changed without moving, so a
+ * test can tell what the blend mixed in from what the pass placed. */
+std::vector<uint8_t> pf_ramp_offset(int levels) {
+    std::vector<uint8_t> out = pf_ramp();
+    for (size_t i = 0; i < out.size(); ++i) {
+        const int raised = static_cast<int>(out[i]) + levels;
+        out[i] = static_cast<uint8_t>(raised > 255 ? 255 : (raised < 0 ? 0 : raised));
+    }
+    return out;
+}
 
 } // namespace phase_fixture
 
@@ -1210,6 +1262,204 @@ NRR_TEST(test_phase_aligned_gate_converts_the_magnitude_with_the_frame_width) {
                   "verdicts together say the magnitude was converted with the frame, not with the output");
     NRR_ASSERT(std::string(refused.phase_note).find("no field") != std::string::npos,
                "the note must be the no-field refusal; got '" + std::string(refused.phase_note) + "'");
+}
+
+
+/* One declared motion magnitude, two consumers, one unit.
+ *
+ * The blend's history weight and the phase-aligned gate both read
+ * NRRFrameInput::temporal.motion_magnitude, and they used to read it as two different things: the gate
+ * multiplied it by the frame width and compared pixels, while the blend compared the raw fraction against a
+ * constant of 0.3 - so a real measurement (6 px of camera motion at 1920 = 0.0031) left the gate refusing the
+ * frame and the blend holding 0.7 of its history, in the same frame. The field is now declared as a fraction
+ * of the frame width and converted once, by motion_magnitude_px(), into the pixels both thresholds are in.
+ *
+ * This pins that agreement at a known grid: one number below both gates makes both consumers accept, one
+ * number above both makes both back off, and the ABI echo stays the fraction the caller declared.
+ */
+NRR_TEST(test_motion_magnitude_reaches_both_consumers_in_one_unit) {
+    using namespace phase_fixture;
+    TemporalAccumulator accumulator;
+    accumulator.initialize();
+    accumulator.set_phase_aligned_enabled(true);
+    NRR_ASSERT(PHASE_ALIGNED_MOTION_GATE_PX < TEMPORAL_ALPHA_MOTION_GATE_PX,
+               "the integration's gate has to be the stricter one, or the two cases below are not distinct");
+
+    std::vector<uint8_t> frame = pf_ramp();
+    const NRRFrameInput first = pf_input(1, 0.25f, 0.0f, true, 0.0f);
+    accumulator.apply(first, frame, pf_w, pf_h, pf_no_field,
+                      phase_aligned_frame_for(first, false, pf_w, pf_h, pf_w, pf_h));
+
+    /* Below both gates: the integration accepts and the blend keeps its full history weight. */
+    const float under_px = 0.5f * PHASE_ALIGNED_MOTION_GATE_PX;
+    const float under_declared = under_px / static_cast<float>(pf_w);
+    std::vector<uint8_t> still = pf_ramp();
+    const NRRFrameInput still_input = pf_input(2, -0.25f, 0.0f, true, under_declared);
+    const TemporalAccumulator::Result still_result =
+        accumulator.apply(still_input, still, pf_w, pf_h, pf_no_field,
+                          phase_aligned_frame_for(still_input, false, pf_w, pf_h, pf_w, pf_h));
+    NRR_EXPECT_NEAR(still_result.motion_px, under_px, 1e-6,
+                    "the declared fraction is converted with the frame's own grid");
+    NRR_EXPECT_NEAR(still_result.state.temporal_alpha, TEMPORAL_BASE_ALPHA, 1e-6,
+                    "the blend keeps its history below its own gate");
+    NRR_EXPECT_EQ(still_result.phase_aligned_frames, 2u,
+                  "and the stricter gate lets the same frame integrate");
+    NRR_EXPECT_NEAR(still_result.state.motion_magnitude, under_declared, 1e-6,
+                    "the ABI echo stays the fraction the caller declared");
+
+    /* Above both: the integration resets and the blend's weight decays. One number, one direction. */
+    const float over_px = 3.0f;
+    const float expected_alpha =
+        TEMPORAL_BASE_ALPHA *
+        (1.0f - (over_px - TEMPORAL_ALPHA_MOTION_GATE_PX) /
+                    (TEMPORAL_ALPHA_MOTION_FULL_PX - TEMPORAL_ALPHA_MOTION_GATE_PX));
+    NRR_ASSERT(over_px > TEMPORAL_ALPHA_MOTION_GATE_PX &&
+               over_px < TEMPORAL_ALPHA_MOTION_FULL_PX,
+               "the moving value has to land inside the decay band, or the assertions below are about clamps");
+    std::vector<uint8_t> moved = pf_ramp();
+    const NRRFrameInput moved_input = pf_input(3, 0.25f, 0.0f, true,
+                                               over_px / static_cast<float>(pf_w));
+    const TemporalAccumulator::Result moved_result =
+        accumulator.apply(moved_input, moved, pf_w, pf_h, pf_no_field,
+                          phase_aligned_frame_for(moved_input, false, pf_w, pf_h, pf_w, pf_h));
+    NRR_EXPECT_NEAR(moved_result.motion_px, over_px, 1e-6, "the same conversion, a larger value");
+    NRR_EXPECT_EQ(moved_result.phase_aligned_frames, 0u,
+                  "past its gate the integration empties the accumulation");
+    NRR_EXPECT_NEAR(moved_result.state.temporal_alpha, expected_alpha, 1e-6,
+                    "and the blend's weight decays, from the same converted number");
+
+    /* The grid the conversion uses: with no frame width from the pass, the caller's declared render
+     * resolution is what remains, so a 2x pipeline cannot silently halve the motion. */
+    NRRFrameInput wide = pf_input(4, 0.25f, 0.0f, true, 0.5f);
+    wide.temporal.resolution_x = 2 * pf_w;
+    NRR_EXPECT_NEAR(motion_magnitude_px(wide, 0, pf_w), 0.5f * static_cast<float>(2 * pf_w), 1e-6,
+                    "the declared resolution is the fallback grid");
+}
+
+
+/* The composition of the two accumulators, in the order apply() runs them.
+ *
+ * Nothing tested this before: every phase-aligned test above passes an empty motion provider, so the
+ * reprojection blend never fired and the pass was only ever exercised on its own. But the runtime's
+ * arrangement is not "integrate the model's output" - the blend writes the displayed frame first, the
+ * integration accumulates *that*, and the resolve is what is recorded as the next frame's history, so the
+ * two accumulators feed each other. (What the composition is worth is measured in tools/aa_resolve_probe.py's
+ * composition_check: the blend in front of the integration costs 4% of the integration's gain for the placed
+ * arrangement and 11% for the unplaced one, so it does not throw the gain away.)
+ *
+ * Three things are pinned here:
+ *   - both passes run in one frame, which the empty-field tests could not show;
+ *   - a still, unchanged scene is undisturbed: with identical frames the blend of the resolve with itself is
+ *     the identity, so the displayed frame is the same whether the pass is on or off;
+ *   - the history the blend mixes is the *resolve*, not the raw frame. A frame whose content changed without
+ *     moving makes the two runs differ by an amount fixed by the placement bias the pass introduced - and
+ *     that difference vanishes if the blend is fed the raw frame, which is what a reordered pipeline would
+ *     do. The expectation is derived here (weight x bias), not hard-coded, so it tracks the policy.
+ */
+NRR_TEST(test_phase_aligned_pass_and_blend_compose_in_one_frame) {
+    using namespace phase_fixture;
+
+    const float kOffset = 0.5f;      /* constant per frame, so every placement bias is the same */
+    const int kContentChange = 8;    /* levels: the scene changes between frames without moving */
+
+    struct Run {
+        TemporalAccumulator::Result second;
+        std::vector<uint8_t> displayed_first;
+        std::vector<uint8_t> displayed_second;
+    };
+    auto run_sequence = [&](bool phase_aligned, int levels) {
+        TemporalAccumulator accumulator;
+        accumulator.initialize();
+        accumulator.set_phase_aligned_enabled(phase_aligned);
+
+        Run run;
+        std::vector<uint8_t> first = pf_ramp();
+        const NRRFrameInput first_input = pf_input(1, kOffset, 0.0f, true, 0.0f);
+        accumulator.apply(first_input, first, pf_w, pf_h, [] { return pf_field(0.0f, 0.0f); },
+                          phase_aligned_frame_for(first_input, false, pf_w, pf_h, pf_w, pf_h));
+        run.displayed_first = first;
+
+        std::vector<uint8_t> second = pf_ramp_offset(levels);
+        const NRRFrameInput second_input = pf_input(2, kOffset, 0.0f, true, 0.0f);
+        run.second = accumulator.apply(second_input, second, pf_w, pf_h,
+                                       [] { return pf_field(0.0f, 0.0f); },
+                                       phase_aligned_frame_for(second_input, false, pf_w,
+                                                               pf_h, pf_w, pf_h));
+        run.displayed_second = second;
+        return run;
+    };
+
+    const Run composed = run_sequence(true, 0);
+    NRR_ASSERT(composed.second.blended,
+               "with a valid field and a previous frame the blend must run - without it this proves nothing");
+    NRR_EXPECT_EQ(composed.second.phase_aligned_frames, 2u,
+                  "and the integration must be accumulating in the same frame");
+    NRR_ASSERT(composed.second.blend_stats.blended_pixels > 0u,
+               "a blend that ran must report the pixels it touched");
+
+    /* The bias and the differences are measured as means over the interior pixels, not at one pixel: a single
+     * uint8 sample of a ramp carries +/-1 level of quantisation, and the identities below multiply it by
+     * (1 + alpha)/2. Interior only, because the placement clamps at the frame's edge where a ramp is not
+     * linear across the clamp, and the mean of ~400 pixels averages the rest of the rounding out. */
+    auto mean_interior_delta = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+        double sum = 0.0;
+        size_t count = 0;
+        for (uint32_t y = 1; y + 1 < pf_h; ++y) {
+            for (uint32_t x = 1; x + 1 < pf_w; ++x) {
+                const size_t p = (static_cast<size_t>(y) * pf_w + x) * 3;
+                sum += static_cast<double>(a[p]) - static_cast<double>(b[p]);
+                ++count;
+            }
+        }
+        return count > 0 ? static_cast<float>(sum / static_cast<double>(count)) : 0.0f;
+    };
+
+    /* The control: unchanged content. This is *not* the identity, and the reason is the composition's one real
+     * subtlety - it is pinned here rather than glossed over. The history the blend mixes is the frame that was
+     * *displayed*, i.e. the resolve, whose content the pass has already placed; placing the mixture again by
+     * the current frame's offset therefore over-corrects the history's share of it. On this ramp that is
+     * visible as a bias that grows from `bias` on the first frame to (1 + alpha)/2 * bias on the second: a
+     * frame that arrived unplaced is placed once, while the resolve inside the blend is placed a second time
+     * and then averaged in. (The history has to be the displayed frame - that is what reprojection reprojects -
+     * so the two accumulators genuinely want different things from it. What that costs on real content, and
+     * whether the pass should instead integrate the pre-blend frame, is the open question; see
+     * composition_check in tools/aa_resolve_probe.py, which measures both orders.) */
+    const Run plain = run_sequence(false, 0);
+    NRR_EXPECT_NEAR(composed.second.state.temporal_alpha, TEMPORAL_BASE_ALPHA, 1e-6,
+                    "a still scene keeps the base history weight while the pass is on");
+    const float first_bias = mean_interior_delta(composed.displayed_first, plain.displayed_first);
+    NRR_ASSERT(first_bias > 1.5f,
+               "the pass must place the first frame by a measurable bias on this ramp; got "
+               + std::to_string(first_bias));
+    const float second_bias = mean_interior_delta(composed.displayed_second, plain.displayed_second);
+    const float expected_second_bias =
+        (1.0f + composed.second.state.temporal_alpha / 2.0f) * first_bias;
+    /* The tolerance is the fixture's own rounding rather than a fudge: each displayed frame is quantised to
+     * uint8 once (+/-0.5), and the two runs here round in opposite directions, so a difference of means can be
+     * off by up to ~1 level while the identity itself is exact. The mean over the interior averages the ramp's
+     * per-pixel rounding out; the bound is what is left. */
+    NRR_ASSERT(std::fabs(second_bias - expected_second_bias) <= 1.0f,
+               "the blend must mix the resolve - already placed - and the pass must place it again: expected a "
+               "second-frame bias of " + std::to_string(expected_second_bias) + " levels, measured "
+               + std::to_string(second_bias));
+
+    /* The ordering, measured: the content changes without moving, so the only difference between the two runs
+     * is what the blend mixed in for the second frame - the resolve of the first (placed, hence biased)
+     * against the raw first frame. Both are affine in the ramp, so the difference is
+     * (1 + alpha/2) * bias - (1 - alpha) * change / 2, with the bias and the weight measured from this same
+     * fixture rather than assumed. It is the same identity as above with a second term, and it fails if the
+     * blend is fed the raw frame instead of the resolve. */
+    const Run changed_on = run_sequence(true, kContentChange);
+    const Run changed_off = run_sequence(false, kContentChange);
+
+    const float alpha = composed.second.state.temporal_alpha;
+    const float expected =
+        (1.0f + alpha / 2.0f) * first_bias
+        - (1.0f - alpha) * static_cast<float>(kContentChange) / 2.0f;
+    const float measured = mean_interior_delta(changed_on.displayed_second, changed_off.displayed_second);
+    NRR_ASSERT(std::fabs(measured - expected) <= 1.0f,
+               "the blend must see the integration's resolve, not the raw frame: expected "
+               + std::to_string(expected) + " levels, measured " + std::to_string(measured));
 }
 
 

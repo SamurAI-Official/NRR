@@ -14,6 +14,100 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### One unit for the motion magnitude, and the two accumulators measured together at last
+
+Two incoherences, and they turned out to be the same mistake: one number carrying two meanings, and a
+measurement instrument with two faults that had been quoted as evidence for a shipped decision.
+
+**One field, two units.** `NRRFrameInput::temporal.motion_magnitude` was documented as a `[0,1]` motion
+"level" and read by two consumers that disagreed about it. The reprojection blend compared the raw fraction
+against `TEMPORAL_MOTION_THRESHOLD = 0.3`; the phase-aligned gate multiplied the same fraction by the frame
+width and compared *pixels* against `PHASE_ALIGNED_MOTION_GATE_PX = 0.2`. 0.3 of a level is 576 px/frame on a
+1920-wide frame, so no measurement could ever cross the blend's threshold - the decay was dead code for any
+caller that measured - while the gate, reading the same value, refused every frame. The new Unity test that
+measures camera motion makes the collision concrete: 6 px of camera movement at 1920 is 0.003125, which the
+gate correctly rejects and the blend reads as "essentially still", keeping 0.7 of its history. Ghosting on a
+moving camera, from a single field.
+
+`motion_magnitude` is now *scene motion per frame as a fraction of the frame width* - what both engine
+bindings measure - and it is converted exactly once, by `nrr::motion_magnitude_px()`, whose grid is the
+frame's own render width (falling back to the caller's declared resolution, then the output width). Both
+thresholds are expressed in the result and both are measured:
+
+| constant | value | what the measurement says |
+|---|---|---|
+| `PHASE_ALIGNED_MOTION_GATE_PX` | 0.2 (unchanged) | integration beats a single frame by -12.5% edge error at 0.143 px/frame, loses by +9.6% at 0.286 |
+| `TEMPORAL_ALPHA_MOTION_GATE_PX` | 1.0 (was 0.3, level units) | below it, dropping the warp costs 1.0x of the blend's gain; at it, 1.44x |
+| `TEMPORAL_ALPHA_MOTION_FULL_PX` | 7.0 (new) | end of the measured range: the warped blend still beats one frame by ratio 0.70 there |
+
+`TemporalStateManager::compute_state()` takes the converted pixels as a required parameter, so no call site can
+quietly keep the old reading, and `TemporalHistory::calculate_motion_magnitude()` returns the same fraction -
+it used to divide by a hard-coded 10, a third scale for the same quantity.
+
+**The instrument was wrong, twice, and the numbers it produced were quoted.** `tools/aa_resolve_probe.py`
+now fixes both and re-measures everything:
+
+* *The warp was applied at half magnitude.* The reprojection tables warped an accumulator at *output*
+  resolution by a displacement in *input* pixels. `resample_motion_field_nchw` multiplies vectors by the
+  resolution ratio for exactly this reason; the probe did not. On the 2x capture every warp was applied at
+  half the field it was given.
+* *The reference never moved.* Translating a frame while scoring against a static target measures the
+  translation, not the temporal path: the later a frame's content is, the further it is from the reference, so
+  an *aligned* history is penalised for following the content and an unwarped one is rewarded for lagging
+  behind it. That is why every warp measured worse than no warp - including an integer-pixel one that costs no
+  interpolation. The reference now moves with the content and carries the capture's own measured grid offset,
+  calibrated once on the samples (`calibrate_reference`: the target's grid sits (+0.50, +0.45) px from the grid
+  a placed frame lands on, which is larger than any effect being measured - a placed frame's edge error is
+  0.0433 there against 0.0891 unshifted). Sweeps use whole-pixel translations in both grids
+  (`integer_motion_sweep`), so nothing in the comparison is blurred by the harness.
+
+What that changes, in the runtime's own comments and the specification rather than in a footnote:
+
+* **Reprojection is not worse than no warping.** Corrected, a reprojected mean wins on a translating scene:
+  edge error 0.0300 at 0.14-1.0 px/frame against 0.0463 for a single frame and 0.0797 for an unwarped mean.
+  The refusal recorded in `nrr_jitter.h` ("+9.5% against -0.6% for leaving it alone") was an artifact of both
+  faults. The shipped per-pixel restart is *not* contradicted - it keeps the still region's gain exactly
+  (0.0277 at 8 frames, the same number a fully still integration reports, against 0.0439 for one frame) - but
+  the two have not been compared head to head on identical content, so that stays a design decision with a
+  measurement behind it instead of a settled optimum.
+* **The AA prize is much larger than the docs claimed**: the sample-side integration (no model) gains -36.9%
+  edge error and -49.7% plain at 8 frames, against the -0.6%/-11.5% the old probe printed.
+* **The 0.2 px gate survives** a cleaner measurement, which is the one number that did not move.
+
+**The composition, measured instead of assumed.** The blend writes the displayed frame first, the integration
+accumulates *that*, and the resolve is recorded as the next frame's history - so the two accumulators feed
+each other and the samples integrated are already a mix. `composition_check` runs five arrangements on the
+same frames: the blend costs 4% of the integration's gain for the placed arrangement (1.040 of AA-only) and
+11% for the unplaced one (1.106), and the runtime's order beats the alternative at rest for the placed case.
+One consequence is now pinned numerically rather than discovered later: the history the blend mixes has
+*already* been placed, so placing the mixture again over-corrects the history's share of it - the placement
+bias on the test fixture grows from `b` to `(1 + alpha/2)*b` on the second frame.
+
+Tests: the C++ suite is **165/165** (was 163), and two new tests close the largest gap - `test_jitter.cpp`
+had eleven phase-aligned tests and *every one* passed an empty motion provider, so the blend never ran and the
+composition had no coverage at all:
+
+* `test_motion_magnitude_reaches_both_consumers_in_one_unit` - one declared value, both consumers, at a known
+  grid: below both gates both accept, above both both back off, the ABI echo stays the fraction, and the
+  conversion's grid is the frame's own width.
+* `test_phase_aligned_pass_and_blend_compose_in_one_frame` - both passes running in one frame with a real
+  RG16F field; the second-frame bias matches `(1 + alpha/2)*bias` and the changed-content difference matches
+  `(1 + alpha/2)*bias - (1 - alpha)*change/2`, both derived from the fixture's own measurements, within the
+  fixture's uint8 rounding. The second identity fails if the blend is fed the raw frame instead of the
+  resolve, i.e. it pins the ordering.
+
+`tests/integration/test_multi_frame.cpp` and `test_temporal_accumulation.cpp` pinned the old level curve; they
+now pin the pixel curve (the policy test passes the pixel value in directly, which is what the parameter is
+for) and the fixture states its motions in pixels and converts with its own width. Documentation brought into
+line: `specification/temporal_rendering.md` (the unit, the decay formula, and a section for the phase-aligned
+pass that the spec did not know existed - including the shared blend/integrate order), `frame_contract.md`
+4.3, `include/nrr.h`, `README.md`, `docs/roadmap.md`, `runtime/nrr_jitter.h`.
+
+**Callers**: no entry point changed, so no binding needs rebuilding. The *meaning* of an existing field did
+tighten - a caller that was feeding a `[0,1]` motion level must now feed `pixels_per_frame / frame_width`, and
+one that feeds a level will see the phase-aligned gate refuse and the blend decay sooner. Both engine bindings
+already measure in the new unit (`NRRRenderer.MeasureMotion`, and Godot's field is absent by default).
+
 ### The renderer measures the motion itself, and reprojection is refused a second time on the arrangement it was meant for
 
 Last round's two open items both ended with "the engine must supply this". One of them did not have to: the

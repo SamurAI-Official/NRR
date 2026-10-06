@@ -17,7 +17,6 @@
 namespace nrr {
 
 static const float BASE_TEMPORAL_ALPHA = TEMPORAL_BASE_ALPHA;
-static const float MOTION_THRESHOLD = TEMPORAL_MOTION_THRESHOLD;
 
 // ============================================================================
 // TemporalHistory
@@ -127,7 +126,7 @@ void TemporalHistory::clear() {
 float TemporalHistory::calculate_motion_magnitude(uint64_t frame_index,
                                                   const std::vector<float>& current_motion,
                                                   uint32_t width, uint32_t height) const {
-    if (current_motion.size() < 2) return 0.0f;
+    if (current_motion.size() < 2 || width == 0) return 0.0f;
     float sum = 0.0f;
     size_t count = current_motion.size() / 2;
     for (size_t i = 0; i < count; ++i) {
@@ -136,7 +135,10 @@ float TemporalHistory::calculate_motion_magnitude(uint64_t frame_index,
         sum += std::sqrt(mx * mx + my * my);
     }
     float avg = sum / std::max(count, (size_t)1);
-    return std::min(avg / 10.0f, 1.0f);
+    /* A fraction of the frame width, which is what NRRFrameInput::temporal.motion_magnitude means. It used
+     * to divide by a hard-coded 10 and saturate at 1, a scale nothing else in the runtime used. */
+    const float fraction = avg / static_cast<float>(width);
+    return fraction > 1.0f ? 1.0f : fraction;
 }
 
 // ============================================================================
@@ -148,8 +150,7 @@ TemporalRenderer::TemporalRenderer()
     , initialized_(false)
     , last_frame_index_(0)
     , last_timestamp_(0.0f)
-    , temporal_alpha_(BASE_TEMPORAL_ALPHA)
-    , motion_threshold_(MOTION_THRESHOLD) {
+    , temporal_alpha_(BASE_TEMPORAL_ALPHA) {
 }
 
 TemporalRenderer::~TemporalRenderer() {
@@ -354,7 +355,8 @@ TemporalStateManager::TemporalStateManager()
     , initialized_(false)
     , frame_index_(0)
     , temporal_alpha_(0.0f)
-    , motion_threshold_(MOTION_THRESHOLD)
+    , alpha_motion_gate_px_(TEMPORAL_ALPHA_MOTION_GATE_PX)
+    , alpha_motion_full_px_(TEMPORAL_ALPHA_MOTION_FULL_PX)
     , current_motion_magnitude_(0.0f)
     , first_frame_(true) {
 }
@@ -382,7 +384,8 @@ float TemporalStateManager::analyze_motion(const NRRFrameInput& input,
 }
 
 NRRTemporalState TemporalStateManager::compute_state(const NRRFrameInput& input,
-                                                    const TemporalHistory& history) {
+                                                    const TemporalHistory& history,
+                                                    float motion_px) {
     NRRTemporalState state = input.temporal;
     current_motion_magnitude_ = analyze_motion(input,
                                                input.temporal.resolution_x,
@@ -393,18 +396,18 @@ NRRTemporalState TemporalStateManager::compute_state(const NRRFrameInput& input,
         // First frame: no history to blend with.
         temporal_alpha_ = 0.0f;
         first_frame_ = false;
+    } else if (motion_px <= alpha_motion_gate_px_) {
+        /* Still enough that the history is aligned and all of it is signal - which is what the blend is for.
+         * The measurement behind the two constants is on TEMPORAL_ALPHA_MOTION_GATE_PX. */
+        temporal_alpha_ = BASE_TEMPORAL_ALPHA;
+    } else if (motion_px >= alpha_motion_full_px_) {
+        /* Past the measured range: the caller's field is trusted less than the frame itself. */
+        temporal_alpha_ = 0.0f;
     } else {
-        float motion = current_motion_magnitude_;
-        if (motion < motion_threshold_) {
-            temporal_alpha_ = BASE_TEMPORAL_ALPHA;
-        } else {
-            float denom = 1.0f - motion_threshold_;
-            if (denom <= 0.0f) {
-                temporal_alpha_ = 0.0f;
-            } else {
-                temporal_alpha_ = BASE_TEMPORAL_ALPHA * (1.0f - (motion - motion_threshold_) / denom);
-            }
-        }
+        const float span = alpha_motion_full_px_ - alpha_motion_gate_px_;
+        temporal_alpha_ = span > 0.0f
+            ? BASE_TEMPORAL_ALPHA * (1.0f - (motion_px - alpha_motion_gate_px_) / span)
+            : 0.0f;
         temporal_alpha_ = std::max(0.0f, std::min(1.0f, temporal_alpha_));
     }
 
@@ -445,7 +448,9 @@ NRRTemporalState TemporalStateManager::update_state(NRRDevice* device,
                                                     const TemporalFrameData& frame) {
     (void)device;
     (void)output;
-    NRRTemporalState state = compute_state(input, history);
+    NRRTemporalState state = compute_state(input, history,
+                                           motion_magnitude_px(input, 0,
+                                                               input.temporal.resolution_x));
     record_frame(input, frame, history);
     return state;
 }
@@ -651,7 +656,13 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         previous_input_height_ = 0;
     }
 
-    result.state = state_.compute_state(input, history_);
+    /* One conversion for both consumers: the history weight (compute_state) and the phase-aligned gate below
+     * read the same number, so they cannot disagree about what the caller's declared motion means. The grid
+     * is the frame's own render width - what the thresholds were measured on - which on an upscaling pipeline
+     * is not the output width. */
+    const uint32_t motion_frame_grid = motion_grid(input, phase.frame_width, width);
+    result.motion_px = motion_magnitude_px(input, phase.frame_width, width);
+    result.state = state_.compute_state(input, history_, result.motion_px);
 
     std::vector<float> displayed;
     rgb8_to_interleaved_float(rgb8, displayed);
@@ -714,22 +725,26 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
     }
 
     /* ---- Phase-aligned integration (opt-in) -------------------------------- *
-     * The frame the blend just produced is the one being displayed, and it is the one whose sub-pixel
-     * phase the caller declared: integrating *that* is what turns a model that cannot know its own
-     * sampling grid into an antialiased sequence (measured -27.8% edge error at 4 frames), and a model
-     * that can into a mean of its own reconstructions (-18.0% at 8). Both numbers, and the reason the
-     * two cases need different offsets, are in tools/aa_resolve_probe.py.
+     * The frame the blend just produced is the one being displayed, and it is the one whose sub-pixel phase
+     * the caller declared: integrating *that* is what turns a model that cannot know its own sampling grid
+     * into an antialiased sequence, and a model that can into a mean of its own reconstructions. Which of the
+     * two arrangements is which, and what each is worth, is measured in tools/aa_resolve_probe.py: at K=8 and
+     * zero motion the placed arrangement gains -45.0% edge error and the unplaced one -27.3% (both against a
+     * reference carrying the capture's measured grid offset), and the sample-side prize - no model, just the
+     * frames placed and averaged - is -36.9% edge / -49.7% plain.
      *
-     * The pass is deliberately after the blend and not instead of it: the blend is the reprojection
-     * history, which is what handles motion, and this is the integration, which requires its absence.
-     * Both write the displayed frame, in that order, so the caller uploads one image either way. */
+     * The pass is deliberately after the blend and not instead of it: the blend is the reprojection history,
+     * which is what handles motion, and this is the integration, which requires its absence. Both write the
+     * displayed frame, in that order, so the caller uploads one image either way. That ordering is measured
+     * too, because it was not obvious: composition_check runs five arrangements on the same frames, and the
+     * blend in front of the integration costs 4% of the integration's gain for the placed arrangement (1.040
+     * of AA-only) and 11% for the unplaced one (1.106) - the two accumulators compose, in this order. */
     if (phase_aligned_enabled_) {
-        /* The declared magnitude is a fraction of the frame; the gate is in frame-grid pixels, which is the
-         * grid it was measured on. Converting with the *output* width on a 2x pipeline compares units that
-         * differ by a factor of two and makes the gate twice as strict as the measurement behind it, so the
-         * frame's own width comes from the caller (PhaseAlignedFrame::frame_width). */
-        const uint32_t gate_grid = phase.frame_width > 0 ? phase.frame_width : width;
-        const float motion_px = result.state.motion_magnitude * static_cast<float>(gate_grid);
+        /* The declared magnitude is a fraction of the frame and every threshold below is in frame-grid
+         * pixels; the conversion happened once, above, and its result is what the blend's history weight
+         * was computed from too (Result::motion_px). */
+        const uint32_t gate_grid = motion_frame_grid;
+        const float motion_px = result.motion_px;
         if (!phase.eligible) {
             /* No distinct phases to integrate: either the renderer does not jitter, or the frame's
              * phase has already been spent - a model with a `jitter` input de-jitters internally, and
@@ -740,14 +755,24 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         } else {
             /* Per pixel when the caller supplies a motion field, and never by warping.
              *
-             * Warping the accumulation was measured and refused: on the static capture, translating the
-             * frames 0.5 px per frame with the exact field that describes it leaves the reprojected mean
-             * at +9.5% of a single frame's edge error against -0.6% for leaving it alone (and the plain
-             * error moves the same way), because a bilinear warp spreads each sample over its neighbours
-             * and does it again every frame - it destroys the sub-pixel diversity this pass exists to
-             * integrate. Restarting a pixel loses nothing the pixel had not already lost: measured on a
-             * scene that is half still and half moving, the still half keeps its -9.8% plain-error gain
-             * while the moving half is no worse than a single frame (tools/aa_resolve_probe.py). */
+             * Restarting is measured to work: on a scene that is half still and half moving, the still half
+             * keeps exactly the gain it has on a fully still scene (edge error 0.027703 - the same number the
+             * fully still integration reports at K=8) while the global gate, which drops the whole
+             * accumulation because one part of the frame moved, loses it entirely (0.043929, i.e. a single
+             * frame). The moving part is no worse than a single frame, because that is what a rewritten pixel
+             * becomes.
+             *
+             * What is *not* established is the comparison this comment used to make. "Warping the
+             * accumulation was measured and refused (+9.5% against -0.6% for leaving it alone)" was measured
+             * with two instrument faults: the warp was applied at half its magnitude on this 2x capture, and
+             * the accumulation was scored against a target that never moved, which rewards a history for
+             * lagging behind the content. Corrected, a reprojected mean does *win* on a fully translating
+             * scene (edge error 0.0300 at 0.14-1.0 px/frame against 0.0463 for one frame and 0.0797 for an
+             * unwarped mean), so "never warp" is not a general conclusion. On the partly moving scene, though,
+             * the restart keeps more of the integration than any whole-frame arrangement tested, and the two
+             * have not been run head to head on identical content - so this stays a design decision with a
+             * measurement behind it, not a measured optimum. See reproject_successive and
+             * per_pixel_gate_check in tools/aa_resolve_probe.py. */
             std::vector<uint8_t> restart;
             bool any_restart = false;
             if (phase_aligned_.frame_count() > 0) {
