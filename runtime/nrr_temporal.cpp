@@ -768,37 +768,31 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
              * the accumulation was scored against a target that never moved, which rewards a history for
              * lagging behind the content. Corrected, a reprojected mean does *win* on a fully translating
              * scene (edge error 0.0300 at 0.14-1.0 px/frame against 0.0463 for one frame and 0.0797 for an
-             * unwarped mean), so "never warp" is not a general conclusion. On the partly moving scene, though,
-             * the restart keeps more of the integration than any whole-frame arrangement tested, and the two
-             * have not been run head to head on identical content - so this stays a design decision with a
-             * measurement behind it, not a measured optimum. See reproject_successive and
-             * per_pixel_gate_check in tools/aa_resolve_probe.py. */
-            std::vector<uint8_t> restart;
-            bool any_restart = false;
+             * unwarped mean). The head-to-head that settles what *this* pass should do was then run on
+             * identical content - a still scene with one rectangle moving whole pixels per frame, scored
+             * inside and outside the rectangle separately - and warping the accumulation wins there: on the
+             * moved pixels restarting is exactly a single frame (0.0% against one), the unwarped mean smears
+             * (+9% to +24%), and the warp stays a third below a single frame (-33% to -35%) while leaving
+             * the still region bit-identical. So the field is used to *move* the accumulation, not to decide
+             * which pixels to throw away. */
+            std::vector<float> warp_field;
             if (phase_aligned_.frame_count() > 0) {
-                /* The field is in output pixels (it is the same quantity the blend's warp subtracts), so
-                 * the threshold is the gate converted into output pixels. */
+                /* The field is in output pixels and follows the blend's convention (`source = x - field`),
+                 * so the same interleaved quantity is handed to both. `motion_vectors_scale` is the
+                 * caller's own unit conversion and applies to either use. */
                 const std::vector<float>& field = output_motion();
                 if (!field.empty()) {
                     const float field_scale = input.temporal.motion_vectors_scale > 0.0f
                                                   ? input.temporal.motion_vectors_scale
                                                   : 1.0f;
-                    const float threshold = PHASE_ALIGNED_MOTION_GATE_PX
-                                          * (static_cast<float>(width) / static_cast<float>(gate_grid));
-                    const size_t plane = static_cast<size_t>(width) * height;
-                    restart.assign(plane, 0);
-                    for (size_t i = 0; i < plane; ++i) {
-                        const float dx = field[i * 2] * field_scale;
-                        const float dy = field[i * 2 + 1] * field_scale;
-                        if (std::sqrt(dx * dx + dy * dy) > threshold) {
-                            restart[i] = 1;
-                            any_restart = true;
-                        }
+                    warp_field.resize(field.size());
+                    for (size_t i = 0; i < field.size(); ++i) {
+                        warp_field[i] = field[i] * field_scale;
                     }
                 }
             }
 
-            if (restart.empty() && motion_px > PHASE_ALIGNED_MOTION_GATE_PX) {
+            if (warp_field.empty() && motion_px > PHASE_ALIGNED_MOTION_GATE_PX) {
                 /* No field to be per-pixel about, and the declared magnitude says the whole frame moved:
                  * what has been accumulated belongs to an earlier view of the scene. Dropped rather than
                  * kept, because a mean of before and after ghosts - and the reprojection blend above has
@@ -816,7 +810,8 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                 /* Output grid == frame grid, so the placement's scale is 1 and the offset is already in
                  * output pixels: this is the case the native-resolution test pins as exactly the de-jitter. */
                 if (phase_aligned_.add_frame(phase_frame_, 3, width, height, width, height,
-                                             JitterOffset(phase.offset_x, phase.offset_y), restart)) {
+                                             JitterOffset(phase.offset_x, phase.offset_y),
+                                             std::vector<uint8_t>(), warp_field)) {
                     std::vector<float> resolved;
                     if (phase_aligned_.resolve(resolved)) {
                         for (size_t i = 0; i < plane; ++i) {
@@ -825,8 +820,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                             displayed[i * 3u + 2u] = resolved[plane * 2u + i];
                         }
                         interleaved_float_to_rgb8(displayed, rgb8);
-                        result.phase_note = any_restart ? "phase-aligned per-pixel"
-                                                       : "phase-aligned";
+                        result.phase_note = warp_field.empty() ? "phase-aligned" : "phase-aligned warped";
                     }
                 }
             }

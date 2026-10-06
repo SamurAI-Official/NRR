@@ -905,11 +905,15 @@ std::vector<uint8_t> pf_ramp() {
  * way an engine would. */
 NRRFrameInput pf_input(uint64_t index, float offset_x, float offset_y, bool jittered,
                        float motion = 0.0f) {
-    NRRFrameInput input;
+    /* Value-initialised: an uninitialised `NRRFrameInput` leaves fields like motion_vectors_scale
+     * indeterminate, and a garbage scale multiplies the motion field into nonsense - which is a silent,
+     * order-dependent failure in whatever test happens to read it first. */
+    NRRFrameInput input = {};
     input.temporal.frame_index = index;
     input.temporal.resolution_x = pf_w;
     input.temporal.resolution_y = pf_h;
     input.temporal.motion_magnitude = motion;
+    input.temporal.motion_vectors_scale = 1.0f;
     input.temporal.jitter.offset_x = offset_x;
     input.temporal.jitter.offset_y = offset_y;
     input.temporal.jitter.enabled = jittered ? 1 : 0;
@@ -962,6 +966,25 @@ std::vector<uint8_t> pf_ramp_offset(int levels) {
     for (size_t i = 0; i < out.size(); ++i) {
         const int raised = static_cast<int>(out[i]) + levels;
         out[i] = static_cast<uint8_t>(raised > 255 ? 255 : (raised < 0 ? 0 : raised));
+    }
+    return out;
+}
+
+/* An integer shift of the ramp, clamped at the edges: the content moved by (dx, dy) with no resampling. */
+std::vector<uint8_t> pf_ramp_shifted(int dx, int dy) {
+    const std::vector<uint8_t> source = pf_ramp();
+    std::vector<uint8_t> out(source.size(), 0);
+    for (uint32_t y = 0; y < pf_h; ++y) {
+        for (uint32_t x = 0; x < pf_w; ++x) {
+            const int sx = std::min<int>(std::max<int>(static_cast<int>(x) - dx, 0),
+                                         static_cast<int>(pf_w) - 1);
+            const int sy = std::min<int>(std::max<int>(static_cast<int>(y) - dy, 0),
+                                         static_cast<int>(pf_h) - 1);
+            for (int c = 0; c < 3; ++c) {
+                out[(static_cast<size_t>(y) * pf_w + x) * 3 + c] =
+                    source[(static_cast<size_t>(sy) * pf_w + sx) * 3 + c];
+            }
+        }
     }
     return out;
 }
@@ -1460,6 +1483,107 @@ NRR_TEST(test_phase_aligned_pass_and_blend_compose_in_one_frame) {
     NRR_ASSERT(std::fabs(measured - expected) <= 1.0f,
                "the blend must see the integration's resolve, not the raw frame: expected "
                + std::to_string(expected) + " levels, measured " + std::to_string(measured));
+}
+
+
+/* The field now *moves* the accumulation instead of deciding what to throw away, which the head-to-head in
+ * tools/aa_resolve_probe.py's warp_vs_restart_check settles on identical content: on the moved pixels
+ * restarting is exactly a single frame, while warping stays about a third below it and leaves the still
+ * region bit-identical. Three facts pin the implementation, all on the linear ramp so the arithmetic is
+ * exact: a zero field is the identity, a constant field shifts what was accumulated by that much (the
+ * resolve of a ramp and its shifted self is the shift halved), and a field whose source leaves the frame
+ * restarts rather than reading the clamped border inwards. */
+NRR_TEST(test_phase_aligned_pass_warps_the_accumulation_by_the_field) {
+    using namespace phase_fixture;
+    const float kStep = 255.0f / static_cast<float>(pf_w);   /* the ramp's value step per pixel */
+
+    struct Frame {
+        TemporalAccumulator::Result result;
+        std::vector<uint8_t> image;
+    };
+    auto run_pair = [&](float field_x, int frame2_shift) {
+        TemporalAccumulator accumulator;
+        accumulator.initialize();
+        accumulator.set_phase_aligned_enabled(true);
+        Frame first, second;
+        first.image = pf_ramp();
+        const NRRFrameInput first_input = pf_input(1, 0.0f, 0.0f, true, 0.0f);
+        accumulator.apply(first_input, first.image, pf_w, pf_h,
+                          [field_x] { return pf_field(field_x, 0.0f); },
+                          phase_aligned_frame_for(first_input, false, pf_w, pf_h, pf_w, pf_h));
+        /* The second frame is the first one moved by the field, which is the case the field *describes*: the
+         * scene translated by exactly that much. It also makes the reprojection blend a no-op - it warps the
+         * previous frame by the field and finds this one - so what is left to measure is the accumulation's
+         * own warp and not the composition, which the test above pins separately. */
+        second.image = pf_ramp_shifted(frame2_shift, 0);
+        const NRRFrameInput second_input = pf_input(2, 0.0f, 0.0f, true, 0.0f);
+        second.result = accumulator.apply(second_input, second.image, pf_w, pf_h,
+                                          [field_x] { return pf_field(field_x, 0.0f); },
+                                          phase_aligned_frame_for(second_input, false, pf_w, pf_h,
+                                                                  pf_w, pf_h));
+        return second;
+    };
+
+    auto interior_mean = [&](const std::vector<uint8_t>& image) {
+        double sum = 0.0;
+        size_t count = 0;
+        for (uint32_t y = 1; y + 1 < pf_h; ++y) {
+            for (uint32_t x = 2; x + 2 < pf_w; ++x) {
+                sum += static_cast<double>(pf_pixel(image, x, y));
+                ++count;
+            }
+        }
+        return static_cast<float>(sum / static_cast<double>(count));
+    };
+
+    const std::vector<uint8_t> reference = pf_ramp();
+    const float reference_mean = interior_mean(reference);
+
+    /* A zero field is the identity: the accumulation averages the same frame twice, so the resolve of a mean
+     * is the frame itself, whatever it is. */
+    const Frame still = run_pair(0.0f, 0);
+    NRR_EXPECT_EQ(still.result.phase_aligned_frames, 2u, "both frames must accumulate");
+    NRR_ASSERT(std::string(still.result.phase_note) == "phase-aligned warped",
+               "a frame with a field must be reported as warped; got '"
+               + std::string(still.result.phase_note) + "'");
+    NRR_EXPECT_NEAR(interior_mean(still.image), reference_mean, 1.0f,
+                    "a zero field must leave the accumulation where it was");
+
+    /* A scene that translates by exactly the field: the accumulation must follow it, so the resolve is the
+     * whole accumulation moved by that many pixels - one shift's worth of the ramp, not half and not twice. */
+    const float field_x = 2.0f;
+    const Frame warped = run_pair(field_x, static_cast<int>(field_x));
+    NRR_EXPECT_NEAR(interior_mean(warped.image), reference_mean - field_x * kStep, 1.5f,
+                    "the field must move the accumulated frame by exactly that much, not restart it");
+
+    /* And a source outside the frame has no sample to move, so that pixel starts again rather than reading
+     * the clamped border inwards. Checked on the accumulator directly rather than through apply(): the blend
+     * warps the history with the same field and clamps it at the border, so through the full pass this rule
+     * would be masked by the composition (which the test above covers). Every source is far outside here, so
+     * the resolve must be the second frame alone. */
+    {
+        PhaseAlignedAccumulator accumulator;
+        std::vector<float> frame_a(static_cast<size_t>(pf_w) * pf_h * 3, 0.25f);
+        std::vector<float> frame_b(static_cast<size_t>(pf_w) * pf_h * 3, 0.75f);
+        NRR_ASSERT(accumulator.add_frame(frame_a, 3, pf_w, pf_h, pf_w, pf_h, JitterOffset()),
+                   "the first frame must be accepted");
+        std::vector<float> warp(static_cast<size_t>(pf_w) * pf_h * 2, 0.0f);
+        for (size_t i = 0; i < static_cast<size_t>(pf_w) * pf_h; ++i) {
+            warp[i * 2] = 1000.0f; /* an impossible displacement: nothing to read anywhere */
+        }
+        NRR_ASSERT(accumulator.add_frame(frame_b, 3, pf_w, pf_h, pf_w, pf_h, JitterOffset(),
+                                          std::vector<uint8_t>(), warp),
+                   "the second frame must be accepted");
+        std::vector<float> resolved;
+        NRR_ASSERT(accumulator.resolve(resolved), "a two-frame accumulation must resolve");
+        float worst = 0.0f;
+        for (size_t i = 0; i < resolved.size(); ++i) {
+            worst = std::max(worst, std::fabs(resolved[i] - frame_b[i]));
+        }
+        NRR_ASSERT(worst < 1e-6f,
+                   "an out-of-frame warp must restart the pixel, so the resolve is the new frame alone; "
+                   "worst difference " + std::to_string(worst));
+    }
 }
 
 

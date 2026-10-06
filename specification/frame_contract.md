@@ -101,6 +101,21 @@ A caller that has no measurement should pass 0 rather than a guess: the phase-al
 anything large, so a placeholder disables the feature instead of misusing it. Values above 1 (a whole frame
 width per frame) are clamped.
 
+**Migrating from the `[0, 1]` motion level.** Earlier revisions documented this field as a motion "level" and
+the runtime compared it against `0.3`, which no measurement could reach (0.3 of a level is 576 px/frame on a
+1920-wide frame). A caller that was feeding a level must divide instead:
+
+    motion_magnitude = pixels_moved_per_frame / frame_width
+
+where both are measured on the frame's *render* grid (not the output grid - on a 2x pipeline they differ by a
+factor of two). Typical values are small: a 1920-wide frame panning 6 px in a frame is `0.003125`. A frame
+width per frame (1.0) is the fastest motion the field can express, and a caller that keeps feeding a level
+will see the phase-aligned gate refuse every frame and the history weight decay sooner - both of which are
+visible in `NRRFrameOutput::temporal` (`motion_magnitude` is echoed back clamped, `temporal_alpha` is the
+weight the runtime computed) rather than silent. Both shipped engine bindings already measure in the new
+unit: `NRRRenderer.MeasureMotion` projects a reference-depth point through the previous and current
+view-projection matrices and reports the screen displacement over the width.
+
 ### 4.4 Previous Output
 
 Optional. If provided, must match previous NRR output resolution and format.

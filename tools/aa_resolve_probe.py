@@ -874,8 +874,119 @@ def composition_check(label, session, frames, target, weights, motions, count, m
                      edge / single_edge, edge / integrated_edge))
 
 
-def gate_sweep(frames, target, weights, motions, count):
+def warp_by_field(image, field):
+    """Resample `image` per pixel by a field of displacements, in output pixels.
 
+    This is what a reprojecting accumulator does to its history: for every output pixel, read the history
+    where the field says its content was last frame. `field` is H x W x 2.
+    """
+    height, width = image.shape[:2]
+    xs = np.arange(width, dtype=np.float32)[None, :]
+    ys = np.arange(height, dtype=np.float32)[:, None]
+    grid_x = np.broadcast_to(xs, (height, width)) + field[..., 0]
+    grid_y = np.broadcast_to(ys, (height, width)) + field[..., 1]
+    return samples._bilinear(image, grid_x, grid_y)
+
+
+def warp_vs_restart_check(frames, target, weights, motions, count):
+    """Warping the accumulation against restarting the moved pixels - the head-to-head that never ran.
+
+    The shipped behaviour restarts the pixels a motion field reports as moved and warps nothing, and that
+    was justified by a comparison of a reprojected *whole-frame* mean against an unwarped one - i.e. by
+    arrangements neither of which is what the accumulator does. This runs the two candidates on identical
+    content: a still scene with one rectangle that moves `motion` frame pixels per frame, given the exact
+    field (zero outside the rectangle, the displacement inside it). Whole-pixel translations, and both the
+    input's rectangle and the reference's are moved by the same whole number of pixels, so nothing in the
+    comparison is blurred except by the rules being compared:
+
+      * one frame       - the first frame, placed;
+      * mean            - the accumulation with no rule at all: the smearing the gate exists to prevent;
+      * restart         - the shipped rule: the rectangle's pixels are emptied and this frame is their first
+                          sample, their neighbours keep integrating;
+      * warp            - the alternative: the accumulation is resampled by the field before the new frame is
+                          added. The field moves only the rectangle, so this warps only the moving part.
+    """
+    h_out, w_out = target.shape[:2]
+    h_in, w_in = frames[0]["input"].shape[:2]
+    out_block = (int(h_out * 0.25), int(h_out * 0.75), int(w_out * 0.25), int(w_out * 0.75))
+    in_block = (int(h_in * 0.25), int(h_in * 0.75), int(w_in * 0.25), int(w_in * 0.75))
+    scale = h_out / float(h_in)
+    inside = np.zeros((h_out, w_out), dtype=bool)
+    inside[out_block[0]:out_block[1], out_block[2]:out_block[3]] = True
+    print("\nwarp vs restart, a still scene with one %dx%d rectangle moving j frame px/frame (K=%d)"
+          % (out_block[1] - out_block[0], out_block[3] - out_block[2], count))
+    print("  scored inside the moving rectangle and outside it separately: a whole-frame edge error is")
+    print("  dominated by the still region, where every arrangement keeps integrating and nothing differs.")
+    print("  %-9s %-9s %-9s %-9s %-9s %s"
+          % ("j px/f", "region", "mean", "restart", "warp", "better"))
+    for motion in motions:
+        step = motion * scale                      # the *per-frame* displacement, in output pixels
+        field = np.zeros((h_out, w_out, 2), dtype=np.float32)
+        # Reading the history at x + step puts its content where this frame's content is: the content moves
+        # -step per frame, so the history is displaced by -step to be aligned with the present.
+        field[out_block[0]:out_block[1], out_block[2]:out_block[3]] = step
+        moved = np.sqrt(field[..., 0] ** 2 + field[..., 1] ** 2) > 0.5
+
+        accumulated = None
+        weight = np.zeros((h_out, w_out, 1), dtype=np.float32)
+        mean = np.zeros_like(target)
+        one_frame = None
+        for index in range(count):
+            source = frames[index]["input"].copy()
+            source[in_block[0]:in_block[1], in_block[2]:in_block[3]] = \
+                translated(frames[index]["input"],
+                           (motion * index, motion * index))[
+                    in_block[0]:in_block[1], in_block[2]:in_block[3]]
+            frame = placed_sample(source, frames[index]["jitter"], target.shape[:2], scale)
+            # The baseline is the *last* frame placed, not the first: a single frame is the thing an
+            # accumulation has to beat, and its content has to be where the reference's content is.
+            one_frame = frame
+            mean += frame
+            if accumulated is None:
+                accumulated = frame.copy()
+                warp_accumulated = frame.copy()
+                weight[...] = 1.0
+            else:
+                warp_accumulated = warp_by_field(warp_accumulated, field)
+                # Restart: the marked pixels drop what they had, so the resolve divides by the *weight*
+                # (that is why the runtime carries one) rather than by the frame count.
+                accumulated = np.where(moved[..., None], frame, accumulated + frame)
+                weight = np.where(moved[..., None], 1.0, weight + 1.0)
+                warp_accumulated = warp_accumulated + frame
+        mean /= float(count)
+        restart = accumulated / weight
+        warped = warp_accumulated / float(count)
+
+        last = count - 1
+        reference = target.copy()
+        reference[out_block[0]:out_block[1], out_block[2]:out_block[3]] = \
+            translated(target, (motion * last * scale, motion * last * scale))[
+                out_block[0]:out_block[1], out_block[2]:out_block[3]]
+        ref_weights = samples.edge_weights(reference)
+        for region, mask in (("still", ~inside), ("moving", inside)):
+            region_weights = ref_weights * mask
+            total = region_weights.sum()
+            if total > 0:
+                region_weights = region_weights / total
+            scores = {}
+            for name, image in (("one frame", one_frame), ("mean", mean),
+                                ("restart", restart), ("warp", warped)):
+                scores[name] = samples.edge_error(image, reference, region_weights)
+            baseline = scores["one frame"]
+            best = min(scores, key=scores.get)
+            print("  %-9.3f %-9s %s  -> %s"
+                  % (motion, region,
+                     "  ".join("%-9.6f" % (scores[name] - baseline) for name in
+                               ("mean", "restart", "warp")) + "  (deltas vs one frame %.6f)" % baseline,
+                     best))
+            print("  %-9s %-9s %s"
+                  % ("", "",
+                     "  ".join("%-9s" % ("%+.1f%%" % (100.0 * (scores[name] - baseline) / baseline))
+                               for name in ("mean", "restart", "warp"))))
+    return 0
+
+
+def gate_sweep(frames, target, weights, motions, count):
     """How much scene motion the integration tolerates, on the real static frames.
 
     Each frame is translated by its own distance from the first - a scene that moves m pixels per
@@ -1012,6 +1123,8 @@ def main(argv):
     reproject_successive(frames, target, weights,
                          integer_motion_sweep(min(8, args.frames), scale, min(1.0, args.motion)),
                          min(8, args.frames))
+    warp_vs_restart_check(frames, target, weights,
+                          integer_motion_sweep(min(8, args.frames), scale, 1.0), min(8, args.frames))
     per_pixel_gate_check(frames, target, weights,
                          integer_motion_sweep(min(8, args.frames), scale, 0.5)[-1],
                          min(8, args.frames))

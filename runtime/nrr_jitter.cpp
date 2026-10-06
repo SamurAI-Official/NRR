@@ -149,7 +149,8 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
                                         uint32_t width, uint32_t height,
                                         uint32_t out_width, uint32_t out_height,
                                         const JitterOffset& offset,
-                                        const std::vector<uint8_t>& restart) {
+                                        const std::vector<uint8_t>& restart,
+                                        const std::vector<float>& warp) {
     if (channels <= 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0) return false;
     const size_t in_plane = static_cast<size_t>(width) * height;
     if (frame_nchw.size() < in_plane * static_cast<size_t>(channels)) return false;
@@ -157,6 +158,7 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
     /* A mask of the wrong size would silently mis-index, so it is refused rather than resized: a caller
      * that computed it for another grid has made the same mistake the output-grid check below catches. */
     if (!restart.empty() && restart.size() < out_plane) return false;
+    if (!warp.empty() && warp.size() < out_plane * 2) return false;
 
     /* A sequence has one output grid. Mixing two would average samples that were
      * placed for different displays, so refuse rather than reinterpret them. */
@@ -185,6 +187,60 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
 
     const float shift_x = offset.x * (static_cast<float>(out_width) / static_cast<float>(width));
     const float shift_y = offset.y * (static_cast<float>(out_height) / static_cast<float>(height));
+
+    /* Move what has been accumulated by the caller's field, before this frame is added.
+     *
+     * This is the alternative to restarting the pixels the field reports as moved, and it is what a
+     * head-to-head on identical content settles: restarting is a *floor* there (the pixel simply becomes
+     * this frame, exactly a single frame's worth of evidence), while warping keeps the integration running
+     * across the move and stays about a third below a single frame's edge error on the moving pixels. The
+     * still region is untouched either way, because a zero field is the identity.
+     *
+     * The weights travel with the samples: a pixel's history now holds the samples that were behind the
+     * place its content came from, so the count has to come from there too, or a moved pixel with one
+     * sample behind it would resolve as if it had eight. */
+    std::vector<uint8_t> out_of_frame;
+    if (!warp.empty() && frame_count_ > 0) {
+        warped_.assign(sum_.size(), 0.0);
+        warped_weight_.assign(weight_.size(), 0.0);
+        out_of_frame.assign(out_plane, 0);
+        const float max_x = static_cast<float>(out_width - 1);
+        const float max_y = static_cast<float>(out_height - 1);
+        for (uint32_t y = 0; y < out_height; ++y) {
+            for (uint32_t x = 0; x < out_width; ++x) {
+                const size_t p = static_cast<size_t>(y) * out_width + x;
+                /* The same convention as the reprojection blend's field: `source = x - field`, so a
+                 * caller hands the same interleaved field to both and cannot get the sign wrong in one
+                 * place and right in the other. */
+                const float u = static_cast<float>(x) - warp[p * 2];
+                const float v = static_cast<float>(y) - warp[p * 2 + 1];
+                /* A source outside the frame has no sample to move: a bilinear gather there would read
+                 * the clamped border and smear it inwards, which is worse than starting again. */
+                if (u < 0.0f || v < 0.0f || u > max_x || v > max_y) {
+                    out_of_frame[p] = 1;
+                    continue;
+                }
+                int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+                float lx = 0.0f, ly = 0.0f;
+                bilinear_taps(u, static_cast<int>(out_width), x0, x1, lx);
+                bilinear_taps(v, static_cast<int>(out_height), y0, y1, ly);
+                for (int c = 0; c < channels_; ++c) {
+                    const double* base = &sum_[static_cast<size_t>(c) * out_plane];
+                    const double top = base[static_cast<size_t>(y0) * out_width + x0] * (1.0f - lx)
+                                     + base[static_cast<size_t>(y0) * out_width + x1] * lx;
+                    const double bottom = base[static_cast<size_t>(y1) * out_width + x0] * (1.0f - lx)
+                                        + base[static_cast<size_t>(y1) * out_width + x1] * lx;
+                    warped_[static_cast<size_t>(c) * out_plane + p] = top * (1.0f - ly) + bottom * ly;
+                }
+                warped_weight_[p] = weight_[static_cast<size_t>(y0) * out_width + x0] * (1.0f - lx) * (1.0f - ly)
+                                  + weight_[static_cast<size_t>(y0) * out_width + x1] * lx * (1.0f - ly)
+                                  + weight_[static_cast<size_t>(y1) * out_width + x0] * (1.0f - lx) * ly
+                                  + weight_[static_cast<size_t>(y1) * out_width + x1] * lx * ly;
+            }
+        }
+        sum_.swap(warped_);
+        weight_.swap(warped_weight_);
+    }
 
     for (uint32_t y = 0; y < out_height; ++y) {
         /* Read back at Y + shift_y, which is the de-jitter's own direction: a frame recorded at
@@ -217,7 +273,8 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
              * averaged into the new content. That is the whole difference between a per-pixel restart and
              * a reprojection: nothing is warped, so nothing is blurred, and the sample phases the
              * integration lives on survive in the pixels that did not move. */
-            const bool restart_here = !restart.empty() && restart[p] != 0;
+            const bool restart_here = (!restart.empty() && restart[p] != 0) ||
+                                      (!out_of_frame.empty() && out_of_frame[p] != 0);
             for (int c = 0; c < channels; ++c) {
                 const float* base = &scratch_[static_cast<size_t>(c) * out_plane];
                 const float top = base[static_cast<size_t>(y0) * out_width + x0] * wx0

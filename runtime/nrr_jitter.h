@@ -148,12 +148,28 @@ bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
  * content. Corrected, a reprojected *whole-frame* mean does win on a scene that
  * translates (0.0300 at 0.14-1.0 px/frame against 0.0463 for one frame and 0.0797 for
  * an unwarped mean), so "never warp" is not a general conclusion - but restarting
- * beats every whole-frame arrangement on the partly-moving content each was measured
- * on, and the two have not been compared head to head. That comparison is open, and
- * it is a design decision rather than an overdue fix.
+ * The field is used, not just its magnitude: warping the accumulation by it is what the
+ * comparison above settles, and it is decisive on identical content with the exact field.
+ * A still scene with one rectangle moving a whole pixel per frame, scored inside the
+ * rectangle and outside it separately, against the last frame placed:
  *
- * Memory: the resolved frame plus one scratch frame at the output resolution
- * (~25 MB at 1920x1080 RGB). An instance is not thread-safe; give each thread its
+ *     j px/f   still region (mean/restart/warp)   moving region (mean/restart/warp)
+ *     0.000    -42.2 / -42.2 / -42.2 %            -39.4 / -39.4 / -39.4 %
+ *     0.143    -43.4 / -43.4 / -43.4 %            -12.7 / -12.7 / -33.8 %
+ *     0.286    -42.8 / -42.8 / -42.8 %             +9.2 /   0.0 / -33.4 %
+ *     0.429    -42.7 / -42.7 / -42.7 %            +24.0 /   0.0 / -34.6 %
+ *
+ * Restarting is a *floor* on the moved pixels: it is exactly a single frame there, which
+ * is why its column is 0.0%. Warping keeps integrating through the motion and stays a
+ * third below a single frame, costs nothing where the field is zero (the whole still
+ * column is bit-identical to leaving the accumulation alone), and does not disturb the
+ * still region at all. So the rule is now: warp by the field, and restart only where the
+ * warp cannot be trusted - a source outside the frame, where a bilinear gather would
+ * smear the border pixel inwards. The caller's `restart` mask is still honoured for
+ * pixels it names, so a caller with a disocclusion detector can still drop them.
+ *
+ * Memory: the resolved frame plus two scratch frames at the output resolution
+ * (~25 MB at 1920x1080 RGB each). An instance is not thread-safe; give each thread its
  * own, as with the other accumulators in this runtime. */
 class PhaseAlignedAccumulator {
 public:
@@ -171,12 +187,23 @@ public:
      * outside the frame. Those pixels are *emptied* and this frame becomes their
      * first sample, which is how a part of the image that moves keeps its neighbours
      * integrating instead of dragging the whole frame's accumulation down with it.
-     * Empty means "nothing to restart", which is the identity. */
+     * Empty means "nothing to restart" for the caller; the pixels whose warp would read from
+     * outside the frame are restarted regardless, because a bilinear gather there smears the
+     * border inwards.
+     *
+     * `warp` (optional, `out_width * out_height * 2` interleaved floats, in output pixels) is the
+     * caller's motion field. When present, the accumulation collected so far is resampled by it
+     * *before* this frame is added, so its content follows the motion instead of being dropped -
+     * measured, that keeps a third of the edge error off the moving pixels, where restarting only
+     * matches a single frame there. A zero field is the identity, and no field at all leaves the
+     * accumulation untouched: a caller that cannot supply one gets exactly what this class did
+     * before. */
     bool add_frame(const std::vector<float>& frame_nchw, int channels,
                    uint32_t width, uint32_t height,
                    uint32_t out_width, uint32_t out_height,
                    const JitterOffset& offset,
-                   const std::vector<uint8_t>& restart = std::vector<uint8_t>());
+                   const std::vector<uint8_t>& restart = std::vector<uint8_t>(),
+                   const std::vector<float>& warp = std::vector<float>());
 
     /* The mean of the frames accumulated so far, at the output resolution.
      * False (leaving `out_nchw` untouched) when nothing has been added. */
@@ -194,6 +221,10 @@ private:
      * resolved frame is compared against a torch reference at tight tolerance. */
     std::vector<double> sum_;
     std::vector<float> scratch_; /* one upsampled frame, reused across calls */
+    /* The warped accumulation and its weights, reused across calls: the warp needs the sums and the
+     * counts before the swap, so it cannot be done in place. */
+    std::vector<double> warped_;
+    std::vector<double> warped_weight_;
     /* Samples behind each output pixel. A whole-frame accumulation would count to the
      * frame count everywhere, but a per-pixel restart empties individual pixels, so the
      * resolve is a division by this rather than by the count - and it is why the class no

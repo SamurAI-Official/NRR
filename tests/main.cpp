@@ -304,6 +304,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_phase_aligned_gate_converts_the_magnitude_with_the_frame_width);
     NRR_RUN_TEST(test_motion_magnitude_reaches_both_consumers_in_one_unit);
     NRR_RUN_TEST(test_phase_aligned_pass_and_blend_compose_in_one_frame);
+    NRR_RUN_TEST(test_phase_aligned_pass_warps_the_accumulation_by_the_field);
     NRR_RUN_TEST(test_temporal_history_names_classify_as_history);
     NRR_RUN_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_it);
 
