@@ -76,6 +76,10 @@ namespace NRR
                     // first entry of the sequence rather than wherever the old one left off.
                     _jitter.Reset();
                     _baseProjectionCaptured = false;
+                    // The motion measurement is a difference between consecutive frames, so it starts over
+                    // too: comparing against a matrix captured before the reset would report the pause as
+                    // camera motion.
+                    _hasPreviousViewProjection = false;
                 }
             }
         }
@@ -117,16 +121,32 @@ namespace NRR
         }
 
         /// <summary>
-        /// Per-frame scene motion, in frame fractions (the runtime converts it with the frame width; its
-        /// gate is 0.2 px). Nothing here measures it: fill it from the project's own motion pass - a mean
-        /// |motion| over the frame - and leave it at zero only while the scene really is still. A camera
-        /// whose motion field is a constant is not a measurement (the captures in this repository read
-        /// 0.10998 on scenes that do not move at all), so a magnitude copied from such a field will either
-        /// refuse every frame or accept every frame.
+        /// Per-frame scene motion, in frame fractions. Zero means "measure it from the camera yourself"
+        /// (the default); a non-zero value is the caller's own measurement and is used instead, which is
+        /// what a project with a real motion pass - or one with moving objects, which a camera cannot see -
+        /// should set.
         /// </summary>
-        [Tooltip("Declared per-frame scene motion, in frame fractions. Must come from a real " +
-                 "measurement; the runtime refuses to integrate past 0.2 px of it.")]
+        [Tooltip("0 = the renderer measures the camera's motion itself. Set it from your own motion pass " +
+                 "to include object motion; the runtime refuses to integrate past 0.2 px of it.")]
         public float MotionMagnitude = 0.0f;
+
+        /// <summary>
+        /// Depth at which the renderer's camera-motion measurement is exact, in world units.
+        ///
+        /// The measurement projects one world point through the previous and the current view-projection
+        /// matrices, so a pure rotation is exact at any depth while a translation is exact only at the depth
+        /// of the point it projects: content twice as far away moves half as far on screen, so a magnitude
+        /// taken at `r` misstates that content by the ratio of its depth to `r`. A gate wants an estimate
+        /// that is right at the distance the viewer is looking, which is what this is.
+        /// </summary>
+        [Tooltip("World-space depth the camera-motion estimate is exact at.")]
+        public float MotionReferenceDepth = 10.0f;
+
+        /// <summary>
+        /// What the last frame reported to the runtime: the caller's MotionMagnitude when it is non-zero,
+        /// otherwise the renderer's own camera measurement. Exposed so a caller can log or assert it.
+        /// </summary>
+        public float LastMotionMagnitude { get; private set; }
 
         private NRRTexture _colorIn;
         private NRRTexture _depthIn;
@@ -136,6 +156,8 @@ namespace NRR
         private bool _baseProjectionCaptured;
         private bool _phaseAligned;
         private bool _phaseAlignedWarningLogged;
+        private Matrix4x4 _previousViewProjection;
+        private bool _hasPreviousViewProjection;
 
         /// <summary>
         /// Pushes <see cref="PhaseAlignedAccumulation"/> to the device, if there is one.
@@ -272,6 +294,61 @@ private void Update()
             }
         }
 
+        /// <summary>
+        /// The camera's screen-space motion, in frame fractions, measured from the previous frame's
+        /// view-projection matrix to this one.
+        ///
+        /// One world point at <see cref="MotionReferenceDepth"/> is projected through both matrices: the
+        /// distance it appears to move on screen *is* the quantity the runtime's gate is about, in the units
+        /// that gate uses - a fraction of the frame's own width, which is what the runtime multiplies by the
+        /// low-resolution width. A pure rotation is exact at any depth (the point's depth cancels), and a
+        /// translation is exact at the reference depth, scaling with the inverse of the real depth. Object
+        /// motion is not visible here at all - a camera cannot see it - which is exactly why a project with a
+        /// real motion pass should set <see cref="MotionMagnitude"/> instead.
+        ///
+        /// The first call has nothing to compare against and reports zero. Called every frame, integration or
+        /// not, so that turning the integration on mid-run does not compare against a stale matrix.
+        /// </summary>
+        private float MeasureCameraMotion(Camera camera)
+        {
+            if (camera == null)
+            {
+                return 0.0f;
+            }
+
+            var current = camera.projectionMatrix * camera.worldToCameraMatrix;
+            var reference = camera.transform.position +
+                            camera.transform.forward * Mathf.Max(MotionReferenceDepth, 0.01f);
+            var previous = _previousViewProjection;
+            var hadPrevious = _hasPreviousViewProjection;
+            _previousViewProjection = current;
+            _hasPreviousViewProjection = true;
+            if (!hadPrevious)
+            {
+                return 0.0f;
+            }
+
+            return MeasureMotion(previous, current, reference, InputWidth, InputHeight);
+        }
+
+        /// <summary>
+        /// The measurement above as a pure function of two camera states, so it can be checked against a
+        /// rendered measurement without driving a whole frame: NRRJitterCameraTests moves a real camera,
+        /// correlates the two frames to measure the content's shift in pixels, and compares it to this.
+        /// </summary>
+        public static float MeasureMotion(Matrix4x4 previousViewProjection, Matrix4x4 currentViewProjection,
+                                          Vector3 worldPoint, int frameWidth, int frameHeight)
+        {
+            // MultiplyPoint applies the perspective divide, so these are normalized device coordinates in
+            // [-1, 1]; half the range spans the frame, which makes the conversion to pixels and then to a
+            // fraction of the frame's width a scale rather than an approximation.
+            var before = previousViewProjection.MultiplyPoint(worldPoint);
+            var after = currentViewProjection.MultiplyPoint(worldPoint);
+            var deltaX = (after.x - before.x) * 0.5f * frameWidth;
+            var deltaY = (after.y - before.y) * 0.5f * frameHeight;
+            return Mathf.Sqrt(deltaX * deltaX + deltaY * deltaY) / Mathf.Max(frameWidth, 1);
+        }
+
         /// <summary>Capture the current camera frame and run NRR neural render.</summary>
         public void Render()
         {
@@ -330,6 +407,11 @@ private void Update()
             _depthIn.Upload(new byte[InputWidth * InputHeight * 4]);
             _motionIn.Upload(new byte[InputWidth * InputHeight * 4]);
 
+            // Motion: the caller's own measurement when it has one, otherwise the camera's. Measured after
+            // the jitter has been restored, so the renderer's own sub-pixel offset - which the runtime
+            // subtracts as jitter rather than as scene motion - is not read back as the scene moving.
+            LastMotionMagnitude = MotionMagnitude > 0.0f ? MotionMagnitude : MeasureCameraMotion(camera);
+
             var input = new NRRFrameInput
             {
                 color = _colorIn.Handle,
@@ -353,10 +435,12 @@ private void Update()
                     delta_time = Time.deltaTime,
                     resolution_x = (uint)InputWidth,
                     resolution_y = (uint)InputHeight,
-                    // Carried from the caller, not invented here: the runtime's 0.2 px gate is fed by this
-                    // number, and a zero passes it on every frame. Measured from the project's motion pass
-                    // where one exists; the warning below fires once when the integration is on without it.
-                    motion_magnitude = MotionMagnitude,
+                    // Measured by this renderer unless the caller supplied its own (see MotionMagnitude):
+                    // the runtime's 0.2 px gate is fed by this number, and a zero passes it on every frame.
+                    // The camera measurement cannot see object motion, so a project that has moving objects
+                    // sets MotionMagnitude from its own motion pass; the warning below fires once when the
+                    // integration is on with no camera and no measurement to feed the gate.
+                    motion_magnitude = LastMotionMagnitude,
                     temporal_alpha = 0.9f,
                     history_frames = 0,
                     motion_vectors_scale = 1.0f,
@@ -380,13 +464,14 @@ private void Update()
                 object_ids = System.IntPtr.Zero,
             };
 
-            if (_phaseAligned && MotionMagnitude <= 0.0f && !_phaseAlignedWarningLogged)
+            if (_phaseAligned && camera == null && MotionMagnitude <= 0.0f && !_phaseAlignedWarningLogged)
             {
                 _phaseAlignedWarningLogged = true;
-                Debug.LogWarning("[NRR] phase-aligned accumulation is on with MotionMagnitude = 0, so the " +
-                                 "runtime's 0.2 px gate accepts every frame: a moving camera will smear " +
-                                 "rather than accumulate. Set MotionMagnitude from a real measurement (a " +
-                                 "mean |motion| over the frame).");
+                Debug.LogWarning("[NRR] phase-aligned accumulation is on with no camera to measure motion " +
+                                 "from and MotionMagnitude = 0, so the runtime's 0.2 px gate accepts every " +
+                                 "frame: a moving scene will smear rather than accumulate. Assign Camera.main " +
+                                 "or set MotionMagnitude from a real measurement (a mean |motion| over the " +
+                                 "frame).");
             }
 
             NRRReferenceSet? references = Reference != null

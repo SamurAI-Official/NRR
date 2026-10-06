@@ -531,6 +531,133 @@ namespace NRR.Tests
                 if (readback != null) UnityEngine.Object.Destroy(readback);
             }
         }
+        /// <summary>
+        /// The camera-motion measurement the renderer feeds the runtime's gate, checked against the render.
+        ///
+        /// The gate that decides whether a frame may join the phase-aligned accumulation is fed
+        /// NRRRenderer.LastMotionMagnitude, which the renderer now measures from the camera when the caller
+        /// has no measurement of its own. A number that decides when to stop integrating has to describe the
+        /// *scene*, so this moves the camera by a known world distance at the quad's known depth and compares
+        /// the renderer's prediction with the content's shift measured out of the rendered frames by the same
+        /// correlation instrument the jitter test calibrates. It also pins the two claims the documentation
+        /// makes about the estimate - exact at MotionReferenceDepth, scaling with the inverse of the depth -
+        /// because a caller chooses the reference depth by reading them.
+        /// </summary>
+        [Test]
+        public void CameraMotionMeasurementMatchesTheRenderedShift()
+        {
+            Texture2D pattern = null, readback = null;
+            GameObject quad = null, camGo = null;
+            RenderTexture target = null;
+            Material material = null;
+            try
+            {
+                pattern = MakeTestPattern();
+                bool urpActive = GraphicsSettings.currentRenderPipeline != null;
+                var shader = urpActive
+                    ? Shader.Find("Universal Render Pipeline/Unlit")
+                    : Shader.Find("Unlit/Texture");
+                Assert.That((UnityEngine.Object)shader, Is.Not.Null,
+                    "no unlit shader found for " + (urpActive ? "URP" : "the built-in pipeline"));
+                material = new Material(shader);
+                material.SetTexture(urpActive ? "_BaseMap" : "_MainTex", pattern);
+
+                quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                quad.transform.position = Vector3.zero;
+                quad.transform.localScale = new Vector3(4f, 4f, 1f);
+                quad.GetComponent<Renderer>().sharedMaterial = material;
+
+                camGo = new GameObject("nrr-motion-camera");
+                var camera = camGo.AddComponent<Camera>();
+                camera.clearFlags = CameraClearFlags.SolidColor;
+                camera.backgroundColor = Color.black;
+                camera.fieldOfView = 60f;
+                camera.nearClipPlane = 0.01f;
+                camera.farClipPlane = 50f;
+                camera.allowMSAA = false;
+                // Stated, not inherited, exactly as in the jitter test: the projection the estimate reads is
+                // the camera's own, so an unstated aspect scales the magnitude with the Game view's ratio.
+                camera.aspect = (float)Width / Height;
+                camGo.transform.position = new Vector3(0f, 0f, -2f);
+                camGo.transform.rotation = Quaternion.identity;
+
+                target = new RenderTexture(Width, Height, 24, RenderTextureFormat.ARGB32);
+                target.antiAliasing = 1;
+                readback = new Texture2D(Width, Height, TextureFormat.RGBA32, false);
+
+
+                // Warm-up: URP compiles its unlit shader on the first explicit render, and a first frame
+                // that is still black would correlate against nothing.
+                RenderNow(camera, target);
+                RenderNow(camera, target);
+                var baseline = Readback(target, readback);
+
+                // The quad is at z = 0 and the camera at z = -2, so every point of the content is at depth
+                // 2: a lateral camera move shifts a constant-depth plane by the *same* amount everywhere,
+                // which is what makes one reference point representative of the whole frame.
+                //
+                // 6px, not more: the pattern is a 16px checkerboard, and a global-translation fit cannot tell
+                // a shift from its period. A first draft asked for 24px and the instrument read 7.036px -
+                // which is 24 - 16, the lattice repeat, not the render being wrong. Inside half a period
+                // (8px) the reading is the shift itself.
+                const float depth = 2f;
+                const float cameraMovePixels = 6f;
+                float worldPerPixel =
+                    2f * Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad) * depth / Height;
+                var previousViewProjection = camera.projectionMatrix * camera.worldToCameraMatrix;
+                camGo.transform.position = new Vector3(worldPerPixel * cameraMovePixels, 0f, -2f);
+                RenderNow(camera, target);
+                var shifted = Readback(target, readback);
+                var currentViewProjection = camera.projectionMatrix * camera.worldToCameraMatrix;
+
+                var measured = MeasureTranslation(baseline, shifted, Width, Height);
+                var reference = camGo.transform.position + camGo.transform.forward * depth;
+                float predicted = NRRRenderer.MeasureMotion(previousViewProjection, currentViewProjection,
+                                                            reference, Width, Height) * Width;
+                float atTwiceTheDepth = NRRRenderer.MeasureMotion(
+                    previousViewProjection, currentViewProjection,
+                    camGo.transform.position + camGo.transform.forward * (depth * 2f),
+                    Width, Height) * Width;
+
+                TestContext.WriteLine(string.Format(
+                    "camera motion: the camera moved {0:F3} units (= {1:F1}px at depth {2}); the content " +
+                    "measured ({3:F3},{4:F3}); MeasureMotion predicted {5:F3}px, and the same point at " +
+                    "twice the depth {6:F3}px",
+                    worldPerPixel * cameraMovePixels, cameraMovePixels, depth, measured.x, measured.y,
+                    predicted, atTwiceTheDepth));
+                Mark(string.Format("camera motion predicted {0:F3}px vs rendered {1:F3}px",
+                                   predicted, measured.magnitude));
+
+                Assert.That(measured.magnitude, Is.EqualTo(cameraMovePixels).Within(0.6f),
+                    "the instrument did not read the camera move it was given, so it cannot judge the " +
+                    "prediction");
+                Assert.That(measured.x, Is.LessThan(0.0f),
+                    "moving the camera right moved the content right: the sign convention this measurement " +
+                    "is compared against is not the one the render produces");
+                Assert.That(predicted, Is.EqualTo(measured.magnitude).Within(0.5f),
+                    "the renderer's camera-motion measurement disagrees with the rendered content's own " +
+                    "shift, so the integration gate is fed a number that is not the scene's motion");
+                Assert.That(atTwiceTheDepth, Is.EqualTo(predicted * 0.5f).Within(0.5f),
+                    "the estimate does not scale with the inverse of the depth, which is what the " +
+                    "documentation promises callers when it says the estimate is exact at " +
+                    "MotionReferenceDepth");
+            }
+            finally
+            {
+                if (camGo != null)
+                {
+                    var cam = camGo.GetComponent<Camera>();
+                    if (cam != null) cam.targetTexture = null;
+                }
+                if (target != null) { target.Release(); UnityEngine.Object.Destroy(target); }
+                if (quad != null) UnityEngine.Object.Destroy(quad);
+                if (camGo != null) UnityEngine.Object.Destroy(camGo);
+                if (material != null) UnityEngine.Object.Destroy(material);
+                if (pattern != null) UnityEngine.Object.Destroy(pattern);
+                if (readback != null) UnityEngine.Object.Destroy(readback);
+            }
+        }
+
     }
 }
 

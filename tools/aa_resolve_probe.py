@@ -29,6 +29,18 @@ integration as the reference.
   3. GATE. The static frames translated by a known per-frame amount, integrated with the placement:
      the error against the same frames left still, as a function of the translation.
 
+  4. REPROJECTION, and then reprojection on the arrangement it was designed for. Warping the
+     accumulation of *samples* by the field is worse than leaving it alone (measured, both metrics:
+     the warp spreads each sample over its neighbours and that compounds). Reprojection belongs on an
+     accumulation of *reconstructions*, so this translates the frames, reconstructs each with the
+     model, and compares one frame against the plain mean of the reconstructions and the same mean
+     reprojected frame by frame. It loses there too, by the same mechanism - but the plain mean also
+     beats a single frame out to 0.5 px/frame where the sample accumulation loses by 0.5, which is the
+     measurement that says the runtime's 0.2 px gate is stricter than this arrangement needs.
+
+  5. PER-PIXEL RESTARTS. The cheaper alternative to warping: the field marks the pixels whose content
+     moved, those are restarted, their neighbours keep integrating.
+
 Usage:
     python tools/aa_resolve_probe.py
     python tools/aa_resolve_probe.py --frames 8 --data models/training-data/godot-static
@@ -487,6 +499,86 @@ def per_pixel_gate_check(frames, target, weights, motion, count=8, gate=0.2):
     print("  per-pixel gate   edge %.6f  plain %.6f   -> %.3f of one frame"
           % (per_pixel_edge, float(np.abs(weighted - target).mean()), per_pixel_edge / single_edge))
 
+def reconstruction_accumulation_check(frames, target, weights, motions, count=8):
+    """The *other* accumulation: de-jittered reconstructions, with reprojection.
+
+    The sample accumulation cannot be reprojected - measured, warping it loses on both metrics because the
+    warp destroys the sub-pixel phases it exists to integrate. A reconstruction is a different object: a
+    frame de-jittered onto the nominal grid has no phases left to destroy, and averaging several of those is
+    a denoise rather than an integration of distinct samples. That is the arrangement a warped history is
+    *for*, so this measures whether it pays where the sample version did not: one frame, the plain mean of
+    the de-jittered frames, and that mean reprojected frame by frame with the exact field.
+    """
+    print("\nreconstruction accumulation (de-jittered frames), scene motion per frame, K=%d" % count)
+    single_edge = samples.edge_error(
+        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
+    single_plain = float(np.abs(samples.upsample(frames[0]["input"], target.shape[:2])
+                                - target).mean())
+    print("  %-11s %-22s %-22s %s"
+          % ("motion px/f", "mean (edge/plain)", "mean reprojected (edge/plain)", "reprojected/single edge"))
+    for motion in motions:
+        unwarped = np.zeros_like(target)
+        warped = np.zeros_like(target)
+        for index in range(count):
+            moved = translated(frames[index]["input"], (motion * index, motion * index))
+            # The reconstruction this frame's model would produce: corrected onto the nominal grid.
+            reconstructed = np.clip(samples.de_jitter(moved, frames[index]["jitter"]), 0.0, 1.0)
+            placed = samples.upsample(reconstructed, target.shape[:2])
+            if index > 0:
+                warped = translated(warped, (motion, motion))
+            unwarped += placed
+            warped += placed
+        unwarped /= float(count)
+        warped /= float(count)
+        reprojected_edge = samples.edge_error(warped, target, weights)
+        print("  %-11.3f %-22s %-22s %.4f"
+              % (motion,
+                 "%.6f / %.6f" % (samples.edge_error(unwarped, target, weights),
+                                  float(np.abs(unwarped - target).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
+                 reprojected_edge / single_edge))
+    print("  one frame: edge %.6f  plain %.6f" % (single_edge, single_plain))
+
+def model_reconstruction_check(label, session, frames, target, weights, motions, count=8):
+    """The same question about a *model's* reconstructions, which is the arrangement the item was about.
+
+    The de-jittered interpolate above is a weak reconstruction - its own correction is a bilinear resample,
+    so the accumulation starts from something already blurred and the warp's cost dominates. A model that
+    consumes the offset produces a reconstruction worth the name, and averaging several of them measured
+    -18.0% edge error on still content. This runs the model on translated frames to find out what
+    reprojection does to that gain once the scene moves: the same three arrangements, with the model's own
+    output as the frame.
+    """
+    print("\nmodel reconstructions (%s), scene motion per frame, K=%d" % (label, count))
+    single_edge = samples.edge_error(
+        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
+    print("  %-11s %-22s %-22s %s"
+          % ("motion px/f", "mean (edge/plain)", "mean reprojected (edge/plain)", "reprojected/single edge"))
+    for motion in motions:
+        unwarped = np.zeros_like(target)
+        warped = np.zeros_like(target)
+        for index in range(count):
+            moved = dict(frames[index])
+            moved["input"] = translated(frames[index]["input"],
+                                        (motion * index, motion * index)).astype(np.float32)
+            output = session.run(None, build_feeds(session, moved))[0][0].transpose(1, 2, 0)
+            if index > 0:
+                warped = translated(warped, (motion, motion))
+            unwarped += output
+            warped += output
+        unwarped /= float(count)
+        warped /= float(count)
+        reprojected_edge = samples.edge_error(warped, target, weights)
+        print("  %-11.3f %-22s %-22s %.4f"
+              % (motion,
+                 "%.6f / %.6f" % (samples.edge_error(unwarped, target, weights),
+                                  float(np.abs(unwarped - target).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
+                 reprojected_edge / single_edge))
+    print("  one frame: edge %.6f" % single_edge)
+
+
+
 def gate_sweep(frames, target, weights, motions, count):
 
     """How much scene motion the integration tolerates, on the real static frames.
@@ -567,6 +659,11 @@ def main(argv):
             print("  NOTE: the model does not match the arm it is passed as - see the inputs above")
         outputs = run_model(session, frames)
         arrangement(label, outputs, frames, target, weights, counts)
+        # The reconstruction question, on the model's own outputs: does reprojection preserve the gain that
+        # averaging reconstructions has on still content? Fewer frames than the sample sweeps, because each
+        # one is an inference.
+        model_reconstruction_check(label, session, frames, target, weights,
+                                   [0.0, 0.25, 0.5, 0.75, 1.0], min(4, args.frames))
 
     input_side(frames, target, weights, counts)
     motions = [float(value) for value in args.motion.split(",")]
@@ -579,6 +676,7 @@ def main(argv):
     motion_estimator_check(frames, [0.0, 0.25, 0.5], scale)
     reproject_successive(frames, target, weights, [0.0, 0.25, 0.5, 1.0], min(8, args.frames))
     per_pixel_gate_check(frames, target, weights, 0.5, min(8, args.frames))
+    reconstruction_accumulation_check(frames, target, weights, [0.0, 0.25, 0.5, 1.0], min(8, args.frames))
     return 0
 
 

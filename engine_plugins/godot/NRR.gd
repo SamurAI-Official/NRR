@@ -162,8 +162,13 @@ func reset_temporal_history() -> bool:
 ## offset (render_frame() submits frames with no jitter, so the runtime declines to integrate - it will
 ## not average identically-phased frames and call it antialiasing) and a per-frame motion measurement
 ## (motion_magnitude; the runtime stops integrating once a frame's scene motion exceeds 0.2 px, and a zero
-## passes that gate on every frame). The switch is exposed so a caller that supplies both through the
-## native interface can use it, and so its state is at least observable from GDScript.
+## passes that gate on every frame). The magnitude a caller fills in is the camera's screen-space movement
+## as a fraction of the frame width: project one world point at a reference depth through the previous and
+## the current camera matrices, take the distance it moved in pixels, divide by the frame width. That is
+## exact for rotation at any depth and exact for translation at the reference depth - the Unity renderer
+## does exactly this (NRRRenderer.MeasureMotion) and its camera test measures the result against a render.
+## The switch is exposed so a caller that supplies both through the native interface can use it, and so its
+## state is at least observable from GDScript.
 ## Returns false when the device is missing or its backend has no accumulator (see last_error()).
 func set_phase_aligned_accumulation(enabled: bool) -> bool:
 	if not available or _native == null:

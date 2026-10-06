@@ -74,7 +74,12 @@ public:
 	 *  The frames' offsets come from the frame input (the jitter the renderer applied); the *motion*
 	 *  budget does not, and the runtime's gate (0.2 px per frame) reads it from
 	 *  NRRTemporalState::motion_magnitude, so a caller that enables this with a moving camera and no
-	 *  measurement of the motion will smear rather than accumulate. Returns false, with the reason in
+	 *  measurement of the motion will smear rather than accumulate. This binding cannot measure it for
+	 *  you: it is handed images, not a Camera3D, so the caller computes the magnitude and fills
+	 *  motion_magnitude itself - the same quantity the Unity renderer derives by projecting one world
+	 *  point at a reference depth through the previous and the current camera matrices and taking the
+	 *  distance it moved on screen as a fraction of the frame width (exact for rotation at any depth,
+	 *  exact for translation at the reference depth). Returns false, with the reason in
 	 *  get_last_error(), when the device is missing or its backend has no accumulator - a backend that
 	 *  cannot integrate is not the same answer as "off". */
 	bool set_phase_aligned_accumulation(bool p_enabled);

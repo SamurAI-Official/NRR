@@ -14,6 +14,77 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The renderer measures the motion itself, and reprojection is refused a second time on the arrangement it was meant for
+
+Last round's two open items both ended with "the engine must supply this". One of them did not have to: the
+magnitude the gate reads can be measured where the camera is, so `NRRRenderer` now measures it and
+`MotionMagnitude` becomes an override instead of a requirement.
+
+**The measurement.** Each frame, one world point at `MotionReferenceDepth` is projected through the previous
+and the current view-projection matrices and the distance it appears to move on screen is reported as a
+fraction of the frame width - the same unit and the same grid the accumulator's gate multiplies by
+(`motion_magnitude * frame_width`, per frame rather than per output pixel). A pure rotation is exact at any
+depth, because the point's depth cancels; a translation is exact at the reference depth and scales with the
+inverse of the real depth; object motion is invisible to it, which is exactly what a camera can be expected to
+know. So a project with moving objects - or a subject whose distance differs from the reference - still sets
+`MotionMagnitude` from its own pass, and a non-zero value is used instead of the measurement. `LastMotionMagnitude`
+exposes what the last frame sent, and the once-only warning now fires only when the integration is on with
+neither a camera nor a caller measurement, because only then is the gate genuinely being fed a zero.
+`NRRRenderer.MeasureMotion` is the arithmetic as a pure function so it can be checked without a frame.
+
+**Measured against a render, not against itself** - `NRRJitterCameraTests.CameraMotionMeasurementMatchesTheRenderedShift`
+moves a real camera and recovers the content's own shift from the two rendered frames by the same
+correlation instrument the jitter test calibrates:
+
+```
+camera motion: the camera moved 0.054 units (= 6.0px at depth 2); the content measured (-6.000,0.000);
+MeasureMotion predicted 6.000px, and the same point at twice the depth 3.000px
+```
+
+The prediction matches the render to the instrument's precision, the sign is the render's (the content moves
+left when the camera moves right), and the depth claim in the documentation is pinned by an assertion rather
+than asserted in prose. The first draft asked for a 24 px move and the instrument answered 7.036 px - 24 minus
+the test pattern's 16 px period, a lattice repeat rather than a wrong render - so the test now stays inside
+half a period and the comment says why.
+
+**Godot cannot do this and now says so precisely**: that binding is handed images rather than a `Camera3D`, so
+the caller computes the magnitude; the header and `NRR.gd` document the exact quantity to compute.
+
+**Reprojection, second pass: it loses on the arrangement it was designed for.** The refusal last round was
+measured on the *sample* accumulation, where a bilinear warp destroys the sub-pixel phases the pass exists to
+integrate. The honest objection was that reprojection belongs on an accumulation of *reconstructions*, where
+there are no phases left to destroy - so that arrangement was measured too, with the model's own outputs:
+`aa_resolve_probe.py` now runs the deployed jitter-aware model on translated frames and compares one frame,
+the plain mean of the reconstructions, and the same mean reprojected frame by frame with the exact field
+(K=4, edge / plain):
+
+| scene motion per frame | one frame | mean of reconstructions | mean, reprojected |
+| --- | --- | --- | --- |
+| 0.00 px | 0.089511 / 0.013051 | 0.063241 / 0.008977 | 0.063241 / 0.008977 |
+| 0.25 px | 0.089511 / 0.013051 | 0.077910 / 0.010685 | 0.090831 / 0.012206 |
+| 0.50 px | 0.089511 / 0.013051 | 0.086799 / 0.012050 | 0.098279 / 0.013672 |
+| 0.75 px | 0.089511 / 0.013051 | 0.093140 / 0.013294 | 0.103082 / 0.015130 |
+| 1.00 px | 0.089511 / 0.013051 | 0.101343 / 0.014791 | 0.116009 / 0.017584 |
+
+Reprojection is worse than leaving the buffer alone at every motion level (+9.8% of a single frame's edge
+error at 0.5 px/frame against -3.0% for the plain mean, +29.6% against +13.2% at 1.0), for the same mechanical
+reason as the sample case: the warp is a bilinear resample applied to the accumulated buffer every frame, and
+its damage compounds. The same measurement also says something the current constant does not act on: the mean
+of *reconstructions* still beats a single frame out to 0.5 px/frame (edge -3.0%, plain -7.7%) whereas the
+sample accumulation loses by 0.5 px, so the 0.2 px gate - which was measured on samples - is 2.5x stricter
+than this arrangement needs. Acting on that means giving the reconstruction arrangement its own measured
+constant, which is a change to the accumulator rather than to the bindings, and is left for a round that can
+measure it on more than one content and one cell count.
+
+Verified: Unity PlayMode suite **7/7** with the CUDA runtime on `PATH` (the session-provider test fails
+without it, which the test itself says: put `third_party/cuda-runtime-cu12/bin` on PATH), C++ suite
+**163/163**, and `tools/aa_resolve_probe.py` now measures five tables. One trap recorded because it cost a
+cycle: `tools/build.ps1 -NoBuild -RunTests` reuses a test binary that can be older than the runtime it tests -
+the first run here failed `NRR_ENTRY_POINT_COUNT must match the declarations in include/nrr.h - expected 45
+but got 47`, which is the stale tests against a freshly rebuilt 47-entry library, and it disappeared on a
+rebuild. `-NoBuild` is fine for a suite that did not change and wrong for one that did.
+
+
 ### Per-pixel restarts instead of reprojection, and three measurements that refuse a derived motion magnitude
 
 Two gaps were left open deliberately last round: the integration does not reproject, and nothing measures
