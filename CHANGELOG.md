@@ -2675,3 +2675,39 @@ has been released either, and the phase-status claims live in
 `479dde1` is where continuous integration (`build` + suite, and the AddressSanitizer job)
 and `tools/build.ps1` began, and where the README stopped claiming capabilities that had
 not been tested. The changes in this changelog continue from there.
+### The Godot binding takes the temporal inputs, and the NVIDIA Streamline seam is specified
+
+The Godot addon submitted every frame with no sampling offset and no motion measurement, so the two consumers
+of those values had nothing to work with: the phase-aligned integration declined (`jitter.enabled == 0`) and
+the history weight stayed at its base value on a moving scene. Both are now reachable from GDScript, measured
+the same way the Unity renderer measures them:
+
+* `set_jitter(offset, enabled)` / `set_motion_magnitude(value)` / `temporal_state()` on `NRRNative`, wrapped by
+  `NRR.gd`, with `NRR.measure_camera_motion()` as the measurement itself (one world point at a reference depth
+  projected through the previous and current view-projections, over the frame width - exact for rotation at any
+  depth, exact for translation at the reference depth).
+* `NRRPostProcess` reports both, lagged by one frame to match its read-back (the node submits the last
+  *completed* frame, so this frame's camera would misdescribe it), and accepts `jitter_offset`,
+  `jitter_enabled` and a `motion_vectors` texture for a caller that already has a velocity buffer.
+* `temporal_state()` returns what the runtime *decided* - magnitude, weight, history depth, whether the
+  integration is on, and its own debug note - because "off", "declined" and "ran" are three different answers
+  and only one of them means the feature works.
+
+**NVIDIA Streamline/DLSS seam.** The NVIDIA Godot fork (`NVIDIA-RTX/godot`, branch `nvidia-pt-dlss`) carries the
+three inputs NRR wants in `RendererRD::DLSSContext::Parameters`: `RID velocity`, `Vector2 jitter`, and the
+camera/`internal_size` data that the magnitude is measured from, alongside `sl::kFeatureDLSS`/`kFeatureNIS`
+usage in `servers/rendering/renderer_rd/effects/dlss.{h,cpp}`. They live inside the RD renderer with no
+GDExtension accessor, so `docs/nvidia-streamline-godot.md` specifies the one patch needed - expose the two
+fields next to the parameters DLSS is already called with - and maps each to its NRR counterpart.
+
+**Benchmark harness.** `engine_plugins/godot_verify/benchmark_temporal.gd` runs headless and compares
+configurations that differ only in what the caller tells the runtime, on a jittered moving sequence
+synthesised from a high-resolution ground truth (known sub-pixel offsets, whole-pixel motion, so no
+reference-resampling confound). It reports the evaluation protocol temporal pair plus fidelity against each
+frame's own reference and writes JSON. Measured on the shipped fixture model (CUDA): the fidelity columns are
+identical because that model ignores its inputs, while frame-to-frame change drops from 0.1219 to 0.0836 with
+the offsets and the measurement supplied - the temporal path acting on the display, which is what a quality
+comparison with a trained model will build on.
+
+Tests: the Godot extension builds and installs (`setup.ps1`), the verification project still passes, and the
+benchmark exits 0 with `RESULT: PASS`.

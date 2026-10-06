@@ -21,6 +21,7 @@ using godot::Image;
 using godot::PackedByteArray;
 using godot::Ref;
 using godot::String;
+using godot::Vector2;
 
 namespace {
 
@@ -221,6 +222,10 @@ Ref<Image> NRRNative::render_frame(const Ref<Image> &p_color,
 	input.temporal.resolution_x = static_cast<uint32_t>(width);
 	input.temporal.resolution_y = static_cast<uint32_t>(height);
 	input.temporal.motion_vectors_scale = 1.0f;
+	input.temporal.motion_magnitude = motion_magnitude_;
+	input.temporal.jitter.offset_x = jitter_.x;
+	input.temporal.jitter.offset_y = jitter_.y;
+	input.temporal.jitter.enabled = jitter_enabled_ ? 1 : 0;
 
 	NRRFrameOutput output{};
 	output.color = output_texture_;
@@ -246,6 +251,20 @@ Ref<Image> NRRNative::render_frame(const Ref<Image> &p_color,
 	}
 
 	last_render_time_ms_ = output.stats.render_time_ms;
+	{
+		/* What the runtime decided, alongside what it was told: the magnitude is echoed clamped, the weight
+		 * is the one it actually used, and the debug line carries the blend/phase reason. A benchmark needs
+		 * all of it to tell "off" from "declined" from "ran". */
+		godot::Dictionary state;
+		state["frame_index"] = static_cast<int64_t>(input.temporal.frame_index);
+		state["motion_magnitude"] = output.temporal.motion_magnitude;
+		state["temporal_alpha"] = output.temporal.temporal_alpha;
+		state["history_frames"] = static_cast<int64_t>(output.temporal.history_frames);
+		state["jitter_enabled"] = jitter_enabled_;
+		state["phase_aligned_enabled"] = get_phase_aligned_accumulation();
+		state["debug_info"] = godot::String(output.stats.debug_info);
+		last_temporal_state_ = state;
+	}
 	++frame_index_;
 	return Image::create_from_data(width, height, false, Image::FORMAT_RGBA8,
 	                                bytes);
@@ -293,6 +312,43 @@ int NRRNative::get_phase_aligned_accumulation() {
 		return -1;
 	}
 	return enabled != 0 ? 1 : 0;
+}
+
+bool NRRNative::set_motion_magnitude(float p_magnitude) {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return false;
+	}
+	/* Stored rather than validated: the runtime clamps to [0, 1] and echoes what it used back through
+	 * get_temporal_state(), so a caller that hands over a raw pixel count finds out from the runtime's
+	 * report instead of from a silent clip here. */
+	motion_magnitude_ = p_magnitude;
+	return true;
+}
+
+float NRRNative::get_motion_magnitude() const {
+	return motion_magnitude_;
+}
+
+bool NRRNative::set_jitter(Vector2 p_offset, bool p_enabled) {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return false;
+	}
+	jitter_ = p_offset;
+	jitter_enabled_ = p_enabled;
+	return true;
+}
+
+Dictionary NRRNative::get_temporal_state() const {
+	if (last_temporal_state_.is_empty()) {
+		Dictionary empty;
+		empty["frame_index"] = static_cast<int64_t>(-1);
+		return empty;
+	}
+	return last_temporal_state_;
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +513,14 @@ void NRRNative::_bind_methods() {
 	                            &NRRNative::set_phase_aligned_accumulation);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_phase_aligned_accumulation"),
 	                            &NRRNative::get_phase_aligned_accumulation);
+	godot::ClassDB::bind_method(godot::D_METHOD("set_motion_magnitude", "magnitude"),
+	                            &NRRNative::set_motion_magnitude);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_motion_magnitude"),
+	                            &NRRNative::get_motion_magnitude);
+	godot::ClassDB::bind_method(godot::D_METHOD("set_jitter", "offset", "enabled"),
+	                            &NRRNative::set_jitter);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_temporal_state"),
+	                            &NRRNative::get_temporal_state);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_backend_name"),
 	                            &NRRNative::get_backend_name);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_capabilities"),

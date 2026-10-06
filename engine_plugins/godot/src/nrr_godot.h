@@ -99,6 +99,31 @@ public:
 	 *  ONNX Runtime actually attached (see nrr_model_get_info). */
 	godot::String get_model_info() const;
 
+	/** The scene motion the runtime should assume for the frames submitted next, in the unit
+	 *  NRRFrameInput::temporal.motion_magnitude is declared in: pixels moved per frame divided by the frame
+	 *  width (specification/frame_contract.md 4.3). Both engine bindings measure it the same way - project
+	 *  one world point at a reference depth through the previous and the current camera matrices and report
+	 *  the screen distance over the frame width - and the runtime clamps it to [0, 1]. Zero means "no
+	 *  measurement", which is what makes the phase-aligned gate fail closed rather than integrate a moving
+	 *  scene. */
+	bool set_motion_magnitude(float p_magnitude);
+	float get_motion_magnitude() const;
+
+	/** The sub-pixel offset the renderer sampled this frame's grid at, and whether the sequence jitters at
+	 *  all. Without it the runtime declines to integrate: it will not average identically-phased frames and
+	 *  call it antialiasing. A temporal upscaler already produces exactly this offset per frame - DLSS/DLAA
+	 *  through Streamline in the NVIDIA Godot fork (RendererRD::DLSSContext::Parameters::jitter), TAA or
+	 *  FSR2 otherwise - so a caller driving one of those hands it straight through. A caller that does not
+	 *  jitter leaves `p_enabled` false and gets the pass declined, which is the honest answer. */
+	bool set_jitter(godot::Vector2 p_offset, bool p_enabled);
+
+	/** The runtime's own report for the last rendered frame: the magnitude it used, the history weight it
+	 *  computed, the history depth it saw, whether the integration is on, and the debug line. Returned
+	 *  rather than logged because a benchmark has to compare what the runtime decided against what it was
+	 *  asked - and because "the pass is off", "the pass declined" and "the pass ran" are three different
+	 *  answers, which is what the phase note distinguishes. */
+	godot::Dictionary get_temporal_state() const;
+
 protected:
 	static void _bind_methods();
 
@@ -123,6 +148,12 @@ private:
 	bool initialized_ = false;
 	uint64_t frame_index_ = 0;
 	float last_render_time_ms_ = 0.0f;
+	/** What the caller told the runtime about the scene, and what it decided - see set_motion_magnitude,
+	 *  set_jitter and get_temporal_state. */
+	float motion_magnitude_ = 0.0f;
+	godot::Vector2 jitter_;
+	bool jitter_enabled_ = false;
+	godot::Dictionary last_temporal_state_;
 	godot::String last_error_;
 };
 
