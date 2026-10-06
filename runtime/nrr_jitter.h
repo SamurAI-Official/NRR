@@ -75,6 +75,92 @@ bool dejitter_nchw(const std::vector<float>& in_nchw,
                    const JitterOffset& offset,
                    std::vector<float>& out_nchw);
 
+/* Resizes a planar [C, H, W] float frame with the same conventions as everything
+ * else here: bilinear, edge-clamped, and the pixel-centre convention
+ * `interpolate(..., mode="bilinear", align_corners=False)` uses - a continuous
+ * source coordinate of `k` lands on pixel centre `k`.
+ *
+ * Exposed rather than kept private to the accumulator because the comparison that
+ * justifies the accumulator has two sides - "de-jitter each frame, then upsample
+ * and average" against "leave each frame's samples where they were and integrate"
+ * - and a comparison whose two sides resize differently measures the resize.
+ * Returns false (leaving `out_nchw` untouched) on a bad shape. */
+bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
+                            uint32_t width, uint32_t height,
+                            uint32_t out_width, uint32_t out_height,
+                            std::vector<float>& out_nchw);
+
+/* Integrates the sub-pixel samples of several jittered frames into one frame.
+ *
+ * De-jittering corrects ONE frame onto the nominal grid, which is what a model
+ * needs as input, and it is deliberately not an antialiasing operation: every
+ * frame it corrects ends up describing the same grid, so the average of K of them
+ * carries no more information than one of them - plus the resampling blur of K
+ * corrections. Antialiasing comes from the opposite arrangement: the frames'
+ * samples fell on *different* sub-pixel positions, so leaving them there and
+ * averaging integrates a denser sampling of the scene than any one frame holds.
+ *
+ * Measured on the probe's zone plate at 8 samples (tools/aa_samples_probe.py --scene zoneplate):
+ * edge error falls 33.4% for phase-aligned integration, against 26.0% for de-jitter-then-average
+ * and 0% for a single sample - and only 22.3% if the placement sign is mirrored, which is how the
+ * measured convention shows up a second time here. On the real capture the same integration gains
+ * nothing (edge-weighted +0.3% with the correct sign, +5.9% mirrored): that capture carries camera
+ * motion (mean |motion| 0.109) and only one or two distinct phases, so it can demonstrate the sign
+ * but not the prize. That is a property of the capture, not of this code.
+ *
+ * Placement follows the same measured convention as dejitter_nchw(): a frame
+ * recorded at offset j satisfies input(x) = scene(x - j), so its pixel p holds the
+ * scene at p + j frame pixels, i.e. at (p + j) * scale in output pixels, while
+ * upsampling the frame puts that sample at p * scale. It therefore has to be read
+ * back at X - j * scale to land where it was taken. Reading at X + j * scale
+ * instead - the direction this codebase used before the sign was measured -
+ * scatters the samples to the wrong places, and the average then blurs edges
+ * rather than resolving them.
+ *
+ * Only frames of one scene may be accumulated: this integrates samples, it does
+ * not reproject them, so a moving camera or object has to be excluded by the
+ * caller (or reprojected first) or the average blurs the motion. Deciding that is
+ * what the probe's motion check is for.
+ *
+ * Memory: the resolved frame plus one scratch frame at the output resolution
+ * (~25 MB at 1920x1080 RGB). An instance is not thread-safe; give each thread its
+ * own, as with the other accumulators in this runtime. */
+class PhaseAlignedAccumulator {
+public:
+    /* Records one frame's samples at the positions they were taken.
+     *
+     * `frame_nchw` is planar [C, width, height] float. `out_width`/`out_height` are
+     * the resolution the samples are placed into and have to stay fixed for the
+     * life of a sequence: they are the display grid the samples are being
+     * integrated on, so a change is a different accumulator, and this returns false
+     * rather than silently mixing two grids (or two channel counts). */
+    bool add_frame(const std::vector<float>& frame_nchw, int channels,
+                   uint32_t width, uint32_t height,
+                   uint32_t out_width, uint32_t out_height,
+                   const JitterOffset& offset);
+
+    /* The mean of the frames accumulated so far, at the output resolution.
+     * False (leaving `out_nchw` untouched) when nothing has been added. */
+    bool resolve(std::vector<float>& out_nchw) const;
+
+    void reset();
+
+    uint32_t frame_count() const { return frame_count_; }
+    uint32_t out_width() const { return out_width_; }
+    uint32_t out_height() const { return out_height_; }
+    int channels() const { return channels_; }
+
+private:
+    /* Summed in double: a long sequence of frames would otherwise drift, and the
+     * resolved frame is compared against a torch reference at tight tolerance. */
+    std::vector<double> sum_;
+    std::vector<float> scratch_; /* one upsampled frame, reused across calls */
+    uint32_t frame_count_ = 0;
+    uint32_t out_width_ = 0;
+    uint32_t out_height_ = 0;
+    int channels_ = 0;
+};
+
 } // namespace nrr
 
 #endif /* NRR_JITTER_H */

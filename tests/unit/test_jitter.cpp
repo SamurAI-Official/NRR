@@ -367,5 +367,463 @@ NRR_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_i
                "recording nothing must clear the frame rather than leave the previous one");
 }
 
+/* ---------------------------------------------------------------------------
+ * The phase-aligned path: the same measured convention, on the operation the
+ * de-jitter does not perform.
+ *
+ * The constants below come from tools/regen_aa_fixture.py, which validates itself
+ * before printing them: that the C++-mirrored bilinear taps agree with torch's
+ * interpolate + grid_sample to 8e-8, that the capture's sign reconstructs a frame far
+ * better than its mirror, and that the ordering asserted below holds in Python. Two
+ * fixtures, because they pin different steps:
+ *
+ *   * a 64x64 bilinear capture of a 128x128 ramp, three frames at the capture's own
+ *     Halton offsets, placed and averaged. On a ramp the mean equals a single placed
+ *     frame, so this pins the placement - scale and sign included - and cannot see the
+ *     accumulate-and-divide step at all.
+ *   * a point-sampled zone plate, where the accumulation itself is pinned, plus the
+ *     ordering that says the accumulator does something a de-jitter cannot.
+ * --------------------------------------------------------------------------- */
+namespace aa_fixture {
+
+const uint32_t aa_hi = 128;  /* the output grid the samples are placed into */
+const uint32_t aa_lo = 64;   /* the resolution the frames were rendered at */
+
+/* The ordering fixture's plate: 0.040 radians per target pixel squared, which is the probe's
+ * own plate strength in these units - about 3.3 cycles per frame pixel at the rim, far past
+ * the frame grid's Nyquist limit. That strength is not decoration. In the mildly aliased
+ * regime an un-jittered single frame can beat any integration (measured +7% on this same
+ * fixture at k = 0.006), so an ordering test needs content that genuinely aliases, which is
+ * also the content the feature exists for. */
+const float aa_plate_k = 0.040f;
+
+/* Pinned values at these points. The offsets equal aa_halton(1..3), asserted in the first
+ * test, so the fixture cannot drift from the tool's frame set unnoticed. */
+const int aa_points[6][2] = {{0, 0}, {10, 20}, {32, 33}, {63, 62}, {100, 101}, {127, 127}};
+const double aa_resolved[6] = {0.005534859, 0.175781250, 0.320312500,
+                               0.607421875, 0.984375000, 1.234085648};
+const int aa_wrong_points[2][2] = {{32, 33}, {63, 62}};
+const double aa_wrong[2] = {0.319010417, 0.606119792};
+const double aa_one_frame[2] = {0.320312500, 0.607421875};
+const int aa_plate_points[3][2] = {{20, 30}, {64, 64}, {110, 100}};
+const double aa_plate_resolved[3] = {0.367409754, 0.997542337, 0.625756466};
+const double aa_plate_single[3] = {0.654102142, 0.998502148, 0.546668620};
+
+/* Halton (2,3) with index = frame + 1: the capture's own sequence, so the fixture is not a set
+ * of offsets chosen to make the arithmetic work out. Computed in double and stored as float,
+ * exactly as the tool does - a float32 radical inverse would show up in the pinned values,
+ * since these are scaled by the resolution ratio before use. */
+inline double aa_radical_inverse(int value, int radix) {
+    double result = 0.0, fraction = 1.0;
+    while (value > 0) {
+        fraction /= static_cast<double>(radix);
+        result += fraction * static_cast<double>(value % radix);
+        value /= radix;
+    }
+    return result;
+}
+
+inline JitterOffset aa_halton(int index) {
+    return JitterOffset(static_cast<float>(aa_radical_inverse(index, 2) - 0.5),
+                        static_cast<float>(aa_radical_inverse(index, 3) - 0.5));
+}
+
+/* Clamped bilinear sample of a planar image at a continuous coordinate. Written out rather than
+ * reused from nrr_jitter.cpp, where the tap helper is private to the implementation: a fixture
+ * that borrowed it could not catch a change in it. The floor is taken *before* the clamp, which
+ * is the part that is easy to get subtly wrong, and the pinned constants catch it - clamping a
+ * negative coordinate to 0 and then stepping to pixel 1 is a different interpolation. */
+inline float aa_sample(const std::vector<float>& plane, uint32_t width, uint32_t height,
+                       float u, float v) {
+    const float base_x = std::floor(u);
+    const float base_y = std::floor(v);
+    const int x0 = std::min(std::max(static_cast<int>(base_x), 0), static_cast<int>(width) - 1);
+    const int x1 = std::min(std::max(static_cast<int>(base_x) + 1, 0), static_cast<int>(width) - 1);
+    const int y0 = std::min(std::max(static_cast<int>(base_y), 0), static_cast<int>(height) - 1);
+    const int y1 = std::min(std::max(static_cast<int>(base_y) + 1, 0), static_cast<int>(height) - 1);
+    const float lx = u - base_x;
+    const float ly = v - base_y;
+    const float top = plane[static_cast<size_t>(y0) * width + x0] * (1.0f - lx)
+                    + plane[static_cast<size_t>(y0) * width + x1] * lx;
+    const float bottom = plane[static_cast<size_t>(y1) * width + x0] * (1.0f - lx)
+                       + plane[static_cast<size_t>(y1) * width + x1] * lx;
+    return top * (1.0f - ly) + bottom * ly;
+}
+
+/* The un-jittered signal at the output resolution. Same shape of fixture as jf_scene(), and
+ * likewise not normalised to [0,1]: the arithmetic under test does not clamp, so a ramp that
+ * stays inside the range would only be hiding that. */
+std::vector<float> aa_ramp() {
+    std::vector<float> out(static_cast<size_t>(aa_hi) * aa_hi, 0.0f);
+    for (uint32_t y = 0; y < aa_hi; ++y) {
+        for (uint32_t x = 0; x < aa_hi; ++x) {
+            out[static_cast<size_t>(y) * aa_hi + x] =
+                (static_cast<float>(x) + 0.25f * static_cast<float>(y)) / static_cast<float>(aa_hi);
+        }
+    }
+    return out;
+}
+
+/* One frame of `target` on a sampling grid displaced by `offset`: pixel p holds the scene at
+ * (p + 0.5 + offset) * 2 - 0.5 in target pixels. Bilinear here - a surrogate that has been
+ * pre-filtered, which is fine for pinning placement and useless for showing an integration
+ * gain, because a pre-filtered signal has no aliasing left to resolve. */
+std::vector<float> aa_capture(const std::vector<float>& target, const JitterOffset& offset) {
+    std::vector<float> out(static_cast<size_t>(aa_lo) * aa_lo, 0.0f);
+    const float step = static_cast<float>(aa_hi) / static_cast<float>(aa_lo);
+    for (uint32_t y = 0; y < aa_lo; ++y) {
+        const float v = (static_cast<float>(y) + 0.5f + offset.y) * step - 0.5f;
+        for (uint32_t x = 0; x < aa_lo; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f + offset.x) * step - 0.5f;
+            out[static_cast<size_t>(y) * aa_lo + x] = aa_sample(target, aa_hi, aa_hi, u, v);
+        }
+    }
+    return out;
+}
+
+inline float aa_plate_value(float x, float y) {
+    const float dx = x - 0.5f * static_cast<float>(aa_hi);
+    const float dy = y - 0.5f * static_cast<float>(aa_hi);
+    return 0.5f + 0.5f * std::cos(aa_plate_k * (dx * dx + dy * dy));
+}
+
+/* The ground truth: the plate averaged over each pixel's footprint, i.e. a supersampled render.
+ * A point-evaluated reference is itself aliased at these frequencies, and comparing one aliased
+ * image against another measures the phase of two sampling grids rather than the reconstruction. */
+std::vector<float> aa_plate_reference() {
+    const int oversample = 4;
+    std::vector<float> out(static_cast<size_t>(aa_hi) * aa_hi, 0.0f);
+    for (uint32_t y = 0; y < aa_hi; ++y) {
+        for (uint32_t x = 0; x < aa_hi; ++x) {
+            double total = 0.0;
+            for (int oy = 0; oy < oversample; ++oy) {
+                for (int ox = 0; ox < oversample; ++ox) {
+                    const float sx = static_cast<float>(x)
+                                   + (static_cast<float>(ox) + 0.5f) / oversample - 0.5f;
+                    const float sy = static_cast<float>(y)
+                                   + (static_cast<float>(oy) + 0.5f) / oversample - 0.5f;
+                    total += static_cast<double>(aa_plate_value(sx, sy));
+                }
+            }
+            out[static_cast<size_t>(y) * aa_hi + x] =
+                static_cast<float>(total / static_cast<double>(oversample * oversample));
+        }
+    }
+    return out;
+}
+
+/* One frame of the plate: a *point* sample per pixel, no interpolation. That is what a rasteriser
+ * writes, and it is the regime in which an integration can recover anything. */
+std::vector<float> aa_point_frame(const JitterOffset& offset) {
+    std::vector<float> out(static_cast<size_t>(aa_lo) * aa_lo, 0.0f);
+    const float step = static_cast<float>(aa_hi) / static_cast<float>(aa_lo);
+    for (uint32_t y = 0; y < aa_lo; ++y) {
+        const float sy = (static_cast<float>(y) + 0.5f + offset.y) * step - 0.5f;
+        for (uint32_t x = 0; x < aa_lo; ++x) {
+            const float sx = (static_cast<float>(x) + 0.5f + offset.x) * step - 0.5f;
+            out[static_cast<size_t>(y) * aa_lo + x] = aa_plate_value(sx, sy);
+        }
+    }
+    return out;
+}
+
+/* Normalised gradient magnitude of the reference, as the probe and the tool use: a plain mean over
+ * a mostly flat frame hides an edge effect in the flat fraction. Central differences inside the
+ * frame and one-sided at its edges, matching numpy's gradient. */
+std::vector<double> aa_edge_weights(const std::vector<float>& image) {
+    std::vector<double> weights(static_cast<size_t>(aa_hi) * aa_hi, 0.0);
+    double total = 0.0;
+    for (uint32_t y = 0; y < aa_hi; ++y) {
+        for (uint32_t x = 0; x < aa_hi; ++x) {
+            const size_t here = static_cast<size_t>(y) * aa_hi + x;
+            const double gx = x == 0 ? image[here + 1] - image[here]
+                            : x + 1 == aa_hi ? image[here] - image[here - 1]
+                            : 0.5 * (image[here + 1] - image[here - 1]);
+            const double gy = y == 0 ? image[here + aa_hi] - image[here]
+                            : y + 1 == aa_hi ? image[here] - image[here - aa_hi]
+                            : 0.5 * (image[here + aa_hi] - image[here - aa_hi]);
+            const double magnitude = std::sqrt(gx * gx + gy * gy);
+            weights[here] = magnitude;
+            total += magnitude;
+        }
+    }
+    for (size_t i = 0; i < weights.size(); ++i) {
+        weights[i] = total > 0.0 ? weights[i] / total : 0.0;
+    }
+    return weights;
+}
+
+double aa_edge_error(const std::vector<float>& candidate, const std::vector<float>& reference,
+                     const std::vector<double>& weights) {
+    double total = 0.0;
+    for (size_t i = 0; i < candidate.size(); ++i) {
+        total += std::fabs(static_cast<double>(candidate[i]) - static_cast<double>(reference[i]))
+               * weights[i];
+    }
+    return total;
+}
+
+} // namespace aa_fixture
+
+/* The placement parity. The pinned values come from the torch pair (interpolate + grid_sample),
+ * mirrored by tools/regen_aa_fixture.py and validated against torch to 8e-8 before it printed them.
+ * This is what a half-pixel convention, an offset not scaled into output pixels, or the pre-flip sign
+ * cannot survive: each of those produces a plausible picture and a different number here. */
+NRR_TEST(test_aa_accumulator_places_each_frame_where_it_was_sampled) {
+    using namespace aa_fixture;
+    const double kTolerance = 1e-6;
+
+    /* The tool's offsets have to be the capture's own sequence, or fixture and tool have drifted
+     * apart without either of them failing. */
+    const JitterOffset expected[3] = {aa_halton(1), aa_halton(2), aa_halton(3)};
+    NRR_ASSERT(std::fabs(expected[0].x) < 1e-6 && std::fabs(expected[0].y + 0.166666667f) < 1e-6,
+               "aa_halton(1) must be Halton(2,3)'s first offset");
+    NRR_ASSERT(std::fabs(expected[2].x - 0.25f) < 1e-6 && std::fabs(expected[2].y + 0.388888889f) < 1e-6,
+               "aa_halton(3) must be Halton(2,3)'s third offset");
+
+    const std::vector<float> scene = aa_ramp();
+    PhaseAlignedAccumulator accumulator;
+    std::vector<float> resolved;
+    NRR_ASSERT(!accumulator.resolve(resolved), "a resolve with nothing accumulated must fail");
+    for (int k = 0; k < 3; ++k) {
+        const JitterOffset offset = aa_halton(k + 1);
+        NRR_ASSERT(accumulator.add_frame(aa_capture(scene, offset), 1, aa_lo, aa_lo, aa_hi, aa_hi, offset),
+                   "a valid frame must be accepted");
+    }
+    NRR_EXPECT_EQ(accumulator.frame_count(), 3u, "three frames must have been accumulated");
+
+    NRR_ASSERT(accumulator.resolve(resolved), "a resolve after three frames must succeed");
+    NRR_EXPECT_EQ(resolved.size(), static_cast<size_t>(aa_hi) * aa_hi,
+                  "the resolve must have the output resolution");
+    for (int i = 0; i < 6; ++i) {
+        const size_t index = static_cast<size_t>(aa_points[i][0]) * aa_hi
+                           + static_cast<size_t>(aa_points[i][1]);
+        NRR_ASSERT(std::fabs(static_cast<double>(resolved[index]) - aa_resolved[i]) < kTolerance,
+                   "resolved sample " + std::to_string(aa_points[i][0]) + "," + std::to_string(aa_points[i][1])
+                   + " must match the Python reference; got " + std::to_string(resolved[index])
+                   + " against " + std::to_string(aa_resolved[i]));
+    }
+
+    /* One frame placed with the capture's sign. On a ramp this equals the three-frame mean above - a
+     * linear function is its own average under a shift - so the two pin the placement without pinning
+     * the division, which the zone-plate constants in the next test do instead. */
+    const JitterOffset first = aa_halton(1);
+    PhaseAlignedAccumulator one_frame, flipped;
+    NRR_ASSERT(one_frame.add_frame(aa_capture(scene, first), 1, aa_lo, aa_lo, aa_hi, aa_hi, first),
+               "a single frame must be accepted");
+    std::vector<float> one;
+    NRR_ASSERT(one_frame.resolve(one), "a single-frame resolve must succeed");
+
+    /* The same frame with the mirrored sign: the check that the pinned placement is the capture's
+     * direction and not its mirror. The values differ in the third decimal - the offset times the ramp
+     * slope - which is precisely the size of the misalignment being corrected. */
+    NRR_ASSERT(flipped.add_frame(aa_capture(scene, first), 1, aa_lo, aa_lo, aa_hi, aa_hi,
+                                 JitterOffset(-first.x, -first.y)),
+               "a frame placed with the mirrored sign must still be accepted");
+    std::vector<float> wrong;
+    NRR_ASSERT(flipped.resolve(wrong), "the mirrored resolve must succeed");
+
+    for (int i = 0; i < 2; ++i) {
+        const size_t index = static_cast<size_t>(aa_wrong_points[i][0]) * aa_hi
+                           + static_cast<size_t>(aa_wrong_points[i][1]);
+        NRR_ASSERT(std::fabs(static_cast<double>(one[index]) - aa_one_frame[i]) < kTolerance,
+                   "the capture's sign must place the frame where the Python reference puts it; got "
+                   + std::to_string(one[index]) + " against " + std::to_string(aa_one_frame[i]));
+        NRR_ASSERT(std::fabs(static_cast<double>(wrong[index]) - aa_wrong[i]) < kTolerance,
+                   "the mirrored sign must place the frame where the Python reference puts *it*; got "
+                   + std::to_string(wrong[index]) + " against " + std::to_string(aa_wrong[i]));
+        NRR_ASSERT(std::fabs(static_cast<double>(wrong[index]) - static_cast<double>(one[index])) > 1e-3,
+                   "the two signs must not produce the same frame, or this test proves nothing");
+    }
+}
+
+/* The claim the accumulator exists for, measured: integrating frames whose samples fell on different
+ * sub-pixel positions beats one frame, and beats de-jittering every frame and then averaging - the
+ * operation that corrects geometry per frame and, by putting every frame back onto the same grid,
+ * removes the diversity an integration is meant to use. Python's numbers on this fixture are 0.199397
+ * single, 0.149468 de-jittered, 0.136076 phase-aligned, 0.156270 phase-aligned with the mirrored sign,
+ * i.e. 1.000 / 0.750 / 0.682 / 0.784 of the single-sample error. */
+NRR_TEST(test_aa_accumulator_integrates_distinct_subpixel_samples) {
+    using namespace aa_fixture;
+    const int kFrames = 8;
+    const std::vector<float> reference = aa_plate_reference();
+    const std::vector<double> weights = aa_edge_weights(reference);
+
+    std::vector<float> single;
+    NRR_ASSERT(upsample_bilinear_nchw(aa_point_frame(JitterOffset(0.0f, 0.0f)), 1, aa_lo, aa_lo,
+                                      aa_hi, aa_hi, single),
+               "upsampling an un-jittered frame must succeed");
+    for (int i = 0; i < 3; ++i) {
+        const size_t index = static_cast<size_t>(aa_plate_points[i][0]) * aa_hi
+                           + static_cast<size_t>(aa_plate_points[i][1]);
+        NRR_ASSERT(std::fabs(static_cast<double>(single[index]) - aa_plate_single[i]) < 1e-5,
+                   "the un-jittered frame's upsample must match the Python reference; got "
+                   + std::to_string(single[index]) + " against " + std::to_string(aa_plate_single[i]));
+    }
+
+    PhaseAlignedAccumulator accumulator, mirrored;
+    std::vector<float> de_jittered(static_cast<size_t>(aa_hi) * aa_hi, 0.0f);
+    for (int k = 1; k <= kFrames; ++k) {
+        const JitterOffset offset = aa_halton(k);
+        const std::vector<float> frame = aa_point_frame(offset);
+        NRR_ASSERT(accumulator.add_frame(frame, 1, aa_lo, aa_lo, aa_hi, aa_hi, offset),
+                   "every frame of the sequence must be accepted");
+        NRR_ASSERT(mirrored.add_frame(frame, 1, aa_lo, aa_lo, aa_hi, aa_hi,
+                                      JitterOffset(-offset.x, -offset.y)),
+                   "the mirrored accumulator must accept the same frames");
+
+        /* The operation being replaced: correct this frame where it was rendered, then upsample it to
+         * the output grid and average. It uses the shipped correction, so this column is the real
+         * alternative rather than a straw man. */
+        std::vector<float> corrected, upsampled;
+        NRR_ASSERT(dejitter_nchw(frame, 1, aa_lo, aa_lo, offset, corrected),
+                   "de-jittering a frame must succeed");
+        NRR_ASSERT(upsample_bilinear_nchw(corrected, 1, aa_lo, aa_lo, aa_hi, aa_hi, upsampled),
+                   "upsampling a de-jittered frame must succeed");
+        for (size_t i = 0; i < de_jittered.size(); ++i) {
+            de_jittered[i] += upsampled[i];
+        }
+    }
+    for (size_t i = 0; i < de_jittered.size(); ++i) {
+        de_jittered[i] /= static_cast<float>(kFrames);
+    }
+
+    std::vector<float> aligned, wrong;
+    NRR_ASSERT(accumulator.resolve(aligned), "the accumulated resolve must succeed");
+    NRR_ASSERT(mirrored.resolve(wrong), "the mirrored resolve must succeed");
+
+    const double single_edge = aa_edge_error(single, reference, weights);
+    const double de_jittered_edge = aa_edge_error(de_jittered, reference, weights);
+    const double aligned_edge = aa_edge_error(aligned, reference, weights);
+    const double wrong_edge = aa_edge_error(wrong, reference, weights);
+    const std::string ratios = "single " + std::to_string(single_edge)
+                             + ", de-jittered " + std::to_string(de_jittered_edge)
+                             + ", aligned " + std::to_string(aligned_edge)
+                             + ", mirrored " + std::to_string(wrong_edge);
+
+    NRR_ASSERT(aligned_edge < single_edge * 0.85,
+               "integrating distinct sub-pixel samples must beat one frame by a wide margin; got " + ratios);
+    NRR_ASSERT(aligned_edge < de_jittered_edge * 0.95,
+               "it must also beat de-jittering every frame and averaging them; got " + ratios);
+    NRR_ASSERT(aligned_edge < wrong_edge * 0.95,
+               "and it must beat the same integration with the mirrored sign; got " + ratios);
+
+    /* The accumulation itself, pinned. This fixture is not linear, so unlike the ramp it can see the
+     * mean. Tolerance 1e-5 rather than 1e-6: the frames here are float32 while the mirror is float64,
+     * and the plate has steep local gradients - 3.3 cycles per frame pixel at the rim. */
+    for (int i = 0; i < 3; ++i) {
+        const size_t index = static_cast<size_t>(aa_plate_points[i][0]) * aa_hi
+                           + static_cast<size_t>(aa_plate_points[i][1]);
+        NRR_ASSERT(std::fabs(static_cast<double>(aligned[index]) - aa_plate_resolved[i]) < 1e-5,
+                   "accumulated sample " + std::to_string(aa_plate_points[i][0]) + ","
+                   + std::to_string(aa_plate_points[i][1]) + " must match the Python reference; got "
+                   + std::to_string(aligned[index]) + " against " + std::to_string(aa_plate_resolved[i]));
+    }
+}
+
+/* A sequence has one output grid and one channel count, and a frame that was rendered for a different
+ * display is refused rather than reinterpreted - silently averaging samples placed for another grid
+ * would be a wrong picture with no error anywhere. Refusal also has to leave the accumulator usable,
+ * so the failure paths are checked for side effects rather than only for their return value. */
+NRR_TEST(test_aa_accumulator_refuses_mixed_grids_and_bad_shapes) {
+    using namespace aa_fixture;
+    const std::vector<float> frame(static_cast<size_t>(aa_lo) * aa_lo, 0.5f);
+
+    PhaseAlignedAccumulator accumulator;
+    std::vector<float> out(4, 7.0f);
+
+    /* Nothing accumulated: a resolve must refuse rather than fabricate a frame. */
+    NRR_ASSERT(!accumulator.resolve(out), "a resolve with no frames must fail");
+    NRR_EXPECT_EQ(out[0], 7.0f, "a refused resolve must not touch the output");
+
+    NRR_ASSERT(!accumulator.add_frame(frame, 0, aa_lo, aa_lo, aa_hi, aa_hi, JitterOffset()),
+               "a zero channel count must be refused");
+    NRR_ASSERT(!accumulator.add_frame(frame, 1, 0, aa_lo, aa_hi, aa_hi, JitterOffset()),
+               "a zero frame width must be refused");
+    NRR_ASSERT(!accumulator.add_frame(frame, 1, aa_lo, aa_lo, 0, aa_hi, JitterOffset()),
+               "a zero output width must be refused");
+    NRR_ASSERT(!accumulator.add_frame(std::vector<float>(10, 0.0f), 1, aa_lo, aa_lo, aa_hi, aa_hi,
+                                      JitterOffset()),
+               "a short frame must be refused rather than read past its end");
+    NRR_EXPECT_EQ(accumulator.frame_count(), 0u, "a refused frame must not count as accumulated");
+    NRR_ASSERT(!accumulator.resolve(out), "and none of them may have left anything to resolve");
+
+    /* One accepted frame, and then attempts to fold a different sequence into it. */
+    NRR_ASSERT(accumulator.add_frame(frame, 1, aa_lo, aa_lo, aa_hi, aa_hi, JitterOffset()),
+               "the first frame must be accepted");
+    std::vector<float> first;
+    NRR_ASSERT(accumulator.resolve(first), "one frame must resolve");
+    NRR_ASSERT(!accumulator.add_frame(frame, 3, aa_lo, aa_lo, aa_hi, aa_hi, JitterOffset()),
+               "a different channel count must be refused, not reinterpreted");
+    NRR_ASSERT(!accumulator.add_frame(frame, 1, aa_lo, aa_lo, aa_hi / 2, aa_hi, JitterOffset()),
+               "a different output grid must be refused");
+    NRR_EXPECT_EQ(accumulator.frame_count(), 1u, "a refused frame must not count as accumulated");
+
+    std::vector<float> unchanged;
+    NRR_ASSERT(accumulator.resolve(unchanged), "the accumulator must still resolve");
+    for (size_t i = 0; i < first.size(); ++i) {
+        NRR_ASSERT(unchanged[i] == first[i],
+                   "a refused frame must leave the accumulated sum exactly as it was");
+    }
+    NRR_EXPECT_EQ(accumulator.out_width(), aa_hi, "the grid must be the one the accepted frame set");
+    NRR_EXPECT_EQ(accumulator.channels(), 1, "the channel count must be the accepted frame's");
+
+    /* A reset has to discard, not merely restart the count. */
+    accumulator.reset();
+    NRR_EXPECT_EQ(accumulator.frame_count(), 0u, "a reset must clear the count");
+    NRR_ASSERT(!accumulator.resolve(out), "a reset must leave nothing to resolve");
+    NRR_ASSERT(accumulator.add_frame(frame, 1, aa_lo, aa_lo, aa_hi, aa_hi, JitterOffset()),
+               "and the accumulator must be usable again, with its grid chosen afresh");
+}
+
+/* The resize the accumulator places through, on its own. The same-size case has to be exact rather
+ * than merely close - it is the path taken when display and render resolution match, and a half-pixel
+ * convention error would appear here as a small uniform blur that nothing else in the suite notices. */
+NRR_TEST(test_aa_upsample_is_the_identity_at_native_resolution) {
+    using namespace aa_fixture;
+    const std::vector<float> source = aa_ramp();
+    std::vector<float> out;
+    NRR_ASSERT(upsample_bilinear_nchw(source, 1, aa_hi, aa_hi, aa_hi, aa_hi, out),
+               "a same-size resize must succeed");
+    NRR_EXPECT_EQ(out.size(), source.size(), "a same-size resize must not change the size");
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (out[i] != source[i]) {
+            NRR_ASSERT(false, "a same-size resize must be exactly the identity");
+        }
+    }
+
+    /* A constant must stay constant at any scale: that is what a normalised filter does, and an
+     * off-by-half kernel or double-weighted edge would show up as a ramp towards the border. */
+    const std::vector<float> flat(static_cast<size_t>(aa_lo) * aa_lo, 0.25f);
+    std::vector<float> doubled;
+    NRR_ASSERT(upsample_bilinear_nchw(flat, 1, aa_lo, aa_lo, aa_hi, aa_hi, doubled),
+               "an upsample must succeed");
+    for (size_t i = 0; i < doubled.size(); ++i) {
+        NRR_ASSERT(std::fabs(doubled[i] - 0.25f) < 1e-6f,
+                   "a constant frame must upsample to the same constant");
+    }
+
+    /* Planar layout: channel 1 must be read from its own plane, not from channel 0's rows. */
+    const size_t plane = static_cast<size_t>(aa_lo) * aa_lo;
+    std::vector<float> two_channel(plane * 2, 0.0f);
+    for (size_t i = 0; i < plane; ++i) {
+        two_channel[plane + i] = 0.75f;
+    }
+    std::vector<float> both;
+    NRR_ASSERT(upsample_bilinear_nchw(two_channel, 2, aa_lo, aa_lo, aa_hi, aa_hi, both),
+               "a two-channel upsample must succeed");
+    const size_t out_plane = static_cast<size_t>(aa_hi) * aa_hi;
+    NRR_ASSERT(std::fabs(both[out_plane / 2]) < 1e-6f, "channel 0 must keep its own values");
+    NRR_ASSERT(std::fabs(both[out_plane + out_plane / 2] - 0.75f) < 1e-6f,
+               "channel 1 must keep its own values");
+
+    NRR_ASSERT(!upsample_bilinear_nchw(flat, 1, aa_lo, aa_lo, 0, aa_hi, out),
+               "a zero output width must be refused");
+    NRR_ASSERT(!upsample_bilinear_nchw(flat, 1, 0, 0, aa_hi, aa_hi, out),
+               "a zero source size must be refused");
+    NRR_ASSERT(!upsample_bilinear_nchw(std::vector<float>(10, 0.0f), 1, aa_lo, aa_lo, aa_hi, aa_hi, out),
+               "a short source must be refused rather than read past its end");
+}
+
 } // namespace test
 } // namespace nrr

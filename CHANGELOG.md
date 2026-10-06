@@ -14,6 +14,57 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The phase-aligned accumulator: built on the settled sign, and measured in the runtime
+
+The sign was settled first for a reason, and this is where it pays. `runtime/nrr_jitter.{h,cpp}` now carry
+`PhaseAlignedAccumulator`, the operation the de-jitter deliberately does not perform. `dejitter_nchw` corrects
+ONE frame onto the nominal grid, which is what a model needs as input - and every frame it corrects ends up
+describing that same grid, so averaging K of them carries no more information than one of them, plus the
+resampling blur of K corrections. What antialiases is the opposite: the frames' samples fell on *different*
+sub-pixel positions, so leaving them there and integrating them samples the scene more densely than any one
+frame does. That needs the capture's sign, and it is the same one the de-jitter uses: a frame recorded at offset
+j has pixel p holding the scene at p + j, so its sample belongs at X - j*scale in the output grid; the pre-flip
+direction would place it at X + j*scale and blur edges instead of resolving them.
+
+`upsample_bilinear_nchw` is exposed alongside it because the measurement that justifies the accumulator has two
+sides - "de-jitter each frame, upsample, average" against "place each frame's samples where they were taken and
+integrate" - and a comparison whose sides resize differently measures the resize.
+
+**Measured in the runtime, on a point-sampled zone plate, 8 frames, edge-weighted error against a
+4x4-supersampled reference** (in brackets, as a fraction of the single-sample error):
+
+```
+single 0.199397 (1.000)   de-jittered 0.149468 (0.750)   phase-aligned 0.136076 (0.682)   mirrored sign 0.156270 (0.784)
+```
+
+That reproduces `tools/aa_samples_probe.py --scene zoneplate` (-33.4% / -26.0% / -22.3% at 8 samples) from the
+other side of the language boundary. `tools/regen_aa_fixture.py` pins the placement and the accumulation
+against torch - validating the mirrored bilinear taps against `interpolate` + `grid_sample` to 8e-8, and the
+capture's sign against its mirror, before it prints anything - and refuses to print constants when the ordering
+about to be asserted does not hold in Python. Four tests in `tests/unit/test_jitter.cpp` assert the placement,
+the ordering, the refusal semantics and the resize; the suite is 151/151.
+
+Two things this measurement settled that the earlier probe entry could not:
+
+- **The comparison that is deliberately *not* asserted** is de-jitter-then-average against a single frame. It
+  falls on both sides of 1.0 depending on the regime: it improves where the frames themselves alias (the
+  probe's plate: -26.0% at 8 samples) and degrades where one frame's shortfall is interpolation rather than
+  aliasing (a mildly undersampled plate: +7%; bilinear sub-samples of a real render: +3.1%, as recorded
+  above). Asserting its direction would assert something about the fixture rather than about the code, so the
+  fixture keeps the comparison and the test drops the claim.
+- **Plate strength matters, not just plate shape.** The ordering is stable across every parameter swept
+  (k = 0.018-0.080, 4 and 8 frames, with the aligned column between 0.64 and 0.91 of the single-sample error),
+  but *below* that band an un-jittered single frame can beat any integration. At k = 0.006 - a plate that is
+  undersampled at the frame grid but still well below its Nyquist limit - the measured ordering reverses:
+  aligned +7.2% against the single frame, while de-jitter-then-average is +98.9%. The fixture therefore uses
+  the probe's own plate strength (about 3.3 cycles per frame pixel at the rim) and says so where it is defined.
+
+Not wired into the render path yet, and deliberately: `PhaseAlignedAccumulator` is the component, with its
+placement, its normalisation and its refusal semantics pinned by tests. This integrates samples; it does not
+reproject them, so deciding which frames may be accumulated (motion-gated, or reprojected first) is a caller's
+policy rather than something the class can guess - and the capture's own motion (mean |motion| 0.109) is
+exactly why the probe grew that check in the first place.
+
 ### P4: the temporal model loses on jittered data too, so colour-only stands - and three real bugs
 
 P3 lever 1 closed the input-set question on `godot-v2`, whose input was a filtered downscale of the target.
@@ -441,10 +492,10 @@ misaligned by 2j had enough slack to "succeed" at being mediocre; removing that 
 separate cleanly. The `godot-v2` controls (which have no jitter in the data) still pass 6/6, which is the
 other half of the argument: it is the jitter *in the data* that a jitter-free model cannot cope with.
 
-Still deferred, deliberately: the runtime phase-aligned accumulator that integrates distinct sub-pixel
-samples across frames (the -33.4% edge-error prize measured on the zone plate). It is the next piece of
-work, and it is the one thing that should not be built on an unsettled convention - which is why the
-sign came first.
+Still deferred at that point, deliberately: the runtime phase-aligned accumulator that integrates distinct
+sub-pixel samples across frames (the -33.4% edge-error prize measured on the zone plate). It is the one thing
+that should not be built on an unsettled convention - which is why the sign came first - and it is built now;
+see the accumulator entry above.
 
 ### A static jittered capture, the AA numbers on real frames, and a sign the pipeline and the data disagree on
 
@@ -541,7 +592,10 @@ frame's samples onto the nominal grid; antialiasing needs several frames' *disti
   integrating distinct samples cuts edge-weighted error from 0.199 to **0.133 at 8 samples (-33.4%)**
   and 0.130 at 16 (-34.6%). Phase-aligned accumulation beats de-jitter-then-average throughout, and the
   gap widens with K (-28.1% vs -25.8% at 4, -33.4% vs -29.0% at 8), because de-jittering resamples
-  every frame back onto the grid it is supposed to escape.
+  every frame back onto the grid it is supposed to escape. (Re-measured after the sign was corrected: the
+  de-jitter column now reads -25.8% at 4 and -26.0% at 8, because it calls the trainer's correction, whose
+  direction was flipped. The phase-aligned column is unchanged, and that is the point - its placement was
+  measured from the capture rather than assumed.)
 
 So: the AA payoff is real and roughly a third of edge error, and reaching it requires accumulation in
 the output domain at each frame's own sub-pixel phase - not the de-jitter path, which corrects geometry

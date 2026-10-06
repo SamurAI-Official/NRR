@@ -281,6 +281,13 @@ void run_all_tests() {
     NRR_RUN_TEST(test_jitter_corrects_every_channel);
     NRR_RUN_TEST(test_jitter_history_records_each_frames_own_offset);
     NRR_RUN_TEST(test_jitter_input_names_classify_as_the_offset);
+    /* The phase-aligned path: the same convention, on the operation de-jittering does not perform -
+     * integrating several frames' distinct sub-pixel samples. Pinned against the torch reference by
+     * tools/regen_aa_fixture.py, and ordered against the de-jitter alternative it replaces. */
+    NRR_RUN_TEST(test_aa_accumulator_places_each_frame_where_it_was_sampled);
+    NRR_RUN_TEST(test_aa_accumulator_integrates_distinct_subpixel_samples);
+    NRR_RUN_TEST(test_aa_accumulator_refuses_mixed_grids_and_bad_shapes);
+    NRR_RUN_TEST(test_aa_upsample_is_the_identity_at_native_resolution);
     NRR_RUN_TEST(test_temporal_history_names_classify_as_history);
     NRR_RUN_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_it);
 
