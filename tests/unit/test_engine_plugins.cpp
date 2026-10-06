@@ -17,6 +17,7 @@
 // below and that consumer-side check agree by construction.
 // ---------------------------------------------------------------------------
 #include "test_framework.h"
+#include "nrr.h"
 
 #include <cctype>
 #include <fstream>
@@ -333,6 +334,37 @@ NRR_TEST(test_godot_addon_has_no_nested_project_file) {
                                "RESULT: FAIL"}) {
         require_contains(driver, needle, "verify.gd");
     }
+}
+
+/* NRR_ENTRY_POINT_COUNT is what every binding and every document quotes as "the C ABI surface", and
+ * nrr_test_entry_point_count() returns that macro - so comparing the two is the macro agreeing with
+ * itself and cannot fail. This counts the header's declarations instead: every public entry point is
+ * declared with NRR_API at the start of a line, and the single test-only entry is excluded because it
+ * is not part of the surface a consumer links against. It is the check that would have noticed a
+ * declaration added without the macro, or a macro bumped without a declaration. */
+NRR_TEST(test_c_api_entry_point_count_matches_header) {
+    using namespace plugin_files;
+    const std::string header = read("include/nrr.h");
+
+    size_t declared = 0;
+    size_t test_only = 0;
+    size_t pos = 0;
+    while (pos < header.size()) {
+        size_t line_end = header.find('\n', pos);
+        if (line_end == std::string::npos) line_end = header.size();
+        const std::string line = header.substr(pos, line_end - pos);
+        if (line.rfind("NRR_API", 0) == 0) {
+            ++declared;
+            if (line.find("nrr_test_") != std::string::npos) ++test_only;
+        }
+        pos = line_end + 1;
+    }
+
+    std::cout << "  declared NRR_API entry points: " << declared << " (" << test_only
+              << " test-only)" << std::endl;
+    NRR_ASSERT(test_only >= 1, "the test harness entry point must be declared and excluded");
+    NRR_EXPECT_EQ(declared - test_only, static_cast<size_t>(NRR_ENTRY_POINT_COUNT),
+                  "NRR_ENTRY_POINT_COUNT must match the declarations in include/nrr.h");
 }
 
 } // namespace test

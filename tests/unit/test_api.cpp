@@ -57,6 +57,50 @@ NRR_TEST(test_api_entry_point_count) {
     std::cout << "  Exported entry points: " << count << std::endl;
 }
 
+/* The descriptor query, which exists because a caller has no other way to learn the size of a
+ * texture the runtime created - the Unity renderer sized its readback from its own input and came
+ * back with a buffer that disagreed with the copy it made. Round-tripped rather than merely
+ * callable: every field must come back as it went in. */
+NRR_TEST(test_api_texture_desc) {
+    NRRTextureDesc desc = {};
+    NRR_EXPECT_EQ(nrr_texture_get_desc(nullptr, nullptr, &desc), NRR_ERROR_INVALID_ARGUMENT,
+                  "null device must fail");
+    NRR_EXPECT_EQ(nrr_texture_get_desc(nullptr, nullptr, nullptr), NRR_ERROR_INVALID_ARGUMENT,
+                  "null output must fail");
+
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    if (nrr_device_create(&options, &device) != NRR_SUCCESS || device == nullptr) {
+        std::cout << "  (no backend available; descriptor round-trip not exercised)" << std::endl;
+        return;
+    }
+
+    NRRTextureDesc wanted = {};
+    wanted.width = 8;
+    wanted.height = 4;
+    wanted.format = NRR_TEXTURE_FORMAT_RGBA8;
+    wanted.usage = NRR_TEXTURE_USAGE_COLOR;
+    wanted.array_layers = 1;
+    wanted.mip_levels = 1;
+
+    NRRTexture* texture = nullptr;
+    NRR_EXPECT_EQ(nrr_texture_create(device, &wanted, &texture), NRR_SUCCESS, "create texture");
+
+    NRRTextureDesc got = {};
+    NRR_EXPECT_EQ(nrr_texture_get_desc(device, texture, &got), NRR_SUCCESS, "query descriptor");
+    NRR_EXPECT_EQ(got.width, wanted.width, "width round-trip");
+    NRR_EXPECT_EQ(got.height, wanted.height, "height round-trip");
+    NRR_EXPECT_EQ(got.format, wanted.format, "format round-trip");
+    NRR_EXPECT_EQ(got.usage, wanted.usage, "usage round-trip");
+    NRR_EXPECT_EQ(got.array_layers, wanted.array_layers, "layer count round-trip");
+    NRR_EXPECT_EQ(got.mip_levels, wanted.mip_levels, "mip count round-trip");
+    std::cout << "  " << got.width << "x" << got.height << " format=" << (int)got.format
+              << " usage=" << got.usage << std::endl;
+
+    nrr_texture_destroy(device, texture);
+    nrr_device_destroy(device);
+}
+
 NRR_TEST(test_api_reference_load_null) {
     NRRDevice* dummy_device = nullptr;
     NRRReference* ref = nullptr;

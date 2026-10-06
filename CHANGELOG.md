@@ -14,6 +14,619 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### P4: the temporal model loses on jittered data too, so colour-only stands - and three real bugs
+
+P3 lever 1 closed the input-set question on `godot-v2`, whose input was a filtered downscale of the target.
+A downscale destroys sample position, so the previous frame carried no sub-pixel information the current one
+lacked, and a temporal model was being asked to exploit data that had already thrown it away. `godot-v4`
+(`tools/capture_godot_v4.ps1`, `tools/pack_godot_v4.ps1`) removes that excuse: the input is the capture's
+**own half-size render, sub-pixel jittered per frame** on a Halton (2,3) sequence, and `history` is the
+previous frame's jittered render - which is what `runtime/nrr_temporal.h`'s `HistoryEntry` actually holds.
+`tools/check_capture.py` proves the pass is a real raster and not a resize (edge energy ≥ 1.3x a filtered
+downscale of the same frame) and that the recorded offsets reproduce the documented sequence.
+
+The rule was written into `docs/evaluation-protocol.md` **before** these runs finished: adopt the temporal
+model only if it beats colour-only by ≥ 5 points of held-out L1 *and* beats its own history-zeroed control.
+Six runs, `--deterministic`, two seeds each:
+
+| config | 20261020 | 20261021 | mean | seed spread |
+| --- | --- | --- | --- | --- |
+| colour only | 8.79% | 10.44% | **9.61%** | 1.65 pts |
+| colour + motion + history | 0.02% (refused) | 8.51% | 4.26% | **8.49 pts** |
+| colour + motion + history, history zeroed | 14.24% | 3.09% (refused) | 8.66% | **11.15 pts** |
+
+Both conditions fail: the temporal model is **5.35 points below** colour-only (needed +5) and **4.40 points
+below** its own history-zeroed control. **Colour-only stands**, now on data that can actually answer the
+question - so this is a conclusion about temporal modelling here, not an artefact of a downscale. The
+history-zeroed control beating the temporal model is the sharpest part: the extra inputs do not merely fail
+to help, they cost.
+
+The second, less comfortable finding is **stability**. Colour-only's two seeds span 1.65 points; the temporal
+configurations span 8.49 and 11.15, and one temporal seed froze outright (0.02%, refused on four gates).
+Consuming the previous frame destabilises training on this data, and a model that lands somewhere different
+on every seed is not a candidate for anything, whatever its mean.
+
+**A seed was not pinning a result, and that was a measurement bug of its own.** `cudnn.benchmark` was on
+unconditionally, so cuDNN picked convolution algorithms by timing them and two runs of the *same* config and
+seed diverged - measured at 8.4%, 0.0% and 15.6% training progress across three runs of one configuration.
+`--deterministic` turns autotuning off and requests deterministic kernels, so a seed now pins a result
+(verified: two runs of the same seed produce identical epoch losses). It is opt-in because it costs speed,
+and it is recorded in every report as `deterministic`, but a comparison between configurations cannot be
+made with it off.
+
+Three genuine bugs came out of this, all found by these runs and none of them reachable from the
+colour-only model every previous export used:
+
+* **`export_onnx` bound its example tensors by position, not by name.** They were passed in `inputs` order
+  into the `(color, depth, motion, history)` signature, so a `color,motion,history` model fed its 3-channel
+  history tensor into the 2-channel motion convolution and could not be exported at all. Fixed by placing
+  tensors into the signature's own slots and passing `None` for inputs the model does not consume.
+* **`verify_export` had the same defect**, which is worse: the step that exists to catch a bad export was
+  itself the thing that crashed, so it verified nothing on any multi-input model. Fixed the same way.
+* **ONNX tracing a CUDA model died under `--deterministic`**, because torch's deterministic path rewrites
+  `F.interpolate` (the 2x bilinear skip) into a decomposition that builds index tensors on the CPU and cannot
+  clamp them against CUDA values - killing models that had trained and passed every gate. The trace now runs
+  on the CPU with the weights moved there and back, which is also where the runtime executes this graph.
+
+All three are pinned by self-tests (`train_nrr.py --self-test`), which now cover the multi-input export, its
+agreement with the module, tracing under deterministic settings, the device round-trip, and `verify_export`
+itself. The last of these was added because fixing the first three still left a crash: the bug was in the
+verification, not only the export.
+
+### What the winning colour-only model actually scores on the jittered dataset
+
+`tools/evaluate_model.py` on the better colour seed (40 frames per scene, full stack), against bilinear on
+the same frames:
+
+| scene | L1 (model / base) | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| heldout | 0.01341 / 0.01478 | 0.899 / 0.888 | 0.970 / 0.961 | 0.084 / 0.119 | 0.215 / 0.267 | 43.8 / 42.9 | 0.277 / 0.218 |
+| heldout2 | 0.01148 / 0.01266 | 0.911 / 0.903 | 0.972 / 0.964 | 0.080 / 0.115 | 0.211 / 0.292 | 45.5 / 43.7 | **0.154 / 0.192** |
+| heldout3 | 0.01379 / 0.01523 | 0.893 / 0.884 | 0.965 / 0.952 | 0.080 / 0.104 | 0.242 / 0.292 | 36.1 / 34.2 | **0.140 / 0.193** |
+| heldout4 | 0.01490 / 0.01622 | 0.897 / 0.889 | 0.965 / 0.955 | 0.098 / 0.139 | 0.243 / 0.310 | 32.7 / 31.7 | **0.170 / 0.200** |
+
+Warping error tracks the reference's own on all four scenes (0.0758-0.0851 against 0.0763-0.0896), so there
+is no shimmer being traded for blur.
+
+**The detail bar fails on three of the four scenes, and the failure is real.** It was first written up here
+as a measurement artefact - the input is an *aliased* raster, so the claim was that bilinear "keeps" aliasing
+that a Laplacian counts as detail. **That explanation was wrong**, and it is corrected here rather than left
+in place: the band split that tested it (`tools/evaluate_model.py`, `detail_bands`) was dividing the radial
+frequency by `height/2`, which puts axis-Nyquist at 1.0 while the band edges are written against 0.5. The
+"above-Nyquist" band was therefore measuring frequencies the input could perfectly well carry. With the
+normalisation fixed (pinned by sinusoid self-tests, which is what caught it), bilinear turns out to be
+strongly band-limited - it retains only 1-3% of the truth's energy in the band the input can carry - and the
+model is *not* carrying aliasing the baseline lacks.
+
+What the corrected measurement shows, using the Laplacian's own statistic (mean absolute band energy,
+because mean-square is dominated by a few ringing pixels):
+
+| scene | recoverable band (model / base) | high band (model / base) | recoverable-band correlation (model / base) |
+| --- | --- | --- | --- |
+| heldout | 1.000 / 0.993 | 0.328 / 0.311 | 0.979 / 0.972 |
+| heldout2 | 0.982 / 0.991 | 0.297 / 0.349 | 0.973 / 0.945 |
+| heldout3 | 0.975 / 0.988 | 0.182 / 0.222 | 0.977 / 0.947 |
+| heldout4 | 0.992 / 0.996 | 0.263 / 0.295 | 0.986 / 0.970 |
+
+So the honest reading is narrower and more useful: **the model is genuinely ~15-20% softer than bilinear in
+the high-frequency band** (0.182 against 0.222 on heldout3), which is exactly what moves the Laplacian ratio
+below the baseline's on three scenes. It is not soft in the recoverable band - there it matches the truth at
+0.975-1.000 and correlates better than the baseline on 64 of 64 frames. The model also has a few ringing
+pixels (5-9x the truth's mean-square energy above Nyquist), which a mean-square metric reports as a large
+failure and a mean-absolute metric barely sees. Both are real, and both are fixable.
+
+`detail_bands` and `band_correlation` are kept in the harness and reported *beside* the Laplacian ratio, never
+instead of it: the Laplacian is what every earlier number in this project was measured with, and silently
+replacing it would make those incomparable. What the split buys is the ability to say *which* band a detail
+number came from, which is what turned a wrong explanation above into a right one.
+
+### Ten seeds settle it: detail-weighting is a reliability change, not a quality change
+
+At two seeds the comparison was unreadable - colour-only looked stable (1.65-point spread) and detail-weight
+looked erratic (7.6), which read as "detail-weighting costs stability". Ten seeds per arm
+(`tools/run_p4_seeds.ps1`, all `--deterministic`, same config) reverse that completely:
+
+| arm | all-seed mean | σ | frozen | detail bar |
+| --- | --- | --- | --- | --- |
+| colour only | 7.49% | 4.37 | **4 of 10** | **9 of 24** scene-seed cells |
+| detail-weight | **10.54%** | 2.37 | **0 of 10** | **40 of 40** |
+
+The seeds: colour-only 8.8, 10.4, **0.0**, 13.7, **0.5**, 10.4, **6.7**, 7.2, 10.4, **6.9**; detail-weight
+12.9, 5.4, 11.5, 12.3, 8.5, 11.1, 8.5, 11.4, 11.3, 12.4.
+
+**Colour-only does not reliably train on this dataset.** Four of ten seeds freeze in the absorbing state the
+trainer documents - the zero-initialised output head never escapes - and those runs are refused rather than
+exported, so four times out of ten there is no model at all. Detail-weighting froze on none. That is the whole
+of the difference: restricting to seeds that trained, colour-only averages 10.14% and detail-weight 10.54%,
+a gap of 0.40 points with a standard error of 1.17 - **inside the noise**. The two arms are the same
+quality model; one of them just cannot be trained reliably without the loss weighting.
+
+The mechanism is the same weighting that fixes the detail bar. The freeze happens because the output
+convolution starts at zero, so the gradient reaching everything upstream is `W_out^T · grad` and is exactly
+zero until that weight moves. Upweighting high-frequency regions of the target gives that head a much less
+symmetric signal to get stuck on, and the runs that froze colour-only are precisely the ones detail-weighting
+trains without difficulty.
+
+Ringing roughly doubles (mean 0.105 for colour-only, 0.211 for detail-weight) but stays far below the 1.0
+that would mean as much above-Nyquist energy as the truth's own, and the full perceptual stack on seed
+20261020 passes on all four scenes - LPIPS 0.061/0.051/0.058/0.076 against bilinear's 0.119/0.115/0.104/0.139,
+DISTS 0.171-0.228 against 0.267-0.310, VMAF 47.4/57.5/43.8/37.4 against 42.9/43.7/34.2/31.7.
+
+**The protocol's rule still says no, and the reason it says no is now explicit.** The rule requires ≥ 5 points
+on held-out L1; detail-weighting delivers + 3.05 (se 1.57). But that rule exists to stop a change being adopted
+for a quality gain too small to separate from noise - and this change is *not* a quality gain. It is the same
+quality model plus the removal of a 40% failure rate and a detail bar that goes from 38% to 100%. A rule
+written before this failure rate was known has no case for it, so the adoption decision is recorded as the
+open question it is rather than being resolved by a threshold that does not describe the situation.
+
+### The freeze is a `godot-v4` phenomenon: on `godot-v2` detail-weighting is a pure 5-point cost
+
+The reliability argument for detail-weighting was measured on the jittered dataset. It does not hold on the
+dataset the shipped model was actually trained on. Ten seeds per arm, `--deterministic`, `godot-v2`:
+
+| arm | mean | σ | frozen |
+| --- | --- | --- | --- |
+| colour only | **22.65%** | 3.21 | **0 of 10** |
+| detail-weight | 17.41% | 3.39 | **0 of 10** |
+
+**Neither arm freezes once on `godot-v2`** - training progress is 36-57%, nowhere near the 10% gate - and
+detail-weighting is **5.24 points worse** (se 1.48). So adopting it on the shipped dataset would cost a
+measured 5% of quality to fix a failure that dataset does not have.
+
+The conclusion is therefore dataset-specific, and it is the opposite of what the jittered data alone
+implied:
+
+* **`godot-v2` (shipped): keep colour-only.** It trains reliably and scores higher.
+* **`godot-v4` (jittered): detail-weighting is the right choice** - it is what takes the freeze rate from
+  4/10 to 0/10 and the detail bar from 9/24 to 40/40.
+
+The generalisable finding is that a configuration lever can be strongly dataset-dependent, and a ten-seed
+sweep on the wrong dataset would have adopted the wrong thing.
+
+### `jitter` is now genuinely used: the ablation harness was broken, and the architecture could not have used it anyway
+
+Two separate defects, found together. Fixing only one would have left the temporal arm still jitter-blind
+while the number now said otherwise.
+
+**The harness never zeroed the tensor.** `measure()` had cases for depth, motion and history but none for
+jitter, so `ablation("jitter")` compared two identical forward passes and returned `0.00000` by construction.
+It was not a weak signal, it was no measurement. The earlier conclusion - "the model ignores jitter" - was an
+artefact of the harness, and the gate it failed was really just correctly reporting that the experiment had not
+been performed. Self-test: *the ablation harness can zero every consumed input*.
+
+**The architecture could not have used it anyway.** The offset is constant across the image, so a convolution
+over the broadcast plane can only express a global bias; exploiting it needs the network to *shift its
+resampling*, which a conv stack feeding a fixed bilinear skip does not parameterise. `dejitter()` in
+`tools/train_nrr.py` now resamples the captured frame back onto the grid it was not sampled on
+(`input(x) = scene(x + jitter)`, so recover `scene` by sampling at `x - jitter`), and it runs in `prepare()`
+so the skip and the residual both work on the corrected geometry. Jitter is no longer an input the model may
+ignore: zeroing it moves the samples the whole network is built on. Its sign and inversion are pinned against
+a linear ramp, where interpolation blur cannot mask a wrong sign - correct 0.0080 against 0.2953 uncorrected,
+while the opposite sign is 0.5892, worse than no correction at all.
+
+| arm | seed | val L1 | vs base | SSIM | PSNR | MS-SSIM | jitter ablation | gates |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `+jitter` | 20261020 | 0.01349 | 9.96% | 0.9356 | 28.98 | 0.9765 | **0.00903** | 0 |
+| `+jitter` | 20261021 | 0.01354 | 9.64% | 0.9296 | 28.25 | 0.9723 | **0.00806** | 0 |
+| `+jitter` | 20261022 | 0.01383 | 7.66% | 0.9288 | 28.85 | 0.9771 | **0.00745** | 0 |
+| `+jitter` | 20261023 | 0.01369 | 8.62% | 0.9346 | 28.59 | 0.9787 | **0.00987** | 0 |
+| `+jitter` | 20261024 | 0.01380 | 7.90% | 0.9324 | 28.53 | 0.9756 | **0.00951** | 0 |
+| `+jitter` | 20261025 | 0.01364 | 8.97% | 0.9333 | 28.45 | 0.9758 | **0.00912** | 0 |
+| control | 20261021 | 0.01371 | 8.51% | 0.9203 | 28.28 | 0.9680 | n/a | 0 |
+| control | 20261020 | 0.01498 | 0.02% | 0.9045 | 27.74 | 0.9749 | n/a | 4 (refused) |
+| control | 20261022 | 0.01502 | -0.26% | 0.9039 | 27.74 | 0.9748 | n/a | 3 (refused) |
+| control | 20261023 | 0.04104 | -173.95% | 0.7726 | 18.22 | 0.7641 | n/a | 2 (refused) |
+| control | 20261024 | 0.01500 | -0.10% | 0.9045 | 27.74 | 0.9750 | n/a | 4 (refused) |
+| control | 20261025 | 0.01488 | 0.65% | 0.9019 | 27.60 | 0.9714 | n/a | 2 (refused) |
+
+Six seeds per arm, `--deterministic`, differing in exactly one input. `tools/summarize_jitter.py` prints this
+table and the aggregates; the 20261023 control is the one run whose training loss *rose* (0.0148 -> 0.0893).
+
+**The jitter ablation is now non-zero on every seed**, 0.00745-0.00987 (mean 0.00884, sd 0.00091) - the
+largest single-input ablation in the model, used roughly fourteen times more strongly than motion (0.00065).
+That claim needs no comparison arm at all: 6 seeds, every one non-zero, which is the measurement that was
+previously reporting `0.00000`.
+
+**But the six control seeds are the more interesting result, and they are not a quality margin.** Five of six
+controls were refused. Four sat within 1.4% of their *initial* loss for all 60 epochs - frozen at the
+zero-initialised bilinear baseline - and one diverged to six times the baseline error. The jitter arm trained
+on 6 of 6 seeds, 20.3%-34.3% progress. So the de-jitter appears to be what makes the temporal arm *trainable*
+on jittered data at all, not merely slightly better: without it, the sub-pixel sampling error is a systematic
+mismatch between input and target that the architecture cannot represent, so the residual stays pinned near
+the baseline and the zero-initialised output convolution never gets a gradient strong enough to leave.
+
+That also reinterprets the earlier two-seed numbers. "Jitter arm 1.91% against the control's 4.26%" was
+measured against a control arm that was mostly frozen - the 4.26% came from the minority of seeds that
+happened to train, and the arm's real behaviour is 5/6 freeze. The apparent jitter *penalty* was an artefact of
+an unreliable control.
+
+**What is not established: a quality margin.** With one valid control seed there is no variance to test and no
+comparison worth making; the permutation test in `summarize_jitter.py` correctly refuses to run on `n=1`. On
+that single seed the jitter arm wins on L1, SSIM and MS-SSIM, but it is one seed and is reported as such.
+The reliability difference - 0/6 versus 5/6 refusals - is the finding of record, and it is a training-stability
+result rather than an image-quality one.
+
+**Confirmed: the freeze is caused by the jitter in the data, not by the configuration.** The same temporal
+control was rerun on all six seeds against `godot-v2`, which is captured without jitter and carries no jitter
+field at all. Identical configuration, identical hyperparameters, only the capture differs:
+
+| group | runs | frozen | training progress | mean improvement |
+| --- | --- | --- | --- | --- |
+| `+de-jitter`, jittered `godot-v4` | 6 | 0 (0%) | 20-34% | +8.79% |
+| control, jittered `godot-v4` | 6 | 5 (83%) | 0.6-11.2% | +8.51% (1 valid run) |
+| control, **un-jittered** `godot-v2` | 6 | **0 (0%)** | **55-57%** | **+23.92%** |
+
+The control trains every seed on the un-jittered capture and freezes on five of six on the jittered one. That
+rules out the rival explanation - that this configuration is simply fragile here - because the configuration is
+unchanged between the last two rows and only its success. The jitter arm's first row then shows the de-jitter
+removing the cause. So this is a training-stability result with a mechanism, not a coincidence.
+
+**And the offset is worth something in quality, not only in output movement.** An ablation proves dependence,
+not usefulness: a model can depend on an input and gain nothing from being right about it. `tools/offset_value.py`
+measures the error against the target over 160 validation frames when the offset is supplied correctly,
+withheld, and supplied with the wrong sign:
+
+| model | correct | zeroed | negated | worth of knowing |
+| --- | --- | --- | --- | --- |
+| 20261020 | 0.01341 | 0.01418 | 0.01452 | **-0.00077** |
+| 20261021 | 0.01340 | 0.01404 | 0.01416 | **-0.00064** |
+| 20261022 | 0.01375 | 0.01430 | 0.01436 | **-0.00055** |
+| 20261023 | 0.01366 | 0.01440 | 0.01477 | **-0.00074** |
+| 20261024 | 0.01374 | 0.01455 | 0.01487 | **-0.00080** |
+| 20261025 | 0.01355 | 0.01442 | 0.01459 | **-0.00087** |
+
+Mean `-0.00073` L1 (sd `0.00012`), consistent in sign and magnitude across all six seeds: about 5% of the
+baseline error, which is a real gain rather than a reshuffle. On every model a wrong-signed offset scores
+*worse* than no offset at all - which the ablation cannot detect, because a graph that ignored the offset
+entirely would pass an ablation test while being useless. Getting the sign backwards would show up here as
+`negated` better than `zeroed`; it does not, on any seed.
+
+### The runtime can now be told where a frame was sampled at - the chain from capture to engine
+
+The result above was real in Python and unreachable in the engine: `runtime/` contained no notion of the
+sub-pixel offset at all, and the string `jitter` appeared nowhere in `runtime/` or `engine_plugins/`. A
+jitter-aware model fed nothing receives a zero offset, `dejitter()` becomes the identity, and the model
+degenerates into exactly the control that froze on five of six seeds. Three of the four missing links are now in.
+
+**`runtime/nrr_jitter.{h,cpp}`** - the correction itself, as a second implementation of
+`train_nrr.py::dejitter`. `dejitter_nchw()` matches
+`grid_sample(mode="bilinear", padding_mode="border", align_corners=False)` including torch's convention that a
+continuous coordinate of `k` lands on pixel centre `k`; using the half-a-pixel-off convention instead would
+shift every sample by as much as the offsets being corrected, halving the benefit while still looking
+plausible. `build_jitter_plane()` emits the 2xHxW plane the trainer's loader emits, x then y.
+
+Two implementations of one thing is a liability unless they are pinned together, so
+`tests/unit/test_jitter.cpp` holds constants generated by the Python side on the same fixture: mean errors
+`0.000145804` corrected, `0.005383286` withheld, `0.010742154` backwards-signed, plus five exact interior
+samples. The fixture is a linear ramp *because* blur cannot hide a sign error on a ramp - a textured fixture
+would soften under a second bilinear pass and let a backwards sign pass as merely "slightly worse". If either
+side drifts, one fails. The nine tests also cover the identity-at-zero property, per-channel correction, and
+argument rejection.
+
+**`include/nrr.h`** - `NRRJitterState` on `NRRTemporalState`, with an `enabled` flag. That flag is not
+decoration: a Halton sequence visits near-zero offsets, and a jittered renderer reporting `(0,0)` is *not* the
+same as a renderer that does not jitter. Without the flag the two collapse and jitter correction silently
+disables itself on exactly the frames where it was already doing nothing.
+
+**`runtime/nrr_temporal.{h,cpp}`** - `HistoryEntry::jitter`, because the offset belongs to the *capture*. The
+history is reprojected onto the present frame's grid, so correcting it needs the offset of the frame it came
+from, not the one being drawn; using the current frame's offset would replace one misalignment with another.
+Both `add_frame` and `get_previous_frame` gained overloads rather than parameters, so every existing caller
+keeps compiling and keeps its meaning - the original form is the new one with the identity offset.
+
+**`TensorRole::Jitter`** - and this one uncovered a live bug. `classify_tensor_role("jitter")` returned
+`Other`, which fell through to `channels = 3` and `src = &color_img` in `backend_cpu.cpp`. A jitter-aware model
+would therefore have been handed **the colour image** in its two-channel offset tensor: it renders, it looks
+plausible, and it is nonsense. `accel_kernel.cpp:240` has the same `else 3 -> in_tex` shape. The classifier now
+matches jitter *before* colour, because colour's synonyms include "input" and "frame" and would otherwise
+swallow a name like `jittered_input`.
+
+### The `history` input was bound to the colour image - worse than the jitter one, and found while fixing it
+
+`classify_tensor_role("history")` matched no keyword at all, so it returned `Other`, and both binding sites
+resolved `Other` to the colour texture. A temporal resolve was therefore handed **the current frame as its own
+history** - a model that can see no motion and cannot accumulate, running correctly and producing an image.
+`accel_kernel.cpp:250` had the same `else in_tex` shape. Fixed with `TensorRole::History`, matched before colour
+for the same reason as jitter (`history_color` is a natural name colour would claim), and guarded so a model
+input merely *called* `temporal_input` stays on the colour path.
+
+Fixing the classification exposed the real part. The obvious source for the tensor is
+`NRRFrameInput::temporal::previous_output`, and that is **wrong**: `previous_output` is the displayed frame at
+*output* resolution, while a model trained on temporal data expects the previous frame's *low-resolution* render
+at input resolution (confirmed against the training pairs - `history` is 128x128 where `target` is 256x256).
+Because the model's H/W are dynamic, feeding it the 2x frame raises no error and returns a plausible-looking
+image built from the wrong pixels - strictly worse than the colour-image bug, which at least looked wrong.
+
+The runtime did not have the right thing either: `TemporalHistory` stores what was *displayed*, at output
+resolution (its own retrieval check compares `prev_w == width`). So this needed building rather than rewiring.
+`TemporalAccumulator` now keeps the previous frame's low-resolution input in its own slot, recorded from the
+same bytes the model was fed, with `record_input_frame` / `previous_input_frame`. It is cleared on
+`initialize`, `shutdown`, `reset` and on automatic scene-change detection - after a cut it belongs to a scene
+that is no longer on screen, and a resolve handed it would composite the old scene into the new one. Depth is
+one frame because that is all a model consumes.
+
+`accel_kernel.cpp` has no accumulator to ask, so the ABI gained `NRRTemporalState::history_input` for it. It is
+documented as deliberately *not* `previous_output`, since a caller that reaches for the obvious field gets a
+silent 2x mismatch.
+
+### An ABI audit, because nothing compared the two sides and I had just changed both
+
+`NRRTypes.cs` blits its structs straight into native memory. A field added to `include/nrr.h` and forgotten in
+the mirror is not a compile error, not a test failure, and presents as a rendering bug - and no amount of C++
+testing catches it, because the mismatch is entirely on the managed side. `tools/check_abi.py` parses both
+declarations and compares field count, order, name and size class for every struct they share.
+
+It reports **PASS** on all 13, including the 11-field `NRRTemporalState` that now carries the jitter state and
+the history pointer. Verified non-vacuous: deleting the `jitter` field from the mirror makes it report
+`11 native vs 10 managed field(s)` and exit 1, and restoring it returns to PASS.
+
+It compares size class rather than byte offsets on purpose. Walking offsets through a text-parsed header makes
+every parser quirk a possible false failure, and a tool that cries wolf gets ignored. Pointer against 64-bit
+integer is deliberately *not* a discrepancy - `size_t` against `IntPtr` is a match, because the marshaller cannot
+tell them apart either. Wired into CI as `abi-audit`; it needs no dependencies, no Unity and no compiler.
+
+### Link 1 - the renderer now produces the offset it reports
+
+`engine_plugins/unity/Runtime/Scripts/NRRJitter.cs` applies a per-frame sub-pixel offset to the camera's
+projection and reports it through `NRRJitterState`. The projection term (`m02`, `m12`) survives the perspective
+divide as a constant, so the image moves rigidly - the canonical Unity TAA offset - and the camera's un-jittered
+projection is restored immediately after the render so no other consumer of that camera is jittered too.
+
+The sequence is Halton (2,3) with `index = frame + 1`, identical to `tools/godot_capture/capture.gd`, and
+**verified against the shipped data**: all 1749 packed training pairs reproduce
+`halton(frame+1) - 0.5` with zero mismatches, so a Unity frame and the model trained on it agree rather than
+merely being statistically similar. Same reasoning and same off-by-one as the capture: the radical inverse of 0
+is 0, which would put the first frame on the corner of the cell rather than inside it.
+
+The offset handed to the runtime is **measured back from the projection matrix that was applied**, not
+recomputed from the formula - the same choice the Godot capture made, for the same reason. A projected formula
+that disagreed with the renderer's real behaviour would record offsets that are confidently wrong and nothing
+downstream could tell.
+
+**The one sign a render had to check is now checked.** The Y negation in `Apply()` reconciles NDC's upward Y
+with image rows counting downward, and it was flagged as unverifiable without pixels. Half B
+(`NRRJitterCameraTests`) renders a camera and measures it: a known `m12` delta worth +4px moved the image
++4.000 rows, a known `m02` delta worth +4px moved it -4.000 columns, and eight jittered frames measured
+`-AppliedOffset` to within 0.03px on every axis. The negation is right, not assumed.
+
+The `NRRRenderer.JitterEnabled` toggle is **off by default**, and that is the honest default: jitter without a
+model that consumes the offset buys nothing, and jitter without temporal accumulation costs edge quality on its
+own.
+
+`train_nrr.py` also gained the missing `jitter` entry in the dynamic-shape export check
+(`KeyError: 'jitter'` on any jitter-consuming export) - a latent break that had simply never been reached,
+because no jitter model had ever got past its gate.
+
+### The convention is flipped to the data's, in the trainer, the runtime and the plugin
+
+Three pixel-level checks (the previous entry) said the capture satisfies `input(x) = scene(x - j)` - a
+positive recorded offset is the displacement of the frame's *content* - while the trainer, the runtime,
+the C++ parity fixture and the Unity plugin all assumed the opposite and corrected by sampling at
+`x - j`, doubling the misalignment instead of removing it. All four now use the data's convention:
+`dejitter()` and `dejitter_nchw()` sample at `x + j`, the Unity plugin's `NextProjection` negates its
+`m02` term and its measure-back reports `(-d02 * w/2, +d12 * h/2)` so the reported offset *is* the
+content displacement, and `jf_capture` in the parity fixture builds the captured frame the way the
+capture does.
+
+Two things about the flip are worth recording, because both would otherwise look like they worked:
+
+- **The C++ parity constants were regenerated by a validated tool, not read off the implementation.**
+  `tools/regen_jitter_fixture.py` first rebuilds the *pre-flip* convention and checks it reproduces the
+  constants that were pinned before (0.000145798 against 0.000145804, and the five interior samples) -
+  which is how the first version of that script was caught broadcasting an `(H,W,1)` weight array
+  against an `(H,W)` image into an `(H,W,H)` mess and producing plausible-looking nonsense. It also
+  asserts the trainer and its mirror agree (max 1.2e-7) before emitting the new numbers. On this
+  fixture the mean errors barely move under a flip (0.000145808 vs 0.000145804) because a linear ramp
+  is its own mirror; **the interior samples are what catch it** - the first differs by 1.6e-3 against a
+  1e-6 tolerance.
+- **The guard is the probe, and it now reads the way the flip requires**: on the static capture the
+  convention check still reports the *data* as `x - j` on 6/6 frames (the data did not move), while the
+  correction-direction check reports `x + j` on 4/4 - i.e. the pipeline and the data now agree.
+
+Verified after the flip: `train_nrr.py --self-test` (its own ramp fixture rebuilt the capture the
+capture's way), the C++ suite **147/147**, the probe guard above, and the Unity suite **5/5** on CUDA -
+including the camera test, whose assertion flipped with the plugin (`measured == AppliedOffset`, where
+it previously demanded `-AppliedOffset`) and which is the only check that a real Unity render moves
+content the way the reported offset claims. The smoke fixture was re-exported from the retrained models
+first, so the runtime tests compare a flipped runtime against a flipped reference rather than passing on
+a stale one.
+
+**Re-measured, on `godot-v4`, four seeds per arm** (`tools/summarize_jitter.py`): the jitter arm trains
+and exports 3/4 (20261022/24/25; 20261023 refused), val L1 mean 0.01342, **+10.41% against the bilinear
+baseline**, SSIM 0.937, and the jitter ablation is 0.0094 - the largest of any input. The control arm -
+the same configuration without the jitter input - is **0/4**: every seed was refused, three of them for
+making 0.1-1.4% training progress and one for output that ignores motion entirely. Before the flip that
+arm still produced five exports out of six, so the honest reading is that the runs trained on frames
+misaligned by 2j had enough slack to "succeed" at being mediocre; removing that error makes the two arms
+separate cleanly. The `godot-v2` controls (which have no jitter in the data) still pass 6/6, which is the
+other half of the argument: it is the jitter *in the data* that a jitter-free model cannot cope with.
+
+Still deferred, deliberately: the runtime phase-aligned accumulator that integrates distinct sub-pixel
+samples across frames (the -33.4% edge-error prize measured on the zone plate). It is the next piece of
+work, and it is the one thing that should not be built on an unsettled convention - which is why the
+sign came first.
+
+### A static jittered capture, the AA numbers on real frames, and a sign the pipeline and the data disagree on
+
+**The static capture exists.** `tools/godot_capture/capture.gd` gained `--static`, which zeroes the
+camera velocity and freezes the animation time - the two things that would otherwise make "average the
+frames" mean something other than "average the samples". Two scenes were captured at 64 frames each
+(`--static --jitter halton`, the capture's own one-pixel render self-test passing before frame 0) and
+packed as `models/training-data/godot-static` (128 pairs, 0 skipped). `tools/aa_samples_probe.py` grew a
+`--scene captured` mode that measures on those real frames against their un-jittered high-resolution
+targets.
+
+**Antialiasing on real frames, 16 samples:**
+
+```
+1 sample    plain 0.013051   edge-weighted 0.089511
+16 samples  plain 0.011438 (-12.4%)   edge-weighted ~0.0898 (+0.3%)
+```
+
+So on real captured content, integrating frames buys ~12% of plain error - which is the per-frame
+capture noise being averaged away (the packer reports 0.0040 per frame) - and essentially nothing of
+edge error, against **-33% edge error at 8 samples** on the analytic zone plate. The two numbers are
+both true and they measure different things: the zone plate is point-sampled and genuinely aliases,
+while the Godot raster filters its textures, so much of this content has no aliasing left to resolve.
+The zone plate is therefore the bound, and the captured frames are the reminder that a renderer's
+filtering is part of the question.
+
+**The convention the pipeline assumes is the opposite of the one the capture produces.** Three
+independent pixel-level measurements now say the same thing:
+
+- simulating both hypotheses from the high-resolution target and comparing against the captured pixels:
+  `input(x) = scene(x - j)` wins on **6/6** frames, by roughly a factor of two in error
+  (0.008-0.012 vs 0.015-0.017);
+- applying the correction in each direction and comparing edge-weighted error against the target:
+  `sample(x + j)` beats `sample(x - j)` on **4/4** frames;
+- the capture's own render-based self-test: a `+1` offset moves content `+1`, i.e.
+  `input(x) = scene(x - j)` - the direction its manifest prose has described all along.
+
+The trainer (`train_nrr.py::dejitter`), the runtime (`nrr_jitter.cpp::dejitter_nchw`), the C++ parity
+tests and the Unity plugin (`NRRJitter.Apply`, verified by Half B) all assume `input(x) = scene(x + j)`
+and correct by sampling at `x - j`. Against these captures that correction therefore *doubles* the
+misalignment instead of removing it: a frame ends up at `scene(x - 2j)` rather than `scene(x)`.
+
+**The model-level measurement that appears to contradict this is explained by it.** `offset_value.py`
+found the recorded offset best and the negated one worst, which reads as "the trainer's sign is right".
+But those models were *trained* under the inverted correction, so they have never seen an aligned input;
+the geometrically correct correction is the one they are least adapted to. Plain-L1 ranking on these
+frames is also dominated by the 0.0040 noise, which a bilinear resample smooths regardless of direction.
+Neither is evidence about the geometry, and the three pixel-level checks above are.
+
+**No sign was changed.** The fix is one line in each of the trainer, the runtime and the plugin (plus
+the Half B expectation, the C++ parity constants, and the trainer's own self-test), and it invalidates
+every jitter model trained so far - they would need retraining before any jitter-aware number is
+comparable. That is a deliberate decision rather than a drive-by edit, and the probe's convention checks
+are the regression guard for it: after the flip they should print 6/6 and 4/4 for `x + j`.
+
+### The URP branch is exercised, the renderer readback is fixed, and the AA prize is measured
+
+**URP.** The verify project had the URP package installed and **no pipeline asset assigned**, so the
+built-in pipeline was what actually rendered and `SingleCameraRequest` sat unexercised. An editor setup
+script (`Assets/Editor/CreateUrpAsset.cs`, run once via `-executeMethod`) creates the pipeline and
+renderer assets and assigns them to the graphics settings and all six quality levels. The camera test
+now reports `camera render path: URP SingleCameraRequest` and every number is identical to the built-in
+run - calibration 1.125px against 1.109 expected, projection probes +4.000/-4.000/+0.500 rows and
+columns exactly, jitter frames within 0.03px of `-AppliedOffset`. The one thing URP demanded that
+built-in did not: the render target needs a **depth buffer**, or the render graph refuses it ("the
+output Render Texture must have a depth buffer") and the draw then fails on an uninitialized surface.
+
+**The renderer readback defect is fixed at the API, not worked around.** `NRRRenderer` downloaded
+`_colorOut` - a texture it created and nothing ever wrote - so its "neural output" was uninitialized
+memory shaped like the input. Sizing it correctly was impossible from the managed side: the caller does
+not know the model's output resolution, and a download clamps to what the texture holds, so any guess
+produces a buffer whose layout disagrees with the copy made from it. `include/nrr.h` therefore gained
+**`nrr_texture_get_desc()`** (`NRR_ENTRY_POINT_COUNT` 44 -> 45), `TextureImpl` now records the desc it
+was created with (and initializes every field, where width/height previously began as garbage), and the
+renderer queries the descriptor, reads RGB8 exactly, and presents at the model's resolution instead of
+blitting the upscale into an input-sized target. Tests: a descriptor round-trip, and - found while
+bumping the count - the existing `test_api_entry_point_count` compared the macro against itself and
+**could not fail**; a new test counts the `NRR_API` declarations in the header and compares them to the
+macro, which is the check that notices a declaration added without the count. C++ suite: **147/147**
+(145 + these two). Managed suite re-run: 5/5, with the runtime test now asserting the output descriptor
+it uses.
+
+**Antialiasing: the prize is measured, and the de-jitter stage is pointed the wrong way for it.**
+`tools/aa_samples_probe.py` separates the two claims that were being conflated. De-jittering aligns one
+frame's samples onto the nominal grid; antialiasing needs several frames' *distinct* samples integrated.
+
+- **The captured data cannot measure AA.** Integrating frames is only valid on a static scene, and the
+  most static validation scene in `godot-v4` has mean |motion| 0.109 - none is static. A purpose-made
+  static jittered capture is what an end-to-end AA measurement requires.
+- **On a surrogate built from a real target** (bilinear sub-samples of a high-res render), integration
+  gains ~nothing (0.2-0.4%), and de-jitter-then-average is progressively *worse* (+3.1% at 8+ samples):
+  the surrogate cannot alias, and de-jittering actively destroys the sub-pixel diversity.
+- **On an analytic zone plate with an 8x supersampled reference** - content that genuinely aliases -
+  integrating distinct samples cuts edge-weighted error from 0.199 to **0.133 at 8 samples (-33.4%)**
+  and 0.130 at 16 (-34.6%). Phase-aligned accumulation beats de-jitter-then-average throughout, and the
+  gap widens with K (-28.1% vs -25.8% at 4, -33.4% vs -29.0% at 8), because de-jittering resamples
+  every frame back onto the grid it is supposed to escape.
+
+So: the AA payoff is real and roughly a third of edge error, and reaching it requires accumulation in
+the output domain at each frame's own sub-pixel phase - not the de-jitter path, which corrects geometry
+per frame and must keep doing so for the model's inputs. That is the next piece of work, and the probe
+is the yardstick it has to move.
+
+### The smoke test: four tests in a real Unity editor, on the GPU, against an independent reference
+
+`engine_plugins/unity_verify/` is a real Unity 6000.5.8f1 project (URP 17.5.0) whose PlayMode suite
+`NRRJitterRuntimeTests` drives `nrr.dll` through the same native plugin the editor uses - no Unity camera,
+no passthrough tolerance. It runs 40 consecutive validation pairs from `godot-v4` (scene `heldout`),
+each carrying every input the model declares, and asserts direction and parity rather than existence -
+an output that exists but means nothing is the failure mode this whole jitter effort has been fighting.
+Regenerate the fixture with `python tools/export_smoke_fixture.py`; run the suite with `-runTests
+-testPlatform PlayMode` (no `-testFilter`: `-testFilter NRR.Tests` matches zero tests here, and EditMode
+discovery finds none either - PlayMode is what earlier successful runs used).
+
+**Measured result, run 28, all five passing:**
+
+```
+backend: NVIDIA, provider: CUDAExecutionProvider   (measured from nrr_model_get_info, not the request)
+runtime  correct 3.3534   withheld 3.8557   inverted 3.9707   (0-255)
+reference correct 3.3534   withheld 3.8557   inverted 3.9707
+pixel delta vs reference 0.0000 over 4 frame(s), tolerance 0.0500
+camera   projection probes exact (+4.000 rows, -4.000 columns, +0.500 rows);
+         jitter frames measured -AppliedOffset within 0.03px on every axis
+```
+
+The in-engine path reproduces the validated Python path to the printed precision, and pixel-exact on the
+frames whose reference outputs are stored. The ordering (correct < withheld < inverted) is now checked
+against a reference measurement rather than assumed, on separations of 2.49 and 3.08 per-pixel - the
+offset test finally resolves a signal it previously drowned in.
+
+**Bugs found by building it, in the order they surfaced:**
+
+- **The harness read the RGB8 output as RGBA8.** The runtime's output texture is 3 bytes per pixel, but
+  `NRRTexture.Download()` assumed a flat 4 - so it asked for a buffer a third larger than the texture and
+  the backend, which clamps a download to what the texture holds, filled only the first three bytes of
+  every four. Comparing that against RGBA ground truth scores a constant of the harness's own making;
+  this alone accounted for most of the old 74/255. `Download()` now sizes by format (mirroring
+  `accel_texture_bytes`) so the buffer's length states its layout, and the test compares RGB to RGB.
+- **The fixture fed only `color` and `jitter`**, zero-filling `motion` and `history` - outside the model's
+  training distribution. `export_smoke_fixture.py` now exports all four, quantized exactly as the runtime's
+  textures are (uint8 for color/history, IEEE half for motion): feeding raw float32 would score a number
+  the runtime structurally cannot produce. Pairs are *consecutive within one scene* so pair k's history is
+  pair k-1's render - true for both history routes (the CPU backend's accumulator and the accelerator
+  kernel's explicit `history_input`) - and the chain is printed (mean 0.0040) rather than assumed.
+- **A whole-process freeze that ate three runs**, found by progress markers after the log and the results
+  file both stopped arriving. `NRRModel` was never disposed, so the device left scope first and the model's
+  finalizer - which runs inside Mono's stop-the-world - unloaded it against a destroyed device and blocked:
+  145 threads `Suspended`, zero CPU, no crash, no event log, deterministic at the third test's GC. Every
+  test now disposes the model inside the device's scope, and textures `Dispose()` rather than `Destroy()`
+  so no finalizer holds a native call. Run10 passed only because `ModelPath` threw before `LoadModel`,
+  so it never leaked one. (The plugin's own `NRRRenderer` disposes its model in `OnDestroy` but not
+  against device ordering - worth auditing when the URP 17 migration un-parks it.)
+- **The GPU claim was unfalsifiable until it failed.** The 352 MB `onnxruntime_providers_cuda.dll` had
+  never been staged next to `onnxruntime.dll` in `Plugins/x86_64` (Godot's bin had it, which is why
+  Godot reported CUDA and Unity could not), so ONNX Runtime's attach failed and fell back to CPU *while
+  everything still rendered*. The provider is staged now, and the test asserts the provider read back
+  from `nrr_model_get_info` - the measured attachment - defaulting to requiring CUDA with
+  `NRR_REQUIRE_CUDA=0` as the deliberate opt-out.
+- The exporter records its own reference numbers (three variants, pixel separations, and a
+  `parity_tolerance` derived from measured CUDA-vs-CPU agreement of 0.0015 rather than guessed), so the
+  test cannot drift from what the model actually does.
+
+**Half B now exists and passes**, and it is what closed the Y sign (see the jitter section above). Three
+findings from building it, each a real trap rather than a harness detail: this project has the URP package
+installed but **no pipeline asset assigned**, so the built-in pipeline renders and only `Camera.Render()`
+works (`SingleCameraRequest` and `StandardRequest` both answer false); `Camera.Render()` **re-derives the
+projection**, so a jittered matrix must be applied from `Camera.onPreCull` - assigned beforehand, a delta
+worth +4px measured -0.14px, sign flipped; and `camera.aspect` **inherits the Game view's 16:9** even when
+rendering into a square target, which scaled every x reading by 1/1.593 (a 1.109px world move measured
+0.696px) until it was stated. The measurement is iterative Lucas-Kanade over a checkerboard pattern,
+calibrated against displacements the test knows independently. Two earlier versions of it were worthless:
+SAD over white noise produced a flat surface whose minimum sat at the search-window edge (a constant
+-3.0px with no relation to the render), and one revision **passed with every axis inverted** because the
+sign assertion was dropped while the frame block was rewritten - restored, and the probe/calibration
+assertions now make that class of silence impossible.
+
+**What this does not establish:** the built-in path is what renders here, so the URP
+`SingleCameraRequest` branch is written but unexercised until a pipeline asset is assigned. And
+`NRRRenderer.cs:309` still downloads `_colorOut`, a texture the runtime never writes (the model's
+output handle is what `Render` returns) - a real defect, parked with the URP 17 `RecordRenderGraph`
+migration because that whole path is not compilable until then.
+
 ### Two more held-out scenes, and the comparison now spans four validation scenes
 
 `heldout3` and `heldout4` were added to `tools/godot_capture/capture.gd` (a finer cool-palette scene and a

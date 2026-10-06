@@ -227,6 +227,41 @@ measured, and temporal/reference data actually changes that image.
       it already is: the runtime's `TemporalAccumulator`, measured by `TemporalBlendStats`. A ten-seed
       noise floor later put that comparison on firmer ground still: σ ≈ 2.4 points, and the two-seed
       12.12% was itself 2.2 points optimistic.
+- [x] **The model contract re-decided on data that can actually answer it, and it did not change.**
+      The result above was measured on a *filtered downscale* input, which destroys sample position -
+      every input pixel lands on an output-grid sample, so a previous frame carried no sub-pixel
+      information the current one lacked. That is evidence about the dataset, not about temporal
+      modelling, so the question was re-asked on `godot-v4`: the input is the capture's own
+      half-resolution render, sub-pixel jittered per frame on a Halton (2,3) sequence, with `history`
+      as the previous frame's jittered render - exactly what `runtime/nrr_temporal.h`'s `HistoryEntry`
+      holds. Same pre-registered rule, two seeds each, `--deterministic`: colour-only 9.61%, temporal
+      4.26%, history-zeroed control 8.66%. Both conditions fail, and the temporal model is 5.35 points
+      *below* colour-only and 4.40 below its own control, so the extra inputs cost. The single-frame
+      model stands on this evidence too. The temporal configurations are also far less stable (seed
+      spreads 8.5 and 11.2 points against colour-only's 1.65), and one temporal seed froze outright.
+- [x] **A seed was not pinning a result - fixed, because the comparison above depended on it.**
+      `cudnn.benchmark` was unconditional, so cuDNN chose convolution algorithms by timing them and the
+      same config and seed reached 8.4%, 0.0% and 15.6% training progress across three runs. Any
+      cross-configuration comparison is unsound without this fixed. `--deterministic` turns autotuning
+      off and requests deterministic kernels (verified: identical epoch losses across runs of one
+      seed), is recorded in every report, and is opt-in only because it costs speed.
+- [x] **The chosen configuration does not reliably train, and ten seeds found the fix.** On the
+      jittered `godot-v4` dataset the colour-only configuration **freezes on 4 of 10 seeds** - the
+      zero-initialised output head never escapes its absorbing state, the run is refused, and no model
+      exists. `--detail-weight 0.5` froze on **0 of 10**, over ten seeds per arm, and takes the detail
+      retention bar from 9 of 24 scene-seed cells to **40 of 40**. Restricted to seeds that trained, the
+      two configurations are the same quality model (10.14% vs 10.54%, a 0.40-point gap with a standard
+      error of 1.17), so what the lever buys is not quality but a training process that produces a model -
+      plus the detail bar, which the colour-only configuration genuinely fails. `docs/evaluation-protocol.md`
+      records a reliability criterion for adopting a lever on those grounds, written before the decision.
+- [x] **Three real bugs in the export/verify path, found by these runs and fixed.** Example tensors
+      and the verification batch were bound to `forward`'s parameter slots by position rather than by
+      name, so any multi-input model fed its 3-channel history tensor into the 2-channel motion
+      convolution and could not be exported at all - and `verify_export`, the step whose job is to catch
+      a bad export, crashed the same way, so it was verifying nothing. ONNX tracing a CUDA model also
+      died under `--deterministic`, because torch's deterministic `F.interpolate` decomposition builds
+      index tensors on the CPU; that killed models which had trained and passed every gate. All three
+      are pinned by `tools/train_nrr.py --self-test`, which CI now runs (it did not before).
 - [x] **Training accuracy characterised, and a one-in-five run failure rate fixed.** Ten seeds of the
       chosen configuration: mean 9.95% better than bilinear, σ ≈ 2.4 points, with two seeds failing
       outright - one froze with its output at the bilinear baseline, one converged to 2.9%. Both are

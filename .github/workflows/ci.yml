@@ -634,4 +634,64 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "tools/quality_metrics.py self-check failed" }
           python tools/evaluate_model.py --self-test
           if ($LASTEXITCODE -ne 0) { throw "tools/evaluate_model.py --self-test failed" }
+          # Cross-checks the many-model scorer against evaluate_model.py, and skips with a message rather
+          # than passing silently where the generated models it compares are absent.
+          python tools/score_models.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "tools/score_models.py --self-test failed" }
+
+  abi-audit:
+    # The Unity plugin's NRRTypes.cs blits its structs straight into native memory, so a field present
+    # in include/nrr.h and missing in the mirror is not a compile error - it is a silent read of the
+    # wrong bytes that presents as a rendering bug. Nothing else in the build compares the two, and
+    # no amount of C++ testing catches it, because the mismatch is entirely on the managed side.
+    # Pure text parsing with no dependencies, so it needs neither Unity nor a compiler.
+    name: C ABI / managed mirror audit
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compare every shared struct, field by field
+        shell: pwsh
+        run: |
+          python tools/check_abi.py
+          if ($LASTEXITCODE -ne 0) { throw "tools/check_abi.py found a C/C# ABI divergence" }
+
+  # ---------------------------------------------------------------------------
+  # The trainer's own self-checks. These are the checks that caught three real bugs in the
+  # export/verify path (example tensors and the verification batch bound to forward's parameter
+  # slots by position instead of by name, and ONNX tracing a CUDA model under --deterministic).
+  # None of the three is reachable from a colour-only model, which is every model the metrics job
+  # above exercises, so without this job the regressions those bugs came from would be invisible in
+  # CI even though the trainer is the tool that trains the shipped weights.
+  #
+  # CPU-only and torch-only by design: the deterministic-kernel checks that need a GPU report
+  # themselves as skipped rather than passing silently, so the same command is meaningful on a
+  # machine with and without one.
+  trainer-self-check:
+    name: Trainer self-checks (gates, losses, ONNX export)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the trainer's dependencies (CPU torch, onnx, onnxruntime, numpy, pillow)
+        shell: pwsh
+        run: python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch && python -m pip install --quiet onnx onnxruntime numpy pillow
+
+      - name: Run the trainer self-checks
+        shell: pwsh
+        run: |
+          python tools/train_nrr.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw "tools/train_nrr.py --self-test failed" }
 

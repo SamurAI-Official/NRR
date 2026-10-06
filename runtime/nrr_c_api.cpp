@@ -450,6 +450,20 @@ NRRResult nrr_texture_download(NRRDevice* device, NRRTexture* texture, void* dat
     return impl->download_texture(reinterpret_cast<nrr::TextureImpl*>(texture), data, size);
 }
 
+NRRResult nrr_texture_get_desc(NRRDevice* device, NRRTexture* texture, NRRTextureDesc* out_desc) {
+    if (!device || !texture || !out_desc) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+    const NRRResult result =
+        impl->texture_desc(reinterpret_cast<nrr::TextureImpl*>(texture), out_desc);
+    if (result != NRR_SUCCESS) {
+        nrr::set_last_error(result, "could not read the texture's descriptor");
+    }
+    return result;
+}
+
 NRRResult nrr_buffer_create(NRRDevice* device, const NRRBufferDesc* desc, NRRBuffer** out_buffer) {
     if (!device || !desc || !out_buffer) {
         nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "invalid arguments");

@@ -29,6 +29,11 @@ public:
     NRRResult destroy_texture(TextureImpl* texture);
     NRRResult upload_texture(TextureImpl* texture, const void* data, size_t size);
     NRRResult download_texture(TextureImpl* texture, void* data, size_t size);
+    /* Reads back a texture's descriptor (dims, format, usage, layers, mips), including textures the
+     * runtime created itself. Reports NRR_ERROR_INVALID_ARGUMENT for a texture owned by another
+     * device, so a caller cannot size a buffer from a descriptor that does not describe what it
+     * holds. */
+    NRRResult texture_desc(TextureImpl* texture, NRRTextureDesc* out_desc);
 
     NRRResult create_buffer(const NRRBufferDesc& desc, BufferImpl* buffer);
     NRRResult destroy_buffer(BufferImpl* buffer);

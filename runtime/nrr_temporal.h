@@ -9,6 +9,7 @@
 #define NRR_TEMPORAL_H
 
 #include "nrr.h"
+#include "nrr_jitter.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -53,7 +54,7 @@ inline bool temporal_scene_changed(bool has_history,
 }
 
 struct HistoryEntry {
-    HistoryEntry() : frame_index(0), timestamp(0.0f) {}
+    HistoryEntry() : frame_index(0), timestamp(0.0f) { jitter = JitterOffset(); }
     uint64_t frame_index;
     float timestamp;
     std::vector<float> color_data;
@@ -63,6 +64,16 @@ struct HistoryEntry {
     uint32_t height;
     NRRTextureFormat color_format;
     NRRTextureFormat depth_format;
+    /* The sub-pixel offset this frame's samples were taken at.
+     *
+     * Recorded rather than recomputed because it belongs to the *capture*, not to
+     * the frame being rendered: the history is reprojected onto the present frame's
+     * grid, so correcting the history needs the offset of the frame it came from, not
+     * the one being drawn. A jittered renderer that omits this warps its accumulated
+     * history by up to half a pixel every frame - the same error the model is being
+     * asked to undo in the present frame, reintroduced in the past one. Defaults to
+     * the identity offset, which is correct for a renderer that does not jitter. */
+    JitterOffset jitter;
 };
 
 /* A rendered frame captured for temporal reuse.
@@ -80,6 +91,9 @@ struct TemporalFrameData {
     uint32_t height = 0;
     NRRTextureFormat color_format = NRR_TEXTURE_FORMAT_RGB8;
     NRRTextureFormat depth_format = NRR_TEXTURE_FORMAT_R32F;
+    /* The offset this frame's samples were taken at. Identity unless the renderer
+     * jitters; see HistoryEntry::jitter for why it travels with the frame. */
+    JitterOffset jitter = JitterOffset();
 
     bool has_image() const { return width > 0 && height > 0 && !color.empty(); }
 };
@@ -105,11 +119,35 @@ public:
                    uint32_t width, uint32_t height,
                    NRRTextureFormat color_format, NRRTextureFormat depth_format);
 
+    /* The same, recording the sub-pixel offset the frame was sampled at. Overloaded
+     * rather than added as parameters so every existing caller keeps compiling and
+     * keeps its current meaning: the original form is exactly this one with the
+     * identity offset, which is what a renderer that does not jitter should record. */
+    void add_frame(uint64_t frame_index, float timestamp,
+                   const std::vector<float>& color,
+                   const std::vector<float>& depth,
+                   const std::vector<float>& motion,
+                   uint32_t width, uint32_t height,
+                   NRRTextureFormat color_format, NRRTextureFormat depth_format,
+                   const JitterOffset& jitter);
+
     bool get_previous_frame(uint64_t current_frame_index,
                             std::vector<float>& color,
                             std::vector<float>& depth,
                             std::vector<float>& motion,
                             uint32_t& width, uint32_t& height) const;
+
+    /* Also reports the offset the retrieved frame was sampled at. The retrieved
+     * history has to be de-jittered with *its own* offset, not the present frame's:
+     * it was captured on a different sub-pixel grid, and correcting it with the
+     * current frame's offset would replace one misalignment with another. The
+     * overload exists so a caller that needs this cannot forget to ask for it. */
+    bool get_previous_frame(uint64_t current_frame_index,
+                            std::vector<float>& color,
+                            std::vector<float>& depth,
+                            std::vector<float>& motion,
+                            uint32_t& width, uint32_t& height,
+                            JitterOffset& jitter) const;
 
     void clear();
     uint32_t get_frame_count() const { return frame_count_; }
@@ -291,6 +329,33 @@ public:
     uint32_t history_frames() const { return history_.get_frame_count(); }
     bool has_history() const { return seen_frame_; }
 
+    /* The previous frame's *input* render, kept separately from the accumulated
+     * output history above.
+     *
+     * These are two different things and conflating them is a real trap. The
+     * accumulated history holds what was *displayed*, at output resolution, after
+     * blending. A temporal resolve's `history` input wants the previous frame's
+     * *low-resolution render*, at input resolution, before any blending - that is
+     * what the model was trained against. Feeding the displayed frame instead is a
+     * 2x resolution mismatch that a dynamically-shaped graph accepts silently and
+     * answers with nonsense, so the two are stored apart.
+     *
+     * Depth is one frame because that is all the model consumes; a deeper ring would
+     * cost memory for nothing.
+     *
+     * Call `record_input_frame` after a frame has been rendered and
+     * `previous_input_frame` before the next one binds its tensors. Ordering is the
+     * caller's responsibility and is the natural order: bind, infer, then record. */
+    void record_input_frame(const uint8_t* rgb8, uint32_t width, uint32_t height,
+                            NRRTextureFormat format);
+    /* False when there is no previous frame, which is the first frame of a sequence
+     * and every frame after a reset or scene change - the caller then zero-fills the
+     * model's history tensor, as it already does for an absent depth or motion. */
+    bool previous_input_frame(std::vector<uint8_t>& out_rgb8,
+                              uint32_t& out_width, uint32_t& out_height,
+                              NRRTextureFormat& out_format) const;
+    bool has_previous_input() const { return !previous_input_.empty(); }
+
 private:
     TemporalHistory history_;
     TemporalStateManager state_;
@@ -301,6 +366,12 @@ private:
     uint64_t last_frame_index_;
     uint32_t last_width_;
     uint32_t last_height_;
+
+    /* The previous frame's low-resolution input render; see record_input_frame(). */
+    std::vector<uint8_t> previous_input_;
+    uint32_t previous_input_width_;
+    uint32_t previous_input_height_;
+    NRRTextureFormat previous_input_format_;
 };
 
 } // namespace nrr

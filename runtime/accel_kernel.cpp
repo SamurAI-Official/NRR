@@ -16,6 +16,7 @@
 #include "onnx_runtime.h"
 #include "nrr_model.h"
 #include "nrr_inference.h"
+#include "nrr_jitter.h"
 #include "nrr_quality.h"
 #include "nrr_runtime.h"
 
@@ -182,6 +183,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         return NRR_ERROR_INVALID_ARGUMENT;
     TextureImpl* depth_tex = reinterpret_cast<TextureImpl*>(input.depth);
     TextureImpl* motion_tex = reinterpret_cast<TextureImpl*>(input.motion_vectors);
+    /* The previous frame's low-resolution render, for a temporal model's `history`
+     * input. Supplied by the caller as a texture, because unlike the CPU backend this
+     * kernel does not own an accumulator to ask. `previous_output` is deliberately not
+     * used: that is the displayed frame at *output* resolution, twice the size, and
+     * feeding it where the model expects a same-resolution low-res render would be a
+     * mismatch a dynamic graph accepts silently. */
+    TextureImpl* history_tex = reinterpret_cast<TextureImpl*>(input.temporal.history_input);
     const uint32_t w = in_tex->width;
     const uint32_t h = in_tex->height;
 
@@ -240,7 +248,9 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
             const int channels = (role == TensorRole::Depth) ? 1
                                : (role == TensorRole::Motion) ? 2 : 3;
             TextureImpl* src = (role == TensorRole::Depth) ? depth_tex
-                             : (role == TensorRole::Motion) ? motion_tex : in_tex;
+                             : (role == TensorRole::Motion) ? motion_tex
+                             : (role == TensorRole::History) ? history_tex
+                             : in_tex;
 
             std::vector<int64_t> shape;
             if (!concrete_input_shape(rt->get_input_shape(i), channels,
@@ -253,7 +263,16 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
             t.name = name;
             t.shape = shape;
             std::vector<float> data;
-            if (role == TensorRole::Color) {
+            if (role == TensorRole::Jitter) {
+                /* Built, not downloaded: the offset is two numbers the caller filled
+                 * in, not an attachment. Without this case it fell through to the
+                 * colour path and a two-channel offset tensor was filled with the
+                 * colour image - a silent corruption that renders and looks fine. */
+                const JitterOffset offset = input.temporal.jitter.enabled
+                    ? JitterOffset(input.temporal.jitter.offset_x, input.temporal.jitter.offset_y)
+                    : JitterOffset();
+                if (!build_jitter_plane(offset, w, h, data)) return false;
+            } else if (role == TensorRole::Color) {
                 /* Already converted above; its shape is the texture's own size. */
                 data = color_nchw;
             } else {

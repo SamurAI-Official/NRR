@@ -37,6 +37,27 @@ float half_to_float(uint16_t h) {
 
 TensorRole classify_tensor_role(const std::string& name) {
     std::string n = to_lower(name);
+    /* Jitter is matched before color deliberately. The classifier is substring-based
+     * and several colour synonyms ("frame", "image", "input") are common words; the
+     * offset plane is named precisely enough that matching it first cannot collide,
+     * whereas matching color first would swallow a name like "jittered_input" and
+     * hand a two-channel offset plane to the three-channel colour path. */
+    if (n.find("jitter") != std::string::npos ||
+        n == "subpixel" || n == "sub_pixel" || n.find("offset") != std::string::npos) {
+        return TensorRole::Jitter;
+    }
+    /* History is matched early, and before colour, for the same reason: "history_color"
+     * is a natural input name that the colour synonyms would otherwise claim. The
+     * temporal guard on the last clause keeps a model input merely called
+     * "temporal_input" on the colour path, since that is describing the model rather
+     * than naming a history tensor. */
+    if (n.find("history") != std::string::npos ||
+        n.find("previous") != std::string::npos ||
+        n.find("prev_") != std::string::npos ||
+        n == "prev" || n == "accum" ||
+        (n.find("temporal") != std::string::npos && n.find("input") == std::string::npos)) {
+        return TensorRole::History;
+    }
     if (n.find("depth") != std::string::npos ||
         n == "z" || n.find("linear_depth") != std::string::npos) {
         return TensorRole::Depth;

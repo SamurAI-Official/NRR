@@ -187,6 +187,40 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       not support the extra inputs. The model contract is therefore unchanged and the runtime keeps
       temporal accumulation where it already is. Full numbers and both failures that nearly went
       unreported: the stage-4 entry in CHANGELOG.md.
+- [x] **The input-set question was re-asked on data that can answer it, and colour-only won
+      again - this time on sub-pixel jittered input.** The earlier result was measured on an
+      input that was a *filtered downscale*, which destroys sample position and so leaves a
+      temporal model nothing extra to consume. `godot-v4` captures a real half-resolution raster,
+      sub-pixel jittered per frame on a Halton (2,3) sequence, with `history` as the previous
+      frame's jittered render - what `runtime/nrr_temporal.h`'s `HistoryEntry` actually holds.
+      Against the same pre-registered rule (beat colour-only by 5 points *and* beat the
+      history-zeroed control), over two seeds: colour-only 9.61%, temporal 4.26%, control 8.66%.
+      Both conditions fail - the temporal model is 5.35 points *below* colour-only and 4.40 below
+      its own control, so the extra inputs cost rather than help. Colour-only stands, and now on
+      a conclusion about temporal modelling rather than about a downscale. The temporal configs
+      are also far less stable (seed spreads of 8.5 and 11.2 points against colour-only's 1.65).
+- [x] **A seed was not pinning a result, which was a measurement bug of its own.** cuDNN
+      autotuning was unconditional, so the same config and seed reached 8.4%, 0.0% and 15.6%
+      training progress across three runs. `--deterministic` makes a seed pin a result and is
+      recorded in every report; without it, cross-configuration comparisons are not sound.
+- [x] **The detail bar was failing for a real reason, and ten seeds showed the fix is a
+      reliability change rather than a quality one.** A band split (recoverable vs above-Nyquist,
+      reported beside the Laplacian ratio, never instead of it) showed the model was ~15-20% softer
+      than bilinear in the high band while matching the truth in the band the input can carry.
+      `--detail-weight 0.5` closes that gap, and at **ten seeds per arm** the comparison reversed:
+      colour-only **freezes on 4 of 10 seeds** - the zero-initialised head never escapes and the
+      run is refused, so there is no model - while detail-weight froze on **0 of 10**, and takes the
+      detail bar from 9 of 24 scene-seed cells to **40 of 40**. Restricted to seeds that trained the
+      two are the same quality model (10.14% vs 10.54%, gap 0.40 with se 1.17, inside the noise).
+      The detail bar is therefore fixable, and what detail-weighting actually buys is a training
+      process that produces a model.
+- [x] **Three real bugs in the export/verify path, none reachable from a colour-only model.**
+      Example tensors and the verification batch were bound to `forward`'s parameter slots *by
+      position*, so any multi-input model fed history into the 2-channel motion convolution - and
+      `verify_export`, the step meant to catch a bad export, was itself the thing that crashed.
+      ONNX tracing a CUDA model also died under `--deterministic` (torch's deterministic
+      `F.interpolate` decomposition mixes devices), killing models that had passed every gate.
+      All three are fixed and pinned by self-tests that run in CI.
 - [x] **Accuracy is characterised, and the training setup had a one-in-five failure rate that is
       now fixed.** Ten seeds of the chosen configuration give σ ≈ 2.4 points and a mean of 9.95%
       better than bilinear, which supersedes the 12.12% two-seed figure above (both of those seeds

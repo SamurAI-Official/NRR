@@ -24,6 +24,7 @@
 #include "unit/test_vulkan_caps.cpp"
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_quality_parity.cpp"
+#include "unit/test_jitter.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
@@ -49,6 +50,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_api_version);
     NRR_RUN_TEST(test_api_error_handling);
     NRR_RUN_TEST(test_api_entry_point_count);
+    NRR_RUN_TEST(test_c_api_entry_point_count_matches_header);
+    NRR_RUN_TEST(test_api_texture_desc);
     NRR_RUN_TEST(test_api_device_create_null);
     NRR_RUN_TEST(test_api_device_destroy_null);
     NRR_RUN_TEST(test_api_get_capabilities_null);
@@ -264,6 +267,22 @@ void run_all_tests() {
     NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
     NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
     NRR_RUN_TEST(test_godot_addon_has_no_nested_project_file);
+
+    std::cout << "\n--- Jitter Tests ---\n";
+    /* The runtime's sub-pixel offset handling is a second implementation of the
+     * Python trainer's de-jitter, so these assert parity with it as well as the
+     * sign and identity properties. */
+    NRR_RUN_TEST(test_jitter_zero_offset_is_identity);
+    NRR_RUN_TEST(test_jitter_plane_layout_matches_the_trainer);
+    NRR_RUN_TEST(test_jitter_correcting_the_offset_recovers_the_scene);
+    NRR_RUN_TEST(test_jitter_wrong_sign_is_worse_than_no_offset);
+    NRR_RUN_TEST(test_jitter_matches_the_python_reference);
+    NRR_RUN_TEST(test_jitter_rejects_malformed_input);
+    NRR_RUN_TEST(test_jitter_corrects_every_channel);
+    NRR_RUN_TEST(test_jitter_history_records_each_frames_own_offset);
+    NRR_RUN_TEST(test_jitter_input_names_classify_as_the_offset);
+    NRR_RUN_TEST(test_temporal_history_names_classify_as_history);
+    NRR_RUN_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_it);
 
     std::cout << "\n--- Performance Tests ---\n";
     NRR_RUN_TEST(performance_device_creation_time);

@@ -25,6 +25,17 @@ enum class TensorRole {
     Color,
     Depth,
     Motion,
+    /* The frame's sub-pixel sampling offset, two channels broadcast over the frame.
+     * Added because a jitter-aware model declares a `jitter` input, and without a
+     * role for it every such model classified as Other and was fed nothing - which
+     * is the same as feeding it a zero offset, so it silently ran as the control. */
+    Jitter,
+    /* The previously displayed output, fed back for a temporal resolve. It matched no
+     * keyword at all, so it fell through to Other and every binding site handed it the
+     * *colour image* - the same failure the jitter input had, and worse here, because
+     * history is what a temporal model is built around. A resolve given the current
+     * frame as its own history sees no motion and no accumulation at all. */
+    History,
     Other,
 };
 

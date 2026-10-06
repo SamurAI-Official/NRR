@@ -55,7 +55,7 @@ typedef struct NRRBuffer NRRBuffer;
 /* Number of public C entry points exported by the library. Used by the
  * implementation-testing hook nrr_test_entry_point_count(). Keep in sync
  * with the exported function table in nrr_c_api.cpp. */
-#define NRR_ENTRY_POINT_COUNT 44
+#define NRR_ENTRY_POINT_COUNT 45
 
 /* ============================================================================
  * Result Codes
@@ -214,6 +214,28 @@ typedef struct {
     int normal_space; /* 0 = world, 1 = view */
 } NRRCameraData;
 
+/* The sub-pixel offset a jittered capture rendered this frame at, in low-resolution
+ * pixels, +x right and +y down - the same convention and sign the training data uses.
+ *
+ * A renderer that jitters its sampling grid (TAA-style, as DLSS's jittered MRT does)
+ * needs to tell the runtime where each frame's samples actually fell, because a
+ * jitter-aware resolve has to resample the frame back onto the grid the target lives
+ * on rather than treat the shifted samples as if they were on it. Measured on the
+ * training harness, a resolve that is not told the offset scores identically to one
+ * given no jitter at all - the information is not optional.
+ *
+ * `enabled` distinguishes "this renderer does not jitter" (0) from "this renderer
+ * jitters, and on this particular frame the offset happened to be zero" (1). The two
+ * are not the same: a Halton sequence visits near-zero offsets, and collapsing them
+ * would silently disable jitter correction on exactly the frames where it is
+ * already doing nothing. Callers that do not jitter should leave this zeroed, which
+ * is the identity path and costs nothing per frame. */
+typedef struct {
+    float offset_x;
+    float offset_y;
+    int32_t enabled;
+} NRRJitterState;
+
 typedef struct {
     uint64_t frame_index;
     float delta_time;
@@ -224,6 +246,20 @@ typedef struct {
     float temporal_alpha;        /* [0,1] */
     uint32_t history_frames;
     float motion_vectors_scale;
+    NRRJitterState jitter;       /* zeroed by callers that do not jitter */
+    /* The previous frame's low-resolution render, for a temporal model's `history`
+     * input. Optional; NULL on the first frame of a sequence, where the runtime
+     * zero-fills the tensor instead.
+     *
+     * Distinct from `previous_output` above, and the distinction matters:
+     * `previous_output` is the *displayed* frame at output resolution (2x), which is
+     * what the temporal blend reprojects. A model trained on temporal data expects
+     * `history` to be the previous frame's low-resolution render at *input*
+     * resolution. Because the model's H/W are dynamic, handing it the 2x displayed
+     * frame would not raise an error - it would produce a plausible-looking image
+     * built from the wrong pixels. Backends that keep their own input record (the CPU
+     * one does) fill this themselves and callers may leave it NULL there. */
+    NRRTexture* history_input;   /* may be NULL */
 } NRRTemporalState;
 
 typedef struct {
@@ -366,6 +402,22 @@ NRR_API NRRResult nrr_texture_create(NRRDevice* device, const NRRTextureDesc* de
 NRR_API NRRResult nrr_texture_destroy(NRRDevice* device, NRRTexture* texture);
 NRR_API NRRResult nrr_texture_upload(NRRDevice* device, NRRTexture* texture, const void* data, size_t size);
 NRR_API NRRResult nrr_texture_download(NRRDevice* device, NRRTexture* texture, void* data, size_t size);
+
+/* Fills *out_desc with the texture's real descriptor: the dimensions, format, usage and layer/mip
+ * counts it was created with - including a texture the RUNTIME created and returned, such as
+ * NRRFrameOutput::color, whose size a caller has no other way to learn.
+ *
+ * This exists because the alternative is worse than it looks. A renderer that wants to read back the
+ * frame the model produced has to size its buffer somehow, and without a way to ask, the obvious
+ * thing is to size it from its own render target or its own input texture. Neither is necessarily
+ * the model's output resolution, and a download is clamped to what the texture really holds, so the
+ * buffer that comes back has a layout that disagrees with the copy the caller makes of it. It
+ * presents as a rendering bug, not as an API gap - see engine_plugins/unity NRRRenderer, where
+ * exactly that produced a "neural output" that was the un-written input texture.
+ *
+ * Returns NRR_ERROR_INVALID_ARGUMENT for a null argument or for a texture that belongs to a
+ * different device. */
+NRR_API NRRResult nrr_texture_get_desc(NRRDevice* device, NRRTexture* texture, NRRTextureDesc* out_desc);
 
 NRR_API NRRResult nrr_buffer_create(NRRDevice* device, const NRRBufferDesc* desc, NRRBuffer** out_buffer);
 NRR_API NRRResult nrr_buffer_destroy(NRRDevice* device, NRRBuffer* buffer);

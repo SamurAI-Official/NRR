@@ -1,4 +1,4 @@
-# Evaluation protocol
+﻿# Evaluation protocol
 
 Pre-registered **before** the P2 frontier decision (ch32 vs ch64) and **before** any P3 quality-lever
 result. Every bar and rule below was fixed in advance, so a number that arrives later cannot be used to
@@ -92,3 +92,107 @@ forward if adopted, otherwise the config reverts):
 No lever changes the protocol: the same scenes, seeds, tiers and bars judge every lever, and a lever that
 wins on L1 alone but regresses a structural/perceptual metric is refused, because a single-number win is
 exactly what this protocol exists to prevent.
+
+## P4 temporal lever, on the jittered dataset (`godot-v4`)
+
+Pre-registered **before** any P4 run finished, and this section was written before its results were read.
+The commit that introduces it is the timestamp of that fixing.
+
+### Why the question is re-opened at all
+
+P3 lever 1 closed the input-set question, and the answer was colour-only: the temporal model scored 9.48%
+against colour-only's 12.12%, a gap of 2.64 points against a required 5. But that answer was measured on
+`godot-v2`, whose input is a **filtered 2x downscale** of the target frame. A downscale destroys sample
+position: every input pixel sits exactly on an output-grid sample, so the previous frame's history carries no
+sub-pixel information the current frame does not already have. A temporal model was being asked to exploit
+information the dataset had already thrown away, and its failure there is evidence about `godot-v2`, not
+about temporal modelling.
+
+`godot-v4` removes that excuse, which is the entire point of capturing it (`tools/capture_godot_v4.ps1`):
+
+* the input is the capture's **own low-resolution render** - a real raster at half size, not a resize, proven
+  by `tools/check_capture.py` (its edge energy sits ≥ 1.3x above a filtered downscale of the same frame);
+* that render is **sub-pixel jittered per frame** on a documented Halton (2,3) sequence, so consecutive
+  frames sample the scene at *different* sub-pixel positions - the situation a temporal accumulator exists
+  to exploit;
+* the offsets are recorded per frame in the capture manifest and carried into each pair as `jitter`, so a
+  consumer is not asked to re-derive them;
+* `history` is the previous frame's **jittered low-resolution render**, which is what
+  `runtime/nrr_temporal.h`'s `HistoryEntry` actually holds.
+
+The target stays un-jittered, deliberately: a temporal upscaler resolves its accumulated samples onto the
+regular output grid, so comparing against a plain native render is the convention that claim is about.
+
+### The rule (fixed in advance)
+
+The temporal model is adopted **only if both** hold across **both** seeds (`20261020`, `20261021`):
+
+1. its mean held-out L1 improvement exceeds colour-only's by **≥ 5 points** - the same magnitude as
+   `MIN_IMPROVEMENT` and the same margin the frontier and lever rules use, because σ ≈ 2.4 points on this
+   measurement means anything smaller is inside the noise; **and**
+2. it beats its **own history-zeroed control** (`--zero-input history`, same config, same seeds) by more
+   than the seed spread.
+
+Rule 2 is the one that distinguishes *using* history from merely having the parameters. A temporal model can
+beat colour-only while its history input is ignored, which is a strictly worse claim than the one the
+adoption rule is meant to make. If a configuration fails either condition, **colour-only stands** and the
+runtime keeps its existing temporal accumulation where it is; the P4 dataset is still worth keeping, because
+it is the first data here that can answer the question at all.
+
+Runs that trip the trainer's own gates (no progress, ignores an input it was given, does not beat the
+baseline) are recorded as refusals, not silently dropped and not averaged in - a refused run is a result.
+
+### Detail bar: what it measures, and a correction to an earlier explanation
+
+The bar is the mean-absolute-Laplacian ratio against the truth. When it failed on three of the four scenes
+for the colour-only model on this dataset, the first explanation offered was that the input is an *aliased*
+raster and the baseline was being credited with aliasing the metric read as detail. **That explanation was
+tested and was wrong.** The band split built to check it divided the radial frequency by `height/2`, putting
+axis-Nyquist at 1.0 while the band edges are written against 0.5, so the "unrecoverable" band was measuring
+frequencies the input could carry. Corrected, and pinned by sinusoid self-tests:
+
+* bilinear is strongly band-limited - it retains only 1-3% of the truth's energy in the band the input *can*
+  carry, and ~0.07-0.11 of it above Nyquist;
+* the model is **not** short of detail in the recoverable band (0.975-1.000 of the truth, correlating better
+  than the baseline on 64 of 64 frames);
+* the model is genuinely **15-20% softer than bilinear in the high band** (0.182 against 0.222 on heldout3),
+  which is what moves the Laplacian ratio below the baseline's.
+
+So the bar is measuring what it claims, and the model is failing it for a real reason.
+
+**The progress gate is measured on unweighted residual L1.** It was previously computed on the training
+objective, whose scale moves with `--loss` and `--detail-weight` (0.0148 for a plain L1 run, 0.035 for a
+detail-weighted one), so one threshold meant different things for different configurations - it refused two
+detail-weight runs at 9.7% and 8.9% that had actually trained 16.8% and 15.9%. The unweighted number is the
+same quantity for every run and still catches a frozen run at ~0%. The objective's own progress is reported
+alongside it as `objective_progress`.
+
+`detail_bands`, `band_correlation` and `ringing_index` are reported **beside** the Laplacian ratio, never
+instead of it. The Laplacian is what every earlier number here was measured with; replacing it would make
+them incomparable. The split exists to say which band a detail number came from, and to separate "soft" from
+"ringing", which a single scalar conflates.
+
+### A lever may also be adopted for reliability, and this protocol has no rule for it
+
+Measured at ten seeds per arm on `godot-v4`, the colour-only configuration the rest of this protocol points at
+**fails to train on 4 of 10 seeds** - the zero-initialised output head never escapes its absorbing state, the
+run is refused, and no model exists. `--detail-weight 0.5` froze on 0 of 10. Restricted to seeds that trained,
+the two are the same quality model (10.14% vs 10.54%, a 0.40-point gap with a standard error of 1.17).
+
+So the lever's value is not a quality gain, and the ≥ 5-point rule below - which exists to refuse gains too
+small to separate from noise - does not describe the case. It neither passes (+3.05, se 1.57) nor is it trying
+to buy quality. What it buys is a training process that produces a model, plus a detail bar that goes from 9
+of 24 scene-seed cells to 40 of 40.
+
+**Amendment, recorded before the adoption decision is taken:** a lever may also be adopted on a *reliability*
+criterion, and the bar for that is stated here rather than left to judgement after the fact -
+
+* it must eliminate a failure mode that the current configuration exhibits at a rate worth eliminating
+  (measured: 4 of 10 seeds produce no model), and
+* the new configuration's quality must be **no worse** than the current one's by more than the seed noise -
+  here "no worse" means a difference whose standard error does not separate it from zero, and
+* it must pass every bar above, on every validation scene, on every seed that trained.
+
+That is deliberately a weaker quality bar than the ≥ 5-point rule, because the claim being made is different:
+not "this is a better model" but "this is the same model that can be trained". The bar on it is that the
+failure rate must actually reach zero on ten seeds, not that it merely fall.

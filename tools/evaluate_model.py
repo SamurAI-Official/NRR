@@ -117,6 +117,10 @@ def load_pair(data_dir, entry):
             "depth": pair["depth"].astype(np.float32),
             "motion": pair["motion"].astype(np.float32),
             "history": pair["history"].astype(np.float32) if "history" in pair else None,
+            # The per-frame sub-pixel sampling offset, kept as the raw 2-vector. `build_feed` is what
+            # broadcasts it, and it must match the trainer's layout exactly - a model that scored differently
+            # here than it trained would make every downstream comparison a lie.
+            "jitter": pair["jitter"].astype(np.float32) if "jitter" in pair else None,
         }
 
 
@@ -133,6 +137,13 @@ def build_feed(pair, inputs, use_clean):
     if "history" in inputs:
         history = pair["history"] if pair["history"] is not None else np.zeros_like(color)
         feed["history"] = history.transpose(2, 0, 1)[None].copy()
+    if "jitter" in inputs:
+        # The 2-vector is broadcast to a plane for the same reason the trainer broadcasts it: the graph's
+        # de-jitter stage builds a sampling grid the size of the frame, so it needs a full H x W offset plane,
+        # not a single vector. `np.broadcast_to` is a view, hence the copy - the session needs a real buffer.
+        offset = pair["jitter"] if pair.get("jitter") is not None else np.zeros(2, np.float32)
+        feed["jitter"] = np.ascontiguousarray(
+            np.broadcast_to(offset.reshape(1, 2, 1, 1), (1, 2, color.shape[0], color.shape[1])))
     return feed
 
 
@@ -156,17 +167,98 @@ def bilinear_upscale(image, factor=2):
     return up[0].numpy().transpose(1, 2, 0)
 
 
+LUMA = np.array([0.299, 0.587, 0.114], np.float32)
+
+
 def high_frequency_energy(image):
     """Mean absolute Laplacian - a cheap stand-in for the detail a viewer reads.
 
     The ratio model/reference is what matters, not the absolute value: 1.0 is as much detail as the truth,
     below 1.0 is softening, and above 1.0 is detail the input never had, which on an upscaler usually means
-    ringing or over-sharpening rather than recovered structure."""
-    grey = image @ np.array([0.299, 0.587, 0.114], np.float32)
+    ringing or over-sharpening rather than recovered structure.
+
+    This one number cannot tell recovered detail from aliasing, and on an aliased input it cannot: a real
+    low-resolution raster carries energy above its own Nyquist, an upscaler smears that energy into the
+    output, and a Laplacian counts it exactly as it counts recovered structure. `detail_bands` splits the two
+    apart. The Laplacian is kept because it is what every earlier number in this project was measured with -
+    changing it silently would make those numbers incomparable - not because it is the better measurement."""
+    grey = image @ LUMA
     laplacian = np.zeros_like(grey)
     laplacian[1:-1, 1:-1] = (4.0 * grey[1:-1, 1:-1] - grey[:-2, 1:-1] - grey[2:, 1:-1]
                              - grey[1:-1, :-2] - grey[1:-1, 2:])
     return float(np.mean(np.abs(laplacian)))
+
+
+def band_component(image, lo, hi):
+    """The component of an image between `lo` and `hi` cycles per *output* pixel.
+
+    Radially band-limited in the frequency domain, so "the detail in this band" means the detail at those
+    spatial frequencies and nothing else. Returned with the mean removed and in the input's own units, so
+    two images of the same size can be compared directly."""
+    grey = (image @ LUMA).astype(np.float64)
+    grey = grey - grey.mean()
+    height, width = grey.shape
+    spectrum = np.fft.fftshift(np.fft.fft2(grey))
+    y, x = np.indices((height, width))
+    # Bin offsets are frequency * height, so dividing by height makes `radius` cycles per pixel directly and
+    # puts the axis Nyquist at 0.5 - which is what the band edges are written against. Dividing by height/2
+    # instead puts Nyquist at 1.0, which silently makes the "unrecoverable" band measure frequencies the
+    # input could in fact carry; the self-test's sinusoid checks are what caught that.
+    radius = np.sqrt((y - height // 2) ** 2 + (x - width // 2) ** 2) / float(height)
+    spectrum[(radius < lo) | (radius >= hi)] = 0.0
+    return np.real(np.fft.ifft2(np.fft.ifftshift(spectrum)))
+
+
+def recoverable_edge(factor):
+    """The highest frequency, in cycles per output pixel, that the low-resolution input can carry.
+
+    A `factor`x upscale puts the input's Nyquist at 0.5/factor cycles per *output* pixel: content above it
+    was never in the input and no single-frame upscaler can have recovered it. Derived from the actual
+    factor rather than hardcoded, so a 3x dataset moves the edge instead of being measured with a 2x
+    assumption."""
+    return 0.5 / max(int(factor), 1)
+
+
+def detail_bands(image, edge):
+    """(recoverable, unrecoverable) mean **absolute** band amplitude, split at `edge`.
+
+    Mean absolute rather than mean square, deliberately: `high_frequency_energy` above is a mean-absolute
+    Laplacian, so this is the same statistic split by frequency, and the two are directly comparable. A
+    mean-square version was tried first and was misleading here - one model has a handful of ringing pixels,
+    and mean square reports that handful as a 5-9x failure in the band above Nyquist while the typical pixel
+    is unchanged. Ringing is real and worth reporting, so it gets its own number (`ringing_index`) instead of
+    distorting this one.
+
+    The split separates two questions the Laplacian conflates: whether the reconstruction carries the detail
+    the input could carry, and whether it carries anything the input could not."""
+    recoverable = band_component(image, 0.0, edge)
+    unrecoverable = band_component(image, edge, 0.5)
+    return float(np.mean(np.abs(recoverable))), float(np.mean(np.abs(unrecoverable)))
+
+
+def ringing_index(image, edge):
+    """Mean-square energy above the input's Nyquist, as a count of spikes rather than a bulk statistic.
+
+    A mean-absolute statistic barely notices a few over-driven pixels; this notices them by construction, and
+    a value well above 1.0 means the reconstruction is putting energy where the input had none. Reported,
+    never gated: a little is normal edge contrast and a lot is ringing, and where that line sits is a
+    judgement this harness is not qualified to make silently."""
+    return float(np.mean(band_component(image, edge, 0.5) ** 2))
+
+
+def band_correlation(image, reference, edge):
+    """Correlation of the recoverable band of `image` with the same band of `reference`.
+
+    Energy alone cannot distinguish the *right* detail from the wrong detail at the same amplitude, which is
+    the difference between recovering structure and amplifying aliasing into a plausible-looking pattern.
+    This asks whether the detail in the band the input could carry actually looks like the truth's."""
+    a = band_component(image, 0.0, edge).ravel()
+    b = band_component(reference, 0.0, edge).ravel()
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        # A band with no variance carries no structure to agree or disagree about; reporting 0.0 would read
+        # as "uncorrelated" when it means "nothing to correlate".
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
 
 
 class Perceptual:
@@ -321,16 +413,31 @@ def evaluate_scene(session, inputs, entries, data_dir, perceptual, ffmpeg, workd
         baseline = bilinear_upscale(source)
         factor = target.shape[0] // max(source.shape[0], 1)
         frames.append({"output": output, "baseline": baseline, "target": target,
+                       "factor": factor,
                        "motion_up": qm.upscale_motion_nearest(pair["motion"], factor)})
 
     image = {key: {"model": [], "baseline": []} for key in ("psnr_db", "ssim", "ms_ssim", "l1")}
     perceptual_metrics = {"lpips": {"model": [], "baseline": []}, "dists": {"model": [], "baseline": []}}
     detail = {"model": [], "baseline": []}
+    # The band split. `factor` is the upscale actually used for this dataset, so the edge follows the data
+    # rather than assuming 2x. Everything here is reported *beside* the Laplacian ratio, never instead of it.
+    edge = recoverable_edge(frames[0]["factor"])
+    bands = {"recoverable": {"model": [], "baseline": []},
+             "unrecoverable": {"model": [], "baseline": []},
+             "correlation": {"model": [], "baseline": []}}
+    ringing = {"model": [], "baseline": []}
     temporal = {key: {"model": [], "reference": []}
                 for key in ("warping_error", "temporal_psnr_db", "temporal_ssim")}
     verified = []
     for frame in frames:
+        target_bands = detail_bands(frame["target"], edge)
+        target_ring = max(ringing_index(frame["target"], edge), 1e-20)
         for key, target_key in (("model", "output"), ("baseline", "baseline")):
+            image_bands = detail_bands(frame[target_key], edge)
+            bands["recoverable"][key].append(image_bands[0] / max(target_bands[0], 1e-20))
+            bands["unrecoverable"][key].append(image_bands[1] / max(target_bands[1], 1e-20))
+            bands["correlation"][key].append(band_correlation(frame[target_key], frame["target"], edge))
+            ringing[key].append(ringing_index(frame[target_key], edge) / target_ring)
             metrics = qm.evaluate(frame[target_key], frame["target"])
             for name in image:
                 image[name][key].append(metrics[name])
@@ -352,6 +459,12 @@ def evaluate_scene(session, inputs, entries, data_dir, perceptual, ffmpeg, workd
         "frames": len(frames),
         "image": {name: {key: accumulate(image[name][key]) for key in image[name]} for name in image},
         "detail_ratio": {key: accumulate(detail[key]) for key in detail},
+        # The band split, reported beside the Laplacian ratio above and never instead of it. `edge` is
+        # recorded so a reader can see which frequencies count as recoverable for this dataset's upscale.
+        "detail_bands": {"edge_cycles_per_output_pixel": edge,
+                         **{name: {key: accumulate(bands[name][key]) for key in bands[name]}
+                            for name in bands},
+                         "ringing": {key: accumulate(ringing[key]) for key in ringing}},
         "temporal": {name: {key: accumulate(temporal[name][key]) for key in temporal[name]}
                      for name in temporal},
         "temporal_verified_fraction": accumulate(verified),
@@ -394,6 +507,20 @@ def print_summary(report):
         detail = scene_report.get("detail_ratio", {})
         log("  detail ratio   model %s | baseline %s   (1.0 = as much detail as the truth)"
             % (_stat(detail.get("model")), _stat(detail.get("baseline"))))
+        split = scene_report.get("detail_bands", {})
+        if split:
+            edge = split.get("edge_cycles_per_output_pixel")
+            log("  detail bands   edge %.3f cyc/px (the input's Nyquist; above it the input carried nothing)"
+                % edge)
+            log("    recoverable  model %s | baseline %s   (energy vs the truth's, input could carry this)"
+                % (_stat(split["recoverable"].get("model")), _stat(split["recoverable"].get("baseline"))))
+            log("    uncarr.      model %s | baseline %s   (energy vs truth's; >1 is aliasing, not detail)"
+                % (_stat(split["unrecoverable"].get("model")), _stat(split["unrecoverable"].get("baseline"))))
+            log("    correlation  model %s | baseline %s   (recoverable band vs the truth's own)"
+                % (_stat(split["correlation"].get("model")), _stat(split["correlation"].get("baseline"))))
+            if "ringing" in split:
+                log("    ringing      model %s | baseline %s   (mean-square above Nyquist vs truth's)"
+                    % (_stat(split["ringing"].get("model")), _stat(split["ringing"].get("baseline"))))
         temporal = scene_report.get("temporal", {})
         verified = (scene_report.get("temporal_verified_fraction", {}).get("mean") or 0.0) * 100.0
         log("  warping error  model %s | reference %s   (motion verified over %.0f%% of pixels)"
@@ -444,6 +571,65 @@ def self_test():
     check("detail of a flat image is zero", high_frequency_energy(flat) == 0.0)
     check("detail is strictly positive for a checkerboard",
           high_frequency_energy((np.indices((16, 16)).sum(axis=0) % 2).astype(np.float32).repeat(3).reshape(16, 16, 3)) > 0.0)
+
+    # The band split. These pin the part of the measurement that decides whether an aliased baseline is
+    # being credited with detail it cannot have had, so they check which frequencies land in which band
+    # rather than only that the functions return a number.
+    check("a 2x upscale puts the input's Nyquist at 0.25 cycles/output-pixel", recoverable_edge(2) == 0.25)
+    check("a 3x upscale moves the edge, it is not hardcoded", recoverable_edge(3) == 0.5 / 3)
+    check("a 1x upscale does not divide by zero", recoverable_edge(1) == 0.5)
+    check("a flat image has no energy in any band",
+          detail_bands(flat, 0.25) == (0.0, 0.0))
+
+    size = 128
+    axis = np.arange(size, dtype=np.float64)
+
+    def sinusoid(cycles, phase=0.0):
+        """A greyscale image holding one pure spatial frequency.
+
+        `cycles` is a whole number of cycles across the frame, so the signal is periodic over the window and
+        does not leak into neighbouring bins. A frequency that is not a whole number of cycles (0.4 at this
+        size is 51.2 cycles) discontinuously wraps at the frame edge and smears ~0.1% of its energy into
+        every other band, which would make a perfectly correct filter look leaky.
+        """
+        wave = np.sin(2.0 * np.pi * cycles * axis / size + phase)[None, :].repeat(size, 0)
+        return np.repeat(wave[:, :, None], 3, axis=2)
+
+    low = band_component(sinusoid(16), 0.0, 0.25)          # 0.125 cyc/px, inside
+    high = band_component(sinusoid(40), 0.0, 0.25)         # 0.3125 cyc/px, outside
+    check("an in-band sinusoid survives the recoverable band",
+          float(np.std(low)) > 0.9 * float(np.std(sinusoid(16))))
+    check("an in-band sinusoid is removed by a disjoint band",
+          float(np.std(band_component(sinusoid(16), 0.30, 0.5))) < 1e-12)
+    check("an above-Nyquist sinusoid is refused by the recoverable band", float(np.std(high)) < 1e-12)
+    check("...and is what the unrecoverable band is for",
+          float(np.std(band_component(sinusoid(40), 0.25, 0.5))) > 0.9 * float(np.std(sinusoid(40))))
+    # Aliasing and detail look identical to a Laplacian; the band split is what separates them. This is the
+    # case the whole measurement exists for, so it is pinned directly rather than only through the helpers.
+    aliasing = detail_bands(sinusoid(40), 0.25)
+    detail_only = detail_bands(sinusoid(16), 0.25)
+    check("a Laplacian counts above-Nyquist energy as detail just the same",
+          high_frequency_energy(sinusoid(40)) > high_frequency_energy(sinusoid(16)) * 0.5)
+    check("the band split routes it to the unrecoverable band instead",
+          aliasing[1] > detail_only[1] * 10.0 and aliasing[0] < detail_only[0])
+    check("correlation is 1.0 for a band matched with itself",
+          abs(band_correlation(sinusoid(16), sinusoid(16), 0.25) - 1.0) < 1e-9)
+    check("correlation is low for unrelated detail in the band",
+          band_correlation(sinusoid(16, 0.0), sinusoid(17, 0.0), 0.25) < 0.5)
+    check("correlation of a flat band reports None, not a fake 0.0",
+          band_correlation(flat, flat, 0.25) is None)
+    check("a band with no variance does not fabricate an anticorrelation",
+          band_correlation(flat, sinusoid(16), 0.25) is None)
+    # Ringing is spikes, so the statistic that finds it is mean-square over the band above Nyquist, and it
+    # must stay quiet for a band-limited image carrying the same typical amplitude.
+    clean = sinusoid(16)
+    spikes = clean.copy()
+    spikes[64, 64] = 40.0                      # one over-driven pixel, as an edge artefact looks
+    check("a single spike barely moves the mean-absolute band statistic",
+          detail_bands(spikes, 0.25)[0] < detail_bands(clean, 0.25)[0] * 1.05)
+    check("...and is unmistakable in the ringing index",
+          ringing_index(spikes, 0.25) > 100.0 * max(ringing_index(clean, 0.25), 1e-12))
+    check("a flat image has no ringing", ringing_index(flat, 0.25) == 0.0)
 
     manifest = {"pairs": [
         {"file": "a.npz", "split": "val", "scene": "s1", "frame": 2},

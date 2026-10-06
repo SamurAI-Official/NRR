@@ -352,6 +352,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_cuda_driver.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_inference.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_jitter.cpp
     ${CMAKE_SOURCE_DIR}/runtime/mobile/mobile_kernel.cpp
     ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_adreno.cpp
     ${CMAKE_SOURCE_DIR}/runtime/mobile/backend_mali.cpp

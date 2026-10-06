@@ -102,6 +102,23 @@ NRRResult DeviceImpl::create_texture(const NRRTextureDesc& desc, TextureImpl* te
     texture->format = desc.format;
     texture->array_layers = desc.array_layers;
     texture->mip_levels = desc.mip_levels;
+    texture->usage = desc.usage;
+    return NRR_SUCCESS;
+}
+
+NRRResult DeviceImpl::texture_desc(TextureImpl* texture, NRRTextureDesc* out_desc) {
+    if (!texture || !out_desc) return NRR_ERROR_INVALID_ARGUMENT;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    /* A texture belonging to another device is refused rather than described: the caller asked this
+     * device about it, and a descriptor that describes something else is exactly the kind of answer
+     * that gets used to size a buffer. */
+    if (texture->device != this) return NRR_ERROR_INVALID_ARGUMENT;
+    out_desc->width = texture->width;
+    out_desc->height = texture->height;
+    out_desc->format = texture->format;
+    out_desc->usage = texture->usage;
+    out_desc->array_layers = texture->array_layers;
+    out_desc->mip_levels = texture->mip_levels;
     return NRR_SUCCESS;
 }
 

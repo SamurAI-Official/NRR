@@ -7,6 +7,10 @@ containing what they should. This decodes them and checks the structure the scen
     colour      non-trivial (a real render, not a flat clear colour)
     motion      exactly zero on the static backdrop, non-zero where the objects moved
     depth       inside the range the scene's geometry implies
+    lowres      a real low-resolution raster, not a resize: its edge energy has to sit clearly above a
+                filtered downscale of the same frame, which is the difference a temporal pass cares about
+    jitter      the recorded per-frame offsets reproduce the documented Halton sequence, lie inside
+                [-0.5, 0.5], and actually move the sample from frame to frame
 
 It reads the scales out of the capture's own manifest rather than taking them as arguments, so the check
 also proves the manifest is sufficient to interpret the data - which is what a later reader will rely on.
@@ -46,6 +50,40 @@ def read_motion(path, manifest):
     return motion, distance
 
 
+def read_lowres(capture_dir, frame):
+    """The low-resolution pass as float RGB in [0,1] - the same read as the colour pass, at half the size."""
+    path = os.path.join(capture_dir, "lowres_%04d.png" % frame)
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+
+
+def downscale2(image):
+    """Area average by 2 - the filtered resize the low-resolution pass must not be."""
+    height, width = image.shape[:2]
+    return image.reshape(height // 2, 2, width // 2, 2, image.shape[2]).mean(axis=(1, 3))
+
+
+def edge_energy(image):
+    """Mean absolute horizontal luminance step. A raster at the low resolution aliases geometry edges, so
+    its value sits well above the same statistic for a filtered downscale of the high-resolution frame; a
+    resize that merely looks smaller would not separate the two, and that is exactly the capture this check
+    exists to refuse."""
+    grey = image.mean(axis=-1)
+    return float(np.abs(np.diff(grey, axis=1)).mean())
+
+
+def halton(index, base):
+    """The radical inverse the capture script's jitter is built from, recomputed here so the recorded
+    offsets can be checked against the documented sequence rather than merely looked at."""
+    result = 0.0
+    fraction = 1.0
+    value = index
+    while value > 0:
+        fraction /= float(base)
+        result += fraction * float(value % base)
+        value //= base
+    return result
+
+
 def main(argv):
     if len(argv) != 2:
         print(__doc__)
@@ -66,9 +104,20 @@ def main(argv):
     magnitudes = []
     largest = []
     distance_range = []
+    has_lowres = "lowres_size" in manifest
+    lowres_size = int(manifest.get("lowres_size", 0))
+    lowres_std = []
+    lowres_edge = []
+    downscale_edge = []
+    jitter = manifest.get("jitter_pixels", [])
     for index in range(frames):
         color = read_color(os.path.join(capture_dir, "color_%04d.png" % index))
         color_std.append(float(color.std()))
+        if has_lowres:
+            lowres = read_lowres(capture_dir, index)
+            lowres_std.append(float(lowres.std()))
+            lowres_edge.append(edge_energy(lowres))
+            downscale_edge.append(edge_energy(downscale2(color)))
         raw = np.fromfile(os.path.join(capture_dir, "motion_%04d.bin" % index),
                           dtype=np.float16).astype(np.float32).reshape(int(manifest["size"]),
                                                                       int(manifest["size"]), 3)
@@ -125,6 +174,57 @@ def main(argv):
     # would mean the transforms are wrong rather than fast.
     if max(largest) > 0.05:
         failures.append("largest geometry motion %.6f UV per frame is implausibly large" % max(largest))
+
+    # The low-resolution pass and its jitter. The capture script already proves a one-pixel offset translates
+    # the render by one pixel against a live render; what cannot be checked there is the aggregate, over a
+    # whole capture, that the pass really is a low-resolution raster and that the recorded offsets are the
+    # sequence they claim to be.
+    if has_lowres:
+        if lowres_size * 2 != int(manifest["size"]):
+            failures.append("lowres_size %d is not half the target size %d"
+                            % (lowres_size, int(manifest["size"])))
+        if min(lowres_std) <= 1e-4:
+            failures.append("a low-resolution frame is flat (std %.6f): nothing was drawn into it"
+                            % min(lowres_std))
+        # A resize tracks the downscale closely; a raster does not. Judged as a ratio, because the scenes
+        # differ in how much high-frequency content they carry.
+        ratio = min(a / b for a, b in zip(lowres_edge, downscale_edge))
+        if ratio < 1.3:
+            failures.append("low-resolution edge energy is only %.2fx a filtered downscale of the same frame:"
+                            " this looks like a resize, not a render" % ratio)
+        if len(jitter) != frames:
+            failures.append("manifest records %d jitter offsets for %d frames" % (len(jitter), frames))
+        else:
+            extremes = [abs(value) for pair in jitter for value in pair]
+            if extremes and max(extremes) > 0.5 + 1e-6:
+                failures.append("jitter %.4f falls outside the half-pixel cell" % max(extremes))
+            bases = manifest.get("jitter_bases", [2, 3])
+            expected = [[halton(index + 1, bases[0]) - 0.5, halton(index + 1, bases[1]) - 0.5]
+                        for index in range(frames)]
+            worst = max(abs(got - want)
+                        for pair, want_pair in zip(jitter, expected)
+                        for got, want in zip(pair, want_pair))
+            if worst > 1e-4:
+                failures.append("recorded jitter does not reproduce the Halton sequence the manifest names: "
+                                "worst difference %.6f" % worst)
+            mean_x = sum(pair[0] for pair in jitter) / float(len(jitter))
+            mean_y = sum(pair[1] for pair in jitter) / float(len(jitter))
+            if max(abs(mean_x), abs(mean_y)) > 0.15:
+                failures.append("mean jitter (%.4f, %.4f) is not centred on the un-jittered grid"
+                                % (mean_x, mean_y))
+            moves = sum(1 for before, after in zip(jitter, jitter[1:]) if before != after)
+            if frames > 1 and moves < frames - 1:
+                failures.append("the jitter repeats between consecutive frames (%d of %d differ)"
+                                % (moves, frames - 1))
+        print("lowres: %dpx, edge energy %.3f-%.3f vs downscale %.3f-%.3f (min ratio %.2fx), "
+              "jitter %.3f..%.3f, mean (%.4f, %.4f)"
+              % (lowres_size, min(lowres_edge), max(lowres_edge),
+                 min(downscale_edge), max(downscale_edge),
+                 min(a / b for a, b in zip(lowres_edge, downscale_edge)),
+                 min(abs(v) for pair in jitter for v in pair),
+                 max(abs(v) for pair in jitter for v in pair),
+                 sum(pair[0] for pair in jitter) / float(len(jitter)),
+                 sum(pair[1] for pair in jitter) / float(len(jitter))))
 
     print("summary: colour_std %.4f..%.4f, geometry %.1f..%.1f%%, mean|motion| %.6f..%.6f, "
           "moving %.1f..%.1f%%, distance %.2f..%.2f, background %.1f..%.1f%%"

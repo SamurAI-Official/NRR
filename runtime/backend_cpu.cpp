@@ -2,6 +2,7 @@
 #include "nrr_device.h"
 #include "onnx_runtime.h"
 #include "nrr_inference.h"
+#include "nrr_jitter.h"
 #include "nrr_quality.h"
 #include "nrr_test_backend.h"
 #include "accel_kernel.h"
@@ -419,6 +420,25 @@ NRRResult BackendCPU::execute_model(
         auto it = cpu_textures_.find(motion_tex->backend_texture);
         if (it != cpu_textures_.end()) motion_img = &it->second;
     }
+    /* The history a temporal resolve is fed back: the previous frame's *low-resolution
+     * render*, taken from the accumulator's own record of input frames.
+     *
+     * Deliberately NOT `input.temporal.previous_output`. That is the displayed frame at
+     * *output* resolution - twice the size - and the model was trained against a
+     * same-resolution low-res render. A dynamically-shaped graph accepts the 2x tensor
+     * without complaint and answers with nonsense, which is strictly worse than the
+     * colour-image misbinding this replaced: that one was obviously wrong, this one
+     * would look trained. */
+    BackendCPU::CPUImage history_img;
+    uint32_t history_w = 0, history_h = 0;
+    NRRTextureFormat history_format = NRR_TEXTURE_FORMAT_RGB8;
+    const bool have_history = temporal_.previous_input_frame(
+        history_img.pixels, history_w, history_h, history_format);
+    if (have_history) {
+        history_img.width = history_w;
+        history_img.height = history_h;
+        history_img.format = history_format;
+    }
 
     const uint32_t in_w = color_img.width;
     const uint32_t in_h = color_img.height;
@@ -440,12 +460,49 @@ NRRResult BackendCPU::execute_model(
         switch (role) {
             case TensorRole::Depth:  channels = 1; break;
             case TensorRole::Motion: channels = 2; break;
+            /* Two channels: the frame's sub-pixel sampling offset, broadcast over the
+             * frame. Without this case the offset fell through to the colour path and
+             * a two-channel offset tensor was filled with the *colour image* - a silent
+             * corruption that renders and looks plausible while being nonsense. */
+            case TensorRole::Jitter: channels = 2; break;
             default:                 channels = 3; break;
+        }
+
+        /* The offset is two numbers, not an image, so it is built rather than
+         * converted. Handled before the texture lookup because there is no texture:
+         * `jitter` names a plane the caller filled in, not an attachment it supplied. */
+        if (role == TensorRole::Jitter) {
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(ort->get_input_shape(i), channels, in_w, in_h, shape)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("model input '") + name +
+                               "' shape conflicts with the frame resolution");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            const JitterOffset offset = input.temporal.jitter.enabled
+                ? JitterOffset(input.temporal.jitter.offset_x, input.temporal.jitter.offset_y)
+                : JitterOffset();
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            /* An un-jittered caller gets the identity plane, which the model's
+             * de-jitter stage treats as "sampled on its nominal grid" - the same
+             * thing it would have been told had it been fed nothing at all, but now
+             * explicitly, so the model's input set is satisfied either way. */
+            if (!build_jitter_plane(offset, in_w, in_h, t.data)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("could not build the offset plane for input '") +
+                               name + "'");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            tensors.push_back(std::move(t));
+            continue;
         }
 
         const BackendCPU::CPUImage* src =
             (role == TensorRole::Depth) ? depth_img
             : (role == TensorRole::Motion) ? motion_img
+            : (role == TensorRole::History) ? (have_history ? &history_img : nullptr)
             : &color_img;
         if (!src) {
             /* Absent optional input (depth/motion): zero-filled tensor. */
@@ -537,6 +594,12 @@ NRRResult BackendCPU::execute_model(
 
     const TemporalAccumulator::Result temporal =
         temporal_.apply(input, out_bytes, out_w, out_h, motion_source);
+
+    /* Record this frame's low-resolution input so the *next* frame can bind it as the
+     * model's history. Recorded after inference, when the input pixels are final, and
+     * from the same bytes the model was fed - the history has to be the low-res render
+     * itself, not a reconstruction of it. */
+    temporal_.record_input_frame(color_img.pixels.data(), in_w, in_h, color_img.format);
     const NRRTemporalState tstate = temporal.state;
     const bool blended = temporal.blended;
     const TemporalBlendStats blend_stats = temporal.blend_stats;

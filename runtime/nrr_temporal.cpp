@@ -10,6 +10,7 @@
 
 #include "nrr_temporal.h"
 #include "nrr_inference.h"
+#include "accel_texture.h"
 #include <cmath>
 #include <algorithm>
 
@@ -37,6 +38,20 @@ void TemporalHistory::add_frame(uint64_t frame_index, float timestamp,
                                 const std::vector<float>& motion,
                                 uint32_t width, uint32_t height,
                                 NRRTextureFormat color_format, NRRTextureFormat depth_format) {
+    /* A caller that does not jitter records the identity offset, which is exactly
+     * what the overload below would have recorded for an un-jittered frame. One
+     * definition, so the two entry points cannot drift apart. */
+    add_frame(frame_index, timestamp, color, depth, motion, width, height,
+              color_format, depth_format, JitterOffset());
+}
+
+void TemporalHistory::add_frame(uint64_t frame_index, float timestamp,
+                                const std::vector<float>& color,
+                                const std::vector<float>& depth,
+                                const std::vector<float>& motion,
+                                uint32_t width, uint32_t height,
+                                NRRTextureFormat color_format, NRRTextureFormat depth_format,
+                                const JitterOffset& jitter) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     HistoryEntry entry;
@@ -49,6 +64,7 @@ void TemporalHistory::add_frame(uint64_t frame_index, float timestamp,
     entry.height = height;
     entry.color_format = color_format;
     entry.depth_format = depth_format;
+    entry.jitter = jitter;
 
     history_.push_back(std::move(entry));
     if (history_.size() > max_frames_) {
@@ -62,6 +78,16 @@ bool TemporalHistory::get_previous_frame(uint64_t current_frame_index,
                                          std::vector<float>& depth,
                                          std::vector<float>& motion,
                                          uint32_t& width, uint32_t& height) const {
+    JitterOffset ignored;
+    return get_previous_frame(current_frame_index, color, depth, motion, width, height, ignored);
+}
+
+bool TemporalHistory::get_previous_frame(uint64_t current_frame_index,
+                                         std::vector<float>& color,
+                                         std::vector<float>& depth,
+                                         std::vector<float>& motion,
+                                         uint32_t& width, uint32_t& height,
+                                         JitterOffset& jitter) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const int index = find_previous_index_locked(current_frame_index);
     if (index < 0) {
@@ -72,6 +98,9 @@ bool TemporalHistory::get_previous_frame(uint64_t current_frame_index,
     motion = history_[static_cast<size_t>(index)].motion_data;
     width = history_[static_cast<size_t>(index)].width;
     height = history_[static_cast<size_t>(index)].height;
+    /* Reported from the stored entry rather than from the caller's frame, so it
+     * cannot be confused with the offset currently being rendered. */
+    jitter = history_[static_cast<size_t>(index)].jitter;
     return true;
 }
 
@@ -506,7 +535,38 @@ static float mean_abs_difference(const std::vector<float>& a,
 
 TemporalAccumulator::TemporalAccumulator()
     : seen_frame_(false), last_frame_index_(0),
-      last_width_(0), last_height_(0) {}
+      last_width_(0), last_height_(0),
+      previous_input_width_(0), previous_input_height_(0),
+      previous_input_format_(NRR_TEXTURE_FORMAT_RGB8) {}
+
+void TemporalAccumulator::record_input_frame(const uint8_t* rgb8, uint32_t width,
+                                            uint32_t height, NRRTextureFormat format) {
+    if (!rgb8 || width == 0 || height == 0) {
+        previous_input_.clear();
+        previous_input_width_ = 0;
+        previous_input_height_ = 0;
+        return;
+    }
+    /* Stored by bytes, not converted: the tensor binding converts it on demand, and
+     * converting every frame whether or not the model declares a history input would
+     * cost a full-frame pass for nothing on a spatial model. */
+    const size_t bytes = accel_texture_bytes(width, height, format);
+    previous_input_.assign(rgb8, rgb8 + bytes);
+    previous_input_width_ = width;
+    previous_input_height_ = height;
+    previous_input_format_ = format;
+}
+
+bool TemporalAccumulator::previous_input_frame(std::vector<uint8_t>& out_rgb8,
+                                              uint32_t& out_width, uint32_t& out_height,
+                                              NRRTextureFormat& out_format) const {
+    if (previous_input_.empty()) return false;
+    out_rgb8 = previous_input_;
+    out_width = previous_input_width_;
+    out_height = previous_input_height_;
+    out_format = previous_input_format_;
+    return true;
+}
 
 TemporalAccumulator::~TemporalAccumulator() {
     shutdown();
@@ -521,6 +581,9 @@ void TemporalAccumulator::initialize() {
     last_frame_index_ = 0;
     last_width_ = 0;
     last_height_ = 0;
+    previous_input_.clear();
+    previous_input_width_ = 0;
+    previous_input_height_ = 0;
 }
 
 void TemporalAccumulator::shutdown() {
@@ -531,6 +594,9 @@ void TemporalAccumulator::shutdown() {
     last_frame_index_ = 0;
     last_width_ = 0;
     last_height_ = 0;
+    previous_input_.clear();
+    previous_input_width_ = 0;
+    previous_input_height_ = 0;
 }
 
 void TemporalAccumulator::reset() {
@@ -542,6 +608,13 @@ void TemporalAccumulator::reset() {
     last_frame_index_ = 0;
     last_width_ = 0;
     last_height_ = 0;
+    /* The stored low-resolution input frame is part of the history in every sense
+     * that matters: after a cut it belongs to a scene that is no longer on screen,
+     * and a resolve fed it would composite the old scene into the new one. Cleared
+     * alongside the accumulated output for exactly that reason. */
+    previous_input_.clear();
+    previous_input_width_ = 0;
+    previous_input_height_ = 0;
 }
 
 TemporalAccumulator::Result TemporalAccumulator::apply(
@@ -562,6 +635,14 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         history_.clear();
         state_.reset();
         seen_frame_ = false;
+        /* The stored low-resolution input render is discarded with the accumulated
+         * output. It is read during tensor binding, which happens before this point,
+         * so the frame that triggered the cut was already blended against it - the
+         * existing policy, and the reason a cut costs one blended frame. Dropping it
+         * here is what stops the *next* frame inheriting it. */
+        previous_input_.clear();
+        previous_input_width_ = 0;
+        previous_input_height_ = 0;
     }
 
     result.state = state_.compute_state(input, history_);

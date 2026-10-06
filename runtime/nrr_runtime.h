@@ -68,12 +68,18 @@ inline void set_fp16_capabilities(NRRCapabilities& caps,
 }
 
 struct TextureImpl {
-    TextureImpl() : device(nullptr), backend_texture(nullptr), format(NRR_TEXTURE_FORMAT_RGB8) {}
+    /* Every field initialised: a desc query can be asked about a texture that was constructed but
+     * whose creation failed, and answering with uninitialised width/height would be worse than
+     * answering zero - a caller sizes a readback buffer from this. */
+    TextureImpl()
+        : device(nullptr), backend_texture(nullptr), format(NRR_TEXTURE_FORMAT_RGB8),
+          width(0), height(0), usage(NRR_TEXTURE_USAGE_NONE), array_layers(0), mip_levels(0) {}
     DeviceImpl* device;
     void* backend_texture;
     NRRTextureFormat format;
     uint32_t width;
     uint32_t height;
+    uint32_t usage;
     uint32_t array_layers;
     uint32_t mip_levels;
 };

@@ -125,4 +125,9 @@ Write-Host ("[cuda] collected {0} file(s), {1:N1} MB -> {2}" -f `
 if ($missing.Count -gt 0) {
     throw "these required DLLs were not found in the wheels: $($missing -join ', ')"
 }
-Write-Host "[cuda] OK. Re-run CMake configure so the build deploys them next to the binaries."
+# Not "re-run CMake configure so the build deploys them next to the binaries" - CMakeLists.txt
+# deliberately never copies this set (it is ~2.3 GB); it globs the directory, sets NRR_HAVE_CUDA_EP,
+# and puts the path on NRR_RUNTIME_DLL_DIRS instead. So the DLLs have to be reachable that way at
+# run time, and saying otherwise sends you looking for copies in the build tree that will never be there.
+Write-Host "[cuda] OK. Re-run CMake configure so NRR_HAVE_CUDA_EP turns on, then make sure this directory"
+Write-Host "       is on PATH when running: the EP loads these by name and is not copied into the build tree."
