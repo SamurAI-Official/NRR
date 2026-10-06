@@ -52,13 +52,15 @@ unity/
 `NRRRenderer.PhaseAlignedAccumulation` (off by default) integrates the distinct sub-pixel samples of
 several frames into the displayed frame: with a jittered render, each frame's samples fall somewhere
 different, and averaging them reconstructs the scene more densely than one frame can. It needs
-`NRRRenderer.JitterEnabled` (no distinct phases, nothing to integrate) and a real
-`NRRRenderer.MotionMagnitude`, in frame fractions: the runtime stops integrating - and drops what it has -
-once a frame's scene motion exceeds 0.2 px, so a magnitude of zero passes that gate on every frame and a
-moving camera smears instead of antialiasing. The renderer logs a warning once when the integration is on
-with nothing measuring the motion. From code, `NRRDevice.SetPhaseAlignedAccumulation` and
-`NRRDevice.TryGetPhaseAlignedAccumulation` are the same switch; the query returns a result code because
-"off" and "this backend cannot integrate" are different answers.
+`NRRRenderer.JitterEnabled` (no distinct phases, nothing to integrate) and, for anything that moves, a real
+`NRRRenderer.MotionMagnitude`, in frame fractions. The runtime uses a supplied motion field per pixel -
+restarting the pixels that moved and keeping the still ones integrating - and falls back to that
+magnitude for the frame as a whole; past 0.2 px it drops the accumulation rather than averaging across the
+move. This renderer zero-fills its motion textures today, so the field it offers says nothing has moved,
+which makes the magnitude the only thing standing between a moving camera and a smear: the renderer logs a
+warning once when the integration is on with nothing measuring the motion. From code,
+`NRRDevice.SetPhaseAlignedAccumulation` and `NRRDevice.TryGetPhaseAlignedAccumulation` are the same switch;
+the query returns a result code because "off" and "this backend cannot integrate" are different answers.
 
 ## Requirements
 

@@ -133,6 +133,16 @@ bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
  * capture's frames the edge error's gain is gone by 0.2 px of scene motion per
  * frame and the plain error's by 0.5, against a jitter whose steps are up to 0.5 px.
  *
+ * Restarting a pixel is how a *partly* moving scene is handled, and warping was
+ * measured and refused: bilinear-warping the accumulated samples by the exact field
+ * that describes a 0.5 px/frame move leaves the mean at +9.5% of a single frame's
+ * edge error against -0.6% for leaving it alone (the plain error moves the same
+ * way), because the warp spreads each sample over its neighbours and does it again
+ * every frame - it destroys the sub-pixel diversity this class exists to integrate.
+ * Marking the pixels a motion field reports as moved, and letting them start again
+ * while their neighbours keep averaging, keeps the still region's -9.8% plain-error
+ * gain and leaves the moving region no worse than a single frame.
+ *
  * Memory: the resolved frame plus one scratch frame at the output resolution
  * (~25 MB at 1920x1080 RGB). An instance is not thread-safe; give each thread its
  * own, as with the other accumulators in this runtime. */
@@ -144,11 +154,20 @@ public:
      * the resolution the samples are placed into and have to stay fixed for the
      * life of a sequence: they are the display grid the samples are being
      * integrated on, so a change is a different accumulator, and this returns false
-     * rather than silently mixing two grids (or two channel counts). */
+     * rather than silently mixing two grids (or two channel counts).
+     *
+     * `restart` (optional, `out_width * out_height` entries) marks the pixels whose
+     * accumulated samples no longer describe what is on screen - the caller's motion
+     * field says the content there has moved, or the history was reprojected from
+     * outside the frame. Those pixels are *emptied* and this frame becomes their
+     * first sample, which is how a part of the image that moves keeps its neighbours
+     * integrating instead of dragging the whole frame's accumulation down with it.
+     * Empty means "nothing to restart", which is the identity. */
     bool add_frame(const std::vector<float>& frame_nchw, int channels,
                    uint32_t width, uint32_t height,
                    uint32_t out_width, uint32_t out_height,
-                   const JitterOffset& offset);
+                   const JitterOffset& offset,
+                   const std::vector<uint8_t>& restart = std::vector<uint8_t>());
 
     /* The mean of the frames accumulated so far, at the output resolution.
      * False (leaving `out_nchw` untouched) when nothing has been added. */
@@ -166,6 +185,11 @@ private:
      * resolved frame is compared against a torch reference at tight tolerance. */
     std::vector<double> sum_;
     std::vector<float> scratch_; /* one upsampled frame, reused across calls */
+    /* Samples behind each output pixel. A whole-frame accumulation would count to the
+     * frame count everywhere, but a per-pixel restart empties individual pixels, so the
+     * resolve is a division by this rather than by the count - and it is why the class no
+     * longer assumes the gather form needs no weight buffer. */
+    std::vector<double> weight_;
     uint32_t frame_count_ = 0;
     uint32_t out_width_ = 0;
     uint32_t out_height_ = 0;

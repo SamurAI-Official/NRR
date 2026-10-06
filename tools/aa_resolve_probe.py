@@ -255,7 +255,240 @@ def translated(image, pixels):
     return samples._bilinear(image, grid_x, grid_y)
 
 
+def gradient_weights(image):
+    """Normalised gradient magnitude, the same weighting the edge-error metric uses: a plain mean over a
+    mostly flat frame hides the signal in the flat fraction, and a mismatch minimum is no different - the
+    surface is flat where the content is."""
+    grey = image.mean(axis=2) if image.ndim == 3 else image
+    gy, gx = np.gradient(grey)
+    magnitude = np.sqrt(gx * gx + gy * gy)
+    total = magnitude.sum()
+    return magnitude / total if total > 0 else magnitude
+
+
+def fit_motion(reference, candidate, shift, step, stride=2, weights=None):
+    """The scene's motion between two frames, fitted from the mismatch surface around the expected shift.
+
+    `reference` is the previous frame, `candidate` this one, and `shift` the displacement that explains a
+    change with no scene motion at all - the difference between the two frames' sub-pixel offsets. Three
+    error evaluations around it locate the minimum of a parabola; the noise floor is common to all three
+    and cancels in the vertex, which is what makes this usable where a plain |difference| is not. Returns
+    (dx, dy, curvature, floor): the extra displacement in pixels, and the numbers a caller needs to judge
+    it - a flat frame has curvature ~0 and a vertex that means nothing.
+    """
+    height, width = candidate.shape[:2]
+
+    def error(sx, sy):
+        xs = np.arange(0, width, stride, dtype=np.float32) + sx
+        ys = np.arange(0, height, stride, dtype=np.float32) + sy
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        moved = samples._bilinear(reference, grid_x, grid_y)
+        difference = np.abs(candidate[::stride, ::stride] - moved)
+        if weights is None:
+            return float(difference.mean())
+        return float((difference * weights[::stride, ::stride][..., None]).sum() / 3.0)
+
+    centre = error(shift[0], shift[1])
+    x_minus = error(shift[0] - step, shift[1])
+    x_plus = error(shift[0] + step, shift[1])
+    y_minus = error(shift[0], shift[1] - step)
+    y_plus = error(shift[0], shift[1] + step)
+
+    def vertex(minus, zero, plus):
+        curvature = minus - 2.0 * zero + plus
+        if curvature <= 1e-12:
+            return 0.0, curvature
+        return step * (minus - plus) / (2.0 * curvature), curvature
+
+    dx, cx = vertex(x_minus, centre, x_plus)
+    dy, cy = vertex(y_minus, centre, y_plus)
+    return dx, dy, max(cx, cy), centre
+
+
+def expected_shift(previous, current, scale, sign):
+    """The displacement that explains a change between two frames with no scene motion at all: the
+    difference between their sub-pixel offsets, in output pixels. The sign is a convention, so the probe
+    measures it rather than assuming it - the wrong one reports roughly twice the jitter as "motion"."""
+    return ((current[0] - previous[0]) * scale * sign, (current[1] - previous[1]) * scale * sign)
+
+
+def mismatch(reference, candidate, shift, stride=2):
+    """Mean absolute difference between two frames with `reference` read back at `shift`.
+
+    The same surface `fit_motion` fits, sampled coarsely: this is used for comparisons between shifts, not
+    for locating a minimum, so a stride costs nothing and a 1080p frame stays cheap."""
+    height, width = candidate.shape[:2]
+    xs = np.arange(0, width, stride, dtype=np.float32) + shift[0]
+    ys = np.arange(0, height, stride, dtype=np.float32) + shift[1]
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    moved = samples._bilinear(reference, grid_x, grid_y)
+    return float(np.abs(candidate[::stride, ::stride] - moved).mean())
+
+
+def motion_estimator_check(frames, motions, scale, count=4):
+    """Can the runtime tell, from the frames it already holds, whether the scene moved?
+
+    A sub-pixel *magnitude* is not measurable this way, and that is a measurement rather than an opinion:
+    the mismatch surface of filtered, noisy, differently-sampled frames is flat enough that a three-point
+    vertex lands anywhere between 0.16 and 1.6 px for a known 0.25 px of motion, with curvature two orders
+    of magnitude below the noise floor. What a *detector* needs is weaker than a vertex: the residual at the
+    alignment the sampling offsets predict, compared with the residual at a deliberately wrong alignment.
+    Still content is explained by those offsets, so the aligned residual is far smaller; content that moved
+    is not explained, and the two converge on 1.
+    """
+    print("\nthe runtime's motion measurement (three-point fit, output px; the fit is *relative* to the")
+    print("expected shift, so still content must read ~0 and a scene moving m px/frame must read m*%.0f)" % scale)
+    print("  %-20s %-22s %-22s %s"
+          % ("case", "plain error fit", "gradient-weighted fit", "curvature / floor (plain)"))
+    for motion_case in motions:
+        plain, weighted = [], []
+        previous_image = None
+        previous_jitter = None
+        for index in range(count):
+            moved = translated(frames[index]["input"], (motion_case * index, motion_case * index))
+            current = samples.upsample(moved, frames[0]["target"].shape[:2])
+            if previous_image is not None:
+                shift = expected_shift(previous_jitter, frames[index]["jitter"], scale, -1.0)
+                plain.append(fit_motion(previous_image, current, shift, 0.5))
+                weighted.append(fit_motion(previous_image, current, shift, 0.5,
+                                           weights=gradient_weights(previous_image)))
+            previous_image = current
+            previous_jitter = frames[index]["jitter"]
+
+        def fitted(rows):
+            dx = sum(row[0] for row in rows) / len(rows)
+            dy = sum(row[1] for row in rows) / len(rows)
+            return "%.3f px (want %.2f)" % ((dx * dx + dy * dy) ** 0.5, motion_case * scale)
+
+        print("  %-20s %-22s %-22s %.5f / %.5f"
+              % ("motion %.2f" % motion_case, fitted(plain), fitted(weighted),
+                 sum(row[2] for row in plain) / len(plain), sum(row[3] for row in plain) / len(plain)))
+
+    print("\nand the weaker question a detector needs: residual at the offset-implied alignment, over the")
+    print("residual at a deliberately wrong one. Still content must read far below 1; content that moved, near 1.")
+    print("  %-22s %-16s %-16s %s" % ("case", "ratio at +-0.5 px", "ratio at +-1.0 px", "aligned residual"))
+    for motion_case in motions:
+        ratios = {0.5: [], 1.0: []}
+        residuals = []
+        previous_image = None
+        previous_jitter = None
+        for index in range(count):
+            moved = translated(frames[index]["input"], (motion_case * index, motion_case * index))
+            current = samples.upsample(moved, frames[0]["target"].shape[:2])
+            if previous_image is not None:
+                shift = expected_shift(previous_jitter, frames[index]["jitter"], scale, -1.0)
+                aligned = mismatch(previous_image, current, shift)
+                residuals.append(aligned)
+                for step in (0.5, 1.0):
+                    displaced = [mismatch(previous_image, current, (shift[0] + dx, shift[1] + dy))
+                                 for dx, dy in ((step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step))]
+                    ratios[step].append(aligned / (sum(displaced) / 4.0))
+            previous_image = current
+            previous_jitter = frames[index]["jitter"]
+        print("  %-22s %-16.3f %-16.3f %.5f"
+              % ("motion %.2f px/f" % motion_case, sum(ratios[0.5]) / len(ratios[0.5]),
+                 sum(ratios[1.0]) / len(ratios[1.0]), sum(residuals) / len(residuals)))
+
+
+
+def reproject_successive(frames, target, weights, motions, count):
+
+    """Does reprojecting the accumulation keep the integration's gain while the scene moves?
+
+    Each frame is translated by its own distance from the first - a scene moving m pixels per frame - and
+    one accumulator is warped by that same amount before each new frame is added, which is what the runtime
+    would do with the frame's motion field. Three columns, because the interesting question is not whether
+    reprojection helps but what it costs: the *unwarped* mean is what happens if the accumulation is simply
+    left running across a move (the smearing the gate exists to prevent), and the *warped* mean is the
+    reprojected one. The warp is bilinear and happens once per frame, so its blur compounds - which is why
+    the m=0 row matters: warping by a whole number of pixels is exactly the identity, so the cost there
+    should be nil and any cost in the other rows is real.
+    """
+    print("\nreprojection: scene motion per frame vs the integration's error (K=%d)" % count)
+    single_edge = samples.edge_error(
+        samples.upsample(frames[0]["input"], target.shape[:2]), target, weights)
+    single_plain = float(np.abs(samples.upsample(frames[0]["input"], target.shape[:2])
+                                - target).mean())
+    print("  %-11s %-22s %-22s %s"
+          % ("motion px/f", "unwarped mean (edge/plain)", "reprojected (edge/plain)", "reprojected/single edge"))
+    for motion in motions:
+        unwarped = np.zeros_like(target)
+        warped = np.zeros_like(target)
+        for index in range(count):
+            moved = translated(frames[index]["input"], (motion * index, motion * index))
+            placed = samples.align_sample(moved, frames[index]["jitter"], target.shape[:2])
+            if index > 0:
+                # The history was built in the previous frame's coordinates and the scene has moved by
+                # `motion` since, so it is read back from where it was taken. The runtime's reprojection
+                # convention is `source = x - motion * scale` (nrr_temporal.h), which is a gather at
+                # X + motion here.
+                warped = translated(warped, (motion, motion))
+            unwarped += placed
+            warped += placed
+        unwarped /= float(count)
+        warped /= float(count)
+        unwarped_edge = samples.edge_error(unwarped, target, weights)
+        reprojected_edge = samples.edge_error(warped, target, weights)
+        print("  %-11.3f %-22s %-22s %.4f"
+              % (motion,
+                 "%.6f / %.6f" % (unwarped_edge, float(np.abs(unwarped - target).mean())),
+                 "%.6f / %.6f" % (reprojected_edge, float(np.abs(warped - target).mean())),
+                 reprojected_edge / single_edge))
+    print("  one frame: edge %.6f  plain %.6f" % (single_edge, single_plain))
+def per_pixel_gate_check(frames, target, weights, motion, count=8, gate=0.2):
+    """Per-pixel gating: use the motion field to decide *where* to integrate instead of warping anything.
+
+    The measurement above says warping the accumulation is worse than leaving it alone on both metrics,
+    because a bilinear warp destroys the sub-pixel diversity the integration lives on and does it again
+    every frame. This asks the cheaper question: if part of the scene is still and part is moving, can the
+    field keep the still part integrating - which the global gate cannot, since one moving frame drops the
+    whole accumulation - without smearing the moving part? The rectangle that moves is translated by
+    `motion` per frame, the field says so (and says zero elsewhere), and three arrangements are compared on
+    the whole frame:
+
+      * one frame                      - what a per-pixel refusal degrades to, locally;
+      * global gate                    - what the runtime does today: the frame moves, so nothing is kept
+                                         anywhere, including the part that is still;
+      * per-pixel gate                 - the still part keeps integrating, the moving part restarts.
+    """
+    height, width = frames[0]["target"].shape[:2]
+    block = (int(height * 0.25), int(height * 0.75), int(width * 0.25), int(width * 0.75))
+    rows, columns = block[0], block[1]
+    print("\nper-pixel gating, a still scene with one %dx%d rectangle moving %.2f px/frame (K=%d)"
+          % (columns - rows, block[3] - block[2], motion, count))
+    print("  the rectangle is what a motion field would report as moved; everything else is still")
+    single = samples.upsample(frames[0]["input"], target.shape[:2])
+    single_edge = samples.edge_error(single, target, weights)
+
+    summed = np.zeros_like(target)
+    weighted = np.zeros_like(target)
+    weights_sum = np.zeros((height, width, 1), dtype=np.float32)
+    global_edge = None
+    for index in range(count):
+        source = frames[index]["input"]
+        # Only the rectangle moves; the rest of the frame is the captured still scene.
+        shifted = translated(source, (motion * index, motion * index))
+        moved = source.copy()
+        moved[rows:columns, block[2]:block[3]] = shifted[rows:columns, block[2]:block[3]]
+        placed = samples.align_sample(moved, frames[index]["jitter"], target.shape[:2])
+        field = np.zeros((height, width, 1), dtype=np.float32)
+        scale = height / float(source.shape[0])
+        field[rows * 2:columns * 2, block[2] * 2:block[3] * 2] = motion * scale
+        still_pixels = field < (gate * scale)
+        summed = np.where(still_pixels, summed + placed, placed)
+        weights_sum = np.where(still_pixels, weights_sum + 1.0, 1.0)
+        weighted = summed / np.maximum(weights_sum, 1.0)
+    per_pixel_edge = samples.edge_error(weighted, target, weights)
+    global_edge = single_edge if motion > gate else per_pixel_edge
+    print("  one frame        edge %.6f  plain %.6f"
+          % (single_edge, float(np.abs(single - target).mean())))
+    print("  global gate      edge %.6f  (the moving frame drops the still part's integration too)"
+          % global_edge)
+    print("  per-pixel gate   edge %.6f  plain %.6f   -> %.3f of one frame"
+          % (per_pixel_edge, float(np.abs(weighted - target).mean()), per_pixel_edge / single_edge))
+
 def gate_sweep(frames, target, weights, motions, count):
+
     """How much scene motion the integration tolerates, on the real static frames.
 
     Each frame is translated by its own distance from the first - a scene that moves m pixels per
@@ -336,8 +569,16 @@ def main(argv):
         arrangement(label, outputs, frames, target, weights, counts)
 
     input_side(frames, target, weights, counts)
-    gate_sweep(frames, target, weights,
-               [float(value) for value in args.motion.split(",")], min(8, args.frames))
+    motions = [float(value) for value in args.motion.split(",")]
+    gate_sweep(frames, target, weights, motions, min(8, args.frames))
+
+    # The two questions the runtime still has to answer for itself: how far the scene moved (which the
+    # caller's motion field cannot be trusted to say), and whether reprojecting the accumulation can keep
+    # it integrating through that motion instead of dropping it.
+    scale = target.shape[0] / float(frames[0]["input"].shape[0])
+    motion_estimator_check(frames, [0.0, 0.25, 0.5], scale)
+    reproject_successive(frames, target, weights, [0.0, 0.25, 0.5, 1.0], min(8, args.frames))
+    per_pixel_gate_check(frames, target, weights, 0.5, min(8, args.frames))
     return 0
 
 

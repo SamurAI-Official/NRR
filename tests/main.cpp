@@ -299,6 +299,9 @@ void run_all_tests() {
     NRR_RUN_TEST(test_phase_aligned_pass_declines_without_distinct_phases);
     NRR_RUN_TEST(test_phase_aligned_pass_is_discarded_by_a_scene_change);
     NRR_RUN_TEST(test_phase_aligned_offset_rule_matches_the_two_model_kinds);
+    NRR_RUN_TEST(test_phase_aligned_restart_empties_only_the_marked_pixels);
+    NRR_RUN_TEST(test_phase_aligned_refuses_a_mask_of_the_wrong_size);
+    NRR_RUN_TEST(test_phase_aligned_gate_converts_the_magnitude_with_the_frame_width);
     NRR_RUN_TEST(test_temporal_history_names_classify_as_history);
     NRR_RUN_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_it);
 

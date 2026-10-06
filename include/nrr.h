@@ -416,7 +416,17 @@ NRR_API NRRResult nrr_device_reset_temporal_history(NRRDevice* device);
  *
  * Returns NRR_ERROR_INVALID_ARGUMENT for a NULL device and NRR_ERROR_STATE_INVALID for a device that is
  * not initialized or whose backend cannot integrate (nothing is enabled in that case, and the caller is
- * told rather than silently given an off switch). */
+ * told rather than silently given an off switch).
+ *
+ * Motion: the runtime restarts the pixels a supplied motion field reports as moved and keeps integrating
+ * the rest, so a partly moving scene keeps the still region's accumulation. It does *not* warp the
+ * accumulation - measured, warping is worse than not warping on both the edge and the plain metrics,
+ * because it spreads each sample over its neighbours every frame. Without a field, the declared
+ * `motion_magnitude` decides for the frame as a whole, and a value past 0.2 px per frame drops the
+ * accumulation. That magnitude cannot be derived by the runtime: three measurements of the frames it
+ * already holds (a sub-pixel fit, and two residual comparisons) found no usable alignment signal at these
+ * scales, so it has to come from the caller - see PHASE_ALIGNED_MOTION_GATE_PX in runtime/nrr_temporal.h.
+ */
 NRR_API NRRResult nrr_device_set_phase_aligned_accumulation(NRRDevice* device, int enabled);
 
 /* Reports whether the accumulator that will run this device's frames has the integration on: 1 or 0 in

@@ -148,10 +148,15 @@ bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
 bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, int channels,
                                         uint32_t width, uint32_t height,
                                         uint32_t out_width, uint32_t out_height,
-                                        const JitterOffset& offset) {
+                                        const JitterOffset& offset,
+                                        const std::vector<uint8_t>& restart) {
     if (channels <= 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0) return false;
     const size_t in_plane = static_cast<size_t>(width) * height;
     if (frame_nchw.size() < in_plane * static_cast<size_t>(channels)) return false;
+    const size_t out_plane = static_cast<size_t>(out_width) * out_height;
+    /* A mask of the wrong size would silently mis-index, so it is refused rather than resized: a caller
+     * that computed it for another grid has made the same mistake the output-grid check below catches. */
+    if (!restart.empty() && restart.size() < out_plane) return false;
 
     /* A sequence has one output grid. Mixing two would average samples that were
      * placed for different displays, so refuse rather than reinterpret them. */
@@ -170,9 +175,9 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
         return false;
     }
 
-    const size_t out_plane = static_cast<size_t>(out_width) * out_height;
     if (frame_count_ == 0) {
         sum_.assign(out_plane * static_cast<size_t>(channels), 0.0);
+        weight_.assign(out_plane, 0.0);
         channels_ = channels;
         out_width_ = out_width;
         out_height_ = out_height;
@@ -207,18 +212,23 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
             const float wx1 = lx;
 
             const size_t p = static_cast<size_t>(y) * out_width + x;
+            /* A pixel the caller marked as no longer describing what is on screen starts again from this
+             * frame: its sum and its weight are rewound, so the samples it had accumulated do not get
+             * averaged into the new content. That is the whole difference between a per-pixel restart and
+             * a reprojection: nothing is warped, so nothing is blurred, and the sample phases the
+             * integration lives on survive in the pixels that did not move. */
+            const bool restart_here = !restart.empty() && restart[p] != 0;
             for (int c = 0; c < channels; ++c) {
                 const float* base = &scratch_[static_cast<size_t>(c) * out_plane];
                 const float top = base[static_cast<size_t>(y0) * out_width + x0] * wx0
                                 + base[static_cast<size_t>(y0) * out_width + x1] * wx1;
                 const float bottom = base[static_cast<size_t>(y1) * out_width + x0] * wx0
                                    + base[static_cast<size_t>(y1) * out_width + x1] * wx1;
-                /* This placement gathers, so every frame contributes exactly one
-                 * value to every output pixel: no weight buffer is needed and the
-                 * resolve is just the frame count. A scatter form would need both. */
-                sum_[static_cast<size_t>(c) * out_plane + p] +=
-                    static_cast<double>(top * wy0 + bottom * wy1);
+                const double sample = static_cast<double>(top * wy0 + bottom * wy1);
+                double& slot = sum_[static_cast<size_t>(c) * out_plane + p];
+                slot = restart_here ? sample : slot + sample;
             }
+            weight_[p] = restart_here ? 1.0 : weight_[p] + 1.0;
         }
     }
 
@@ -229,9 +239,14 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
 bool PhaseAlignedAccumulator::resolve(std::vector<float>& out_nchw) const {
     if (frame_count_ == 0) return false;
     out_nchw.resize(sum_.size());
-    const double inverse = 1.0 / static_cast<double>(frame_count_);
-    for (size_t i = 0; i < sum_.size(); ++i) {
-        out_nchw[i] = static_cast<float>(sum_[i] * inverse);
+    const size_t out_plane = static_cast<size_t>(out_width_) * out_height_;
+    for (size_t i = 0; i < out_nchw.size(); ++i) {
+        /* Per pixel, not per sequence: a restarted pixel holds fewer samples than the pixels around it,
+         * and dividing those by the sequence's frame count would darken exactly the part of the image
+         * that moved. A weight of zero cannot happen after an add - every output pixel receives one
+         * sample per frame - but it is guarded rather than divided by. */
+        const double w = weight_[i % out_plane];
+        out_nchw[i] = w > 0.0 ? static_cast<float>(sum_[i] / w) : 0.0f;
     }
     return true;
 }
@@ -239,6 +254,7 @@ bool PhaseAlignedAccumulator::resolve(std::vector<float>& out_nchw) const {
 void PhaseAlignedAccumulator::reset() {
     sum_.clear();
     scratch_.clear();
+    weight_.clear();
     frame_count_ = 0;
     out_width_ = 0;
     out_height_ = 0;

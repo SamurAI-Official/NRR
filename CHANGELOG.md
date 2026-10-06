@@ -14,6 +14,80 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### Per-pixel restarts instead of reprojection, and three measurements that refuse a derived motion magnitude
+
+Two gaps were left open deliberately last round: the integration does not reproject, and nothing measures
+`MotionMagnitude` for the caller. Both are now settled - one by implementing the part that pays, one by
+establishing with numbers that the obvious implementation does not pay, which is the same outcome this
+repository records when a feature is refused.
+
+**Warping the accumulation is worse than not warping it.** Translating the static capture's frames by a
+known amount per frame and reprojecting the accumulation by the exact field that describes it, on both
+metrics, at 8 frames:
+
+```
+motion px/frame   unwarped mean (edge/plain)   reprojected (edge/plain)   one frame (edge)
+0.00              0.088954 / 0.011548          0.088954 / 0.011548        0.089511
+0.25              0.094305 / 0.012833          0.098042 / 0.013774        0.089511
+0.50              0.099567 / 0.014913          0.107989 / 0.017223        0.089511
+1.00              0.108740 / 0.018854          0.127272 / 0.023938        0.089511
+```
+
+The mechanism is the reason it is not a tuning problem: a bilinear warp spreads each sample over its
+neighbours, and this pass exists because the samples sit at *different* sub-pixel phases - warping is
+applied every frame, so what it destroys compounds. So the class does the cheaper thing instead: the
+caller's motion field marks the pixels whose content has moved, and those pixels are *restarted* - emptied
+and re-seeded from the current frame - while their neighbours keep averaging. Measured on a scene that is
+half still and half moving 0.5 px/frame, against what the runtime does today (one moving frame drops the
+whole accumulation):
+
+```
+one frame        edge 0.089511  plain 0.013051
+global gate      edge 0.089511            (nothing kept anywhere, including the still half)
+per-pixel        edge 0.088954  plain 0.011774   -> 0.994 of one frame, -9.8% plain
+```
+
+That needs a weight buffer, which the class previously argued it did not need ("every frame contributes
+exactly one value to every output pixel") - a restarted pixel holds one sample where its neighbours hold
+several, so the resolve is now a division per pixel rather than by the sequence length, and dividing by the
+length would darken exactly the region that moved.
+
+**The runtime cannot derive the motion magnitude, and that was measured three ways.** The idea (the
+runtime's own recorded previous frame plus the jitter difference) was tried before it was built:
+
+- a three-point parabola on the mismatch surface lands anywhere between 0.16 and 1.6 px for a *known*
+  0.25 px of motion, with the curvature two orders of magnitude below the mismatch floor
+  (0.00046 vs 0.0123) - a vertex with no signal under it;
+- gradient-weighting the error (the fix for flat-frame averaging everywhere else in this codebase) makes
+  it worse rather than better: a still scene reads 0.945 px;
+- the weaker question a *detector* needs - the residual at the alignment the sampling offsets predict,
+  over the residual at a deliberately displaced one - reads 0.998 at +-0.5 px and 1.004 at +-1.0 px for a
+  scene that does not move, i.e. no separation at all. It is not the capture's filtering either: on
+  point-sampled plate frames, where aliasing is maximal, the same ratio is 0.98-1.01, because a
+  point-sampled frame has no correlation between neighbours for *any* metric to align.
+
+So the value stays the caller's, the engine binding keeps its field and its warning, and the warning is now
+backed by a measurement instead of by argument. What a caller should do about it is unchanged: fill it from
+a real motion pass, and leave it at zero only while the scene really is still.
+
+**A unit bug in the gate, found while writing this.** The gate compares `motion_magnitude * width` against a
+constant measured in *frame-grid* pixels, and `width` is the *output* width - so on a 2x pipeline the gate
+was twice as strict as the measurement behind it. `PhaseAlignedFrame` now carries `frame_width` and the
+conversion uses it, pinned by a test that would pass under the old behaviour in one direction and fails in
+the other (0.15 px on a 32-wide frame is inside the gate; the same declared fraction on a 64-wide frame is
+0.3 px and is not).
+
+Verified: C++ suite **163/163** (four new tests: the restart and its weight, a mask of the wrong size
+refused, the gate's conversion), `tools/aa_resolve_probe.py` now measuring the reprojection table, the
+per-pixel table, and the two negative results above. One observation from a run that briefly had the CUDA
+runtime on `PATH`: `latency_frame_budget_breakdown` *enforces* the published GPU tier budget only when a
+device execution provider is attached, and on this host that path reports ~13 ms of inference against
+~450 ms of host overhead for the same frame, so it fails the 150 ms budget where the CPU-EP runs that every
+other result here was produced on skip the check instead. That is a GPU-tier budget question about this
+host, not about the phase-aligned pass - which is off in that test - and it is recorded rather than
+silenced.
+
+
 ### The phase-aligned switch reaches both engines, and both verify projects exercise it
 
 The runtime grew the switch last round with two entry points and no caller, and an entry point an engine

@@ -664,6 +664,28 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         prev_w == width && prev_h == height &&
         prev_color.size() == displayed.size();
 
+    /* The frame's motion field at the output grid, fetched at most once and only when a pass can use it:
+     * the reprojection blend asks for it when it can blend, and the phase-aligned pass asks for it when it
+     * has accumulated samples to judge per pixel. */
+    std::vector<float> motion_out;
+    bool motion_loaded = false;
+    const std::vector<float> no_motion;
+    auto output_motion = [&]() -> const std::vector<float>& {
+        if (!motion_loaded) {
+            motion_loaded = true;
+            const MotionImage field = motion ? motion() : MotionImage();
+            if (field.valid()) {
+                std::vector<float> motion_nchw;
+                if (texture_to_nchw(field.pixels, field.width, field.height, field.format,
+                                    2, motion_nchw)) {
+                    resample_motion_field_nchw(motion_nchw, field.width, field.height,
+                                               width, height, motion_out);
+                }
+            }
+        }
+        return motion_out.empty() ? no_motion : motion_out;
+    };
+
     if (!have_previous) {
         result.note = "no previous frame";
     } else if (result.state.temporal_alpha <= 0.0f) {
@@ -671,16 +693,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
     } else {
         /* Ask for the motion field only now: a frame that cannot blend must not pay
          * for converting one. */
-        std::vector<float> motion_out;
-        const MotionImage field = motion ? motion() : MotionImage();
-        if (field.valid()) {
-            std::vector<float> motion_nchw;
-            if (texture_to_nchw(field.pixels, field.width, field.height, field.format,
-                                2, motion_nchw)) {
-                resample_motion_field_nchw(motion_nchw, field.width, field.height,
-                                           width, height, motion_out);
-            }
-        }
+        const std::vector<float>& frame_motion = output_motion();
 
         HistoryEntry previous;
         previous.frame_index = input.temporal.frame_index;
@@ -689,7 +702,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         previous.height = prev_h;
 
         result.blended = renderer_.blend_frame(
-            displayed, width, height, previous, motion_out,
+            displayed, width, height, previous, frame_motion,
             input.temporal.motion_vectors_scale, result.state.temporal_alpha,
             &result.blend_stats);
         result.note = result.blended ? "accumulated"
@@ -711,7 +724,12 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
      * history, which is what handles motion, and this is the integration, which requires its absence.
      * Both write the displayed frame, in that order, so the caller uploads one image either way. */
     if (phase_aligned_enabled_) {
-        const float motion_px = result.state.motion_magnitude * static_cast<float>(width);
+        /* The declared magnitude is a fraction of the frame; the gate is in frame-grid pixels, which is the
+         * grid it was measured on. Converting with the *output* width on a 2x pipeline compares units that
+         * differ by a factor of two and makes the gate twice as strict as the measurement behind it, so the
+         * frame's own width comes from the caller (PhaseAlignedFrame::frame_width). */
+        const uint32_t gate_grid = phase.frame_width > 0 ? phase.frame_width : width;
+        const float motion_px = result.state.motion_magnitude * static_cast<float>(gate_grid);
         if (!phase.eligible) {
             /* No distinct phases to integrate: either the renderer does not jitter, or the frame's
              * phase has already been spent - a model with a `jitter` input de-jitters internally, and
@@ -719,34 +737,72 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
              * it. Starting from nothing is the honest answer; the note says which. */
             phase_aligned_.reset();
             result.phase_note = "phase-aligned off (frame carries no phase)";
-        } else if (motion_px > PHASE_ALIGNED_MOTION_GATE_PX) {
-            /* The scene moved further than the samples can absorb, so what has been accumulated belongs
-             * to an earlier view of it. Dropped rather than kept: a mean of before and after ghosts,
-             * which is worse than not integrating at all - and the reprojection blend above has already
-             * handled this frame the way it handles motion. */
-            phase_aligned_.reset();
-            result.phase_note = "phase-aligned reset (scene moved)";
         } else {
-            const size_t plane = static_cast<size_t>(width) * height;
-            phase_frame_.assign(plane * 3u, 0.0f);
-            for (size_t i = 0; i < plane; ++i) {
-                phase_frame_[i] = displayed[i * 3u];
-                phase_frame_[plane + i] = displayed[i * 3u + 1u];
-                phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
-            }
-            /* Output grid == frame grid, so the placement's scale is 1 and the offset is already in
-             * output pixels: this is the case the native-resolution test pins as exactly the de-jitter. */
-            if (phase_aligned_.add_frame(phase_frame_, 3, width, height, width, height,
-                                         JitterOffset(phase.offset_x, phase.offset_y))) {
-                std::vector<float> resolved;
-                if (phase_aligned_.resolve(resolved)) {
+            /* Per pixel when the caller supplies a motion field, and never by warping.
+             *
+             * Warping the accumulation was measured and refused: on the static capture, translating the
+             * frames 0.5 px per frame with the exact field that describes it leaves the reprojected mean
+             * at +9.5% of a single frame's edge error against -0.6% for leaving it alone (and the plain
+             * error moves the same way), because a bilinear warp spreads each sample over its neighbours
+             * and does it again every frame - it destroys the sub-pixel diversity this pass exists to
+             * integrate. Restarting a pixel loses nothing the pixel had not already lost: measured on a
+             * scene that is half still and half moving, the still half keeps its -9.8% plain-error gain
+             * while the moving half is no worse than a single frame (tools/aa_resolve_probe.py). */
+            std::vector<uint8_t> restart;
+            bool any_restart = false;
+            if (phase_aligned_.frame_count() > 0) {
+                /* The field is in output pixels (it is the same quantity the blend's warp subtracts), so
+                 * the threshold is the gate converted into output pixels. */
+                const std::vector<float>& field = output_motion();
+                if (!field.empty()) {
+                    const float field_scale = input.temporal.motion_vectors_scale > 0.0f
+                                                  ? input.temporal.motion_vectors_scale
+                                                  : 1.0f;
+                    const float threshold = PHASE_ALIGNED_MOTION_GATE_PX
+                                          * (static_cast<float>(width) / static_cast<float>(gate_grid));
+                    const size_t plane = static_cast<size_t>(width) * height;
+                    restart.assign(plane, 0);
                     for (size_t i = 0; i < plane; ++i) {
-                        displayed[i * 3u] = resolved[i];
-                        displayed[i * 3u + 1u] = resolved[plane + i];
-                        displayed[i * 3u + 2u] = resolved[plane * 2u + i];
+                        const float dx = field[i * 2] * field_scale;
+                        const float dy = field[i * 2 + 1] * field_scale;
+                        if (std::sqrt(dx * dx + dy * dy) > threshold) {
+                            restart[i] = 1;
+                            any_restart = true;
+                        }
                     }
-                    interleaved_float_to_rgb8(displayed, rgb8);
-                    result.phase_note = "phase-aligned";
+                }
+            }
+
+            if (restart.empty() && motion_px > PHASE_ALIGNED_MOTION_GATE_PX) {
+                /* No field to be per-pixel about, and the declared magnitude says the whole frame moved:
+                 * what has been accumulated belongs to an earlier view of the scene. Dropped rather than
+                 * kept, because a mean of before and after ghosts - and the reprojection blend above has
+                 * already handled this frame the way it handles motion. */
+                phase_aligned_.reset();
+                result.phase_note = "phase-aligned reset (scene moved, no field)";
+            } else {
+                const size_t plane = static_cast<size_t>(width) * height;
+                phase_frame_.assign(plane * 3u, 0.0f);
+                for (size_t i = 0; i < plane; ++i) {
+                    phase_frame_[i] = displayed[i * 3u];
+                    phase_frame_[plane + i] = displayed[i * 3u + 1u];
+                    phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
+                }
+                /* Output grid == frame grid, so the placement's scale is 1 and the offset is already in
+                 * output pixels: this is the case the native-resolution test pins as exactly the de-jitter. */
+                if (phase_aligned_.add_frame(phase_frame_, 3, width, height, width, height,
+                                             JitterOffset(phase.offset_x, phase.offset_y), restart)) {
+                    std::vector<float> resolved;
+                    if (phase_aligned_.resolve(resolved)) {
+                        for (size_t i = 0; i < plane; ++i) {
+                            displayed[i * 3u] = resolved[i];
+                            displayed[i * 3u + 1u] = resolved[plane + i];
+                            displayed[i * 3u + 2u] = resolved[plane * 2u + i];
+                        }
+                        interleaved_float_to_rgb8(displayed, rgb8);
+                        result.phase_note = any_restart ? "phase-aligned per-pixel"
+                                                       : "phase-aligned";
+                    }
                 }
             }
         }

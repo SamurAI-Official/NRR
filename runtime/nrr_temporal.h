@@ -43,7 +43,16 @@ constexpr float TEMPORAL_STABILITY_FULL_DELTA = 0.25f;
  * validated against, the motion *field* reads mean |motion| 0.10998 on every frame - byte-identical
  * across a scene whose un-jittered targets are identical, i.e. a decode constant and not motion - and
  * against that field any gate below 1.0 would refuse every frame, which is the safe direction to fail
- * but not a working feature. See the note on apply(). */
+ * but not a working feature. See the note on apply().
+ *
+ * It is *not* derived here from the frames the runtime already holds, and that is a measurement rather
+ * than a preference: a three-point parabola fitted to the mismatch between consecutive displayed frames
+ * lands anywhere between 0.16 and 1.6 px for a known 0.25 px of motion (curvature two orders of magnitude
+ * below the mismatch floor), and the weaker question a detector needs - the residual at the alignment the
+ * sampling offsets predict, over the residual at a deliberately wrong one - reads 0.96-1.00 for *both*
+ * still and moving captured content, and 0.98-1.01 on point-sampled plate frames too. The surface has no
+ * alignment signal at these scales on either kind of content, so the caller must supply the value and the
+ * engine bindings warn when nothing measures it (runtime/../engine_plugins/unity: NRRRenderer). */
 constexpr float PHASE_ALIGNED_MOTION_GATE_PX = 0.2f;
 
 /* Converts a measured frame-to-frame change into that convention. Shared, so the
@@ -337,6 +346,12 @@ public:
         bool eligible = false;
         float offset_x = 0.0f;  /* the content displacement, in OUTPUT pixels */
         float offset_y = 0.0f;
+        /* The width of the grid the frame was sampled on. The gate constant is in *frame-grid* pixels
+         * (that is the grid it was measured on), so the declared magnitude - a fraction of the frame -
+         * has to be converted with this rather than with the output width: on a 2x pipeline the two differ
+         * by a factor of two, which would make the gate twice as strict as the measurement behind it.
+         * Zero means "the output grid", which is what a caller integrating at native resolution means. */
+        uint32_t frame_width = 0;
     };
 
     /* Measured outcome of one frame's temporal pass. */
@@ -373,7 +388,13 @@ public:
      * PhaseAlignedFrame. Opt-in (set_phase_aligned_enabled), and off by default, so a caller that does
      * not ask for it sees exactly the behaviour it saw before. When it is on and the frame is eligible,
      * the *displayed* frame is the mean of the frames accumulated so far, so `rgb8` is rewritten with
-     * the resolve - which is what the caller uploads. */
+     * the resolve - which is what the caller uploads.
+     *
+     * Motion is handled per pixel when the caller supplies a motion field: the pixels it reports as moved
+     * are restarted so their neighbours keep integrating, and nothing is warped (see nrr_jitter.h for the
+     * measurement that decided that). Without a field, the whole frame is judged by the declared
+     * magnitude against PHASE_ALIGNED_MOTION_GATE_PX and the accumulation is dropped when it is past it.
+     * The reason is in Result::phase_note either way. */
     Result apply(const NRRFrameInput& input,
                  std::vector<uint8_t>& rgb8,
                  uint32_t width, uint32_t height,
@@ -467,6 +488,7 @@ inline TemporalAccumulator::PhaseAlignedFrame phase_aligned_frame_for(
     TemporalAccumulator::PhaseAlignedFrame frame;
     if (!input.temporal.jitter.enabled) return frame;
     frame.eligible = true;
+    frame.frame_width = in_width;
     if (!model_uses_jitter && in_width > 0 && in_height > 0) {
         frame.offset_x = input.temporal.jitter.offset_x
                        * (static_cast<float>(out_width) / static_cast<float>(in_width));

@@ -1115,5 +1115,103 @@ NRR_TEST(test_phase_aligned_offset_rule_matches_the_two_model_kinds) {
 }
 
 
+/* The per-pixel restart, and the weight that goes with it.
+ *
+ * A pixel the caller marks as no longer describing what is on screen is emptied and re-seeded from this
+ * frame, while its neighbours keep averaging. That is what lets the still part of an image keep
+ * integrating while the part that moves does not drag it into a smear - and it is why the resolve can no
+ * longer divide by the frame count: a restarted pixel holds one sample where its neighbours hold several,
+ * and dividing those by the sequence length would darken exactly the region that moved.
+ *
+ * The fixture is deliberately trivial so the numbers are exact: a constant plane whose value is the frame
+ * index, placed with a zero offset (the identity), so the mean of three frames is 1 everywhere and a
+ * restarted pixel holds the third frame's 2. */
+NRR_TEST(test_phase_aligned_restart_empties_only_the_marked_pixels) {
+    using namespace phase_fixture;
+    const size_t plane = static_cast<size_t>(pf_w) * pf_h;
+    PhaseAlignedAccumulator accumulator;
+
+    std::vector<uint8_t> restart(plane, 0);
+    const size_t marked = 5u * pf_w + 7u;
+    for (int frame = 0; frame < 3; ++frame) {
+        const std::vector<float> values(plane, static_cast<float>(frame));
+        if (frame == 2) restart[marked] = 1;
+        NRR_ASSERT(accumulator.add_frame(values, 1, pf_w, pf_h, pf_w, pf_h, JitterOffset(),
+                                         (frame == 2) ? restart : std::vector<uint8_t>()),
+                   "every frame must be accepted");
+    }
+
+    std::vector<float> resolved;
+    NRR_ASSERT(accumulator.resolve(resolved), "the resolve must succeed");
+    NRR_EXPECT_EQ(accumulator.frame_count(), 3u, "the sequence length is still reported as three");
+    NRR_ASSERT(std::fabs(resolved[marked] - 2.0f) < 1e-6,
+               "a restarted pixel must hold only the frame that restarted it; got "
+               + std::to_string(resolved[marked]));
+    NRR_ASSERT(std::fabs(resolved[marked + 1] - 1.0f) < 1e-6,
+               "and its neighbour must keep the three-frame mean; got "
+               + std::to_string(resolved[marked + 1]));
+}
+
+/* A mask that does not describe this accumulator's grid is refused rather than resized: it would
+ * otherwise be indexed as if it did, which is the same class of mistake the output-resolution check
+ * catches - and a refused frame must leave the accumulator usable. */
+NRR_TEST(test_phase_aligned_refuses_a_mask_of_the_wrong_size) {
+    using namespace phase_fixture;
+    const size_t plane = static_cast<size_t>(pf_w) * pf_h;
+    const std::vector<float> values(plane, 0.5f);
+    PhaseAlignedAccumulator accumulator;
+
+    NRR_ASSERT(!accumulator.add_frame(values, 1, pf_w, pf_h, pf_w, pf_h, JitterOffset(),
+                                      std::vector<uint8_t>(plane - 1, 0)),
+               "a mask shorter than the output grid must be refused");
+    NRR_EXPECT_EQ(accumulator.frame_count(), 0u, "and must not have counted as a frame");
+    NRR_ASSERT(accumulator.add_frame(values, 1, pf_w, pf_h, pf_w, pf_h, JitterOffset(),
+                                     std::vector<uint8_t>(plane, 0)),
+               "the same frame with a correct mask must still be accepted");
+}
+
+
+/* The gate's units, pinned: the constant is measured in *frame-grid* pixels, so a caller's magnitude - a
+ * fraction of the frame - is converted with the frame's own width. On a 2x pipeline the output width is
+ * twice that, and using it makes the gate twice as strict as the measurement behind it, which is the
+ * defect this pins: the same declared fraction must be judged against the grid it was declared in. */
+NRR_TEST(test_phase_aligned_gate_converts_the_magnitude_with_the_frame_width) {
+    using namespace phase_fixture;
+    std::vector<uint8_t> rgb8(static_cast<size_t>(64) * pf_h * 3, 128);
+
+    /* One declared fraction, read against two different frame grids, with the output width held at 64 in
+     * both: 0.15 px on a 32-wide frame is inside the gate, and the same fraction on a 64-wide frame is
+     * 0.3 px and past it. A conversion that used the output width would read 0.3 px in *both* cases and
+     * refuse the first one, which is what makes the accept below the discriminating observation. */
+    const float fraction = 0.15f / 32.0f;
+
+    TemporalAccumulator narrow;
+    narrow.initialize();
+    narrow.set_phase_aligned_enabled(true);
+    const NRRFrameInput narrow_input = pf_input(1, 0.25f, 0.0f, true, fraction);
+    const TemporalAccumulator::PhaseAlignedFrame narrow_phase =
+        phase_aligned_frame_for(narrow_input, false, 32, pf_h, 64, pf_h);
+    NRR_EXPECT_EQ(narrow_phase.frame_width, 32u,
+                  "the frame's own width must be what the gate converts with");
+    narrow.apply(narrow_input, rgb8, 64, pf_h, pf_no_field, narrow_phase);
+    NRR_EXPECT_EQ(narrow.phase_aligned_frames(), 1u,
+                  "0.15 px on the frame's own grid is inside the 0.2 px gate, even though the output grid "
+                  "is twice as wide");
+
+    TemporalAccumulator wide;
+    wide.initialize();
+    wide.set_phase_aligned_enabled(true);
+    const NRRFrameInput wide_input = pf_input(1, 0.25f, 0.0f, true, fraction);
+    const TemporalAccumulator::Result refused = wide.apply(
+        wide_input, rgb8, 64, pf_h, pf_no_field,
+        phase_aligned_frame_for(wide_input, false, 64, pf_h, 64, pf_h));
+    NRR_EXPECT_EQ(refused.phase_aligned_frames, 0u,
+                  "the same fraction on a 64-wide frame is 0.3 px and must exceed the gate - so the two "
+                  "verdicts together say the magnitude was converted with the frame, not with the output");
+    NRR_ASSERT(std::string(refused.phase_note).find("no field") != std::string::npos,
+               "the note must be the no-field refusal; got '" + std::string(refused.phase_note) + "'");
+}
+
+
 } // namespace test
 } // namespace nrr
