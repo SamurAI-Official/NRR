@@ -14,6 +14,60 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The phase-aligned switch reaches both engines, and both verify projects exercise it
+
+The runtime grew the switch last round with two entry points and no caller, and an entry point an engine
+cannot reach leaves the behaviour unfixable from game code - the argument this repository already made for
+the M1.3 temporal reset. So the exposure is the deliverable, and it is the part that had to be *run* rather
+than read: both verify projects now round-trip the switch through the real library.
+
+**Unity.** `NRRNative.cs` declares both P/Invokes. `NRRDevice` wraps them as
+`SetPhaseAlignedAccumulation` (throws on refusal, like every other setter) and
+`TryGetPhaseAlignedAccumulation` (returns the result code, so "off" and "this backend cannot" stay
+distinguishable - flattening that into a bool is what a binding does when it has not read the ABI note).
+`NRRRenderer` gains the `PhaseAlignedAccumulation` toggle and a `MotionMagnitude` field, replacing the
+`motion_magnitude = 0.0f` it used to hard-code: the runtime's 0.2 px gate is fed by that number, and a zero
+passes it on every frame, so the renderer now logs a warning once when the integration is on with nothing
+measuring the motion rather than letting a moving camera smear silently.
+
+**Godot.** `nrr_godot.{h,cpp}` implement and `ClassDB`-bind both; `NRR.gd` wraps them for GDScript, with the
+query tri-state (1 on, 0 off, -1 cannot). Its doc says plainly what this binding does *not* supply yet - its
+`render_frame` submits frames with no jitter and no motion measurement, so the runtime declines to integrate
+them - because a mean of identically-phased frames reported as antialiasing would be the worse answer.
+
+**Both verify projects exercise it.**
+
+```
+Godot (verify.gd, through the loaded extension):   Unity (NRRJitterRuntimeTests, through nrr.dll):
+phase_aligned_supported=true state_after_off=0     CPU backend: phase-aligned switch accepted and reported
+phase_aligned_enabled=true   state_after_on=1      backend NVIDIA: phase-aligned supported=True
+entry_point_count=47                               (6/6 PlayMode tests, CUDA)
+```
+
+`verify.gd` asserts the invariant rather than success - "off" is never reported as "cannot" or the reverse,
+and a frame rendered with the switch on still comes back non-passthrough - because whether an arbitrary
+host's backend has an accumulator is not something the driver can know. The Unity test makes the CPU device
+a hard requirement (it owns an accumulator in every build) and lets the auto-selected backend refuse, but
+not report a state it does not hold.
+
+**The repointing.** `build/Release/nrr.dll` rebuilt and copied to
+`engine_plugins/unity_verify/Assets/NRR/Plugins/x86_64/nrr.dll` (268800 -> 278016 bytes), and the Godot
+GDExtension relinked by `godot_verify/setup.ps1` against the updated runtime - it links NRR statically, so
+the rebuild is the repointing on that side.
+
+**Guards**, in `tests/unit/test_engine_plugins.cpp`: the new
+`test_engine_bindings_expose_phase_aligned_accumulation` requires each engine's declaration, call, ClassDB
+binding and GDScript/managed wrapper, and compares the Unity binding against the verify project's *copy* of
+it - the same file in two places, which had already drifted once for `NRRRenderer.cs` (deliberately, over
+URP 17) so the two that must match now fail loudly when they do not.
+
+Verified: C++ suite **160/160** (the new guard included), Godot `RESULT: PASS` as recorded above, Unity
+PlayMode **6/6** on CUDA. Two defects were found by *running* it rather than reading it: both launches pass
+the project path with spaces and fail silently without embedded quotes (the Godot setup and the Unity
+editor both), and the Unity test first landed inside the previous method's braces - caught as
+`error CS0106`, which is the compiler doing the job the plan could not.
+
+
 ### The phase-aligned accumulator in the render path - and a sign that was measured against the wrong surrogate
 
 Wiring the accumulator in meant answering two questions the class itself cannot: which image in the render

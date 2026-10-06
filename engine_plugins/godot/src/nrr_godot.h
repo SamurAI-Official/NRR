@@ -69,6 +69,20 @@ public:
 	/** nrr_device_reset_temporal_history(): call on a scene cut. */
 	bool reset_temporal_history();
 
+	/** nrr_device_set_phase_aligned_accumulation(): opt in to integrating distinct sub-pixel samples.
+	 *
+	 *  The frames' offsets come from the frame input (the jitter the renderer applied); the *motion*
+	 *  budget does not, and the runtime's gate (0.2 px per frame) reads it from
+	 *  NRRTemporalState::motion_magnitude, so a caller that enables this with a moving camera and no
+	 *  measurement of the motion will smear rather than accumulate. Returns false, with the reason in
+	 *  get_last_error(), when the device is missing or its backend has no accumulator - a backend that
+	 *  cannot integrate is not the same answer as "off". */
+	bool set_phase_aligned_accumulation(bool p_enabled);
+
+	/** 1 when the accumulator has the integration on, 0 when it is off, -1 when this device has no
+	 *  accumulator at all (see nrr_device_get_phase_aligned_accumulation). */
+	int get_phase_aligned_accumulation();
+
 	godot::String get_backend_name() const;
 	godot::Dictionary get_capabilities() const;
 	double get_render_time_ms() const;

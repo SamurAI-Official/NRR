@@ -266,6 +266,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_godot_binding_entry_symbol_matches_descriptor);
     NRR_RUN_TEST(test_godot_binding_references_only_declared_c_api_entry_points);
     NRR_RUN_TEST(test_godot_binding_exposes_temporal_history_reset);
+    NRR_RUN_TEST(test_engine_bindings_expose_phase_aligned_accumulation);
     NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
     NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
     NRR_RUN_TEST(test_godot_addon_has_no_nested_project_file);

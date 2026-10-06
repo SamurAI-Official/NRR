@@ -56,6 +56,9 @@ pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild
   failure**, and the mean absolute difference against the input is printed so the
   output can be seen to have changed.
 * `reset_temporal_history()` - the M1.3 export reachable from GDScript.
+* `set_phase_aligned_accumulation()` / `phase_aligned_accumulation()` - the switch round-trips, and
+  "off" is never confused with "cannot" (the refusal path reports -1 rather than 0). A frame rendered
+  with it on must still come back non-passthrough.
 * `shutdown()` leaves `available == false`.
 
 ## Recorded result
@@ -71,6 +74,7 @@ load_model=true                render_out=64x48 format=5 (RGBA8)
 model_info ... "provider": "CUDAExecutionProvider" ...
 render_time_ms=632.088         mean_abs_dr_vs_input=0.489112
 reset_temporal_history=true    available_after_shutdown=false
+phase_aligned_supported=true   state_after_off=0   state_after_on=1
 RESULT: PASS
 ```
 

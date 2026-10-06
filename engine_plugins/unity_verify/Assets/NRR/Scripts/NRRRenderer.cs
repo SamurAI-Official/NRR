@@ -86,12 +86,93 @@ namespace NRR
             get { return _jitter != null ? _jitter.AppliedOffset : Vector2.zero; }
         }
 
+        /// <summary>
+        /// Integrate the distinct sub-pixel samples of several frames into one displayed frame
+        /// (opt-in; off by default, and off changes nothing).
+        ///
+        /// This is what a jittered sequence is *for*: each frame's samples fell somewhere different, and
+        /// averaging them reconstructs the scene more densely than one frame can. The runtime places each
+        /// frame where it was taken and displays the mean, so with a model that does not correct its own
+        /// sampling grid it recovers the antialiasing that model loses (measured -27.8% edge error at 4
+        /// frames), and with a jitter-aware model it averages that model's own reconstructions (-18.0% at
+        /// 8). Needs <see cref="JitterEnabled"/>, because without distinct sub-pixel phases there is
+        /// nothing to integrate and the runtime declines rather than quietly averaging frames.
+        ///
+        /// <see cref="MotionMagnitude"/> must be a real measurement: the runtime stops integrating - and
+        /// drops what it has - once a frame's scene motion exceeds 0.2 px, and a magnitude of zero passes
+        /// that gate on every frame, so enabling this with a moving camera and nothing measuring the
+        /// motion smears the image instead of antialiasing it. The renderer warns once when it sees that
+        /// combination rather than leaving it silent.
+        /// </summary>
+        [Tooltip("Integrate the distinct sub-pixel samples of several frames (requires JitterEnabled). " +
+                 "Set MotionMagnitude from a real measurement, or a moving camera smears.")]
+        public bool PhaseAlignedAccumulation
+        {
+            get { return _phaseAligned; }
+            set
+            {
+                _phaseAligned = value;
+                ApplyPhaseAlignedToDevice();
+            }
+        }
+
+        /// <summary>
+        /// Per-frame scene motion, in frame fractions (the runtime converts it with the frame width; its
+        /// gate is 0.2 px). Nothing here measures it: fill it from the project's own motion pass - a mean
+        /// |motion| over the frame - and leave it at zero only while the scene really is still. A camera
+        /// whose motion field is a constant is not a measurement (the captures in this repository read
+        /// 0.10998 on scenes that do not move at all), so a magnitude copied from such a field will either
+        /// refuse every frame or accept every frame.
+        /// </summary>
+        [Tooltip("Declared per-frame scene motion, in frame fractions. Must come from a real " +
+                 "measurement; the runtime refuses to integrate past 0.2 px of it.")]
+        public float MotionMagnitude = 0.0f;
+
         private NRRTexture _colorIn;
         private NRRTexture _depthIn;
         private NRRTexture _motionIn;
         private ulong _frameIndex;
         private NRRJitter _jitter;
         private bool _baseProjectionCaptured;
+        private bool _phaseAligned;
+        private bool _phaseAlignedWarningLogged;
+
+        /// <summary>
+        /// Pushes <see cref="PhaseAlignedAccumulation"/> to the device, if there is one.
+        ///
+        /// Safe before the device exists (an inspector value arrives before Start, so Initialize applies it
+        /// at the end) and safe on a backend that cannot integrate: the runtime reports that as a failure
+        /// rather than accepting a setting nothing honours, and the warning says which of the two happened
+        /// instead of leaving the caller believing a switch was flipped.
+        /// </summary>
+        private void ApplyPhaseAlignedToDevice()
+        {
+            if (Device == null || !Device.IsValid)
+            {
+                return;
+            }
+
+            if (!Device.IsPhaseAlignedAccumulationSupported())
+            {
+                if (_phaseAligned)
+                {
+                    Debug.LogWarning("[NRR] phase-aligned accumulation was requested, but this backend has " +
+                                     "no accumulator (the runtime reports NRR_ERROR_STATE_INVALID for it). " +
+                                     "Frames are rendering without the integration.");
+                }
+                return;
+            }
+
+            Device.SetPhaseAlignedAccumulation(_phaseAligned);
+
+            bool applied;
+            Device.TryGetPhaseAlignedAccumulation(out applied);
+            if (applied != _phaseAligned)
+            {
+                Debug.LogWarning("[NRR] the runtime did not keep the phase-aligned setting: the accumulator " +
+                                 "reports " + applied + " after requesting " + _phaseAligned + ".");
+            }
+        }
 
         private void OnEnable()
         {
@@ -137,6 +218,10 @@ namespace NRR
 
             CreateTextures();
             IsReady = true;
+
+            // An inspector value for PhaseAlignedAccumulation arrives before this method runs, so the
+            // setting is applied to the device here rather than only in the property setter.
+            ApplyPhaseAlignedToDevice();
         }
 
         private void CreateTextures()
@@ -268,7 +353,10 @@ private void Update()
                     delta_time = Time.deltaTime,
                     resolution_x = (uint)InputWidth,
                     resolution_y = (uint)InputHeight,
-                    motion_magnitude = 0.0f,
+                    // Carried from the caller, not invented here: the runtime's 0.2 px gate is fed by this
+                    // number, and a zero passes it on every frame. Measured from the project's motion pass
+                    // where one exists; the warning below fires once when the integration is on without it.
+                    motion_magnitude = MotionMagnitude,
                     temporal_alpha = 0.9f,
                     history_frames = 0,
                     motion_vectors_scale = 1.0f,
@@ -291,6 +379,15 @@ private void Update()
                 materials = System.IntPtr.Zero,
                 object_ids = System.IntPtr.Zero,
             };
+
+            if (_phaseAligned && MotionMagnitude <= 0.0f && !_phaseAlignedWarningLogged)
+            {
+                _phaseAlignedWarningLogged = true;
+                Debug.LogWarning("[NRR] phase-aligned accumulation is on with MotionMagnitude = 0, so the " +
+                                 "runtime's 0.2 px gate accepts every frame: a moving camera will smear " +
+                                 "rather than accumulate. Set MotionMagnitude from a real measurement (a " +
+                                 "mean |motion| over the frame).");
+            }
 
             NRRReferenceSet? references = Reference != null
                 ? new NRRReferenceSet { facial_reference = Reference.Handle }

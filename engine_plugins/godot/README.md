@@ -13,7 +13,7 @@ this file and the runnable project is `../godot_verify/`.
 | Item | State |
 | --- | --- |
 | `plugin.cfg` (INI descriptor) | **Verified.** Godot parses this shape; it previously shipped the Godot 3 XML variant, which Godot 4 never reads. |
-| `NRR.gd` runtime API | **Verified** - `initialize`/`load_model`/`render_frame`/`reset_temporal_history` all exercised in Godot. |
+| `NRR.gd` runtime API | **Verified** - `initialize`/`load_model`/`render_frame`/`reset_temporal_history`/`set_phase_aligned_accumulation`/`phase_aligned_accumulation` all exercised in Godot. |
 | `nrr_plugin.gd` editor plugin | **Source-level verified** (`extends EditorPlugin`, entry symbol matches the descriptor). The status menu item has not been clicked in the editor UI. |
 | `nrr_post_process.gd` | **Source-level verified.** Renderer-agnostic (CanvasLayer overdraw); not yet rendered on screen. |
 | `nrr.gdextension` | **Verified** in Godot 4.7.2 (debug variant, Windows x86_64). |
@@ -193,9 +193,15 @@ last_error=
 render_time_ms=2.926
 mean_abs_dr_vs_input=0.489112
 reset_temporal_history=true
+phase_aligned_supported=true state_after_off=0
+phase_aligned_enabled=true state_after_on=1
 available_after_shutdown=false
 RESULT: PASS
 ```
+
+`entry_point_count` reads `NRR_ENTRY_POINT_COUNT` from the linked runtime and follows it as the
+C ABI grows (44 at the time of the recorded block above, 47 now that the phase-aligned pair is
+exported); the two `phase_aligned_*` lines are the switch being round-tripped through the extension.
 
 `render_time_ms` varies between runs: 2.926 ms and 3.166 ms were observed for the same
 input, so treat it as "~3 ms on this machine", not a benchmark. Everything else is

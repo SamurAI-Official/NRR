@@ -48,6 +48,11 @@ namespace NRR
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_render(IntPtr device, IntPtr model, ref NRRReferenceSet references, ref NRRFrameInput input, out NRRFrameOutput output);
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_wait_idle(IntPtr device);
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_reset_temporal_history(IntPtr device);
+        /* The integration of distinct sub-pixel samples across frames. Two entry points rather than one
+         * because "off" and "this backend cannot integrate" are different answers, and a caller that
+         * cannot tell them apart will believe it enabled something nothing honours. */
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_set_phase_aligned_accumulation(IntPtr device, int enabled);
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_get_phase_aligned_accumulation(IntPtr device, out int out_enabled);
 
         // Texture helpers
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_texture_create(IntPtr device, ref NRRTextureDesc desc, out IntPtr out_texture);

@@ -265,6 +265,36 @@ bool NRRNative::reset_temporal_history() {
 	return true;
 }
 
+bool NRRNative::set_phase_aligned_accumulation(bool p_enabled) {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return false;
+	}
+	if (nrr_device_set_phase_aligned_accumulation(device_, p_enabled ? 1 : 0) != NRR_SUCCESS) {
+		/* The runtime's message distinguishes "device is not initialized" from "this backend has no
+		 * accumulator", and both matter here: the second is the one a caller could mistake for a
+		 * successful disable. */
+		fail("nrr_device_set_phase_aligned_accumulation");
+		return false;
+	}
+	return true;
+}
+
+int NRRNative::get_phase_aligned_accumulation() {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return -1;
+	}
+	int enabled = 0;
+	if (nrr_device_get_phase_aligned_accumulation(device_, &enabled) != NRR_SUCCESS) {
+		fail("nrr_device_get_phase_aligned_accumulation");
+		return -1;
+	}
+	return enabled != 0 ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -423,6 +453,10 @@ void NRRNative::_bind_methods() {
 	    &NRRNative::render_frame, DEFVAL(Ref<Image>()), DEFVAL(Ref<Image>()));
 	godot::ClassDB::bind_method(godot::D_METHOD("reset_temporal_history"),
 	                            &NRRNative::reset_temporal_history);
+	godot::ClassDB::bind_method(godot::D_METHOD("set_phase_aligned_accumulation", "enabled"),
+	                            &NRRNative::set_phase_aligned_accumulation);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_phase_aligned_accumulation"),
+	                            &NRRNative::get_phase_aligned_accumulation);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_backend_name"),
 	                            &NRRNative::get_backend_name);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_capabilities"),

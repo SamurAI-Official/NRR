@@ -155,6 +155,31 @@ func reset_temporal_history() -> bool:
 	return bool(_native.call("reset_temporal_history"))
 
 
+## Integrates the distinct sub-pixel samples of several frames into one displayed frame.
+## Mirrors nrr_device_set_phase_aligned_accumulation() from the public C API.
+##
+## Two things this binding does not supply today, and the runtime needs both: the per-frame sub-pixel
+## offset (render_frame() submits frames with no jitter, so the runtime declines to integrate - it will
+## not average identically-phased frames and call it antialiasing) and a per-frame motion measurement
+## (motion_magnitude; the runtime stops integrating once a frame's scene motion exceeds 0.2 px, and a zero
+## passes that gate on every frame). The switch is exposed so a caller that supplies both through the
+## native interface can use it, and so its state is at least observable from GDScript.
+## Returns false when the device is missing or its backend has no accumulator (see last_error()).
+func set_phase_aligned_accumulation(enabled: bool) -> bool:
+	if not available or _native == null:
+		return false
+	return bool(_native.call("set_phase_aligned_accumulation", enabled))
+
+
+## 1 when the accumulator has the integration on, 0 when it is off, -1 when this device cannot
+## integrate at all - "off" and "cannot" are different answers, and only one of them means the
+## runtime is doing what was asked.
+func phase_aligned_accumulation() -> int:
+	if not available or _native == null:
+		return -1
+	return int(_native.call("get_phase_aligned_accumulation"))
+
+
 ## Name of the backend the device actually selected, e.g. "CPU".
 func backend_name() -> String:
 	if not available or _native == null:

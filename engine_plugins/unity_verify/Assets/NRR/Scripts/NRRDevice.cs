@@ -95,6 +95,60 @@ namespace NRR
         }
 
         // =====================================================================
+        // Phase-aligned accumulation
+        // =====================================================================
+
+        /// <summary>
+        /// Turns the integration of distinct sub-pixel samples across frames on or off (opt-in; off by
+        /// default, and off changes nothing).
+        ///
+        /// A jittered renderer already gives the runtime frames whose samples fell on different sub-pixel
+        /// positions. Integrating them reconstructs the scene more densely than any one frame holds -
+        /// which no single-frame upscale can, because those samples are not on its grid. The runtime
+        /// places each frame's samples where they were taken, averages them, and displays the result.
+        ///
+        /// Two things the caller owns, because the runtime cannot know them: the frame's sub-pixel offset
+        /// (<see cref="NRRTemporalState.jitter"/>, which the renderer fills in) and that the frames belong
+        /// to one still scene - the runtime gates at 0.2 px of per-frame scene motion and resets the
+        /// accumulation past it, so <c>motion_magnitude</c> has to be a real measurement.
+        /// <see cref="NRRRenderer"/> carries that value from its own <c>MotionMagnitude</c> field and warns
+        /// when the integration is on with nothing measuring it, because a magnitude of zero passes the
+        /// gate on every frame and a moving camera then smears instead of accumulating.
+        ///
+        /// Throws when the backend cannot integrate (NRR_ERROR_STATE_INVALID) rather than accepting a
+        /// setting nothing will honour.
+        /// </summary>
+        public void SetPhaseAlignedAccumulation(bool enabled)
+        {
+            NRR.ThrowIfFailed(NRRNative.nrr_device_set_phase_aligned_accumulation(_handle, enabled ? 1 : 0),
+                              "nrr_device_set_phase_aligned_accumulation");
+        }
+
+        /// <summary>
+        /// Whether the accumulator that will run this device's frames has the integration on.
+        ///
+        /// Reports the result instead of throwing, unlike the setters: a caller gates on this per frame,
+        /// and an exception per frame is the wrong shape for a query. A non-success result means the
+        /// device has no accumulator at all (no backend, or a backend that cannot integrate) and leaves
+        /// <paramref name="enabled"/> false - which is why callers that need to distinguish "off" from
+        /// "cannot" should read the returned code, not the flag.
+        /// </summary>
+        public NRRResult TryGetPhaseAlignedAccumulation(out bool enabled)
+        {
+            int value = 0;
+            NRRResult r = NRRNative.nrr_device_get_phase_aligned_accumulation(_handle, out value);
+            enabled = r == NRRResult.Success && value != 0;
+            return r;
+        }
+
+        /// <summary>True when this device has an accumulator the runtime can switch on.</summary>
+        public bool IsPhaseAlignedAccumulationSupported()
+        {
+            bool ignored;
+            return TryGetPhaseAlignedAccumulation(out ignored) == NRRResult.Success;
+        }
+
+        // =====================================================================
         // Textures / buffers
         // =====================================================================
 

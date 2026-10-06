@@ -490,7 +490,76 @@ namespace NRR.Tests
                     "GPU path: put third_party/cuda-runtime-cu12/bin on PATH (the provider needs " +
                     "cudnn64_9.dll), or set NRR_REQUIRE_CUDA=0 to accept CPU deliberately.", provider));
             }
+
         }
+
+
+        /// <summary>
+        /// The phase-aligned switch, through the same native plugin the editor loads.
+        ///
+        /// Two assertions, and they are different claims. A CPU device must accept the switch and report it
+        /// back - that backend owns an accumulator in every build, so a failure here means the entry point
+        /// is exposed and does nothing. The auto-selected backend is allowed to refuse, because whether its
+        /// shared kernel is running is not something a test can assume on an arbitrary host; what it may
+        /// not do is report a state it does not hold. Keeping those two answers apart is exactly why the
+        /// binding exposes the result code as well as the flag: a caller that confuses them believes it
+        /// enabled something nothing honours.
+        /// </summary>
+        [Test]
+        public void PhaseAlignedSwitchIsReachableAndItsAnswersAreDistinguishable()
+        {
+            Mark("Phase-aligned switch test start");
+
+            var cpuOptions = new NRRDeviceOptions { preferred_backend = "CPU" };
+            using (var cpu = NRRDevice.Create(cpuOptions))
+            {
+                Assert.That(cpu.IsPhaseAlignedAccumulationSupported(), Is.True,
+                    "the CPU backend must expose the phase-aligned accumulator: " +
+                    "nrr_device_get_phase_aligned_accumulation did not succeed on it");
+
+                bool enabled;
+                Assert.That(cpu.TryGetPhaseAlignedAccumulation(out enabled), Is.EqualTo(NRRResult.Success),
+                    "the query must succeed on a backend that has an accumulator");
+                Assert.That(enabled, Is.False, "the integration must be off until a caller asks for it");
+
+                cpu.SetPhaseAlignedAccumulation(true);
+                Assert.That(cpu.TryGetPhaseAlignedAccumulation(out enabled), Is.EqualTo(NRRResult.Success));
+                Assert.That(enabled, Is.True, "an accepted switch must be reported as on");
+
+                cpu.SetPhaseAlignedAccumulation(false);
+                Assert.That(cpu.TryGetPhaseAlignedAccumulation(out enabled), Is.EqualTo(NRRResult.Success));
+                Assert.That(enabled, Is.False, "and off again");
+
+                TestContext.WriteLine("CPU backend: phase-aligned switch accepted and reported");
+            }
+
+            using (var device = NRRDevice.Create())
+            {
+                var backend = device.GetBackendName();
+                bool enabled;
+                var queried = device.TryGetPhaseAlignedAccumulation(out enabled);
+                var supported = device.IsPhaseAlignedAccumulationSupported();
+                if (supported)
+                {
+                    device.SetPhaseAlignedAccumulation(true);
+                    Assert.That(device.TryGetPhaseAlignedAccumulation(out enabled),
+                        Is.EqualTo(NRRResult.Success));
+                    Assert.That(enabled, Is.True,
+                        "backend " + backend + " accepted the switch but does not report it on");
+                    device.SetPhaseAlignedAccumulation(false);
+                }
+                else
+                {
+                    Assert.That(queried, Is.Not.EqualTo(NRRResult.Success),
+                        "a backend with no accumulator must not answer the query successfully");
+                    Assert.That(enabled, Is.False,
+                        "a refused query must not leave the caller reading a state that looks like 'off'");
+                }
+
+                TestContext.WriteLine("backend " + backend + ": phase-aligned supported=" + supported);
+            }
+        }
+
     }
 }
 

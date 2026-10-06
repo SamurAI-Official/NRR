@@ -113,6 +113,46 @@ func _ready() -> void:
 
 	print("reset_temporal_history=%s" % nrr.reset_temporal_history())
 
+	# The phase-aligned switch, end to end through the loaded extension. Asserted as an invariant rather
+	# than as success, because whether this host's backend has an accumulator is not something the driver
+	# can know: the point is that "off" and "cannot" never get confused, and that a setting which is
+	# accepted is one the accumulator actually holds.
+	var off_ok := nrr.set_phase_aligned_accumulation(false)
+	var off_state := nrr.phase_aligned_accumulation()
+	print("phase_aligned_supported=%s state_after_off=%d" % [off_ok, off_state])
+	if off_ok and off_state != 0:
+		_fail("the switch was accepted but the accumulator does not report it off (state %d)" % off_state)
+		return
+	if not off_ok and off_state != -1:
+		_fail("the switch was refused but the accumulator reports state %d instead of -1 (cannot)"
+			% off_state)
+		return
+
+	var on_ok := nrr.set_phase_aligned_accumulation(true)
+	var on_state := nrr.phase_aligned_accumulation()
+	print("phase_aligned_enabled=%s state_after_on=%d" % [on_ok, on_state])
+	if on_ok and on_state != 1:
+		_fail("the switch was accepted but the accumulator does not report it on (state %d)" % on_state)
+		return
+	if not on_ok and on_state != -1:
+		_fail("enabling was refused but the accumulator reports state %d instead of -1 (cannot)"
+			% on_state)
+		return
+
+	# A frame rendered with the switch on must still come back non-passthrough: this binding's frames
+	# carry no jitter, so the runtime declines to integrate them - which is the right answer, and the one
+	# that keeps a mean of identically-phased frames from being reported as antialiasing.
+	if on_ok:
+		var integrated := nrr.render_frame(source)
+		if nrr.last_render_was_passthrough:
+			_fail("the frame after enabling the integration came back as passthrough")
+			return
+		if integrated == null:
+			_fail("the frame after enabling the integration was null")
+			return
+	nrr.set_phase_aligned_accumulation(false)
+	print("phase_aligned_final_state=%d" % nrr.phase_aligned_accumulation())
+
 	nrr.shutdown()
 	print("available_after_shutdown=%s" % nrr.available)
 	print("RESULT: PASS")

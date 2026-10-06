@@ -19,6 +19,7 @@
 #include "test_framework.h"
 #include "nrr.h"
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <set>
@@ -49,6 +50,16 @@ inline bool contains(const std::string& haystack, const std::string& needle) {
 inline void require_contains(const std::string& haystack, const std::string& needle,
                              const std::string& what) {
     NRR_ASSERT(contains(haystack, needle), what + ": missing '" + needle + "'");
+}
+
+/// The same text with carriage returns removed.
+///
+/// Used to compare a binding against the verify project's copy of it: they are the same file in two
+/// places, and a checkout may hand one side CRLF and the other LF, which says nothing about whether the
+/// binding drifted.
+inline std::string without_cr(std::string text) {
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    return text;
 }
 
 /// Value of a `key = "value"` / `key="value"` entry, for the INI descriptors
@@ -250,6 +261,64 @@ NRR_TEST(test_godot_binding_exposes_temporal_history_reset) {
     // The GDScript layer must not swallow it either.
     require_contains(read("engine_plugins/godot/NRR.gd"),
                      "reset_temporal_history", "NRR.gd");
+}
+
+/* The phase-aligned switch, reachable from both engines - and the two Unity copies compared.
+ *
+ * The argument for engine bindings is the one written for the M1.3 reset above: an entry point an engine
+ * cannot call leaves the behaviour unfixable from game code. Here that matters twice over, because the
+ * runtime answers "off" and "this backend cannot integrate" differently and a binding that flattened the
+ * query into a bare bool would turn a refusal into a silent no-op. */
+NRR_TEST(test_engine_bindings_expose_phase_aligned_accumulation) {
+    using namespace plugin_files;
+    const std::string header = read("include/nrr.h");
+    const std::string godot = read("engine_plugins/godot/src/nrr_godot.cpp");
+    const std::string godot_h = read("engine_plugins/godot/src/nrr_godot.h");
+    const std::string gd = read("engine_plugins/godot/NRR.gd");
+    const std::string cs_native = read("engine_plugins/unity/Runtime/Scripts/NRRNative.cs");
+    const std::string cs_device = read("engine_plugins/unity/Runtime/Scripts/NRRDevice.cs");
+
+    require_contains(header, "nrr_device_set_phase_aligned_accumulation",
+                     "include/nrr.h must declare the switch");
+    require_contains(header, "nrr_device_get_phase_aligned_accumulation",
+                     "include/nrr.h must declare the query");
+
+    // Godot: declared in the header, called, bound for ClassDB, and wrapped in GDScript.
+    require_contains(godot_h, "set_phase_aligned_accumulation", "nrr_godot.h must declare the switch");
+    require_contains(godot_h, "get_phase_aligned_accumulation", "nrr_godot.h must declare the query");
+    require_contains(godot, "nrr_device_set_phase_aligned_accumulation",
+                     "the binding must call the switch");
+    require_contains(godot, "nrr_device_get_phase_aligned_accumulation",
+                     "the binding must call the query");
+    require_contains(godot, "D_METHOD(\"set_phase_aligned_accumulation\"",
+                     "ClassDB must bind the switch, or GDScript cannot call it");
+    require_contains(godot, "D_METHOD(\"get_phase_aligned_accumulation\"",
+                     "ClassDB must bind the query");
+    require_contains(gd, "func set_phase_aligned_accumulation", "NRR.gd must wrap the switch");
+    require_contains(gd, "func phase_aligned_accumulation", "NRR.gd must wrap the query");
+
+    // Unity: the raw declarations, the managed wrappers, and the query that keeps the two answers apart.
+    require_contains(cs_native, "nrr_device_set_phase_aligned_accumulation",
+                     "NRRNative must declare the switch");
+    require_contains(cs_native, "nrr_device_get_phase_aligned_accumulation",
+                     "NRRNative must declare the query");
+    require_contains(cs_device, "SetPhaseAlignedAccumulation", "NRRDevice must wrap the switch");
+    require_contains(cs_device, "TryGetPhaseAlignedAccumulation",
+                     "NRRDevice must expose the result code, not only a bool - \"off\" and \"cannot\" "
+                     "are different answers");
+
+    // The verify project consumes a COPY of the bindings, so the copy is compared rather than trusted: a
+    // binding that is exercised there but stale here (or the reverse) is the failure this catches.
+    for (const char* name : {"NRRNative.cs", "NRRDevice.cs"}) {
+        const std::string plugin = read(std::string("engine_plugins/unity/Runtime/Scripts/") + name);
+        const std::string mirror =
+            read(std::string("engine_plugins/unity_verify/Assets/NRR/Scripts/") + name);
+        NRR_ASSERT(without_cr(plugin) == without_cr(mirror),
+                   std::string("the Unity binding and the verify project's copy of it must match: ") +
+                   name);
+    }
+
+    std::cout << "  phase-aligned switch exposed by the Godot binding and the Unity binding" << std::endl;
 }
 
 NRR_TEST(test_godot_post_process_is_renderer_agnostic) {
