@@ -56,6 +56,12 @@ public:
     /* Discards the backend's accumulated temporal history (scene changes, camera
      * cuts). */
     NRRResult reset_temporal_history();
+    /* Turns the phase-aligned integration of distinct sub-pixel samples on or off; see the C API note in
+     * include/nrr.h for what the caller owns. Forwarded to the backend, and a backend that cannot
+     * integrate reports NRR_ERROR_STATE_INVALID rather than accepting a setting it will not honour. */
+    NRRResult set_phase_aligned_accumulation(bool enabled);
+    /* Whether the accumulator that will run this device's frames has it on. */
+    NRRResult phase_aligned_accumulation(bool* out_enabled);
     bool is_initialized() const { return initialized_; }
 
 private:

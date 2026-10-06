@@ -100,27 +100,38 @@ bool upsample_bilinear_nchw(const std::vector<float>& in_nchw, int channels,
  * samples fell on *different* sub-pixel positions, so leaving them there and
  * averaging integrates a denser sampling of the scene than any one frame holds.
  *
- * Measured on the probe's zone plate at 8 samples (tools/aa_samples_probe.py --scene zoneplate):
- * edge error falls 33.4% for phase-aligned integration, against 26.0% for de-jitter-then-average
- * and 0% for a single sample - and only 22.3% if the placement sign is mirrored, which is how the
- * measured convention shows up a second time here. On the real capture the same integration gains
- * nothing (edge-weighted +0.3% with the correct sign, +5.9% mirrored): that capture carries camera
- * motion (mean |motion| 0.109) and only one or two distinct phases, so it can demonstrate the sign
- * but not the prize. That is a property of the capture, not of this code.
+ * Measured on the probe's point-sampled zone plate at 8 samples (tools/aa_samples_probe.py --scene
+ * zoneplate): edge error falls 33.4% against 26.0% for de-jitter-then-average and 0% for a single
+ * sample. On the real static capture's frames the same integration is worth far less - 3.0% of edge
+ * error and 15.1% of plain error at 8 samples (tools/aa_resolve_probe.py) - because a Godot raster
+ * filters its textures, so much of that content has no aliasing left to resolve. The plate is the
+ * bound; the captured frames are the reminder that a renderer's filtering is part of the question.
  *
- * Placement follows the same measured convention as dejitter_nchw(): a frame
- * recorded at offset j satisfies input(x) = scene(x - j), so its pixel p holds the
- * scene at p + j frame pixels, i.e. at (p + j) * scale in output pixels, while
- * upsampling the frame puts that sample at p * scale. It therefore has to be read
- * back at X - j * scale to land where it was taken. Reading at X + j * scale
- * instead - the direction this codebase used before the sign was measured -
- * scatters the samples to the wrong places, and the average then blurs edges
- * rather than resolving them.
+ * Placement has to be the de-jitter's own direction, and it is the same convention for the same
+ * reason: a frame recorded at offset j satisfies input(p) = scene(p - j), so pixel p of the frame
+ * holds the scene at p - j and that sample belongs j * scale *earlier* in the output grid than the
+ * upsample put it - both read back at X + j * scale. At scale 1 that makes this class exactly
+ * dejitter_nchw(), which is the invariant the native-resolution test pins; reading at X - j * scale
+ * moves every sample twice as far from where it was taken, which is the defect the de-jitter was
+ * flipped to fix.
+ *
+ * That direction is measured rather than inferred, and it is worth saying which measurement, because
+ * the obvious surrogate gets it backwards: a frame *simulated* by bilinearly sub-sampling a
+ * high-resolution image on a grid displaced by +j (aa_samples_probe.py's sample_scene, and the frame
+ * builders in tools/regen_aa_fixture.py) is the mirror of the real capture, so it confirms the wrong
+ * sign and looks right doing it. On the real frames - measured against their own un-jittered targets,
+ * which are byte-identical frame to frame, so the scene is provably still - the +j * scale direction
+ * improves a single placed frame by 0.4% of edge error where the mirror degrades it by 1.6%, and at
+ * 8 samples the two are -3.0% and -0.6%: the same sign, measured from the other side, as the model
+ * argument in tools/aa_resolve_probe.py (a model that declares a `jitter` input has already spent the
+ * phase, so its output is best left unplaced, where a model without one is best placed).
  *
  * Only frames of one scene may be accumulated: this integrates samples, it does
  * not reproject them, so a moving camera or object has to be excluded by the
- * caller (or reprojected first) or the average blurs the motion. Deciding that is
- * what the probe's motion check is for.
+ * caller (or reprojected first) or the average blurs the motion. That gate is the
+ * caller's policy, and the probe measures what it should be: on the static
+ * capture's frames the edge error's gain is gone by 0.2 px of scene motion per
+ * frame and the plain error's by 0.5, against a jitter whose steps are up to 0.5 px.
  *
  * Memory: the resolved frame plus one scratch frame at the output resolution
  * (~25 MB at 1920x1080 RGB). An instance is not thread-safe; give each thread its

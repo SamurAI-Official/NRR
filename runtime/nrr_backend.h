@@ -59,6 +59,22 @@ public:
      * keep this default and report NRR_ERROR_NOT_SUPPORTED. */
     virtual NRRResult reset_temporal_history() { return NRR_ERROR_NOT_SUPPORTED; }
 
+    /* Turns the phase-aligned integration of distinct sub-pixel samples on or off.
+     *
+     * Implemented once, here, rather than once per vendor backend: every accelerator backend renders its
+     * frames through the shared AcceleratorExecutionKernel, which owns the accumulator (defined in
+     * accel_kernel.cpp, because the kernel's own header includes this one). The alternative - each
+     * backend forwarding by hand - is the arrangement that let the accelerator path silently render
+     * without any temporal history at all until TemporalAccumulator was shared, and six backends each
+     * re-deriving the same three lines is how that happens again.
+     *
+     * Reports NRR_ERROR_STATE_INVALID when there is no accelerator kernel running: a backend that cannot
+     * accumulate must say so rather than accept a setting it will never honour. BackendCPU has its own
+     * accumulator and overrides both. */
+    virtual NRRResult set_phase_aligned_accumulation(bool enabled);
+    /* True only when the accumulator that will actually run the frames has it on. */
+    virtual bool is_phase_aligned_enabled() const;
+
     /* Re-reads state that is only knowable once work has actually run - most
      * importantly the ONNX Runtime execution provider that ended up attached to
      * a loaded model's session - and folds it into get_capabilities().

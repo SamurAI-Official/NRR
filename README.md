@@ -55,7 +55,7 @@ nrr/
 │   └── reference_conditioning.md
 │
 ├── include/
-│   └── nrr.h                   # Phase 1: public C API (44 entry points)
+│   └── nrr.h                   # Phase 1: public C API (47 entry points)
 │
 ├── runtime/                    # Phase 1: C++ runtime
 │   ├── nrr_runtime.h
@@ -511,7 +511,7 @@ otherwise, and CI (no GPU runner) is in that group.
 | **Shogunet** | Nothing. | `G:\Program Prototype\Shogunet` is an empty directory - there is no code to integrate with. NRR's transport-agnostic contract (`NRRFrameDescriptor` / `NRRRenderResult` as structured payloads) is what a Shogunet binding would carry; it does not exist yet. |
 
 The integration surface that matters in both directions is the export table: `include/nrr.h`
-declares 44 entry points (`NRR_ENTRY_POINT_COUNT`), `test_api_entry_point_count` asserts the
+declares 47 entry points (`NRR_ENTRY_POINT_COUNT`), `test_api_entry_point_count` asserts the
 linked library exports all of them, and the Godot GDExtension binding is checked against the
 same header by `test_godot_binding_references_only_declared_c_api_entry_points`. Godot
 itself reported `entry_point_count=44`, so the cross-language count agrees with the C ABI.

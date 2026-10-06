@@ -233,6 +233,10 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
      * actually running the project's own models, they were returning the input
      * image. That went unnoticed while no accelerator backend was reachable. */
     bool zero_filled_optional = false;
+    /* Whether the model declares a `jitter` input. It decides the phase-aligned offset the same way it
+     * does on the CPU path - see phase_aligned_frame_for() - and it is tracked here for the same reason
+     * the CPU backend tracks it: a sequence must not accumulate differently per backend. */
+    bool model_uses_jitter = false;
     auto build_inputs = [&](ONNXRuntime* rt, std::vector<TensorInput>& tins) -> bool {
         tins.clear();
         const int count = rt->get_input_count();
@@ -245,8 +249,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                 role != TensorRole::Motion) {
                 role = TensorRole::Color; /* generic single-input models */
             }
+            /* Jitter is two channels, as it is on the CPU path. Without its own case here it fell
+             * through to three, so a jitter-aware model's offset tensor was declared at the wrong
+             * channel count and the plane built below was the only thing shaped correctly - a mismatch
+             * that the CPU path does not have and that no accelerator test covered. */
             const int channels = (role == TensorRole::Depth) ? 1
-                               : (role == TensorRole::Motion) ? 2 : 3;
+                               : (role == TensorRole::Motion) ? 2
+                               : (role == TensorRole::Jitter) ? 2 : 3;
             TextureImpl* src = (role == TensorRole::Depth) ? depth_tex
                              : (role == TensorRole::Motion) ? motion_tex
                              : (role == TensorRole::History) ? history_tex
@@ -268,6 +277,7 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                  * in, not an attachment. Without this case it fell through to the
                  * colour path and a two-channel offset tensor was filled with the
                  * colour image - a silent corruption that renders and looks fine. */
+                model_uses_jitter = true;
                 const JitterOffset offset = input.temporal.jitter.enabled
                     ? JitterOffset(input.temporal.jitter.offset_x, input.temporal.jitter.offset_y)
                     : JitterOffset();
@@ -376,8 +386,9 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         return field;
     };
 
-    const TemporalAccumulator::Result temporal =
-        temporal_.apply(input, rgb8, out_w, out_h, motion_source);
+    const TemporalAccumulator::Result temporal = temporal_.apply(
+        input, rgb8, out_w, out_h, motion_source,
+        phase_aligned_frame_for(input, model_uses_jitter, w, h, out_w, out_h));
 
     /* ---- 6. Publish the output texture ---------------------------------- */
     TextureImpl* out_tex = nullptr;
@@ -435,6 +446,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                       static_cast<double>(temporal.displayed_delta),
                       zero_filled_optional ? " [zero-filled optional inputs]" : "");
         std::string info(debug);
+        if (temporal.phase_note[0] != '\0') {
+            char phase[96];
+            std::snprintf(phase, sizeof(phase), " [%s, %u frame%s]", temporal.phase_note,
+                          temporal.phase_aligned_frames,
+                          temporal.phase_aligned_frames == 1 ? "" : "s");
+            info += phase;
+        }
         info += quality_debug_note(quality);
         copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), info);
     }
@@ -455,6 +473,39 @@ void AcceleratorExecutionKernel::reset_temporal_history() {
      * the next frame starts a new sequence instead of being judged a continuation
      * of the discarded one. */
     temporal_.reset();
+}
+
+/* The Backend defaults for the phase-aligned switch.
+ *
+ * Defined here rather than in nrr_backend.h because they need TemporalAccumulator's definition, and the
+ * kernel's own header includes the backend interface rather than the other way round. Every accelerator
+ * vendor backend therefore inherits them and forwards nothing - the arrangement that stops the next
+ * vendor backend from silently rendering without the feature, which is what had already happened to the
+ * temporal history itself. */
+NRRResult Backend::set_phase_aligned_accumulation(bool enabled) {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) {
+        /* No accumulator to switch: say so instead of accepting a setting nothing will honour. The
+         * mobile backends take this path (they render through mobile_kernel), as does any accelerator
+         * backend before its kernel is initialized. */
+        return NRR_ERROR_STATE_INVALID;
+    }
+    kernel->set_phase_aligned_accumulation(enabled);
+    return NRR_SUCCESS;
+}
+
+bool Backend::is_phase_aligned_enabled() const {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) return false;
+    return kernel->is_phase_aligned_enabled();
+}
+
+void AcceleratorExecutionKernel::set_phase_aligned_accumulation(bool enabled) {
+    temporal_.set_phase_aligned_enabled(enabled);
+}
+
+bool AcceleratorExecutionKernel::is_phase_aligned_enabled() const {
+    return temporal_.is_phase_aligned_enabled();
 }
 
 void AcceleratorExecutionKernel::set_memory_limit(size_t bytes) {

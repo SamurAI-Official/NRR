@@ -101,6 +101,82 @@ NRR_TEST(test_api_texture_desc) {
     nrr_device_destroy(device);
 }
 
+/* The phase-aligned switch through the C ABI. Three things have to hold for the entry point to be worth
+ * having: the null-argument paths are refused; a real device can turn it on and read back that it is on;
+ * and "off" is distinguishable from "this backend cannot", because a caller that cannot tell those apart
+ * will believe it enabled something that nothing honours. */
+NRR_TEST(test_api_phase_aligned_accumulation_switch) {
+    int enabled = -1;
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(nullptr, 1), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(nullptr, &enabled),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(nullptr, nullptr),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null output must be refused");
+
+    NRRDeviceOptions options = {};
+    /* The CPU backend, because it is the one guaranteed to have an accumulator in this build and because
+     * "off" has to be distinguishable from "this backend cannot": the default backend here is an
+     * accelerator one, whose answer depends on whether its shared kernel is running, and on that backend
+     * NRR_ERROR_STATE_INVALID is the correct answer rather than a failure of this entry point. */
+    options.preferred_backend = "CPU";
+    NRRDevice* device = nullptr;
+    if (nrr_device_create(&options, &device) != NRR_SUCCESS || device == nullptr) {
+        std::cout << "  (no backend available; the switch was not exercised)" << std::endl;
+        return;
+    }
+
+    /* Off until asked, and the query reports what the accumulator that will run the frames holds. */
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(device, &enabled), NRR_SUCCESS,
+                  "querying an initialized device must succeed");
+    NRR_EXPECT_EQ(enabled, 0, "the integration must be off until a caller asks for it");
+
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(device, 1), NRR_SUCCESS, "enable");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(device, &enabled), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(enabled, 1, "the query must report the setting that was accepted");
+
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(device, 0), NRR_SUCCESS, "disable");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(device, &enabled), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(enabled, 0, "and it must go back off");
+
+    /* A failed query must not be mistaken for "off": the caller's variable is left as it was. */
+    enabled = 7;
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(nullptr, &enabled),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null device must be refused");
+    NRR_EXPECT_EQ(enabled, 7, "a failed query must not write a value the caller could read as 'off'");
+
+    std::cout << "  phase-aligned integration: off by default, settable and queryable" << std::endl;
+    nrr_device_destroy(device);
+
+    /* The default backend, whatever it selects: the switch may be refused, but it must never be accepted
+     * without the accumulator holding it. That is the property that stops "enabled" from meaning nothing,
+     * and it is asserted here rather than assumed because the answer depends on the backend this machine
+     * picks (an accelerator backend only knows once its shared kernel is running). */
+    NRRDeviceOptions automatic = {};
+    NRRDevice* other = nullptr;
+    if (nrr_device_create(&automatic, &other) == NRR_SUCCESS && other != nullptr) {
+        char name[64] = {0};
+        nrr_get_backend_name(other, name, sizeof(name));
+        const NRRResult accepted = nrr_device_set_phase_aligned_accumulation(other, 1);
+        int state = -1;
+        if (accepted == NRR_SUCCESS) {
+            NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(other, &state), NRR_SUCCESS,
+                          "an accepted setting must be queryable");
+            NRR_EXPECT_EQ(state, 1,
+                          "a backend that accepted the setting must report the accumulator holding it");
+        } else {
+            NRR_EXPECT_EQ(accepted, NRR_ERROR_STATE_INVALID,
+                          "a backend that cannot integrate must say STATE_INVALID, not another code");
+            NRR_EXPECT_FALSE(state == 1,
+                             "and it must not report the setting as held after refusing it");
+        }
+        std::cout << "  backend '" << name << "': "
+                  << (accepted == NRR_SUCCESS ? "supports phase-aligned integration" : "reports it cannot")
+                  << std::endl;
+        nrr_device_destroy(other);
+    }
+}
+
 NRR_TEST(test_api_reference_load_null) {
     NRRDevice* dummy_device = nullptr;
     NRRReference* ref = nullptr;

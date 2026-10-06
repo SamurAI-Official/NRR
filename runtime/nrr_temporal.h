@@ -29,6 +29,23 @@ constexpr float TEMPORAL_MOTION_THRESHOLD = 0.3f; /* motion magnitude above whic
  * full [0,1] range, that is reported as zero stability (100 = frame unchanged). */
 constexpr float TEMPORAL_STABILITY_FULL_DELTA = 0.25f;
 
+/* How much scene motion the phase-aligned accumulation tolerates, in *frame-grid pixels per frame*.
+ *
+ * This is a different question from TEMPORAL_MOTION_THRESHOLD above, and a much stricter one: the
+ * reprojection blend can follow motion, so it only has to know when to give up, whereas an integration
+ * of distinct sub-pixel samples is only valid while the scene has not moved. Measured on the static
+ * capture's frames by translating them a known amount per frame while the placement still uses the
+ * recorded jitter (tools/aa_resolve_probe.py): the edge error's gain is gone by 0.2 px/frame
+ * (-3.0% at 0.0, -1.1% at 0.1, +0.5% at 0.2) and the plain error's by about 0.5. 0.2 is therefore the
+ * point past which the AA claim itself does not hold, against jitter steps of up to 0.5 px.
+ *
+ * It is compared in pixels, so a caller's motion has to be a real measurement: on the capture this was
+ * validated against, the motion *field* reads mean |motion| 0.10998 on every frame - byte-identical
+ * across a scene whose un-jittered targets are identical, i.e. a decode constant and not motion - and
+ * against that field any gate below 1.0 would refuse every frame, which is the safe direction to fail
+ * but not a working feature. See the note on apply(). */
+constexpr float PHASE_ALIGNED_MOTION_GATE_PX = 0.2f;
+
 /* Converts a measured frame-to-frame change into that convention. Shared, so the
  * CPU path and the accelerator path cannot drift into reporting the same number
  * with different meanings. */
@@ -298,16 +315,45 @@ public:
     };
     using MotionProvider = std::function<MotionImage()>;
 
+    /* What the frame handed to apply() knows about its own sub-pixel phase.
+     *
+     * The integration the accumulator performs needs two facts the accumulator cannot derive from the
+     * image: whether this frame belongs to a sequence that jitters at all, and how far the frame's
+     * *content* sits from the grid it is displayed on. Both come from the caller, because the answer
+     * depends on what produced the frame:
+     *
+     *   - a model that declares a `jitter` input has already spent the phase - its de-jitter stage
+     *     corrected the frame onto the nominal grid - so its output belongs at offset zero, and
+     *     integrating several of them is a mean (measured -18.0% edge error at 8 frames on the static
+     *     capture);
+     *   - a model that cannot know its own sampling grid reproduces the displacement in its output, so
+     *     the offset is the renderer's jitter scaled into output pixels, and placing the frames before
+     *     averaging is what recovers the samples (measured -27.8% edge error at 4 frames).
+     *
+     * Measured in tools/aa_resolve_probe.py, which asks both questions of every model it is given.
+     * `eligible` is the caller's statement that this frame may be integrated with its neighbours at all
+     * - a jittered sequence, not a frame from a different scene or a different viewport. */
+    struct PhaseAlignedFrame {
+        bool eligible = false;
+        float offset_x = 0.0f;  /* the content displacement, in OUTPUT pixels */
+        float offset_y = 0.0f;
+    };
+
     /* Measured outcome of one frame's temporal pass. */
     struct Result {
         NRRTemporalState state;         /* measured, never an echo of the input */
         float displayed_delta = 0.0f;   /* frame-to-frame change of what was displayed */
         bool blended = false;
         TemporalBlendStats blend_stats;
+        /* Frames in the phase-aligned accumulation after this frame, and what happened to it. */
+        uint32_t phase_aligned_frames = 0;
         /* Why the blend did or did not happen: "no previous frame",
          * "accumulated", "no motion field to reproject with", or
          * "alpha=0 (motion above threshold)".*/
         const char* note = "no previous frame";
+        /* The phase-aligned pass's own reason, empty when it did not run: "phase-aligned 4 samples",
+         * "phase-aligned reset (scene moved ...)", "phase-aligned off (not jittered)". */
+        const char* phase_note = "";
     };
 
     /* Applies temporal accumulation to a frame that has already been rendered.
@@ -320,11 +366,26 @@ public:
      *
      * A scene change (frame index not advancing past the last one recorded, or a
      * change of resolution) discards the history first, so a caller that forgets to
-     * announce a camera cut cannot ghost. */
+     * announce a camera cut cannot ghost. The phase-aligned accumulation is discarded
+     * with it: its frames have to be frames of one scene.
+     *
+     * `phase` is what the caller knows about the frame's sub-pixel phase; see
+     * PhaseAlignedFrame. Opt-in (set_phase_aligned_enabled), and off by default, so a caller that does
+     * not ask for it sees exactly the behaviour it saw before. When it is on and the frame is eligible,
+     * the *displayed* frame is the mean of the frames accumulated so far, so `rgb8` is rewritten with
+     * the resolve - which is what the caller uploads. */
     Result apply(const NRRFrameInput& input,
                  std::vector<uint8_t>& rgb8,
                  uint32_t width, uint32_t height,
-                 const MotionProvider& motion);
+                 const MotionProvider& motion,
+                 const PhaseAlignedFrame& phase = PhaseAlignedFrame());
+
+    /* Turns the phase-aligned integration on or off for this sequence. Off is the default and changes
+     * nothing: the pass costs a placement and a mean per frame, and it rewrites the displayed frame. */
+    void set_phase_aligned_enabled(bool enabled) { phase_aligned_enabled_ = enabled; }
+    bool is_phase_aligned_enabled() const { return phase_aligned_enabled_; }
+    /* Frames in the current accumulation, 0 when nothing is being integrated. */
+    uint32_t phase_aligned_frames() const { return phase_aligned_.frame_count(); }
 
     uint32_t history_frames() const { return history_.get_frame_count(); }
     bool has_history() const { return seen_frame_; }
@@ -361,6 +422,14 @@ private:
     TemporalStateManager state_;
     TemporalRenderer renderer_;
 
+    /* The integration of distinct sub-pixel samples, opt-in and gated by the scene's stillness
+     * (PHASE_ALIGNED_MOTION_GATE_PX). Separate from the reprojection history above because it answers a
+     * different question: that one follows motion, this one requires the absence of it. */
+    PhaseAlignedAccumulator phase_aligned_;
+    bool phase_aligned_enabled_ = false;
+    /* Scratch for the RGB8 -> planar float conversion the accumulator takes, reused per frame. */
+    std::vector<float> phase_frame_;
+
     /* Last frame rendered, for automatic scene-change detection. */
     bool seen_frame_;
     uint64_t last_frame_index_;
@@ -373,6 +442,39 @@ private:
     uint32_t previous_input_height_;
     NRRTextureFormat previous_input_format_;
 };
+
+/* What a rendered frame's phase-aligned pass may use, derived from the frame and the model's input set.
+ *
+ * One definition, because the CPU backend and the accelerator kernel have to derive it identically: a
+ * sequence must not accumulate differently depending on which one rendered it, and the *only* thing
+ * that decides the offset is whether the model corrects its own sampling grid - which both paths know
+ * from the same place, the roles they classify the model's inputs into.
+ *
+ * `model_uses_jitter` true (the model declares a `jitter` input): its de-jitter stage already put the
+ * frame onto the nominal grid, so the output's content is where the scene is and the offset is zero.
+ * Placing it would reintroduce the displacement the model just removed. False: the model cannot know
+ * its sampling grid, so it reproduces the renderer's displacement and the offset is the jitter scaled
+ * from the input grid into the output grid.
+ *
+ * `eligible` is false for an un-jittered sequence (jitter.enabled == 0): with no distinct phases there
+ * is nothing to integrate, and the identity offset would quietly turn the pass into a plain mean.
+ *
+ * Measured both ways on the static capture in tools/aa_resolve_probe.py: -27.8% edge error at 4 frames
+ * for the placed arrangement, -18.0% at 8 for the unplaced one. */
+inline TemporalAccumulator::PhaseAlignedFrame phase_aligned_frame_for(
+    const NRRFrameInput& input, bool model_uses_jitter,
+    uint32_t in_width, uint32_t in_height, uint32_t out_width, uint32_t out_height) {
+    TemporalAccumulator::PhaseAlignedFrame frame;
+    if (!input.temporal.jitter.enabled) return frame;
+    frame.eligible = true;
+    if (!model_uses_jitter && in_width > 0 && in_height > 0) {
+        frame.offset_x = input.temporal.jitter.offset_x
+                       * (static_cast<float>(out_width) / static_cast<float>(in_width));
+        frame.offset_y = input.temporal.jitter.offset_y
+                       * (static_cast<float>(out_height) / static_cast<float>(in_height));
+    }
+    return frame;
+}
 
 } // namespace nrr
 

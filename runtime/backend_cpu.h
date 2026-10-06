@@ -62,6 +62,16 @@ public:
      * detected (see temporal_scene_changed()). */
     NRRResult reset_temporal_history() override;
 
+    /* Enables the integration of distinct sub-pixel samples (see nrr_temporal.h).
+     *
+     * Overridden because this backend accumulates in its OWN TemporalAccumulator rather than the shared
+     * kernel's, and because on the test route - where frames are executed by the kernel - the setting has
+     * to reach that accumulator too, exactly as reset_temporal_history() has to. Reporting success on the
+     * accumulator that is not accumulating is the defect the vendor backends' forwarding exists to
+     * prevent. */
+    NRRResult set_phase_aligned_accumulation(bool enabled) override;
+    bool is_phase_aligned_enabled() const override;
+
     /* Folds the execution provider the loaded model's ONNX session ACTUALLY
      * attached into the capability block (see nrr_backend.h for the contract).
      * Nothing is claimed before a session exists: the provider is not chosen

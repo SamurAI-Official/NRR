@@ -447,6 +447,11 @@ NRRResult BackendCPU::execute_model(
     std::vector<TensorInput> tensors;
     tensors.reserve(static_cast<size_t>(ort->get_input_count()));
     bool optional_zero_filled = false;
+    /* Whether the model declares a `jitter` input, i.e. whether it corrects the frame's sampling grid
+     * itself. It is the difference between the two phase-aligned arrangements: a model that de-jitters
+     * has spent the phase in its output (integrate at offset zero), and one that does not reproduces the
+     * displacement (integrate at the jitter, in output pixels). See PhaseAlignedFrame. */
+    bool model_uses_jitter = false;
 
     for (int i = 0; i < ort->get_input_count(); ++i) {
         const char* name = ort->get_input_name(i);
@@ -472,6 +477,7 @@ NRRResult BackendCPU::execute_model(
          * converted. Handled before the texture lookup because there is no texture:
          * `jitter` names a plane the caller filled in, not an attachment it supplied. */
         if (role == TensorRole::Jitter) {
+            model_uses_jitter = true;
             std::vector<int64_t> shape;
             if (!concrete_input_shape(ort->get_input_shape(i), channels, in_w, in_h, shape)) {
                 set_last_error(NRR_ERROR_RENDER_FAILED,
@@ -592,8 +598,9 @@ NRRResult BackendCPU::execute_model(
         return field;
     };
 
-    const TemporalAccumulator::Result temporal =
-        temporal_.apply(input, out_bytes, out_w, out_h, motion_source);
+    const TemporalAccumulator::Result temporal = temporal_.apply(
+        input, out_bytes, out_w, out_h, motion_source,
+        phase_aligned_frame_for(input, model_uses_jitter, in_w, in_h, out_w, out_h));
 
     /* Record this frame's low-resolution input so the *next* frame can bind it as the
      * model's history. Recorded after inference, when the input pixels are final, and
@@ -673,6 +680,13 @@ NRRResult BackendCPU::execute_model(
                           static_cast<double>(blend_stats.mean_abs_delta));
             info += gain;
         }
+        if (temporal.phase_note[0] != '\0') {
+            char phase[96];
+            std::snprintf(phase, sizeof(phase), " [%s, %u frame%s]", temporal.phase_note,
+                          temporal.phase_aligned_frames,
+                          temporal.phase_aligned_frames == 1 ? "" : "s");
+            info += phase;
+        }
         info += quality_debug_note(quality);
         copy_string(output.stats.debug_info,
                     sizeof(output.stats.debug_info), info);
@@ -722,6 +736,29 @@ NRRResult BackendCPU::reset_temporal_history() {
         if (kernel != nullptr) kernel->reset_temporal_history();
     }
     return NRR_SUCCESS;
+}
+
+NRRResult BackendCPU::set_phase_aligned_accumulation(bool enabled) {
+    if (!initialized_) {
+        return NRR_ERROR_STATE_INVALID;
+    }
+    temporal_.set_phase_aligned_enabled(enabled);
+    /* Same reason as the reset above: on the test route this backend's own accumulator is not the one
+     * that sees the frames, so a caller that enabled the feature would otherwise get a success and no
+     * integration - the silent-loss failure mode, one level down. */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) kernel->set_phase_aligned_accumulation(enabled);
+    }
+    return NRR_SUCCESS;
+}
+
+bool BackendCPU::is_phase_aligned_enabled() const {
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) return kernel->is_phase_aligned_enabled();
+    }
+    return temporal_.is_phase_aligned_enabled();
 }
 
 // ============================================================================

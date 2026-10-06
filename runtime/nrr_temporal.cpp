@@ -604,6 +604,10 @@ void TemporalAccumulator::reset() {
     state_.reset();
     /* Parity with the pre-accumulator BackendCPU path, which reset all three. */
     renderer_.reset();
+    /* The accumulated samples are frames of a scene that is no longer on screen, so they go too: an
+     * integration continued across a cut would average the old scene into the new one, which is the
+     * ghosting this class exists to prevent, in the one pass that cannot reproject its way out. */
+    phase_aligned_.reset();
     seen_frame_ = false;
     last_frame_index_ = 0;
     last_width_ = 0;
@@ -619,7 +623,8 @@ void TemporalAccumulator::reset() {
 
 TemporalAccumulator::Result TemporalAccumulator::apply(
     const NRRFrameInput& input, std::vector<uint8_t>& rgb8,
-    uint32_t width, uint32_t height, const MotionProvider& motion) {
+    uint32_t width, uint32_t height, const MotionProvider& motion,
+    const PhaseAlignedFrame& phase) {
 
     Result result;
 
@@ -634,6 +639,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                                width, height)) {
         history_.clear();
         state_.reset();
+        phase_aligned_.reset();
         seen_frame_ = false;
         /* The stored low-resolution input render is discarded with the accumulated
          * output. It is read during tensor binding, which happens before this point,
@@ -692,6 +698,59 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
 
     if (result.blended) {
         interleaved_float_to_rgb8(displayed, rgb8);
+    }
+
+    /* ---- Phase-aligned integration (opt-in) -------------------------------- *
+     * The frame the blend just produced is the one being displayed, and it is the one whose sub-pixel
+     * phase the caller declared: integrating *that* is what turns a model that cannot know its own
+     * sampling grid into an antialiased sequence (measured -27.8% edge error at 4 frames), and a model
+     * that can into a mean of its own reconstructions (-18.0% at 8). Both numbers, and the reason the
+     * two cases need different offsets, are in tools/aa_resolve_probe.py.
+     *
+     * The pass is deliberately after the blend and not instead of it: the blend is the reprojection
+     * history, which is what handles motion, and this is the integration, which requires its absence.
+     * Both write the displayed frame, in that order, so the caller uploads one image either way. */
+    if (phase_aligned_enabled_) {
+        const float motion_px = result.state.motion_magnitude * static_cast<float>(width);
+        if (!phase.eligible) {
+            /* No distinct phases to integrate: either the renderer does not jitter, or the frame's
+             * phase has already been spent - a model with a `jitter` input de-jitters internally, and
+             * placing its output again would move it away from where it belongs rather than toward
+             * it. Starting from nothing is the honest answer; the note says which. */
+            phase_aligned_.reset();
+            result.phase_note = "phase-aligned off (frame carries no phase)";
+        } else if (motion_px > PHASE_ALIGNED_MOTION_GATE_PX) {
+            /* The scene moved further than the samples can absorb, so what has been accumulated belongs
+             * to an earlier view of it. Dropped rather than kept: a mean of before and after ghosts,
+             * which is worse than not integrating at all - and the reprojection blend above has already
+             * handled this frame the way it handles motion. */
+            phase_aligned_.reset();
+            result.phase_note = "phase-aligned reset (scene moved)";
+        } else {
+            const size_t plane = static_cast<size_t>(width) * height;
+            phase_frame_.assign(plane * 3u, 0.0f);
+            for (size_t i = 0; i < plane; ++i) {
+                phase_frame_[i] = displayed[i * 3u];
+                phase_frame_[plane + i] = displayed[i * 3u + 1u];
+                phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
+            }
+            /* Output grid == frame grid, so the placement's scale is 1 and the offset is already in
+             * output pixels: this is the case the native-resolution test pins as exactly the de-jitter. */
+            if (phase_aligned_.add_frame(phase_frame_, 3, width, height, width, height,
+                                         JitterOffset(phase.offset_x, phase.offset_y))) {
+                std::vector<float> resolved;
+                if (phase_aligned_.resolve(resolved)) {
+                    for (size_t i = 0; i < plane; ++i) {
+                        displayed[i * 3u] = resolved[i];
+                        displayed[i * 3u + 1u] = resolved[plane + i];
+                        displayed[i * 3u + 2u] = resolved[plane * 2u + i];
+                    }
+                    interleaved_float_to_rgb8(displayed, rgb8);
+                    result.phase_note = "phase-aligned";
+                }
+            }
+        }
+        result.phase_aligned_frames = phase_aligned_.frame_count();
     }
 
     /* Frame-to-frame change of what is actually displayed, measured against the

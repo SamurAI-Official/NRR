@@ -55,7 +55,7 @@ typedef struct NRRBuffer NRRBuffer;
 /* Number of public C entry points exported by the library. Used by the
  * implementation-testing hook nrr_test_entry_point_count(). Keep in sync
  * with the exported function table in nrr_c_api.cpp. */
-#define NRR_ENTRY_POINT_COUNT 45
+#define NRR_ENTRY_POINT_COUNT 47
 
 /* ============================================================================
  * Result Codes
@@ -393,6 +393,36 @@ NRR_API NRRResult nrr_device_wait_idle(NRRDevice* device);
  * Returns NRR_ERROR_INVALID_ARGUMENT for a NULL device and
  * NRR_ERROR_STATE_INVALID when the device is not initialized. */
 NRR_API NRRResult nrr_device_reset_temporal_history(NRRDevice* device);
+
+/* Turns the integration of distinct sub-pixel samples across frames on or off (opt-in; off by default,
+ * and off changes nothing).
+ *
+ * A renderer that jitters its sampling grid already gives the runtime frames whose samples fell on
+ * different sub-pixel positions, and integrating them reconstructs the scene more densely than any one
+ * frame holds - which no single-frame upscale can, because the samples are not on its grid. The runtime
+ * places each frame's samples where they were taken (the same measured convention the jitter correction
+ * uses), averages them, and displays the result in place of the frame the model produced.
+ *
+ * Two things the caller owns, because the runtime cannot know them:
+ *   - the frame's sub-pixel offset, which travels in NRRFrameInput::temporal.jitter (an un-jittered
+ *     sequence is reported as not integrable, and the pass does nothing);
+ *   - that the frames belong to one still scene. The runtime gates at 0.2 px of per-frame scene motion
+ *     (PHASE_ALIGNED_MOTION_GATE_PX, measured), and resets the accumulation when a frame exceeds it -
+ *     averaging across a move ghosts rather than antialiases. The gate is fed by
+ *     NRRFrameInput::temporal.motion_magnitude, which must therefore be a real measurement: a capture
+ *     whose motion field is constant reads 0.10998 on scenes that do not move, and against that any
+ *     gate refuses every frame. Failing closed is the safe direction, and the reason is reported in
+ *     NRRRenderStats::debug_info either way.
+ *
+ * Returns NRR_ERROR_INVALID_ARGUMENT for a NULL device and NRR_ERROR_STATE_INVALID for a device that is
+ * not initialized or whose backend cannot integrate (nothing is enabled in that case, and the caller is
+ * told rather than silently given an off switch). */
+NRR_API NRRResult nrr_device_set_phase_aligned_accumulation(NRRDevice* device, int enabled);
+
+/* Reports whether the accumulator that will run this device's frames has the integration on: 1 or 0 in
+ * *out_enabled. "Off" and "cannot" are different answers, so this returns the same
+ * NRR_ERROR_STATE_INVALID the setter does for a device with no accumulator, and writes nothing. */
+NRR_API NRRResult nrr_device_get_phase_aligned_accumulation(NRRDevice* device, int* out_enabled);
 
 /* ============================================================================
  * Resource Management Helpers

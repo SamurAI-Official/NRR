@@ -206,5 +206,5 @@ Reading it honestly: `backend=CPU` is the deterministic auto-selection;
 `mean_abs_dr_vs_input=0.489112` means the output genuinely differs from the input
 - it is not a passthrough - and the size of that difference is what the untrained
 identity fixture from `tools/gen_sample_model.py` produces, not evidence of
-detail. `NRR_ENTRY_POINT_COUNT` (44) matches what the library exports.
+detail. `NRR_ENTRY_POINT_COUNT` (47) matches what the library exports.
 

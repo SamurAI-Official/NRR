@@ -182,10 +182,16 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
     const float shift_y = offset.y * (static_cast<float>(out_height) / static_cast<float>(height));
 
     for (uint32_t y = 0; y < out_height; ++y) {
-        /* Read back at Y - shift_y: the frame's pixel p holds the scene at p + offset,
-         * so its sample belongs `shift_y` further along than the upsample put it. See
-         * the class note for why it is this sign and not its mirror. */
-        const float v = static_cast<float>(y) - shift_y;
+        /* Read back at Y + shift_y, which is the de-jitter's own direction: a frame recorded at
+         * offset j satisfies input(p) = scene(p - j), so its pixel p holds the scene at p - j and
+         * that sample belongs `shift` *earlier* than the upsample put it. Reading at X - shift
+         * instead moves the samples the wrong way and doubles the displacement the capture already
+         * has - the same defect the de-jitter was flipped to fix, and measured the same way: on the
+         * static capture's real frames the +shift direction improves a single placed frame by 0.4%
+         * of edge error while -shift degrades it by 1.6%, and over 8 frames the two are -3.0% and
+         * -0.6% (tools/aa_resolve_probe.py). At scale 1 this is exactly dejitter_nchw(), which is
+         * the invariant the native-resolution test pins. */
+        const float v = static_cast<float>(y) + shift_y;
         int y0 = 0, y1 = 0;
         float ly = 0.0f;
         bilinear_taps(v, static_cast<int>(out_height), y0, y1, ly);
@@ -193,7 +199,7 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
         const float wy1 = ly;
 
         for (uint32_t x = 0; x < out_width; ++x) {
-            const float u = static_cast<float>(x) - shift_x;
+            const float u = static_cast<float>(x) + shift_x;
             int x0 = 0, x1 = 0;
             float lx = 0.0f;
             bilinear_taps(u, static_cast<int>(out_width), x0, x1, lx);

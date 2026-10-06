@@ -391,6 +391,64 @@ NRRResult nrr_device_reset_temporal_history(NRRDevice* device) {
     }
 }
 
+NRRResult nrr_device_set_phase_aligned_accumulation(NRRDevice* device, int enabled) {
+    if (!device) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "device is NULL");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        NRRResult result = impl->set_phase_aligned_accumulation(enabled != 0);
+        if (result == NRR_ERROR_STATE_INVALID) {
+            /* Two very different situations share this code - a device that never initialized, and a
+             * backend with no accumulator - so say which one it is rather than making the caller guess
+             * from a message that fits only the first. */
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no phase-aligned accumulator"
+                                    : "device is not initialized");
+        }
+        return result;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during set_phase_aligned_accumulation");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
+NRRResult nrr_device_get_phase_aligned_accumulation(NRRDevice* device, int* out_enabled) {
+    if (!device || !out_enabled) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        bool enabled = false;
+        const NRRResult result = impl->phase_aligned_accumulation(&enabled);
+        if (result != NRR_SUCCESS) {
+            /* Nothing is written on failure: *out_enabled stays the caller's own value, so a caller that
+             * ignores the result cannot mistake an unset 0 for "off". */
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no phase-aligned accumulator"
+                                    : "device is not initialized");
+            return result;
+        }
+        *out_enabled = enabled ? 1 : 0;
+        return NRR_SUCCESS;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during get_phase_aligned_accumulation");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
 // ============================================================================
 // Resource Management Helpers
 // ============================================================================

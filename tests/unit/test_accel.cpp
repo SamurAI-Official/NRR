@@ -488,6 +488,140 @@ NRR_TEST(test_accel_kernel_accumulates_temporal_history) {
     nrr_device_destroy(device);
 }
 
+/* The phase-aligned integration on the accelerator path.
+ *
+ * Two different claims are asserted. First, that the switch reaches the accumulator the frames actually go
+ * through: the vendor backends inherit the forwarding from Backend (defined in accel_kernel.cpp), so
+ * inheritance alone is not evidence - this checks the object it lands on is the kernel's own
+ * TemporalAccumulator, whose debug_info then reports the pass. Second, that a jittered pair of frames
+ * through execute_frame really produces an integrated frame, and that with the switch off the same frames
+ * come back un-integrated, which is what makes the report a measurement rather than a string.
+ *
+ * Without the first, the CPU backend would accept the setting while every accelerator backend ignored it -
+ * the shape of the defect that left this path with no temporal history at all until TemporalAccumulator
+ * was shared. */
+NRR_TEST(test_accel_phase_aligned_integration_runs_through_the_kernel) {
+    NRRDeviceOptions options = {};
+    NRRDevice* device = nullptr;
+    NRR_EXPECT_EQ(nrr_device_create(&options, &device), NRR_SUCCESS,
+                  "device for the accel phase-aligned test");
+    if (!device) return;
+
+    NRRModel* model = nullptr;
+    if (nrr_model_load(device, NRR_PASSTHROUGH_MODEL, &model) != NRR_SUCCESS || !model) {
+        std::cout << "  (no model available; the accel phase-aligned path was not exercised)"
+                  << std::endl;
+        nrr_device_destroy(device);
+        return;
+    }
+
+    NRRTextureDesc td = {};
+    td.width = 32;
+    td.height = 32;
+    td.format = NRR_TEXTURE_FORMAT_RGBA8;
+    td.usage = NRR_TEXTURE_USAGE_COLOR;
+    NRRTexture* color = nullptr;
+    if (nrr_texture_create(device, &td, &color) != NRR_SUCCESS || !color) {
+        nrr_model_unload(model);
+        nrr_device_destroy(device);
+        return;
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(32) * 32 * 4, 0);
+    for (uint32_t y = 0; y < 32; ++y) {
+        for (uint32_t x = 0; x < 32; ++x) {
+            const uint8_t value = static_cast<uint8_t>(255u * x / 32u);
+            const size_t p = (static_cast<size_t>(y) * 32 + x) * 4;
+            rgba[p] = value;
+            rgba[p + 1] = value;
+            rgba[p + 2] = value;
+            rgba[p + 3] = 255;
+        }
+    }
+    nrr_texture_upload(device, color, rgba.data(), rgba.size());
+
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr) {
+        nrr_texture_destroy(device, color);
+        nrr_model_unload(model);
+        nrr_device_destroy(device);
+        return;
+    }
+    NRR_EXPECT_TRUE(kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, true, false, true),
+                    "accelerator kernel initializes for the phase-aligned test");
+    ModelImpl* impl = reinterpret_cast<ModelImpl*>(model);
+    NRR_EXPECT_TRUE(kernel->load_model(impl), "kernel loads the model session");
+
+    DeviceImpl* dev = reinterpret_cast<DeviceImpl*>(device);
+    Backend* backend = dev ? dev->get_backend() : nullptr;
+    NRR_EXPECT_TRUE(backend != nullptr, "device exposes its backend");
+
+    /* The inherited forwarding, on whichever vendor backend this host selected. */
+    if (backend) {
+        NRR_EXPECT_EQ(backend->set_phase_aligned_accumulation(true), NRR_SUCCESS,
+                      "a vendor backend must honour the switch through its inherited default");
+        NRR_EXPECT_TRUE(kernel->is_phase_aligned_enabled(),
+                        "the setting must reach the accumulator the frames go through");
+        NRR_EXPECT_EQ(backend->set_phase_aligned_accumulation(false), NRR_SUCCESS, "and off again");
+        NRR_EXPECT_FALSE(kernel->is_phase_aligned_enabled(), "off must reach it too");
+    }
+
+
+
+    kernel->reset_temporal_history();
+    kernel->set_phase_aligned_accumulation(true);
+
+    auto render_jittered = [&](uint64_t index, float offset_x, NRRFrameOutput& out) -> NRRResult {
+        NRRFrameInput in = {};
+        in.color = color;
+        in.camera.viewport_width = 32;
+        in.camera.viewport_height = 32;
+        in.temporal.frame_index = index;
+        in.temporal.motion_vectors_scale = 1.0f;
+        in.temporal.jitter.enabled = 1;
+        in.temporal.jitter.offset_x = offset_x;
+        in.temporal.jitter.offset_y = 0.0f;
+        return kernel->execute_frame(
+            impl, in, out,
+            [backend](void* bt, void* dst, std::size_t n) {
+                return backend->download_texture(bt, dst, n);
+            },
+            [backend](void* bt, const void* src, std::size_t n) {
+                return backend->upload_texture(bt, src, n);
+            });
+    };
+
+    /* The passthrough model has no `jitter` input, so its output carries the renderer's displacement and
+     * the frames are placed before being averaged - the arrangement measured at -27.8% edge error. */
+    NRRFrameOutput first = {};
+    NRRFrameOutput second = {};
+    NRR_EXPECT_EQ(render_jittered(1, 0.4f, first), NRR_SUCCESS, "first jittered accelerator frame");
+    NRR_EXPECT_EQ(render_jittered(2, -0.4f, second), NRR_SUCCESS, "second jittered accelerator frame");
+    NRR_EXPECT_TRUE(std::strstr(second.stats.debug_info, "phase-aligned") != nullptr,
+                    "the accelerator path must report the phase-aligned pass it ran; got: "
+                    + std::string(second.stats.debug_info));
+    NRR_EXPECT_TRUE(std::strstr(second.stats.debug_info, "2 frames") != nullptr,
+                    "and how many frames are in it; got: " + std::string(second.stats.debug_info));
+
+    /* With the switch off, the same frames must produce the un-integrated frame. */
+    kernel->set_phase_aligned_accumulation(false);
+    kernel->reset_temporal_history();
+    NRRFrameOutput plain_first = {};
+    NRRFrameOutput plain_second = {};
+    NRR_EXPECT_EQ(render_jittered(1, 0.4f, plain_first), NRR_SUCCESS, "first frame, pass off");
+    NRR_EXPECT_EQ(render_jittered(2, -0.4f, plain_second), NRR_SUCCESS, "second frame, pass off");
+    NRR_EXPECT_TRUE(std::strstr(plain_second.stats.debug_info, "phase-aligned") == nullptr,
+                    "with the pass off nothing may claim to have integrated");
+
+    kernel->unload_model(impl);
+    kernel->cleanup_texture_cache();
+    kernel->shutdown();
+    destroy_accel_kernel();
+
+    nrr_texture_destroy(device, color);
+    nrr_model_unload(model);
+    nrr_device_destroy(device);
+}
+
 
 } // namespace test
 } // namespace nrr

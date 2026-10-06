@@ -52,6 +52,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_api_entry_point_count);
     NRR_RUN_TEST(test_c_api_entry_point_count_matches_header);
     NRR_RUN_TEST(test_api_texture_desc);
+    NRR_RUN_TEST(test_api_phase_aligned_accumulation_switch);
     NRR_RUN_TEST(test_api_device_create_null);
     NRR_RUN_TEST(test_api_device_destroy_null);
     NRR_RUN_TEST(test_api_get_capabilities_null);
@@ -199,6 +200,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_accel_vendor_backends_structure);
     NRR_RUN_TEST(test_device_capabilities_track_measured_provider);
     NRR_RUN_TEST(test_accel_kernel_accumulates_temporal_history);
+    NRR_RUN_TEST(test_accel_phase_aligned_integration_runs_through_the_kernel);
 
     std::cout << "\n--- Capability Claim Tests ---\n";
     /* Nothing here is asserted from a flag: fp16 is the EXECUTION claim and must be
@@ -288,6 +290,14 @@ void run_all_tests() {
     NRR_RUN_TEST(test_aa_accumulator_integrates_distinct_subpixel_samples);
     NRR_RUN_TEST(test_aa_accumulator_refuses_mixed_grids_and_bad_shapes);
     NRR_RUN_TEST(test_aa_upsample_is_the_identity_at_native_resolution);
+    /* The phase-aligned pass in the render path: the policy that decides which frames may be integrated,
+     * the gate that stops it when the scene moves, and the offset rule both backends derive. */
+    NRR_RUN_TEST(test_phase_aligned_pass_is_off_until_asked);
+    NRR_RUN_TEST(test_phase_aligned_pass_places_each_frame_by_its_own_offset);
+    NRR_RUN_TEST(test_phase_aligned_pass_resets_when_the_scene_moves);
+    NRR_RUN_TEST(test_phase_aligned_pass_declines_without_distinct_phases);
+    NRR_RUN_TEST(test_phase_aligned_pass_is_discarded_by_a_scene_change);
+    NRR_RUN_TEST(test_phase_aligned_offset_rule_matches_the_two_model_kinds);
     NRR_RUN_TEST(test_temporal_history_names_classify_as_history);
     NRR_RUN_TEST(test_temporal_previous_input_frame_is_low_resolution_and_reset_clears_it);
 

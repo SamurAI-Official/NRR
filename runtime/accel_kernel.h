@@ -156,6 +156,11 @@ public:
         frame_references_ = references;
     }
 
+    /* Phase-aligned integration, opt-in, held by the shared accumulator (see nrr_temporal.h). The
+     * accelerator backends reach it through the Backend defaults, so one setting covers every vendor. */
+    void set_phase_aligned_accumulation(bool enabled);
+    bool is_phase_aligned_enabled() const;
+
 private:
     bool apply_accel_optimizations();
     bool select_best_execution_provider();

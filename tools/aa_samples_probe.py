@@ -152,12 +152,20 @@ def edge_error(candidate, target, weights):
 def align_sample(frame, offset, target_size):
     """The frame's samples placed at their TRUE positions in the target grid.
 
-    This is the alternative to de-jittering, and the difference is the whole point. A frame's pixel p
-    was sampled at scene position (p + offset) in low-res units, i.e. 2*(p + offset) target pixels;
-    upsampling puts that sample at 2*p, so the image is shifted by -2*offset to restore where the
-    samples actually landed. Accumulating several such frames integrates *distinct* samples, whereas
-    de-jittering first puts every frame back onto the same nominal grid - which removes exactly the
-    diversity that integration is supposed to exploit.
+    This is the alternative to de-jittering, and the difference is the whole point. Upsampling puts a
+    frame's pixel p at 2*p, so restoring where its samples actually landed is a shift of -2*offset - which
+    is the direction this returns, and the direction that wins on the zone plate below.
+
+    **It is not the capture's direction, and on real frames it is the mirror of the one that
+    reconstructs.** The capture's frames satisfy `input(p) = scene(p - j)`, so their samples belong at
+    `p - j` and the placement that aligns them reads back at `X + j*scale`; against the capture's own
+    un-jittered targets that direction improves a frame by 0.4% of edge error where this one degrades it
+    by 1.6% (tools/aa_resolve_probe.py). This helper models the *surrogate* convention - a frame
+    point-sampled from a high-resolution reference on a grid displaced by `+j`, which is what the plate
+    and `regen_aa_fixture.py` used to build - and the two differ by exactly the sign of the offset. The
+    plate accepted the mirrored sign because it is symmetric enough that its sample positions are
+    point-reflections of each other, so an ordering measured on it could not catch the difference; the
+    capture could. Numbers published from the plate side are marked as such where they are quoted.
     """
     upsampled = upsample(frame, target_size)
     height, width = target_size

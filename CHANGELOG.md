@@ -14,6 +14,74 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The phase-aligned accumulator in the render path - and a sign that was measured against the wrong surrogate
+
+Wiring the accumulator in meant answering two questions the class itself cannot: which image in the render
+path to feed it, and when the scene has moved too far for integrating to mean anything. Both are now
+measured (`tools/aa_resolve_probe.py`), and the first measurement turned up something worse than an open
+question.
+
+**The placement sign was measured against a surrogate with the capture's convention mirrored.**
+`PhaseAlignedAccumulator::add_frame` read the upsampled frame back at `X - j*scale`, and the fixture that
+"confirmed" it built its frames by sub-sampling a high-resolution image on a grid displaced by `+j` - which
+is the mirror of what the renderer actually did. The class was therefore correct for the plate and wrong
+for the capture, in the same way and by the same factor as the de-jitter before it was flipped. Measured on
+the static capture's real frames, against their own un-jittered targets:
+
+```
+one frame   placed at X + j*scale (corrected) -0.4% edge / -1.4% plain
+            placed at X - j*scale (shipped)   +1.6% edge / +1.1% plain
+8 frames    placed at X + j*scale (corrected) -3.0% edge / -15.1% plain
+            placed at X - j*scale (shipped)   -0.6% edge / -11.5% plain
+```
+
+The direction is now the de-jitter's own - which makes the class at scale 1 *exactly* `dejitter_nchw()`,
+asserted as a bit-exact invariant in the first AA test and the check that the mirrored direction cannot
+satisfy - and `tools/regen_aa_fixture.py` gained a validation that cross-checks the fixture's sign against
+the capture's own pixels before it prints anything (3/3 on the run that regenerated the constants). The
+plate ordering still holds with the corrected sign: single 0.199397, de-jittered 0.143895, aligned
+0.135836, mirrored 0.156286, i.e. 1.000 / 0.722 / 0.681 / 0.784.
+
+**Two numbers in the entries below are wrong and this is why.** The "+0.3% edge / -12.4% plain" quoted for
+integrating the real capture was the *mirrored* direction; with the capture's own sign it is -3.0% and
+-15.1% at 8 samples. And "the capture's own mean |motion| 0.109" is not a motion measurement at all: the
+same value appears, byte-identical on every frame with 7 distinct values, on the static capture whose
+un-jittered targets are identical frame to frame. It is a property of the motion pass's decode, on both
+captures, and it is why the gate below is set from translated frames rather than from that field.
+
+**Which image to feed it, decided by measurement rather than by preference.** A model that declares a
+`jitter` input has already corrected the frame onto the nominal grid, so its output is best left unplaced
+and integrating several of them is a mean of its own reconstructions: -18.0% edge error at 8 frames, vs
++13.6% if they are placed. A model that cannot know its sampling grid reproduces the displacement, and
+placing its frames is what recovers the samples: -27.8% at 4 frames, -28.7% at 8. The runtime therefore
+derives the offset from the model's own input set, in one place
+(`phase_aligned_frame_for`, `runtime/nrr_temporal.h`), so the CPU backend and the accelerator kernel cannot
+disagree about the same frame.
+
+**The gate, measured.** Translating the static frames by a known amount per frame while the placement still
+uses the recorded jitter: the edge error's gain is gone by 0.2 px/frame (-3.0% at 0.0, -1.1% at 0.1, +0.5%
+at 0.2) and the plain error's by about 0.5. `PHASE_ALIGNED_MOTION_GATE_PX = 0.2`, compared in frame-grid
+pixels against the caller's `motion_magnitude`; a frame past it *empties* the accumulation rather than
+joining it, because a mean of before and after a move ghosts - which the reprojection blend, running
+immediately before this pass, is the one that handles.
+
+**What is wired.** `TemporalAccumulator` owns the pass (opt-in, off by default, byte-identical output when
+off), both backends feed it from the same rule, and the outcome is reported where the other temporal
+outcomes already are: the note and the frame count in `NRRRenderStats::debug_info` ("[phase-aligned, 2
+frames]"). The C ABI gains two entry points (47 now):
+`nrr_device_set_phase_aligned_accumulation` and `nrr_device_get_phase_aligned_accumulation`, where the
+query distinguishes "off" from "this backend cannot" - and a failed query writes nothing, so a caller
+cannot read an unset 0 as "off". The setter is implemented **once**, as a `Backend` default that forwards
+to the shared accelerator kernel, because six vendor backends each re-deriving the same three lines is how
+the accelerator path lost the temporal history in the first place; `BackendCPU` overrides it, since it owns
+its own accumulator. The accelerator kernel also gained the `jitter` channel case the CPU path already had:
+without it a jitter-aware model's offset tensor was declared at three channels on that path alone.
+
+Verified: the C++ suite **159/159** (6 new phase-aligned pass tests, 1 accel parity test, 1 ABI test - all
+listed above), `tools/regen_aa_fixture.py` self-validating to 8e-8 against torch and matching the capture's
+pixels 3/3, and `tools/aa_resolve_probe.py` refusing to report an integration gain when the scene moves.
+
+
 ### The phase-aligned accumulator: built on the settled sign, and measured in the runtime
 
 The sign was settled first for a reason, and this is where it pays. `runtime/nrr_jitter.{h,cpp}` now carry
@@ -36,6 +104,12 @@ integrate" - and a comparison whose sides resize differently measures the resize
 ```
 single 0.199397 (1.000)   de-jittered 0.149468 (0.750)   phase-aligned 0.136076 (0.682)   mirrored sign 0.156270 (0.784)
 ```
+
+> **Corrected above**, by the entry at the top of this file: those constants were regenerated once the
+> placement's sign was measured on the capture rather than on the plate, and the current fixture reads
+> `de-jittered 0.143895 (0.722)`, `phase-aligned 0.135836 (0.681)`, `mirrored 0.156286 (0.784)`. The
+> ordering this paragraph relies on is unchanged - which is the point worth keeping: the plate is
+> *symmetric enough* that it accepted the mirrored sign, so the ordering alone could never have caught it.
 
 That reproduces `tools/aa_samples_probe.py --scene zoneplate` (-33.4% / -26.0% / -22.3% at 8 samples) from the
 other side of the language boundary. `tools/regen_aa_fixture.py` pins the placement and the accumulation
@@ -62,8 +136,10 @@ Two things this measurement settled that the earlier probe entry could not:
 Not wired into the render path yet, and deliberately: `PhaseAlignedAccumulator` is the component, with its
 placement, its normalisation and its refusal semantics pinned by tests. This integrates samples; it does not
 reproject them, so deciding which frames may be accumulated (motion-gated, or reprojected first) is a caller's
-policy rather than something the class can guess - and the capture's own motion (mean |motion| 0.109) is
-exactly why the probe grew that check in the first place.
+policy rather than something the class can guess at this level - and the capture's own motion looked like the
+evidence. It is not: that mean |motion| of 0.109 is a constant of the motion pass's decode, present
+byte-identical on a capture whose targets do not move at all (see the entry at the top of this file, where
+both the number and this placement's sign are corrected).
 
 ### P4: the temporal model loses on jittered data too, so colour-only stands - and three real bugs
 
@@ -521,6 +597,12 @@ both true and they measure different things: the zone plate is point-sampled and
 while the Godot raster filters its textures, so much of this content has no aliasing left to resolve.
 The zone plate is therefore the bound, and the captured frames are the reminder that a renderer's
 filtering is part of the question.
+
+> **Both columns above are the mirrored placement**, measured before the sign was checked against the
+> capture's pixels (see the entry at the top of this file). With the capture's own sign the same
+> integration is -3.0% edge and -15.1% plain at 8 samples - better in both columns, and still far from
+> the plate. The conclusion does not change; the numbers do, and the fact that the wrong sign looked
+> like "12% of plain error" rather than like an error is the reason it survived this long.
 
 **The convention the pipeline assumes is the opposite of the one the capture produces.** Three
 independent pixel-level measurements now say the same thing:

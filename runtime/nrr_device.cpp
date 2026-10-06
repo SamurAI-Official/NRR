@@ -267,6 +267,23 @@ NRRResult DeviceImpl::unload_reference(ReferenceImpl* reference) {
     return NRR_ERROR_STATE_INVALID;
 }
 
+NRRResult DeviceImpl::set_phase_aligned_accumulation(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    return backend_->set_phase_aligned_accumulation(enabled);
+}
+
+NRRResult DeviceImpl::phase_aligned_accumulation(bool* out_enabled) {
+    if (out_enabled == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    /* Ask the accumulator that will actually run the frames, never a copy of what was requested: after a
+     * backend or kernel restart the setting can be gone, and a caller reading "on" while nothing
+     * integrates is the state this query exists to make visible. */
+    *out_enabled = backend_->is_phase_aligned_enabled();
+    return NRR_SUCCESS;
+}
+
 void DeviceImpl::refresh_measured_state() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!backend_) return;

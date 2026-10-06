@@ -86,11 +86,20 @@ def scene():
 
 
 def capture(target, offset, size=LO):
-    """One frame of the scene on a sampling grid displaced by `offset`, in the capture's convention:
-    pixel p of the frame holds the scene at (p + 0.5 + offset) * scale - 0.5 in target pixels."""
+    """One frame of the scene on a sampling grid displaced by `offset`, in the capture's measured
+    convention: pixel p of the frame holds the scene at (p + 0.5 - offset) * scale - 0.5 in target
+    pixels, so the frame's *content* is displaced by +offset * scale.
+
+    The sign is not a choice. tools/aa_resolve_probe.py measures it on the real capture's frames
+    against their own un-jittered targets (which are byte-identical frame to frame, so the scene is
+    provably still): there, placing a frame by reading back at X + offset * scale improves it and
+    X - offset * scale degrades it, i.e. the frames' content sits at +offset * scale. A builder that
+    displaces the grid by +offset instead - the obvious way to read "the renderer jittered its grid by
+    j" - produces the *mirror* of the real capture and will happily validate the wrong placement.
+    """
     step = target.shape[1] / float(size)
-    axis_x = (np.arange(size, dtype=np.float64) + 0.5 + offset[0]) * step - 0.5
-    axis_y = (np.arange(size, dtype=np.float64) + 0.5 + offset[1]) * step - 0.5
+    axis_x = (np.arange(size, dtype=np.float64) + 0.5 - offset[0]) * step - 0.5
+    axis_y = (np.arange(size, dtype=np.float64) + 0.5 - offset[1]) * step - 0.5
     grid_x, grid_y = np.meshgrid(axis_x, axis_y)
     return sample(target, grid_x, grid_y)
 
@@ -107,15 +116,16 @@ def upsample_mirror(frame, out_size=HI):
 def place_mirror(frame, offset, sign=1.0, out_size=HI):
     """PhaseAlignedAccumulator::add_frame()'s placement, mirrored.
 
-    `sign=+1` reads the upsampled frame back at X - offset*scale, where the frame's samples were
-    actually taken; `sign=-1` is the pre-flip direction, kept because the test pins that the two
-    produce different numbers and because the ordering check below needs the wrong one to exist.
+    `sign=+1` reads the upsampled frame back at X + offset * scale, where the frame's samples were
+    actually taken (the measured direction, and the one the class implements); `sign=-1` is the mirror
+    that moves every sample twice as far from where it was taken, kept because the test pins that the
+    two produce different numbers and because the ordering check below needs the wrong one to exist.
     """
     up = upsample_mirror(frame, out_size)
     shift_x = sign * offset[0] * out_size / float(frame.shape[1])
     shift_y = sign * offset[1] * out_size / float(frame.shape[0])
-    axis_x = np.arange(out_size, dtype=np.float64) - shift_x
-    axis_y = np.arange(out_size, dtype=np.float64) - shift_y
+    axis_x = np.arange(out_size, dtype=np.float64) + shift_x
+    axis_y = np.arange(out_size, dtype=np.float64) + shift_y
     grid_x, grid_y = np.meshgrid(axis_x, axis_y)
     return sample(up, grid_x, grid_y)
 
@@ -160,12 +170,14 @@ def point_frame(offset, k, size=LO):
 
     This is the regime AA can exist in, and it is the realistic one - a rasteriser writes the scene
     value at the sample position rather than averaging a footprint. Note the contrast with capture()
-    below, which bilinearly sub-samples a high-resolution render and so pre-filters the signal; that is
-    why integration measures ~nothing on such a surrogate.
+    above, which bilinearly sub-samples a high-resolution render and so pre-filters the signal; that is
+    why integration measures ~nothing on such a surrogate. The grid displacement carries the capture's
+    measured sign, as capture() does and for the same reason: a +offset grid here would be the mirror
+    of the real capture.
     """
     step = HI / float(size)
-    axis_x = (np.arange(size, dtype=np.float64) + 0.5 + offset[0]) * step - 0.5
-    axis_y = (np.arange(size, dtype=np.float64) + 0.5 + offset[1]) * step - 0.5
+    axis_x = (np.arange(size, dtype=np.float64) + 0.5 - offset[0]) * step - 0.5
+    axis_y = (np.arange(size, dtype=np.float64) + 0.5 - offset[1]) * step - 0.5
     grid_x, grid_y = np.meshgrid(axis_x, axis_y)
     return plate_value(k, grid_x, grid_y)
 
@@ -190,9 +202,53 @@ def place_torch(frame, offset, out_size=HI):
     tensor = torch.from_numpy(frame[None, None]).float()
     up = F.interpolate(tensor, size=out_size, mode="bilinear", align_corners=False)
     plane = torch.zeros(1, 2, out_size, out_size)
-    plane[:, 0] = -offset[0] * out_size / float(frame.shape[1])
-    plane[:, 1] = -offset[1] * out_size / float(frame.shape[0])
+    plane[:, 0] = offset[0] * out_size / float(frame.shape[1])
+    plane[:, 1] = offset[1] * out_size / float(frame.shape[0])
     return trainer.dejitter(up, plane)[0, 0].numpy()
+
+
+def real_capture_check():
+    """The fixture's convention, cross-checked against the capture's real pixels.
+
+    The fixture is a surrogate, and the surrogate is exactly where this went wrong once: a builder that
+    displaces the grid by +offset validates the *mirror* of the real capture's placement, and every
+    constant it then prints is trustworthy-looking and backwards. So the same question is asked of the
+    renderer's own frames: read back at X + j * scale or at X - j * scale, which one reconstructs the
+    scene? The answer must be the same as the fixture's, and the scene's stillness is established first
+    (the capture's un-jittered targets are byte-identical, so there is no motion to confuse it).
+    """
+    data = os.path.join(HERE, os.pardir, "models", "training-data", "godot-static")
+    manifest = os.path.join(data, "manifest.json")
+    if not os.path.isfile(manifest):
+        print("2b. the static capture is not present - the fixture's convention is not cross-checked")
+        return None
+    import json
+    with open(manifest, "r", encoding="utf-8") as handle:
+        entries = sorted((pair for pair in json.load(handle)["pairs"] if pair.get("split") == "val"),
+                         key=lambda pair: pair["frame"])[:3]
+    reference = None
+    agree = 0
+    for entry in entries:
+        with np.load(os.path.join(data, entry["file"])) as archive:
+            # Luminance: the sign of the displacement is a property of the geometry, not of a channel.
+            target = archive["target"].astype(np.float64).mean(axis=2)
+            frame = archive["input"].astype(np.float64).mean(axis=2)
+            offset = archive["jitter"].astype(np.float64)
+        if reference is None:
+            reference = target
+        elif not np.array_equal(target, reference):
+            print("2b. the capture's targets differ - its scene moves, so it cannot settle the sign")
+            return None
+        size = int(round(target.shape[0] / float(frame.shape[0])))
+        plus = float(np.abs(place_mirror(frame, offset, 1.0, target.shape[0]) - target).mean())
+        minus = float(np.abs(place_mirror(frame, offset, -1.0, target.shape[0]) - target).mean())
+        agree += 1 if plus < minus else 0
+        print("   frame %d (scale %d): read back at X + j*%d %.6f, at X - j*%d %.6f -> %s"
+              % (entry["frame"], size, size, plus, size, minus,
+                 "X + j (the fixture's sign)" if plus < minus else "X - j (the fixture is mirrored)"))
+    print("2b. the real capture agrees with the fixture's sign on %d/%d frames"
+          % (agree, len(entries)))
+    return agree == len(entries)
 
 
 def main():
@@ -220,6 +276,13 @@ def main():
     if not (right_err < wrong_err and right_err < unplaced_err):
         print("   REFUSING: the capture's sign is not the one that reconstructs, so no constant "
               "produced here is trustworthy.")
+        return 1
+
+    # 2b. ... and that sign has to be the one the capture's own pixels ask for, not merely this
+    #     surrogate's. This is the check that was missing when the fixture first validated the mirror.
+    if real_capture_check() is False:
+        print("   REFUSING: the fixture's sign is not the real capture's, so every constant below "
+              "would pin the mirrored placement.")
         return 1
 
     # 3. The ordering the C++ test asserts, measured here first on a target where it can hold. The
