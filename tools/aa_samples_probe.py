@@ -261,11 +261,18 @@ def main(argv):
     manifest = ev.load_manifest(args.data)
     motion = scene_motion(args.data, manifest)
     print("camera motion per validation scene (mean |motion|, 0 = static):")
+    # This number comes from the capture's motion pass, and on the captures in this repository it is not a
+    # measurement of anything: it reads 0.10998 on every frame - byte-identical, with 7 distinct values -
+    # including on godot-static, whose un-jittered targets are identical frame to frame and whose scene
+    # therefore does not move at all. It is a constant of the decode, so it cannot decide whether a scene is
+    # static; tools/aa_resolve_probe.py asks the same question of the targets, which can.
     for scene, value in sorted(motion.items(), key=lambda item: item[1]):
         print("  %-12s %.5f" % (scene, value))
     if motion:
         best_scene, best_value = min(motion.items(), key=lambda item: item[1])
         print("  most static: %s at %.5f" % (best_scene, best_value))
+        print("  (read the note in this file's source before believing that number: it is the same on a")
+        print("   capture that provably does not move, and aa_resolve_probe.py is the check that can tell)")
 
     if args.scene == "zoneplate":
         target_size = (256, 256)
