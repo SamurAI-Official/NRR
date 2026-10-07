@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/io/image.h"
 #include "core/object/object.h"
 #include "core/variant/variant.h"
 

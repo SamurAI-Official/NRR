@@ -59,8 +59,9 @@ that shaped it, two of which only became visible by looking:
   (`ffx_usage_to_rd_usage_flags`), so this is an omission rather than a design decision - and it is part of
   the patch.
 * **The fork is Godot 4.8.0-dev**, while the addon here targets godot-cpp's 4.7 API dump
-  (`compatibility_minimum = "4.7"`). A GDExtension built for an older API can load into a newer engine, but a
-  call whose signature changed in between fails at call time, so a live run should rebuild the addon.
+  (`compatibility_minimum = "4.7"`). Measured rather than assumed: that addon **loads and passes** under the
+  fork engine (`RESULT: PASS`, `library_version=1.0.0`, CUDA provider attached), so a rebuild is not needed
+  unless a call the binding makes changes signature.
 * `Image::FORMAT_RG_HALF` does not exist in that tree - the name there is `FORMAT_RGH`, which the first draft
   of the bridge had wrong.
 
@@ -115,13 +116,18 @@ docs/roadmap.md; the harness needs no change when one arrives.
 ## Honest status
 
 * The patches are written and verified to *apply* - forward and reverse, against a pristine checkout at
-  `135dff3` - but the fork has **not been built or run** here. That needs scons, the non-redistributable
-  Streamline runtime, and a godot-cpp at the fork's version for the addon to load cleanly, so the two numbers
-  above are still the synthesised-jitter ones.
+  `135dff3` - **and the patched tree builds**: 0 errors, and the bridge is live in that binary
+  (`engine_plugins/godot_fork_patch/probe/` prints `has_singleton=true`, `available=true`,
+  `has_last_frame=false`, `RESULT: PRESENT_IDLE`, exit 0). The 4.7-built addon also loads in it
+  (`RESULT: PASS`), so the rebuild this file once assumed was needed is not.
 * Absence is reported rather than faked: `NRRDLSS.is_available()` answers "does this build have the hatch"
   and `has_last_frame()` answers "has DLSS actually run". Stock Godot answers false to both, and the
   verification project plus the benchmark above still pass unchanged on it - the benchmark reproduces its
   recorded baseline exactly (0.1219 and 0.0836), which is how the fallback was checked.
+* What still gates a live measurement is Streamline: its runtime binaries are NVIDIA-licensed and absent
+  here, and this build has no `STREAMLINE_ENABLED`, so no viewport can use the DLSS scaling mode and no
+  frame has come through the seam yet. The two numbers above therefore remain the synthesised-jitter ones,
+  and the probe reports exactly that state rather than a zero offset that would read as a measurement.
 * `velocity_image()` returns the field as *DLSS* receives it: the fork's decode pass rewrites the velocity
   buffer in place, so it is the internal-grid, DLSS-sense field, which may be the opposite sense to the one
   `tools/godot_capture/` writes. That gets pinned by measurement, not assumption.

@@ -1273,33 +1273,38 @@ Recommended pick-per-sitting sequence, with what blocks each one:
 | 7 | M10.3 Blender/CC0 capture factory | nothing | 1-2 days |
 | 8 | M10.5 engine capture mirrors, then the injection benchmark | Unreal install / Unity editor | larger |
 
-### M10.1 - The NVIDIA Streamline seam in the Godot fork `gated: Streamline SDK + engine build`
+### M10.1 - The NVIDIA Streamline seam in the Godot fork `built and probed; live arm gated on Streamline`
 
-`RendererRD::DLSSContext` already caches the last frame's `Parameters` in `last_parameters`
-(`servers/rendering/renderer_rd/effects/dlss.h`), which carries `RID velocity` and `Vector2 jitter`
-alongside `internal_size`, `reprojection`, `cam_projection` and `delta_time`. So the inputs NRR wants are
-already *stored* - one accessor away - rather than something that has to be plumbed out of the upscale
-call site. `docs/nvidia-streamline-godot.md` records the mapping; this item is the build.
+`RendererRD::DLSSContext` already caches the last frame's `Parameters` in `last_parameters`, carrying `RID
+velocity` and `Vector2 jitter` alongside `internal_size`, `reprojection`, `cam_projection` and `delta_time` -
+so the inputs NRR wants were *stored*, not in need of plumbing. Reading the fork at `135dff3` changed the
+shape of the patch twice, and building it changed it twice more; the patch, the module and the probe are in
+`engine_plugins/godot_fork_patch/`, and the findings are in that README.
 
-- [ ] Step 0, before any code: shallow-clone `NVIDIA-RTX/godot` at `nvidia-pt-dlss` and settle who owns
-      the context (`grep -rn "create_context(\|\->upscale(\|DLSSContext \*" servers/`), because that
-      decides whether the accessor is a static on `DLSSContext` or a read of a renderer member
-- [ ] `servers/rendering/renderer_rd/effects/dlss.{h,cpp}`: expose the active context - a static
-      `DLSSContext *get_active_context()`, set in `upscale()` and cleared on destruction
-- [ ] `modules/nrr_dlss_bridge/` (ours, not the fork's): the singleton `NRRDLSS` with
-      `jitter() -> Vector2`, `internal_size() -> Vector2i` and `velocity_image() -> Ref<Image>` (the
-      texture copied out, so no RendererRD type crosses into the addon), guarded by
-      `__has_include("servers/rendering/renderer_rd/effects/dlss.h")` so **the same module compiles
-      against stock Godot 4.7.2 and reports unavailable** - which is what keeps this item from blocking
-      M10.2, and lets the `has_singleton` detection path be tested before the fork exists
-- [ ] `tools/fetch_streamline.ps1`, beside the existing ORT/NDK/Vulkan fetchers: the Streamline runtime
-      is NVIDIA-licensed and is not redistributable (`docs/third-party-sdks.md`), so it is fetched and
-      never committed
-- [ ] Build the fork with Streamline present and run `engine_plugins/godot_verify/benchmark_temporal.gd`
-      against a DLSS-enabled scene. Acceptance is not "it ran": it is `temporal_state()` reporting a
-      non-zero jitter with `integration_observed=true`, against the synthesised-Halton arm's `false`
-      today. The numbers to record are the columns the harness already prints (edge, plain, warping
-      error, temporal PSNR, alpha, the runtime's own note)
+- [x] Step 0 - clone `NVIDIA-RTX/godot` at `nvidia-pt-dlss` and settle who owns the context. Answer: a render
+      buffer (`RenderForwardClustered::RenderBufferDataForwardClustered::dlss_context`), created by
+      `ensure_dlss()` and `memdelete`d with it, so the record must be a value snapshot and a pointer would
+      dangle
+- [x] Expose the last evaluated frame: `DLSSEffect::LastFrame` + `get_last_frame()`, written by `upscale()`
+      *after* its early-outs, because the four-frame warmup would otherwise report a jitter for a frame DLSS
+      never evaluated. Neither of the two designs first planned (a `DLSSContext` accessor, a
+      `RenderingServer` accessor) was needed once the snapshot route was visible
+- [x] `modules/nrr_dlss_bridge/`: the `NRRDLSS` singleton (`jitter()`, `internal_size()`, `delta_time()`,
+      `velocity_image()`, `frame_count()`, `status()`), guarded with `__has_include` so the same module
+      compiles against stock Godot and reports itself **absent** there
+- [x] The velocity buffer's missing `CAN_COPY_FROM` (`render_scene_buffers_rd.cpp`), without which
+      `texture_get_data()` on the field DLSS is given cannot work. Found by reading `get_color_usage_bits()`
+      and confirmed against `fsr2.cpp`, which sets the bit for its own UAVs
+- [x] Build the fork and probe it: 0 errors, `Godot Engine v4.8.dev.custom_build.135dff388`;
+      `engine_plugins/godot_fork_patch/probe/` prints `has_singleton=true`, `available=true`,
+      `has_last_frame=false`, `RESULT: PRESENT_IDLE`, exit 0. The 4.7-built addon loads in that engine too
+      (`RESULT: PASS`), so no godot-cpp 4.8 rebuild is needed
+- [ ] `tools/fetch_streamline.ps1`: `third_party/Streamline` has the SDK's sources and headers, but its
+      runtime binaries (`sl.interposer`, `sl.common`) are NVIDIA-licensed, not redistributable and **not
+      present**, so this build has no `STREAMLINE_ENABLED` and no viewport can take the DLSS scaling mode
+- [ ] The live measurement, once Streamline is present: run the benchmark against a DLSS-enabled scene and
+      record the same columns. Acceptance is not "it ran": it is `temporal_state()` reporting a non-zero
+      jitter with `integration_observed=true`, against the synthesised-jitter arm's `false` today
 
 ### M10.2 - A trained model, committed, with its provenance recorded
 

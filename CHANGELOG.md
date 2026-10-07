@@ -2795,3 +2795,35 @@ baseline exactly (no-jitter frame-to-frame change 0.1219, jitter+magnitude 0.083
 here - scons, the non-redistributable Streamline runtime, and a godot-cpp at the fork's version are the gating
 items - so no live DLSS jitter has been measured yet, and the temporal numbers in
 `docs/nvidia-streamline-godot.md` stay labelled as the synthesised ones.
+
+### The seam built and probed: a module the build ignored, two includes, and an assumption the compiler refuted
+
+The DLSS bridge from the previous entry is now applied to a real Godot 4.8-dev tree, built, and probed. Four
+things only a build could have said:
+
+* **The first full build passed while compiling none of the bridge.** SCons collects a module through its
+  `SCsub`; without one it is silently skipped and the build is green either way. The only evidence was
+  `nrr objects: 0` in the log, which is why the probe exists - "the build passed" is not evidence the module
+  is in the binary.
+* Two includes were missing and only a compiler could have named them: `core/object/class_db.h`
+  (`ClassDB`/`D_METHOD`, 33 errors) and `core/io/image.h` (`Ref<Image>` in the header, 9 more). Both are in
+  the patch.
+* **The 4.7-built addon runs in the 4.8-dev fork**, which the previous entry claimed it would not: the
+  verification project under the fork engine prints `RESULT: PASS` with `library_version=1.0.0` and
+  `CUDAExecutionProvider` attached. The asserted rebuild is not needed. The claim is corrected in
+  `docs/nvidia-streamline-godot.md` and the fork-patch README rather than left standing.
+* The velocity-buffer readback did need `CAN_COPY_FROM`, as the source review predicted: without it
+  `texture_get_data()` on the field DLSS is given cannot work, and `fsr2.cpp` sets that bit for its own UAVs.
+
+Measured: the first full build takes 13m47s and incremental rebuilds 20-50s; both patches apply to and
+reverse-apply from a pristine `135dff3`; and the probe against the built binary prints
+`engine.has_singleton(NRRDLSS)=true`, `available: true`, `has_last_frame: false` with the note "DLSS has not
+evaluated a frame in this process (no viewport is using the DLSS scaling mode, or Streamline is not
+initialised)", `RESULT: PRESENT_IDLE`, exit 0. That is the whole of what is verifiable without Streamline: the
+hatch is real, and it reports that nothing has come through it rather than a zero offset that would read as a
+measurement.
+
+Still gated: the Streamline runtime binaries are NVIDIA-licensed and not present here, so the build has no
+`STREAMLINE_ENABLED`, no viewport can take the DLSS scaling mode, and no live DLSS jitter has been measured -
+so the temporal figures in `docs/nvidia-streamline-godot.md` remain the synthesised-jitter ones.
+`tools/fetch_streamline.ps1` is the next step on that thread.

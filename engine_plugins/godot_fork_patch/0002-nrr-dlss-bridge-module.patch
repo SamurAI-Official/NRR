@@ -1,3 +1,27 @@
+diff --git a/modules/nrr_dlss_bridge/SCsub b/modules/nrr_dlss_bridge/SCsub
+new file mode 100644
+index 0000000..dd5f605
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/SCsub
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python
++from misc.utility.scons_hints import *
++
++Import("env")
++Import("env_modules")
++
++env_nrr_dlss_bridge = env_modules.Clone()
++
++# Godot source files.
++#
++# SCons collects a module through this file, so a module without an SCsub is silently skipped - the build
++# succeeds and the module is simply absent, which is a failure mode worth naming because "the build passed"
++# is not evidence that the module is in it.
++#
++# The sources compile in any tree: the bridge detects the fork's DLSS effect with __has_include and reports
++# itself unavailable when that header does not exist (stock Godot), so there is no platform or engine-flag
++# condition to express here.
++env_nrr_dlss_bridge.add_source_files(env.modules_sources, "*.cpp")
 diff --git a/modules/nrr_dlss_bridge/config.py b/modules/nrr_dlss_bridge/config.py
 new file mode 100644
 index 0000000..d1b015e
@@ -15,11 +39,14 @@ index 0000000..d1b015e
 +    pass
 diff --git a/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp b/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp
 new file mode 100644
-index 0000000..c89c4b3
+index 0000000..3a19796
 --- /dev/null
 +++ b/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,139 @@
 +#include "nrr_dlss_bridge.h"
++
++#include "core/io/image.h"
++#include "core/object/class_db.h"
 +
 +#ifdef NRR_DLSS_BRIDGE_HAS_FORK
 +#include "servers/rendering/renderer_rd/effects/dlss.h"
@@ -157,12 +184,13 @@ index 0000000..c89c4b3
 +}
 diff --git a/modules/nrr_dlss_bridge/nrr_dlss_bridge.h b/modules/nrr_dlss_bridge/nrr_dlss_bridge.h
 new file mode 100644
-index 0000000..99e487f
+index 0000000..e5b5386
 --- /dev/null
 +++ b/modules/nrr_dlss_bridge/nrr_dlss_bridge.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,56 @@
 +#pragma once
 +
++#include "core/io/image.h"
 +#include "core/object/object.h"
 +#include "core/variant/variant.h"
 +

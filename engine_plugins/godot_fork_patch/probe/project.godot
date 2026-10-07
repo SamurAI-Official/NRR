@@ -1,0 +1,13 @@
+; Minimal project for probing the engine-side NRR bridge (engine_plugins/godot_fork_patch).
+; Deliberately empty apart from the version: the probe is a SceneTree script, so no scene is needed,
+; and nothing in this project needs the NRR GDExtension to be loaded for the bridge to answer.
+config_version=5
+
+[application]
+
+config/name="NRR bridge probe"
+config/description="Prints what the engine's DLSS path reports about the frame it last evaluated."
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

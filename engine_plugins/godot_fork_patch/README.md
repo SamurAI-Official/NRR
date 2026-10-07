@@ -110,14 +110,35 @@ properties worth stating plainly:
   is a runtime change (M10.5), not a binding one. Until then this is a benchmark and validation path, and
   it is labelled as one rather than presented as the shipping path.
 
+## Verified on a real build (measured, not inferred)
+
+* `python -m SCons platform=windows target=editor -j16 d3d12=no` on the patched tree: the first full build
+  took 13m47s, incremental rebuilds 20-50s, and the final one linked with **0 errors** -
+  `bin/godot.windows.editor.x86_64.exe`, 156 MB, `Godot Engine v4.8.dev.custom_build.135dff388`.
+* `probe/probe_bridge.gd` against that binary prints `engine.has_singleton(NRRDLSS)=true`,
+  `available: true`, `has_last_frame: false`, with the note *"DLSS has not evaluated a frame in this process
+  (no viewport is using the DLSS scaling mode, or Streamline is not initialised)"* and
+  `RESULT: PRESENT_IDLE`, exit 0. That is the honest half of the seam: the hatch is real, and it says nothing
+  has come through it yet.
+* **The 4.7-built addon runs in 4.8-dev**, contrary to what this file assumed when it was first written: the
+  verification project under the fork engine prints `RESULT: PASS` (exit 0) with `library_version=1.0.0` and
+  `CUDAExecutionProvider` attached. So a godot-cpp 4.8 rebuild is not required unless a call the binding
+  makes changes signature - test that before paying for it.
+* **A module without an `SCsub` is silently skipped.** The first full build succeeded while compiling none of
+  the bridge: SCons collects a module through its `SCsub` and the build is green either way. That is why the
+  probe exists and why "the build passed" is not evidence the module is in the binary.
+* Two includes were missing and only a compiler could have named them (`core/object/class_db.h` for
+  `ClassDB`/`D_METHOD` in the `.cpp`, `core/io/image.h` for `Ref<Image>` in the header). Both are in the
+  patch now, and the compile errors were the whole feedback loop - building before measuring beat reasoning
+  about the API.
+
 ## Honest status
 
-* Verified: the three engine-side changes and the module; both patches apply to and reverse-apply from
-  pristine `135dff3`; the copies in `module/nrr_dlss_bridge/` are byte-identical to the patched tree's.
-* Not verified: the fork has **not been built or run** from this repository, so no live DLSS jitter has
-  been measured yet. The gating items are scons, the Streamline runtime binaries, and - for the addon to
-  load cleanly - a godot-cpp at the fork's version rather than the committed 4.7 build. Until a run
-  happens, the temporal numbers in `docs/nvidia-streamline-godot.md` are the synthesised-jitter ones, and
-  they stay labelled that way.
-
-
+* Verified: both patches apply to and reverse-apply from a pristine `135dff3`; the patched tree **builds**
+  (0 errors) and the bridge is live in that binary (the probe above, exit 0); the 4.7 addon loads in it; the
+  sources in `module/nrr_dlss_bridge/` are the exact bytes the patch carries.
+* Not verified: no frame has come through the seam yet, because that needs Streamline - its runtime binaries
+  are NVIDIA-licensed and absent here, and this build has no `STREAMLINE_ENABLED`. Until they are present and
+  a viewport uses the DLSS scaling mode, `has_last_frame()` stays false and the temporal numbers in
+  `docs/nvidia-streamline-godot.md` stay the synthesised ones. The probe reports exactly that state rather
+  than a zero jitter that would read as a measurement.

@@ -1,5 +1,8 @@
 #include "nrr_dlss_bridge.h"
 
+#include "core/io/image.h"
+#include "core/object/class_db.h"
+
 #ifdef NRR_DLSS_BRIDGE_HAS_FORK
 #include "servers/rendering/renderer_rd/effects/dlss.h"
 #include "servers/rendering/rendering_device.h"
