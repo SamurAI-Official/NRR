@@ -14,6 +14,34 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### A coherent temporal capture, and the data gate's premise questioned by it
+
+With both capture bugs fixed the scenes finally produce what a temporal model needs, and the full run was made:
+400 frames each of `temporal` and `temporal2`, captured with `tools/capture_godot_temporal.ps1`, packed with
+`tools/pack_godot_pairs.py`. Measured on the packed pairs: **100% geometry** (against 20.4% before the mirror
+fix), **two motion layers** - a wall at 2.77 px per frame and objects at 10.12 px - and **1.45% of geometry
+marked as disocclusion** where the motion pass previously could not represent a second layer at all. Validity
+now covers ~85% of a frame instead of ~21%.
+
+And then the packer refused **782 of 800 frames**, leaving 18 pairs. Not a bug: the data gate requires that a
+bilinear 2x upscale of the input be *further* than 0.0100 from the target, and these frames come in just under
+it (measured 0.0065-0.0094 on the refused ones, 0.0109-0.0182 on the accepted ones). The reason is visible in
+the scene: the wall fills the frame and its texture, at the distance that gives the capture its motion, is
+coarse enough on screen that bilinear reconstructs it well. Two knobs were tried and measured - the checker
+frequency (6 -> 48 -> 96) and the wall's width (24 -> 200 units, because a 20-unit dolly otherwise walks out of
+a 24-unit wall after 40 frames and the rest of the capture is empty) - and neither moves the yield much,
+because the margin is set by how much *detail the input cannot carry*, which a flat wall at a useful distance
+simply does not have.
+
+That is where this stops, and the question it leaves is worth more than another tuning pass: **the gate measures
+a spatial property, and a temporal dataset's value is temporal.** A frame in which bilinear already reproduces
+the wall perfectly still carries aliased sub-pixel samples of it - different ones in every frame, which is
+precisely what a temporal resolve fuses - and it is refused for failing a test about the baseline. Whether the
+spatial gate should apply unchanged to temporal captures is now a question with numbers behind it rather than a
+preference, and answering it is the next step: either the scenes need object-scale detail (as the seven
+single-frame scenes have, and pass with 79% yield) or the gate needs a temporal arm.
+
+
 ### The temporal lever is not adopted, and the reason is its own zeroed control
 
 The four-arm comparison finished, and it answers M10.4's question with a no rather than a maybe. Every arm ran on
