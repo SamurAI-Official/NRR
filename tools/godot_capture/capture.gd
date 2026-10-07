@@ -65,6 +65,32 @@ const SCENES := {
 				"position": Vector3(0.0, 0.50, -5.8)},
 		],
 	},
+	# A scene laid out for *temporal* data, which the seven above are not: they were designed while the backdrop
+	# was invisible to the motion pass (see the mirror in _run), so a fresh capture of them measures 79.6% sky
+	# with the little geometry it has moving 0.85 px per frame at the input grid. This one puts the wall close,
+	# the objects in front of it, and dollies the camera fast enough that the wall's own screen-space motion is a
+	# few pixels per frame - the regime a temporal upscaler exists for. Measured with tools/history_reuse_probe.py
+	# and tools/godot_capture's own jitter self-test; the probe's `--data` wants a packed dataset.
+	"temporal": {
+		# 0.05 units per frame against a wall 2.0 away is about 2.4 px per frame on a 128-wide input grid. Over
+		# a 400-frame capture that is 20 units of travel: the camera approaches the wall without reaching it, and
+		# the objects sit between the two so occlusion and disocclusion actually happen.
+		"camera_velocity": Vector3(0.05, 0.02, 0.0),
+		"checker": 6,
+		"backdrop_size": Vector2(24.0, 14.0),
+		"backdrop_z": -2.0,
+		"objects": [
+			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.40,
+				"orbit": 0.35, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.0, "spin": 0.0,
+				"position": Vector3(-0.60, 0.10, -1.10)},
+			{"shape": "box", "color": Color(0.25, 0.55, 0.90), "scale": 0.35,
+				"orbit": 0.25, "axis": Vector3(0.0, 0.0, 1.0), "phase": 1.1, "spin": 0.9,
+				"position": Vector3(0.55, -0.25, -1.45)},
+			{"shape": "sphere", "color": Color(0.90, 0.85, 0.30), "scale": 0.22,
+				"orbit": 0.45, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.3, "spin": 0.0,
+				"position": Vector3(0.10, 0.35, -0.95)},
+		],
+	},
 	# More training content. Capacity is measured to be cheap in latency (eight times the parameters cost
 	# 1.03-1.42x the time), so the frontier sweep will want a model with more room - and a model with more
 	# room needs more than 367 pairs. These are separate scenes rather than a longer capture of the same one,
@@ -277,11 +303,16 @@ func _run() -> void:
 	color_view.add_child(light)
 
 	var checker := _checker_texture(int(scene["checker"]))
+	# The wall's size and distance are the scene's, with the originals as defaults: how far away it sits is what
+	# sets how much screen-space motion a dolly produces, and the seven earlier scenes (8 units) and a temporal
+	# capture (2) want very different answers. See the "temporal" scene.
+	var backdrop_size: Vector2 = scene.get("backdrop_size", Vector2(24.0, 14.0))
+	var backdrop_z: float = scene.get("backdrop_z", -8.0)
 	var backdrop := MeshInstance3D.new()
 	var backdrop_mesh := PlaneMesh.new()
-	backdrop_mesh.size = Vector2(24.0, 14.0)
+	backdrop_mesh.size = backdrop_size
 	backdrop.mesh = backdrop_mesh
-	backdrop.transform = Transform3D(Basis().rotated(Vector3.RIGHT, -PI * 0.5), Vector3(0.0, 0.0, -8.0))
+	backdrop.transform = Transform3D(Basis().rotated(Vector3.RIGHT, -PI * 0.5), Vector3(0.0, 0.0, backdrop_z))
 	var backdrop_material := StandardMaterial3D.new()
 	backdrop_material.albedo_texture = checker
 	backdrop_material.albedo_color = Color(0.9, 0.9, 0.95)
@@ -290,6 +321,36 @@ func _run() -> void:
 	color_view.add_child(backdrop)
 
 	var motion_shader: Shader = load(MOTION_SHADER)
+	# The backdrop needs a mirror in the motion pass, and it was missing - which was a data bug, not a content
+	# choice. The colour pass drew this static textured wall over most of the frame while the depth/motion pass
+	# reported *no geometry* there at all, so the packer marked those pixels sky: depth 0, validity 0, nothing to
+	# trust. A temporal model was being trained on frames whose temporal inputs contradicted their own colour,
+	# and the tell was measurable - geometry 20.4% of pixels against a colour mean of 0.238 where an empty
+	# environment would read ~0.04 (tools/history_reuse_probe.py on a fresh 4-frame capture, before and after).
+	#
+	# Its transform is its own rather than a scene object's, because _place_objects() builds orbit/spin
+	# transforms and a wall's *orientation* is part of its definition here. Static does not mean motionless: a
+	# wall the camera dollies past has screen-space motion like anything else, which is exactly the motion a
+	# temporal model needs most - large, uniform, and over texture.
+	#
+	# Open, and measured: once a wall is in this pass, the scene's *objects* stop appearing in it. With the
+	# wall, every pixel of the depth channel reads the wall's distance (2.000 at 2 units, 7.998 at 8) and none
+	# reads an object's, while the same objects render correctly in the colour pass (1.3% of pixels by their
+	# albedo) and rendered correctly in the motion pass before the wall was added to it. Two ordering
+	# hypotheses were tested and rejected - render_priority -1 and +1 on the wall's material, both leaving the
+	# depth uniform - so the next step is the shader's two position outputs (POSITION and VERTEX are both
+	# written, and which one Godot's depth prepass uses decides this) rather than the render order. It matters
+	# beyond this scene: the packer's occlusion test compares two depth fields, so a capture in which overlapping
+	# geometry keeps only one layer would report disocclusion that never happened.
+	var backdrop_mirror := MeshInstance3D.new()
+	backdrop_mirror.mesh = backdrop.mesh
+	backdrop_mirror.transform = backdrop.transform
+	var backdrop_motion := ShaderMaterial.new()
+	backdrop_motion.shader = motion_shader
+	backdrop_motion.set_shader_parameter("depth_scale", DEPTH_SCALE)
+	backdrop_motion.set_shader_parameter("motion_scale", MOTION_SCALE)
+	backdrop_mirror.material_override = backdrop_motion
+	motion_view.add_child(backdrop_mirror)
 	var movers: Array[Dictionary] = []
 	for entry in scene["objects"]:
 		var node := MeshInstance3D.new()
@@ -324,6 +385,9 @@ func _run() -> void:
 	var previous_mvps: Array = []
 	for index in movers.size():
 		previous_mvps.append(null)
+	# And one for the backdrop, which is not in `movers`; null on the first frame, so frame 0 reports zero
+	# motion for it too.
+	var previous_backdrop_mvp: Variant = null
 
 	# Before a single frame is written: prove the low-resolution sample really moves, and by how much. The
 	# offset is derived from the camera's own projection matrix, so the mapping is exact by construction; the
@@ -359,6 +423,15 @@ func _run() -> void:
 			var previous: Variant = previous_mvps[index]
 			material.set_shader_parameter("prev_mvp", mvp if previous == null else previous)
 			previous_mvps[index] = mvp
+
+		# The backdrop's own MVP, from the same view and projection the movers use. It has to be here rather
+		# than in `movers` because its placement is its own transform (see above), and it has to be updated per
+		# frame for the same reason the movers are: a static surface still moves on screen when the camera does.
+		var backdrop_mvp: Projection = projection * Projection(view_inverse * backdrop.transform)
+		backdrop_motion.set_shader_parameter("cur_mvp", backdrop_mvp)
+		backdrop_motion.set_shader_parameter(
+			"prev_mvp", backdrop_mvp if previous_backdrop_mvp == null else previous_backdrop_mvp)
+		previous_backdrop_mvp = backdrop_mvp
 
 		await RenderingServer.frame_post_draw
 		var color_image := color_view.get_texture().get_image()

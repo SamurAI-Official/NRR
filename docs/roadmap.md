@@ -1397,13 +1397,25 @@ warp's marginal contribution beside it, in four arms rather than two.
       effect on real data measured rather than assumed
 - [~] The four-arm comparison (`tools/run_m10_history_arms.ps1`, the pre-registered config and seeds: colour /
       warped history / warped history + mask / raw history + mask, plus the zeroed controls), judged by the
-      rule in `docs/evaluation-protocol.md` - a lever is not re-judged because the first attempt lost. **First
-      results, seed 20261020: colour-only 8.79%, warped history 14.72% - +5.93 points, which clears the
-      5-point bar on that seed.** That does not contradict the probe's "a correct warp is worth about one
-      percent": alignment is not information. Warping removes the *displacement* between two frames and leaves
-      the aliased sub-pixel samples, and those samples are what a temporal model is looking for - the probe
-      measured how well the previous frame matches the current one, not how much it adds. Seed 20261021 and the
-      zeroed controls were still running when this was written, and adoption needs both seeds and the control
+      rule in `docs/evaluation-protocol.md`. **Six of eight arms are in, and the comparison is inconclusive -
+      with one arm's headline number withdrawn rather than left standing.** Valid results (a run whose training
+      progress cleared the trainer's own 10% bar and therefore may be quoted):
+
+      | arm | seed 20261020 | seed 20261021 |
+      |---|---|---|
+      | colour-only | 8.79% | 10.44% |
+      | warped history | **14.72%** | *refused: stalled (0.6% progress)* |
+      | raw history + mask | *refused: stalled (0.5%)* | 8.99% |
+
+      An earlier version of this bullet quoted the warped arm's +5.93 points over colour-only on seed
+      20261020 as clearing the 5-point bar. It does, on that seed - and the second seed **stalled at 0.6%
+      progress**, which is the degenerate-run gate doing its job rather than a result to average in, so the
+      arm's number is currently one seed's worth and the second has to be re-run before the lever can be
+      judged. The mask without the warp shows nothing on its one valid seed (8.99% against colour's 9.6%
+      mean), which is the opposite of what the content measurements predicted and is itself worth a
+      re-run. Two of six runs stalling is the same 1-in-4-or-5 rate the warmup was added for; the honest
+      reading is that a stalled seed is a fact about the seed, and the sweep needs those seeds re-run rather
+      than either arm declared
 - [x] **The mask needs no contract change: the runtime computes it.** §4.7 of `specification/frame_contract.md`
       records the rule, and `runtime/nrr_temporal.cpp::compute_history_trust_mask()` carries it out - geometry,
       source inside the frame, nothing clearly nearer before - from the current depth, the previous frame's

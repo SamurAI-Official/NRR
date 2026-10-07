@@ -14,6 +14,48 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The capture scenes' motion pass was missing the wall, so 80% of every frame was "sky" in the temporal inputs
+
+The M10.4 measurements said the content was the limit - 86% of a godot-v4 frame is sky and the geometry that
+exists moves 0.7 px per frame. Re-capturing a scene from scratch in this session reproduced both numbers
+(geometry 20.4%, motion 0.85 px) and then found the cause: **the backdrop was added only to the colour pass.**
+`tools/godot_capture/capture.gd` builds every scene twice, once per world, because the motion pass needs its own
+shader - and the wall every scene is built around was given a colour node and no motion node. So the colour
+frame showed a static textured wall filling most of the view while the depth and motion passes reported no
+geometry there at all, and the packer wrote depth 0 and validity 0 for it. A temporal model was being trained on
+frames whose temporal inputs contradicted their own pixels, and the tell was measurable: a colour mean of 0.238
+where an empty environment reads ~0.04.
+
+The wall now has a mirror in the motion pass, driven per frame by the same view and projection the orbiting
+objects use. Measured before and after on the same scene and frame: geometry 20.4% -> **100.0%**, sky 79.6% ->
+0.0%, depth mean 3.155 -> 7.998 (the wall's own distance), **colour mean unchanged at 0.238** - which is the
+point: the colour frames of every existing capture stay valid, and it is the temporal inputs that were wrong.
+
+Fixing it exposed the other half. The same scenes now measure 0.03 px per frame, because their wall is 8 units
+away and their camera crawls: filling the frame removed the sky and left nothing moving. So a second part is
+content rather than repair: a `temporal` scene laid out for it - a wall 2 units away, objects inset in front of
+it, a dolly of 0.05 units per frame - which measures **100% geometry and 1.94 px per frame** over geometry, in
+the regime a temporal upscaler exists for. `tools/capture_godot_temporal.ps1` captures it with the same binary,
+flags and jitter convention as the v4 script.
+
+One thing the fix uncovered and left open, recorded in capture.gd rather than guessed at: **once a wall is in
+the motion pass, the scene's objects stop appearing in it.** With the wall present every pixel of the depth
+channel reads the wall's distance and none reads an object's, while the same objects render correctly in colour
+(1.3% of pixels by their albedo) and rendered correctly in the motion pass before the wall was added. Two
+ordering hypotheses were tested and rejected - `render_priority` at -1 and +1 on the wall's material, both
+leaving the depth uniform - so the next step is the shader's two position outputs (`POSITION` and `VERTEX` are
+both written, and which one the depth prepass uses decides this) rather than the render order. It matters beyond
+this scene: the packer's occlusion test compares two consecutive depth fields, so a capture whose overlapping
+geometry keeps only one layer would report disocclusion that never happened.
+
+The sweep's own status changed with it, and the earlier note is corrected rather than left standing: of the six
+arms that have run, two (warped history on seed 20261021, raw history + mask on 20261020) **stalled at 0.5-0.6%
+training progress and were refused by the trainer's own degenerate-run gate**, so their numbers are not
+comparison results. The valid ones are colour-only 8.79%/10.44%, warped history 14.72% (+5.93 points over
+colour on that seed), and raw history + mask 8.99% - which is not the mask helping. Adoption needs both seeds
+and the control, so the lever is not judged yet.
+
+
 ### The mask a model needs at inference is now built by the runtime, so no engine has to supply one
 
 The data path moved ahead of the contract earlier in this release: the trainer consumes a history trust mask,
