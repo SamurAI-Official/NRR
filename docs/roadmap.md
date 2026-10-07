@@ -1458,10 +1458,24 @@ warp's marginal contribution beside it, in four arms rather than two.
       lever against the jitter-aware reference rather than colour-only, because a phase-blind reference cannot
       measure a phase-carrying lever - on godot-v5 colour-only scores 0.25-0.53% where it scored 9% on v4, and
       the 5-point bar calibrated there would refuse a working lever
-- [ ] **The next step is scale, not the lever.** 175 pairs of uniformly hard content leaves every arm inside
-      2.5%: the effect is consistent but small, and the absolute numbers say the dataset is the limit now. More
-      scenes (the capture script holds two) and longer captures, at the same proportions, with the rule as
-      rewritten - and the same three-arm comparison, which is a few minutes per arm at this dataset size
+- [~] **At scale, the lever beats the reference and fails attribution.** Six scenes, 2400 captured frames, **745
+      pairs** (against godot-v5's 175), same rule, same seeds:
+
+      | arm | 20261020 | 20261021 | progress |
+      | --- | --- | --- | --- |
+      | colour-only | +1.74% | -0.01% | 11.5% / 1.3% |
+      | jitter-aware (the reference) | +1.76% | +0.82% | 24.2% / 2.2% |
+      | warped history + jitter | **+3.00%** | **+2.35%** | 23.6% / 21.7% |
+      | that arm, history zeroed | **+2.87%** | +0.82% | 21.6% / 1.6% |
+
+      Condition 1 passes (the arm beats the phase-aware reference by 1.24 and 1.53 points, and both its seeds
+      now clear the progress gate). Condition 2 fails on the only seed where arm and control are both valid:
+      held-out L1 0.01699 against 0.01701, a 0.00002 difference where the arm's own seed spread is 0.00011 - so
+      the 1.24-point edge over the jitter-only reference is carried by the *motion* input, and history adds
+      nothing measurable on top. History is live (ablation 0.0029 on both seeds) and yet buys nothing, which
+      makes the remaining question one about the *representation*: its advantage is a mosaic of sub-pixel
+      samples at different offsets, and using that needs sub-pixel reasoning rather than a convolution over a
+      plane
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item

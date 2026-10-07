@@ -17,16 +17,22 @@
 $ErrorActionPreference = "Continue"
 $godot = "G:\godot\Godot_v4.7.2-stable_win64_console.exe"
 # 400 frames per scene, matching the v4 training captures: the packer's data gate refuses frames whose content
-# has drifted out of its margin band, and the temporal scene's camera crosses 20 units over 400 frames against
-# a wall at 2.0.
-$scenes = @{ "temporal" = 400; "temporal2" = 400 }
+# has drifted out of its margin band, and each corridor's camera crosses its wall over the run.
+#
+# Six scenes, and the split between them is the point of having six: temporal, temporal3, temporal4 and
+# temporal5 are the training split, temporal2 and temporal6 the held-out one. They differ in wall distance,
+# checker frequency, dolly direction and speed, object count, shape mix and palette, because a validation split
+# has to be different *content* rather than the training content at a different index.
+$frames = @{ "temporal" = 400; "temporal3" = 400; "temporal4" = 400; "temporal5" = 400
+             "temporal2" = 400; "temporal6" = 400 }
+$order = @("temporal", "temporal3", "temporal4", "temporal5", "temporal2", "temporal6")
 $failed = @()
-foreach ($scene in $scenes.Keys) {
-    Write-Output "=== $scene ($($scenes[$scene]) frames) ==="
+foreach ($scene in $order) {
+    Write-Output "=== $scene ($($frames[$scene]) frames) ==="
     & $godot --path tools\godot_capture res://capture.tscn -- `
-        --scene $scene --frames $scenes[$scene] --size 256 --jitter halton `
+        --scene $scene --frames $frames[$scene] --size 256 --jitter halton `
         --out "user://capture/temporal/$scene"
     if ($LASTEXITCODE -ne 0) { $failed += $scene }
 }
 if ($failed.Count -gt 0) { Write-Output "FAILED: $($failed -join ', ')" }
-Write-Output "capture_godot_temporal: $($scenes.Count - $failed.Count)/$($scenes.Count) scenes captured"
+Write-Output "capture_godot_temporal: $($order.Count - $failed.Count)/$($order.Count) scenes captured"

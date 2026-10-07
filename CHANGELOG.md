@@ -14,6 +14,44 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### At four times the data, the history input still does not pay for itself - and the attribution is now exact
+
+The scale step ran: six scenes instead of two, 2400 captured frames instead of 800, **745 pairs instead of 175**,
+on the same recipe (coherent temporal inputs - 100% geometry, 3.50% disocclusion, a reprojection worth 15.2%).
+Eight arms, both seeds, judged by the rule as rewritten. Improvement over bilinear:
+
+| arm | 20261020 | 20261021 | progress | history ablation |
+| --- | --- | --- | --- | --- |
+| colour-only (the old reference) | +1.74% | -0.01% | 11.5% / 1.3% | - |
+| jitter-aware (**the reference**) | +1.76% | +0.82% | 24.2% / 2.2% | - |
+| **warped history + jitter** (the arm) | **+3.00%** | **+2.35%** | 23.6% / 21.7% | 0.00294 / 0.00266 |
+| **the arm, history zeroed** (its control) | **+2.87%** | +0.82% | 21.6% / 1.6% | - |
+
+**Condition 1 passes and condition 2 fails**, and the failure is the one that matters:
+
+  - the arm beats the jitter-aware reference by **1.24 and 1.53 points**, on both seeds, and for the first time
+    both of its seeds clear the training-progress gate (23.6% and 21.7% against a 10% bar). Scale helped: the
+    same arm measured +2.33%/+2.06% at 175 pairs.
+  - it does **not** beat its own history-zeroed control on the only seed where both are valid. On seed
+    20261020 the arm reaches held-out L1 0.01699 and the control 0.01701 - a difference of 0.00002, where the
+    arm's own spread between seeds is 0.00011. The control is *colour + motion + jitter*, so the arm's 1.24-point
+    edge over the jitter-only reference is carried by the **motion** input, and history adds nothing measurable
+    on top of it.
+
+Under the rewritten rule the lever is therefore **not adopted**, and this is a sharper answer than the v4 sweep
+gave: the reference question (does the arm beat a baseline that can see the phase?) is answered yes, and the
+attribution question (is the gain history's?) is answered no. History is used - its ablation is 0.0029 on both
+seeds, a live input - but a model trained with it zeroed reaches the same held-out quality, which means the
+information it carries is either already available from the current frame plus the phase, or not reachable by a
+four-layer convolution at this width.
+
+What is left is a question about the representation rather than about the data, and the data can now ask it:
+the history's remaining advantage is a *mosaic* of sub-pixel samples taken at different offsets, and exploiting
+that needs the network to reason about sub-pixel placement rather than to convolve a plane. `README`-level
+sanity on the numbers: 745 pairs is four times the dataset on which the arms were first measured, the effect is
+consistent, and the null is now specific instead of "the lever lost".
+
+
 ### The lever works once the baseline can see what the lever carries, and the rule is rewritten around that
 
 Ten arms on godot-v5, and the first honest answer this project has had to its own temporal question. Same seeds,
