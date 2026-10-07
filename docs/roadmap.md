@@ -1481,12 +1481,28 @@ warp's marginal contribution beside it, in four arms rather than two.
       wall pixels, high-gradient movers - where the runtime's existing warp was best, the predicted sign was
       worst, and the change was reverted. So the history is already as well aligned as the field allows.
 
-      What that leaves is narrower and more testable: at ~1 px/frame the previous frame is *almost the same
-      view*, and whatever it could add is sub-pixel phase - which the `jitter` input already supplies. History
-      may be **redundant on this data rather than unusable**, and the test is motion: the same arms on a capture
-      whose camera moves several pixels per frame, where consecutive frames sample genuinely different
-      positions (the `temporal` scenes' velocities are the knob, and their movers already give ~4 px/frame
-      regions to check that against)
+- [x] **The redundancy hypothesis, tested by building the data for it: not confirmed.** The same six corridors at
+      five times the camera speed (200 frames each): motion 3.7 px/frame against 1.0, disocclusion **7.20%** of
+      geometry against 3.50%, a reprojection worth **35.5%** against 15.2% - the previous frame is genuinely not
+      the same view. 130 pairs (a faster camera leaves each corridor's objects behind sooner), eight arms: the
+      arm fails condition 1 against the jitter-aware reference (-0.54 / +0.05), passes condition 2 on one seed
+      (+0.83) and ties on the other, and five runs sit under the progress bar. So more temporal content in the
+      data did not make history pay either.
+
+      Across three datasets that is the result rather than a suspicion:
+
+      | dataset | pairs | motion | disocclusion | arm vs reference | arm vs its own control |
+      | --- | --- | --- | --- | --- | --- |
+      | godot-v5 | 175 | 1.0 px | 3.44% | +1.31 / +0.97 | +2.69 / +0.96 |
+      | godot-v6 | 745 | 1.0 px | 3.50% | +1.24 / +1.53 | **+0.13** / +1.53 |
+      | godot-v7 | 130 | 3.7 px | 7.20% | **-0.54** / +0.05 | +0.83 / +0.05 |
+
+      Only the smallest run clears both bars on both seeds, and it stops clearing them when the dataset
+      quadruples. A history plane fed to this convolution stack delivers at best about one point of held-out
+      improvement and does not reproduce - and neither explanation tried (misalignment, refuted directly;
+      redundancy at low motion, refuted here) accounts for it. The limit is how the samples are *consumed*: a
+      conv stack over planes cannot represent where a sample sits, and placement is history's entire content.
+      That is the case for the architectural move below rather than another data pass
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item
