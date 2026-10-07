@@ -14,6 +14,38 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The phase-alignment hypothesis for why history does not pay: derived, tested three ways, refuted
+
+The obvious explanation for "history is live and buys nothing" was that the history was misaligned, and the
+algebra supports it. The capture renders `input(x) = scene(x - j)`, so input pixel x shows the scene point whose
+current nominal coordinate is `x - j_t`; the camera's motion is recorded as "the previous position of the
+content now at cur_uv"; therefore the history pixel matching input pixel x is `x' = x - (m + j_t - j_{t-1})`.
+The runtime's rule - and the packer's, which reproduces it - warps by `m` alone, landing one *phase difference*
+away - up to ~0.7 px on these captures, which is the entire sub-pixel signal a temporal resolve exists to fuse,
+and the model cannot correct it because the `jitter` input it receives is the *current* frame's phase and says
+nothing about where history's samples sit. So the term was added, in both signs, and measured three ways:
+
+| view of the data | camera-motion warp (runtime's rule) | + phase difference | - phase difference |
+| --- | --- | --- | --- |
+| whole frame, 57 frames | **0.00641** | 0.00699 | 0.00650 |
+| wall pixels (clean camera translation) | 0.00127 | 0.00129 | 0.00130 |
+| high-gradient movers, 39 frames | 0.10175 | 0.10862 | 0.10166 |
+
+The camera-motion-only warp the packer already does is the best alignment available, the predicted sign is
+clearly the *worst* on the movers, and the other sign is inside the noise. On wall pixels the surface is too
+smooth for a sub-pixel shift to register at all (all three agree to 0.00003), which is why the movers were the
+view that settled it. So the phase difference is not a real displacement in this capture, the history is
+already as well aligned as the field allows, and **"history fails because it is phase-misaligned" is false**.
+The change was reverted, and the note left in `warp_history_bilinear()` carries the derivation and the three
+measurements so that the next person to have this idea finds it already answered.
+
+What that leaves is a narrower and more plausible hypothesis: at roughly 1 px per frame of motion the previous
+frame is *almost the same view*, and the extra information it could carry is sub-pixel phase - which the
+`jitter` input already delivers directly. History may be redundant on this data rather than unusable, and the
+test is motion: the same comparison on a capture whose camera moves several pixels per frame, where consecutive
+frames sample genuinely different positions.
+
+
 ### At four times the data, the history input still does not pay for itself - and the attribution is now exact
 
 The scale step ran: six scenes instead of two, 2400 captured frames instead of 800, **745 pairs instead of 175**,

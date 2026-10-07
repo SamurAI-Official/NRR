@@ -108,6 +108,19 @@ def warp_history_bilinear(previous, motion):
     temporal *metric* that interpolates across a motion discontinuity is measuring an invented pixel, while
     here the interpolation is the thing being reproduced.
 
+    Measured and rejected: a phase-alignment term. The algebra says the history a model needs is the previous
+    frame's content placed on the *current* frame's sampling grid, `scene_{t-1}(x - (m + j_t - j_{t-1}))`, so
+    the recorded jitter difference looks like a missing sub-pixel term - and since the model's `jitter` input is
+    the current frame's phase, it cannot correct one itself. Adding it was tried, in both signs, on godot-v6's
+    captures and against three views of the data: over the whole frame the camera-motion-only warp was best
+    (mean |history - current| 0.00641 against 0.00699 with +delta and 0.00650 with -delta over 57 frames), on
+    wall pixels where the motion is a clean camera translation all three agreed to 0.00003 (the surface is too
+    smooth for a sub-pixel shift to show), and on the high-gradient movers the predicted sign was clearly the
+    worst (0.10862 against 0.10175) while the other was inside the noise (0.10166). So the term is not a real
+    displacement in this capture, and the field this warp already uses is the best available alignment. That is
+    why the hypothesis "history fails because it is phase-misaligned" is recorded as tested and refuted rather
+    than left to be re-derived and re-tried.
+
     Returns (warped, inside). `inside` is false where the source position fell outside the frame *before* the
     clamp, i.e. exactly the pixels whose value is extrapolated.
     """
@@ -233,6 +246,8 @@ def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 
         if history_mode == "warped":
             # The previous frame as the runtime shows it to a model for *this* frame: reprojected by this
             # frame's motion field, the way runtime/nrr_temporal.cpp does it before a model ever sees history.
+            # A phase-difference term was tried here and rejected by measurement - see the note in
+            # warp_history_bilinear() for the three views of the data that settled it.
             history, warped_inside = warp_history_bilinear(history, motion_low)
             warped_fraction = float(warped_inside.mean())
         else:

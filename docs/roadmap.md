@@ -1472,10 +1472,21 @@ warp's marginal contribution beside it, in four arms rather than two.
       now clear the progress gate). Condition 2 fails on the only seed where arm and control are both valid:
       held-out L1 0.01699 against 0.01701, a 0.00002 difference where the arm's own seed spread is 0.00011 - so
       the 1.24-point edge over the jitter-only reference is carried by the *motion* input, and history adds
-      nothing measurable on top. History is live (ablation 0.0029 on both seeds) and yet buys nothing, which
-      makes the remaining question one about the *representation*: its advantage is a mosaic of sub-pixel
-      samples at different offsets, and using that needs sub-pixel reasoning rather than a convolution over a
-      plane
+      nothing measurable on top. History is live (ablation 0.0029 on both seeds) and yet buys nothing.
+
+      The first explanation tried was misalignment: the history is warped by the camera's motion alone, so it
+      sits a *phase difference* (`j_t - j_{t-1}`, up to ~0.7 px) away from the input's own sampling grid, and
+      the model's `jitter` input describes only the current frame. The algebra is in the note on
+      `warp_history_bilinear()`, and the term was added in both signs and measured three ways - whole frame,
+      wall pixels, high-gradient movers - where the runtime's existing warp was best, the predicted sign was
+      worst, and the change was reverted. So the history is already as well aligned as the field allows.
+
+      What that leaves is narrower and more testable: at ~1 px/frame the previous frame is *almost the same
+      view*, and whatever it could add is sub-pixel phase - which the `jitter` input already supplies. History
+      may be **redundant on this data rather than unusable**, and the test is motion: the same arms on a capture
+      whose camera moves several pixels per frame, where consecutive frames sample genuinely different
+      positions (the `temporal` scenes' velocities are the knob, and their movers already give ~4 px/frame
+      regions to check that against)
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item
