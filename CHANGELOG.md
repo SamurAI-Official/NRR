@@ -14,6 +14,48 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The temporal lever is not adopted, and the reason is its own zeroed control
+
+The four-arm comparison finished, and it answers M10.4's question with a no rather than a maybe. Every arm ran on
+both pre-registered seeds, the three runs the trainer refused were re-run, and all three re-runs reproduced their
+originals **to five decimals** - so `--deterministic` does pin this path, and a stall is a property of
+(seed, config) rather than of the run. `torch.use_deterministic_algorithms(True)` in strict mode also completed a
+run without raising, which is PyTorch's own registry saying no kernel in this path lacks a deterministic
+implementation. (The trainer now also sets `CUBLAS_WORKSPACE_CONFIG`, which deterministic cuBLAS requires and
+which was never set here - compliance rather than a fix, since the reproductions show the path was already
+pinned.)
+
+| arm | seed 20261020 | seed 20261021 |
+|---|---|---|
+| colour-only | 8.79% | 10.44% |
+| warped history | 14.72% | refused: stalled |
+| **warped history, history zeroed** (its own control) | **14.24%** | refused: stalled |
+| raw history + mask | refused: stalled | 8.99% |
+
+The rule wants both conditions across both seeds. Condition 2 - beat its own history-zeroed control by more than
+the seed spread - fails on the only seed where the arm and its control both certified: **14.72 against 14.24 is
++0.48 points**, against a 1.65-point spread between the colour arm's own two seeds and a protocol sigma of 2.4.
+Condition 1 looks satisfied on that seed, +5.93 over colour-only, but the *control* is +5.45 over the same
+baseline - so the gain is not the history input at all, it is the `motion` input, which every temporal arm has
+and colour-only does not. The second seed is reproducibly degenerate for both the arm and its control, so it
+settles nothing either way.
+
+The mechanism is now measured rather than argued. Warping brings the previous frame 0.9% closer to the current
+one, which is a real but small alignment gain, and it is small because the camera barely moves (0.70 px per frame
+over geometry, with phase correlation agreeing at a few tenths of a pixel). The mask's unique signal -
+disocclusion, the one part a model cannot work out for itself - is 1.77% of geometry on godot-v4, and it was
+structurally absent because the motion pass could only hold one layer at all. A lever worth one percent of
+alignment and two percent of mask, wrapped around a motion input that carries the whole gain, is precisely the
+case the pre-registered rule was written to catch, and it caught it.
+
+What that leaves is content, and the capture side now has the bugs fixed rather than the scenes redesigned: the
+backdrop was missing from the motion pass, and the motion shader wrote two position outputs so only one layer
+could survive it. Both fixes are measured (100% geometry against 20.4%, two motion layers at 2.77 and 10.12 px,
+disocclusion 0.00% -> 1.45%), and a `temporal` scene built for motion exists. The full capture -> pack ->
+retrain -> re-measure is the next step, and it is the one that decides whether the arms lost because of the
+input or because of the data.
+
+
 ### The motion pass could only hold one layer, so no capture ever contained disocclusion
 
 The second data-corrupting bug in the capture scenes, and it is the one that explains the mask arm's failure.

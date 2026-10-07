@@ -1353,6 +1353,19 @@ matter too.
       is designed on the confirmed depth pass plus the camera matrices - the primitive `tools/godot_capture/`
       already uses, and exact for camera motion over static geometry - and the Y sign is recorded as
       **unmeasured** rather than assumed
+- [~] **Content, and the two bugs that were hiding it** - the response to the numbers above, and it turned out
+      to be a repair before it was a redesign. The captures had no usable temporal content for a structural
+      reason, twice over: the backdrop every scene is built around was added only to the *colour* pass, so the
+      colour frame showed a wall while the depth and motion passes called it sky (geometry 20.4% of a frame,
+      "sky" 79.6%, and the packer wrote depth 0 and validity 0 for the wall); and the motion shader wrote *two*
+      position outputs, so once a wall was in that pass the rasteriser and the depth prepass disagreed and only
+      one layer survived - the objects became invisible to the depth channel and disocclusion was 0.00%, which
+      is why the mask input could not have helped anything. Both are fixed and measured: 100% geometry, a wall
+      at 2.77 px/frame against objects at 10.12 px, disocclusion 1.45% of geometry (from 0.00%), with a
+      `temporal` scene laid out for motion (wall at 2 units, objects inset, dolly 0.05/frame) and
+      `tools/capture_godot_temporal.ps1` to capture it. What has *not* been done is the run that uses it: a full
+      400-frame capture, packed, retrained and re-measured - which is the next step here, and the one that tests
+      whether the temporal arms' failures were the data or the input
 - [x] Trainer changes a dataset of that size needs: lazy npz loading, crop/flip augmentation, and
       multi-scale crops - **built and measured** (`tools/train_nrr.py`). `--lazy` reads the training split's
       files per batch instead of concatenating the split into RAM: on godot-v4 the training split goes from
@@ -1395,27 +1408,31 @@ warp's marginal contribution beside it, in four arms rather than two.
 - [x] The packer emits the warped history and the trainer consumes the mask as an input
       (`--inputs=color,motion,history,validity`, plus `--zero-input validity` for its control), with the warp's
       effect on real data measured rather than assumed
-- [~] The four-arm comparison (`tools/run_m10_history_arms.ps1`, the pre-registered config and seeds: colour /
-      warped history / warped history + mask / raw history + mask, plus the zeroed controls), judged by the
-      rule in `docs/evaluation-protocol.md`. **Six of eight arms are in, and the comparison is inconclusive -
-      with one arm's headline number withdrawn rather than left standing.** Valid results (a run whose training
-      progress cleared the trainer's own 10% bar and therefore may be quoted):
+- [x] The four-arm comparison is **complete, and the lever is not adopted** (`tools/run_m10_history_arms.ps1`
+      with the pre-registered config and seeds; `tools/run_m10_stalled_reruns.ps1` re-ran the three refused
+      runs, and all three reproduced their originals to five decimals, so a stall here is a property of
+      (seed, config) rather than of the run):
 
       | arm | seed 20261020 | seed 20261021 |
       |---|---|---|
       | colour-only | 8.79% | 10.44% |
-      | warped history | **14.72%** | *refused: stalled (0.6% progress)* |
-      | raw history + mask | *refused: stalled (0.5%)* | 8.99% |
+      | warped history | 14.72% | refused: stalled |
+      | **warped history, history zeroed** (its own control) | **14.24%** | refused: stalled |
+      | raw history + mask | refused: stalled | 8.99% |
 
-      An earlier version of this bullet quoted the warped arm's +5.93 points over colour-only on seed
-      20261020 as clearing the 5-point bar. It does, on that seed - and the second seed **stalled at 0.6%
-      progress**, which is the degenerate-run gate doing its job rather than a result to average in, so the
-      arm's number is currently one seed's worth and the second has to be re-run before the lever can be
-      judged. The mask without the warp shows nothing on its one valid seed (8.99% against colour's 9.6%
-      mean), which is the opposite of what the content measurements predicted and is itself worth a
-      re-run. Two of six runs stalling is the same 1-in-4-or-5 rate the warmup was added for; the honest
-      reading is that a stalled seed is a fact about the seed, and the sweep needs those seeds re-run rather
-      than either arm declared
+      The rule needs both conditions across both seeds, and condition 2 - beat its own history-zeroed control
+      by more than the seed spread - **fails on the only seed where the arm and its control both certified**:
+      14.72 against 14.24 is +0.48 points, against a 1.65-point spread between the colour arm's two seeds and
+      the protocol's own sigma of 2.4. Condition 1 *looks* satisfied on that seed (+5.93 over colour-only),
+      but the control is +5.45 over the same baseline, so the gain is not attributable to history at all - it
+      belongs to the `motion` input, which every temporal arm has and colour-only does not. The second seed is
+      reproducibly degenerate for both the arm and its control, so it separates nothing either.
+
+      What history is worth on this data is measured rather than argued: the warp's alignment is ~1% (it brings
+      the previous frame 0.9% closer to the current one), and the mask's unique signal - disocclusion, the one
+      part of it a model cannot see for itself - was 1.77% of geometry, and structurally absent until the
+      motion pass could hold two layers at all (see M10.3). A lever worth one percent of alignment and two of
+      mask, wrapped around a motion input that carries the gain, is exactly what this rule exists to catch
 - [x] **The mask needs no contract change: the runtime computes it.** §4.7 of `specification/frame_contract.md`
       records the rule, and `runtime/nrr_temporal.cpp::compute_history_trust_mask()` carries it out - geometry,
       source inside the frame, nothing clearly nearer before - from the current depth, the previous frame's

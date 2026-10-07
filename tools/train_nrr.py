@@ -648,8 +648,14 @@ def run(args, log):
         torch.backends.cudnn.benchmark = not args.deterministic
         torch.backends.cudnn.deterministic = bool(args.deterministic)
         if args.deterministic:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-            log("  deterministic: cuDNN autotuning off, deterministic kernels requested (--deterministic)")
+            # warn_only by default, so a kernel without a deterministic implementation is named in a warning
+            # rather than ending the run - and --strict-determinism turns that warning into an error, because a
+            # flag documented as making a seed pin a result should be able to prove it. Two runs of one seed did
+            # reproduce each other's numbers exactly, stall included, so the claim holds here; strict mode is
+            # what would name an op if it stopped holding.
+            torch.use_deterministic_algorithms(True, warn_only=not args.strict_determinism)
+            log("  deterministic: cuDNN autotuning off, deterministic kernels requested (--deterministic%s)"
+                % ("" if args.strict_determinism else ", warn-only: --strict-determinism names the op instead"))
 
     sampler = GpuSampler() if device.type == "cuda" else None
     if sampler is not None:
@@ -1294,10 +1300,29 @@ def main(argv):
                              "sample, which is the multi-scale lever - a model trained at a single frame size "
                              "has seen one tier of it. Width follows the frame's aspect ratio and the target "
                              "is cropped to the matching window. Empty (the default) trains on whole frames")
+    parser.add_argument("--strict-determinism", action="store_true",
+                        help="with --deterministic, make a kernel without a deterministic implementation raise "
+                             "instead of warning, so the op is named rather than tolerated. Off by default "
+                             "because some ops legitimately have no deterministic form and a run is worth more "
+                             "than the label")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv[1:])
     if args.self_test:
         return self_test()
+    if args.deterministic:
+        # A documented prerequisite for deterministic cuBLAS, which cuDNN's implicit-GEMM convolutions ride on,
+        # and one this trainer never set. It belongs here rather than in run() because cuBLAS reads it when its
+        # handle is created.
+        #
+        # Compliance rather than a fix, and said so deliberately: the runs that prompted it were *believed* to
+        # have diverged - the same seed and arguments reported 0.01483 -> 0.01419 by epoch 12 on one run and a
+        # 0.6% total fall on another - and the second of those turned out to be a mid-training dip that recovered,
+        # not a different trajectory. Re-running the seed reproduced the original's numbers exactly (val L1
+        # 0.01498, 0.01% improvement, 0.6% progress, the same four failed gates), so this training path *is*
+        # pinned by --deterministic and the stall is a property of (seed, config) rather than of the run. The
+        # variable stays because the flag's claim should not depend on which kernels a given build happens to
+        # pick, and --strict-determinism is what would name an op that is genuinely not deterministic.
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.set_num_threads(os.cpu_count() or 4)
     return run(args, lambda message: print(message, flush=True))
 

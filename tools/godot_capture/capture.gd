@@ -91,6 +91,27 @@ const SCENES := {
 				"position": Vector3(0.10, 0.35, -0.95)},
 		],
 	},
+	# The held-out companion to "temporal": same idea, different everything that matters - colours, layout, wall
+	# distance and dolly speed - because a validation split has to be different content and not the same content
+	# at a different index. A wall at 3 units with a faster dolly (0.07/frame) crosses 28 units over 400 frames,
+	# which is still short of the wall, and the objects sit between the two again so disocclusion happens.
+	"temporal2": {
+		"camera_velocity": Vector3(-0.07, 0.03, 0.0),
+		"checker": 11,
+		"backdrop_size": Vector2(30.0, 18.0),
+		"backdrop_z": -3.0,
+		"objects": [
+			{"shape": "torus", "color": Color(0.35, 0.80, 0.45), "scale": 0.55,
+				"orbit": 0.30, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.7, "spin": 1.3,
+				"position": Vector3(0.70, 0.20, -1.80)},
+			{"shape": "box", "color": Color(0.90, 0.55, 0.25), "scale": 0.48,
+				"orbit": 0.22, "axis": Vector3(0.0, 0.0, 1.0), "phase": 2.0, "spin": 1.7,
+				"position": Vector3(-0.75, -0.35, -2.30)},
+			{"shape": "sphere", "color": Color(0.55, 0.55, 0.95), "scale": 0.30,
+				"orbit": 0.40, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.4, "spin": 0.0,
+				"position": Vector3(0.05, 0.45, -1.50)},
+		],
+	},
 	# More training content. Capacity is measured to be cheap in latency (eight times the parameters cost
 	# 1.03-1.42x the time), so the frontier sweep will want a model with more room - and a model with more
 	# room needs more than 367 pairs. These are separate scenes rather than a longer capture of the same one,
