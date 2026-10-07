@@ -1364,7 +1364,10 @@ matter too.
       exactly how the first two-tier run died. All three are off by default, so every number already recorded
       stays reproducible, and all three are recorded in the run's JSON. Validation is still materialised whole
       (1205.9 MB either way on godot-v4), because the held-out number needs every output and baseline at once:
-      what the lazy path removes is the *training* split's footprint, which is the one that grows with data.
+      what the lazy path removes is the *training* split's footprint, which is the one that grows with data. It
+      costs wall clock, and the price is measured rather than implied: 4.1 s per epoch eager against 11.9 s per
+      epoch lazy at ch16/batch4 on the same data, because it decompresses a pair per batch instead of once.
+      Unwinnable-in-RAM against slower is the trade the flag offers, and it is why the arm sweeps run eager
       Seven self-tests cover it, including both mirror signs and the stacking invariant
 
 ### M10.4 - Temporal v2: the measurement says the mask, not the warp, is the missing piece

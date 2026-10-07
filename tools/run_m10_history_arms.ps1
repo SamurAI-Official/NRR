@@ -22,7 +22,9 @@ $root = "G:\Program Prototype\NRR"
 $data = "models/training-data/godot-v4-warp"
 $common = @("tools/train_nrr.py", "--data", $data, "--channels", "32",
             "--batch-size", "16", "--measure-batch", "32", "--epochs", "60", "--learning-rate", "0.002",
-            "--size", "128", "--deterministic", "--lazy")
+            "--size", "128", "--deterministic")
+# No --lazy: the split fits in RAM, and laziness costs wall clock for no benefit at this size (measured below).
+# It is still the right flag for a dataset that does not fit, which is what it was added for.
 
 $runs = @(
     @{ name = "m10_colour_20261020";    args = @("--inputs=", "--seed", "20261020") },

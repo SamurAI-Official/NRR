@@ -83,7 +83,11 @@ know or care which it was handed. On godot-v4 (949 train / 800 val pairs):
 Three things about that are worth stating rather than implying. Validation is still loaded whole, because the
 held-out number needs every output and every baseline in memory at once, so laziness there would save a third
 of a split that is by construction a small fraction of the data - on godot-v4 it is 1205.9 MB either way,
-which is the measured reason the flag is called `--lazy` and not "low memory mode". The identical numbers are
+which is the measured reason the flag is called `--lazy` and not "low memory mode". The other half of that
+trade is wall clock, and it is measured too: 4.1 s per epoch eager against 11.9 s per epoch lazy at
+ch16/batch4 on the same data, because the lazy path decompresses a pair per batch rather than once. Running
+the arm sweeps eager and reserving `--lazy` for a dataset that does not fit is the consequence, and it is what
+the sweeps in `tools/` do. The identical numbers are
 a *result* rather than a hope: `--lazy` changes when a pair is read and nothing else, which is why both paths
 share one `pair_from_npz()` and the self-test compares them pair for pair on real files on disk. And the
 zeroed-input ablation has to mean the same thing on both loaders, or a lazy ablation run could not be quoted
