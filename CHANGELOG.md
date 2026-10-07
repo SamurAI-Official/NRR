@@ -2711,3 +2711,41 @@ comparison with a trained model will build on.
 
 Tests: the Godot extension builds and installs (`setup.ps1`), the verification project still passes, and the
 benchmark exits 0 with `RESULT: PASS`.
+
+### The next model, its data, and the engine seam - a sequence with the bars stated first
+
+This entry records decisions and ordering, not landed capability: every item below is a `- [ ]` in
+`docs/roadmap.md` M10, and nothing here is claimed as working.
+
+Three sets of numbers already on disk set the order. Capacity without data loses - ch64 (372,803
+parameters) scored 23.22% against ch32's 20.46% on 367 pairs, a +2.75-point mean under a
+pre-registered 5-point bar. Every quality lever tried since fell inside the +/-2.4-point seed noise.
+The temporal arms lost on data whose `history` input was the *raw* previous frame, unwarped and
+unmasked (4.26% against colour-only's 9.61% and its own zeroed control's 8.66%) - so the result is
+evidence about an input contract, not about temporal rendering. And the model that won is 15-20%
+softer than bilinear *in the high band only* (0.182 against 0.222 on heldout3) while retaining
+0.975-1.000 of the truth's energy in the band the input can carry.
+
+**Data policy (decided).** Weights ship only from data we own or that is CC0/CC-BY: self-generated
+procedural pairs, engine captures of our own scenes, and CC0/CC-BY content (Poly Haven, ambientCG,
+Kenney, the Godot demo projects, Blender open movies). Commercial game captures are for benchmarking
+and measurement, never for weights. Public super-resolution datasets are a colour-arm pretraining
+option at most and never a temporal one, because their low-resolution side is a downsample, which
+destroys the sample position a temporal model needs - the confound this project already found once and
+re-asked the temporal question to avoid. The dataset manifest gains a per-dataset licence, and the
+trainer refuses a dataset without one, in the same shape as its existing refusals.
+
+**The Streamline seam (decided).** `RendererRD::DLSSContext` already caches the last frame's
+`Parameters` in `last_parameters`, carrying `RID velocity` and `Vector2 jitter`, so the inputs are
+already stored rather than in need of plumbing. The bridge is our module (`modules/nrr_dlss_bridge/`),
+guarded with `__has_include` so the same module compiles against stock Godot and reports unavailable -
+which keeps the engine build off the critical path and lets the detection path be tested first.
+`docs/nvidia-streamline-godot.md` carries the mapping, and acceptance for the live run is
+`integration_observed=true` from a real jitter, against today's `false`.
+
+**Sequencing**, pick-per-sitting: the fork seam and the live DLSS benchmark; Godot captures with real
+content plus the trainer's lazy-loading and multi-scale changes; warped-history temporal v2 against the
+existing pre-registered rule; RCAS after the model to answer the detail bar (FidelityFX-SR1 is already
+vendored, so this may clear without any retraining); commit the model with its provenance; the
+Blender/CC0 factory; then the engine capture mirrors and, last, the injection benchmark - which
+measures NRR over an already-reconstructed frame and is offline research only.

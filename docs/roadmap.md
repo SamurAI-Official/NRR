@@ -221,6 +221,7 @@ measured, and temporal/reference data actually changes that image.
       chosen per run, an ablation per input, GPU training at **11.7x the CPU rate**, and refusal to
       export a model that does not beat bilinear by 5%, that differs from it by less than 1e-3, that
       ignores an input it was given, or *whose training made no progress*).
+      Carried forward in M10, which carries the sequence and the bars for the next round.
 - [x] **Decide the model contract - decided against changing it, by measurement.** A previous colour
       frame would have made motion load-bearing, so it was tested rather than argued: four
       configurations x two seeds on 567 captured pairs (367 train, 200 held out) on the GPU, against a
@@ -1184,6 +1185,9 @@ be attached *and verified* here first, the rest implemented and gated with an au
 - [ ] Implement the missing `.cpp` layer: `IMPLEMENT_MODULE`, `nrr.dll` loading and
       teardown with error surfacing, `UNRRComponent` bodies and Blueprint `UFUNCTION`s
 - [ ] Render pass integration (scene view extension / post-process stage)
+- [ ] Capture plugin for training data - a `USceneViewExtension` mirroring `tools/godot_capture`,
+      because Unreal's own TAA already produces the jitter and its motion vectors and depth are in
+      `FSceneView` (see M10.5)
 - [ ] Editor UI for model/reference management
 - [ ] `.uplugin` packaging rules and a sample map
 
@@ -1211,6 +1215,8 @@ platforms' toolchains and a rendered frame.
 - [ ] Capture depth and motion vectors (no portable depth buffer reaches GDScript; none of
       Forward+ motion vectors outside Forward+), without which NRR's depth/motion
       conditioning and motion-adaptive blending stay unused on this path
+- [ ] `tools/godot_capture/` as an installable `nrr_capture` addon, attachable to any project
+      rather than only its own procedural scenes (see M10.5)
 - [ ] Editor UI for model/reference management and a demo project scene
 
 ## M7 - Vendor accelerator kernels `gated: vendor SDKs + hardware`
@@ -1237,6 +1243,169 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 - [ ] Diagnostics/logging API and a complete `RenderStats` surface
 - [ ] Integration guide and backend-authoring guide
 - [ ] Licence/provenance review before any model weights ship
+
+## M10 - The trained model, its data, and the engine seam `active frontier`
+
+Not a numbered progression: M2-M9 are hardware- or install-gated, and this is the work that runs on
+the machine in front of us. It exists because the two questions that decide whether NRR is a product -
+*is the model good* and *where does its data come from* - are close to the same question, and because
+the engine seam that supplies the temporal inputs is now specified well enough to build.
+
+The measurements already on disk set the order below, and they are why it is *this* order: capacity
+without data loses (ch64, 372,803 parameters, scored 23.22% against ch32's 20.46%, a +2.75-point mean
+under a pre-registered 5-point bar, at 367 pairs); every quality lever tried since fell inside the
++/-2.4-point seed noise (depth+motion -2.72, charbonnier +0.92, cosine +2.58, l1ssim +1.65,
+detail-weight 0.5 -2.38); the temporal arms lost on data whose `history` input was the *raw* previous
+frame (4.26% against colour-only's 9.61% and its own zeroed control's 8.66%); and the model that won is
+15-20% softer than bilinear *in the high band only* (0.182 against 0.222 on heldout3) while retaining
+0.975-1.000 of the truth's energy in the band the input can carry.
+
+Recommended pick-per-sitting sequence, with what blocks each one:
+
+| # | Work | Blocked by | Cost |
+| --- | --- | --- | --- |
+| 1 | M10.1 fork seam, then the live DLSS benchmark | Streamline SDK + engine build | ~half a day, mostly build |
+| 2 | M10.3 Godot captures with real content, retrain, re-measure | nothing | hours of rendering |
+| 3 | M10.3 trainer: lazy loading, crop/flip augmentation, multi-scale | nothing | small code change |
+| 4 | M10.4 packer emits warped history + validity, two-arm comparison | nothing | small change, 4 short runs |
+| 5 | M10.2 RCAS post-sharpen against the detail bar | nothing | hours, no training |
+| 6 | M10.2 commit the model + the provenance gate | 2 and 5 | small |
+| 7 | M10.3 Blender/CC0 capture factory | nothing | 1-2 days |
+| 8 | M10.5 engine capture mirrors, then the injection benchmark | Unreal install / Unity editor | larger |
+
+### M10.1 - The NVIDIA Streamline seam in the Godot fork `gated: Streamline SDK + engine build`
+
+`RendererRD::DLSSContext` already caches the last frame's `Parameters` in `last_parameters`
+(`servers/rendering/renderer_rd/effects/dlss.h`), which carries `RID velocity` and `Vector2 jitter`
+alongside `internal_size`, `reprojection`, `cam_projection` and `delta_time`. So the inputs NRR wants are
+already *stored* - one accessor away - rather than something that has to be plumbed out of the upscale
+call site. `docs/nvidia-streamline-godot.md` records the mapping; this item is the build.
+
+- [ ] Step 0, before any code: shallow-clone `NVIDIA-RTX/godot` at `nvidia-pt-dlss` and settle who owns
+      the context (`grep -rn "create_context(\|\->upscale(\|DLSSContext \*" servers/`), because that
+      decides whether the accessor is a static on `DLSSContext` or a read of a renderer member
+- [ ] `servers/rendering/renderer_rd/effects/dlss.{h,cpp}`: expose the active context - a static
+      `DLSSContext *get_active_context()`, set in `upscale()` and cleared on destruction
+- [ ] `modules/nrr_dlss_bridge/` (ours, not the fork's): the singleton `NRRDLSS` with
+      `jitter() -> Vector2`, `internal_size() -> Vector2i` and `velocity_image() -> Ref<Image>` (the
+      texture copied out, so no RendererRD type crosses into the addon), guarded by
+      `__has_include("servers/rendering/renderer_rd/effects/dlss.h")` so **the same module compiles
+      against stock Godot 4.7.2 and reports unavailable** - which is what keeps this item from blocking
+      M10.2, and lets the `has_singleton` detection path be tested before the fork exists
+- [ ] `tools/fetch_streamline.ps1`, beside the existing ORT/NDK/Vulkan fetchers: the Streamline runtime
+      is NVIDIA-licensed and is not redistributable (`docs/third-party-sdks.md`), so it is fetched and
+      never committed
+- [ ] Build the fork with Streamline present and run `engine_plugins/godot_verify/benchmark_temporal.gd`
+      against a DLSS-enabled scene. Acceptance is not "it ran": it is `temporal_state()` reporting a
+      non-zero jitter with `integration_observed=true`, against the synthesised-Halton arm's `false`
+      today. The numbers to record are the columns the harness already prints (edge, plain, warping
+      error, temporal PSNR, alpha, the runtime's own note)
+
+### M10.2 - A trained model, committed, with its provenance recorded
+
+The model exists and is measured; what is missing is a committed one and a licence decision, which is why
+M1's trained-model item is `[~]`. This is the item that turns it into `[x]`.
+
+- [ ] Commit the best ten-seed draw as the product model (seed `20261023`, 25.39% held-out L1 improvement
+      against the ten-seed mean of 22.03% +/- 2.60%) with a model card: configuration, seeds, the bars it
+      passes and the bars it does not
+- [ ] Keep `models/nrr_upscaler_v0.1.onnx` test-only, as the roadmap already requires - it is a ~45 KB
+      untrained identity fixture and must never be presented as the shipped model
+- [ ] **Clear the detail bar without retraining, if the model can.** The failure is specific: 15-20%
+      softer than bilinear in the high band, while retaining 0.975-1.000 of the truth's energy in the
+      band the input can carry and correlating better than the baseline on 64 of 64 frames. AMD
+      FidelityFX-SR1 is already vendored in-tree (`third_party/FidelityFX-FSR1`, `tools/fsr1.py`), so run
+      RCAS as a runtime post-stage and re-measure the *full* stack. If the bar clears, "soft" is a
+      post-process and not a training problem - and no pre-registered threshold moves either way
+- [ ] Per-dataset licence field in the manifest, **enforced by the trainer**: a dataset without a licence
+      string is refused, the same shape as the existing refusals (no export if the model does not beat
+      bilinear by 5%, differs from it by less than 1e-3, ignores a given input, or made no progress). This
+      is the runtime-side twin of M1's reference-provenance check, on the data side instead of the render
+      path
+
+### M10.3 - Data scale-out: the lever the measurements point at
+
+1,749 pairs from seven procedural scenes is the constraint, and the two conclusions above say so
+directly: capacity lost because there was not enough data to feed it, and every architectural lever was
+smaller than the noise. So the next accuracy work is *content*, not architecture, and it has to respect
+the rule the generator already states - weights are only half of a licensing surface, so the data's terms
+matter too.
+
+- [ ] More, shorter, more diverse Godot captures. The capture is deterministic and headless
+      (`tools/capture_godot_v4.ps1`, 7 scenes x 200-400 frames), and camera speed is per frame, so a long
+      capture drifts out of the data gate's margin band - more scenes, not longer captures
+- [ ] **Real textured content in those scenes.** The procedural primitive-and-checkerboard look has
+      already tripped the detail gate once ("almost no high-frequency content"), and it is the most
+      likely cause of the thin margin between NRR and bilinear on structure
+- [ ] A Blender headless factory: `bpy` renders the target plus a jittered half-resolution pass, and its
+      Z (depth) and Vector (motion) passes, over CC0 scenes. It needs the same *probe-and-pin* treatment
+      `tools/godot_capture/shaders/motion.gdshader` needed for its convention (sign, scale,
+      current-to-previous or not) - an unpinned convention is how a comparison ends up measuring the
+      wrong thing
+- [ ] Trainer changes a dataset of that size needs: lazy npz loading and crop/flip augmentation (today
+      every pair is concatenated into RAM), and multi-scale training from captures at 256 -> 512 so the
+      model is not tier-overfit at 128 -> 256 when the runtime scores at 540p -> 1080p and 1080p -> 4K
+
+### M10.4 - Temporal v2: warp the history in the data, not in the model
+
+The temporal arms lost, and the inputs say why: `history` was the previous frame's input, unwarped and
+unmasked, so a model with a hundred thousand parameters was being asked to learn reprojection and
+disocclusion implicitly. `tools/pack_godot_pairs.py` already computes `validity` (a pixel is invalid when
+its reprojection left the frame or when the previous frame held something nearer; sky is 0) - the missing
+piece is the warp.
+
+- [ ] The packer also emits the **warped** history: bilinear reprojection of the previous input by the
+      motion field, the same operation the runtime's accumulator performs, plus the mask as an input
+- [ ] Re-run the two-arm comparison on the same seeds against the **same pre-registered rule** in
+      `docs/evaluation-protocol.md` (beat colour-only by 5 points *and* beat the zeroed control). A lever
+      is not re-judged because the first attempt lost
+- [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
+      **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
+      easier target, it improves the path that already exists, and it is what M1's open item
+      ("temporal accumulation that improves detail") actually asks for
+
+### M10.5 - Games: measurement first, and the injection boundary
+
+Three goals get conflated here, and separating them is most of the work.
+
+- [ ] **Live NRR over a game.** Engine integration works where there is source or a build: the Godot
+      addon today, the Unity plugin in-tree, Unreal `structural`. For a *shipped* game the only route is
+      a present-hook - a Vulkan implicit layer (the sanctioned mechanism, registered under
+      `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers`) or a DXGI/d3d12 proxy. It sees the presented colour
+      frame only: no depth, no motion, no jitter - which fits the committed colour-only model, but it
+      runs *after* the game's own reconstruction, so it measures NRR over an already-upscaled image
+      rather than the product scenario. Anti-cheat software treats injection as cheating, so this path is
+      offline, single-player, research-only, and never shipped
+- [ ] **Training data from a game is not obtainable this way, and this is the important negative.** The
+      low-resolution raster, the jitter, the motion vectors and the depth all live inside the renderer; a
+      present-hook only ever sees the final resolve. Synthesising the low-resolution input by
+      downsampling the presented frame is the "filtered downscale" that destroys sample position - the
+      confound this project already found once and re-asked the temporal question to avoid. So: **measure
+      on games, train on ours.** Game captures are for benchmark numbers on content we did not author,
+      not for weights (see M10.6)
+- [ ] **The engine capture factory is the real source.** `tools/godot_capture` is already
+      scene-agnostic - the motion shader takes per-object MVPs and never looks at the scene - so make it
+      an installable `nrr_capture` addon that attaches to any Godot project, then mirror it: Unreal via a
+      `USceneViewExtension` (the best source, because its own TAA already produces the jitter and its
+      motion vectors and depth are in `FSceneView`), and Unity via `CommandBuffer` with `MotionVectors`
+      and `_CameraDepthTexture`
+
+### M10.6 - Data provenance and licence tiers
+
+The generator's own rationale is the policy: a public super-resolution dataset brings its own terms, and
+weights are only half of the licensing surface. Three tiers, with an enforcement point rather than a
+convention:
+
+| Tier | What | May train shipped weights? |
+| --- | --- | --- |
+| 1 | Self-generated procedural pairs, engine captures of our own scenes, CC0/CC-BY content (Poly Haven, ambientCG, Kenney, the Godot demo projects, Blender open movies) | **Yes** - the licence of every source is recorded in the dataset manifest |
+| 2 | Commercial game captures | **No** - benchmark and quality measurement only |
+| 3 | Public super-resolution datasets (DIV2K/Flickr2K academic; BVI-DVC, REDS, Vimeo-90K research; Sintel, Tanks and Temples) | Pretrain only, per-source terms checked - and structurally unsuitable for anything temporal, because their low-resolution side is a *downsample*, which destroys the sample position a temporal model needs |
+
+- [ ] The trainer refuses a Tier-2 dataset for a model that is being exported as shippable, and the
+      manifest records the tier, the sources and their terms per dataset
+- [ ] M9's licence/provenance review stays the gate before any weights ship, and it now has something to
+      review
 
 ---
 
@@ -1268,7 +1437,7 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | Unreal Engine install | M5 | Not present |
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | **Android toolchain: present.** NDK r27 (`27.0.12077973`), adopted if installed and otherwise fetched by `tools/fetch_ndk.ps1` (cached in CI), so the Android configuration now compiles in the `android-ndk` job (arm64-v8a, `nrr_static`, Vulkan from the NDK sysroot). No device and no emulator image, so device behaviour is still evidenced only by the consumer's `nrr_probe` run. **iOS: no toolchain** (needs macOS/Xcode) |
-| Model weights: train in-house vs license | M1 quality gate, M9 licensing | Undecided |
+| Model weights: train in-house vs license | M1 quality gate, M9 licensing | **Decided (M10.6): trained in-house, on data we own or that is CC0/CC-BY; game captures are for measurement only; public super-resolution datasets are a colour-arm pretrain at most. Weights are Tier-1 only, and the trainer refuses a dataset with no licence recorded.** |
 | `NRRRenderStats::quality_metric`: measure it for real, or declare the field reserved and unset on every path | The field is published to integrators and held three different fabricated constants (0.75 CPU / 0 accelerator / 0.5 legacy), so no caller could interpret it | **Decided and implemented: measured** - SSIM against a `reference_frame` image from the reference set, `0.0` with the reason in `debug_info` when there is nothing to measure against |
 | Performance bar for v1.0 | Whether <16 ms at 1080p->4K is the gate or a lower internal tier is acceptable | Undecided |
 | Platform priority for v1.0 | Sequencing of M4-M8 | Undecided |
@@ -1280,6 +1449,8 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
 | Adding more unverifiable structure (the failure mode that produced the current state) | Every milestone ends with a measured assertion; `gated` labels for anything lacking hardware |
 | ONNX Runtime version coupling (the intentional `ReleaseSession` skip in `runtime/onnx_runtime.cpp` works around a 1.30 hang) | Revisit the leak when upgrading ORT, especially once GPU providers are enabled |
 | Determinism/flakes in the suite | Sanitizers plus repeated CI runs; the aliasing flake fix is guarded by a test |
+| Weights trained on content we do not have redistribution rights to (commercial games, platform SDK samples) | M10.6 tiers, a licence field per dataset, and a trainer refusal rather than a convention |
+| Injection paths (a present-hook) read by anti-cheat as cheating, and their input is not the product scenario | M10.5: offline, research-only, never shipped; the product path is engine integration |
 | Documentation drift from code | This roadmap is authoritative; README summarises it |
 
 ## Running the project

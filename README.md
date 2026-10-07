@@ -175,7 +175,9 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       export** a model that does not beat bilinear by 5%, that differs from bilinear by less
       than 1e-3, that ignores an input it was given, or whose **training made no progress** -
       that last gate exists because five of eight comparison runs silently froze in an
-      absorbing state and were briefly indistinguishable from results.
+      absorbing state and were briefly indistinguishable from results. The next round of data,
+      training and engine-capture work - with its sequence and its bars - is M10 in
+      `docs/roadmap.md`.
 - [x] **The input-set question is settled by measurement, and the answer is the single-frame
       colour model.** Four configurations were trained twice each on 567 captured pairs (367
       train, 200 held out) on the GPU, against a rule fixed before the runs: adopt the temporal
