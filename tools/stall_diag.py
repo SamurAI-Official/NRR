@@ -17,8 +17,9 @@ import train_nrr as T  # noqa: E402
 
 def main():
     _, dataset = T.load_dataset("models/training-data/godot-v1")
-    keys = list(dataset["train"].keys())
-    batch = T.take(dataset["train"], slice(0, 16), keys)
+    # The split hands out its own batches since the loader gained a lazy path: `keys` is a list there, not the
+    # dict-shaped split it used to be, and T.take() is for a materialised split (validation).
+    batch = dataset["train"].batch(slice(0, 16))
 
     for seed in (20261001, 20261002):
         torch.manual_seed(seed)

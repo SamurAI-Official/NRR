@@ -1266,7 +1266,7 @@ Recommended pick-per-sitting sequence, with what blocks each one:
 | --- | --- | --- | --- |
 | 1 | M10.1 fork seam, then the live DLSS benchmark | Streamline SDK + engine build | ~half a day, mostly build |
 | 2 | M10.3 Godot captures with real content, retrain, re-measure | nothing | hours of rendering |
-| 3 | M10.3 trainer: lazy loading, crop/flip augmentation, multi-scale | nothing | small code change |
+| 3 | M10.3 trainer: lazy loading, crop/flip augmentation, multi-scale `done` | nothing | small code change |
 | 4 | M10.4 packer emits warped history + validity, two-arm comparison | nothing | small change, 4 short runs |
 | 5 | M10.2 RCAS post-sharpen against the detail bar | nothing | hours, no training |
 | 6 | M10.2 commit the model + the provenance gate | 2 and 5 | small |
@@ -1353,9 +1353,19 @@ matter too.
       is designed on the confirmed depth pass plus the camera matrices - the primitive `tools/godot_capture/`
       already uses, and exact for camera motion over static geometry - and the Y sign is recorded as
       **unmeasured** rather than assumed
-- [ ] Trainer changes a dataset of that size needs: lazy npz loading and crop/flip augmentation (today
-      every pair is concatenated into RAM), and multi-scale training from captures at 256 -> 512 so the
-      model is not tier-overfit at 128 -> 256 when the runtime scores at 540p -> 1080p and 1080p -> 4K
+- [x] Trainer changes a dataset of that size needs: lazy npz loading, crop/flip augmentation, and
+      multi-scale crops - **built and measured** (`tools/train_nrr.py`). `--lazy` reads the training split's
+      files per batch instead of concatenating the split into RAM: on godot-v4 the training split goes from
+      **1430.5 MB held to 0.0 MB**, and the held-out numbers are identical to the last digit (`measured` and
+      `gates` compare equal), which is what makes the flag quotable rather than merely convenient.
+      `--augment-flip` mirrors each sample and negates the motion/jitter component along the mirrored axis,
+      and `--crop-sizes 96,112` draws the crop **tier once per batch** - per sample is impossible, because
+      samples cropped to different sizes cannot be stacked into the tensor a convolution consumes, which is
+      exactly how the first two-tier run died. All three are off by default, so every number already recorded
+      stays reproducible, and all three are recorded in the run's JSON. Validation is still materialised whole
+      (1205.9 MB either way on godot-v4), because the held-out number needs every output and baseline at once:
+      what the lazy path removes is the *training* split's footprint, which is the one that grows with data.
+      Seven self-tests cover it, including both mirror signs and the stacking invariant
 
 ### M10.4 - Temporal v2: warp the history in the data, not in the model
 

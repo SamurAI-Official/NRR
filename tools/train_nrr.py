@@ -24,6 +24,16 @@ Usage:
     python tools/train_nrr.py --data models/training-data/v1 --out models/nrr_upscaler_trained.onnx
     python tools/train_nrr.py --self-test    # the gates must reject a model that is the baseline
 
+Data path, all off by default so that every recorded number stays reproducible:
+    --lazy          read the training split's files per batch instead of concatenating the whole split into
+                    memory first. Same pairs, same order, same numbers; a dataset larger than RAM becomes
+                    trainable. Validation is still loaded whole, because every val pair is forwarded anyway.
+    --augment-flip  mirror each training sample on both axes at random, negating the motion and jitter
+                    component that points along the mirrored axis so the mirrored pair stays *equal* to a
+                    pair the capture could have produced.
+    --crop-sizes N,M crops for multi-scale training: one size drawn per sample, the target cropped to the
+                    matching window. A model trained at one frame size has seen one tier of it.
+
 Requires: pip install torch, numpy, onnx. onnxruntime is optional and used only to confirm that the
 exported graph agrees with PyTorch.
 
@@ -144,70 +154,315 @@ class GpuSampler(threading.Thread):
                 "memory_used_mb": {"mean": round(sum(memory) / len(memory)), "max": max(memory)}}
 
 
-def load_dataset(data_dir):
-    """Loads the manifest and the pairs it names, as float32 tensors in NCHW order."""
+def pair_from_npz(pair):
+    """One pair file as float32 tensors in NCHW order.
+
+    Both loaders below call this, so the eager and the lazy path cannot disagree about a key's name, order or
+    dtype. `--lazy` is a statement about *when* a pair is read, never about what it contains - if the two
+    disagreed, switching a dataset between them would silently change which inputs a run can use."""
+    item = {
+        "color": torch.from_numpy(pair["input"].transpose(2, 0, 1)[None].copy()),
+        "depth": torch.from_numpy(pair["depth"][None, None].copy()),
+        "motion": torch.from_numpy(pair["motion"].transpose(2, 0, 1)[None].copy()),
+        "target": torch.from_numpy(pair["target"].transpose(2, 0, 1)[None].copy())}
+    # history and validity exist in captures (tools/pack_godot_pairs.py) but not in procedural
+    # pairs. Their absence is not an error - a run that does not ask for them must still work - and
+    # their presence is what makes the history comparison possible at all.
+    if "history" in pair:
+        item["history"] = torch.from_numpy(pair["history"].transpose(2, 0, 1)[None].copy())
+    # Jitter is the sub-pixel offset this frame's low-resolution sample was taken at, in
+    # low-resolution pixels, +x right +y down. It is one 2-vector per frame but is broadcast to a
+    # plane here, because a convolution cannot consume a 2-vector and the whole point of telling the
+    # model where the frame was sampled is so it can correct for it. Without this a temporal model
+    # trained on jittered captures cannot know its own sampling grid, which is the information that
+    # separates a jitter-aware temporal resolve from an unaware one.
+    if "jitter" in pair:
+        height, width = pair["input"].shape[0], pair["input"].shape[1]
+        item["jitter"] = torch.from_numpy(pair["jitter"].astype(np.float32)) \
+            .view(1, 2, 1, 1).expand(1, 2, height, width).clone()
+    return item
+
+
+
+class Split:
+    """One split's pairs, held either as concatenated tensors (eager) or as the files they came from (lazy).
+
+    Both answer the same questions - `keys`, `count`, `batch(index)` - so the training loop does not know or
+    care which it was given, and a lazy run and an eager run of the same seed produce the same tensors in the
+    same order. `zero()` and `to_()` are the two places the driver used to reach into the tensors directly.
+
+    Eager is the default because it is faster: each split is moved to the device once. Lazy exists because
+    "the dataset fits in memory" is a limit a capture factory crosses - a few thousand 128x128 pairs fit, a
+    few hundred thousand do not - and the fix for that has to be a loader change, not a smaller dataset.
+    """
+
+    def __init__(self, keys, device=None, tensors=None, paths=None):
+        self.keys = list(keys)
+        self.device = device
+        self.tensors = tensors                  # eager: {key: (N, C, H, W) tensor}, nothing left to read
+        self.paths = paths                      # lazy: one pair file per position, read on demand
+        self.count = tensors[self.keys[0]].shape[0] if tensors is not None else len(paths)
+        self.zeroed = set()
+
+    def __contains__(self, key):
+        return key in self.keys
+
+    def zero(self, key):
+        """Ablation, for the whole split. Eager replaces the tensor with zeros; lazy remembers not to hand it
+        over. The two produce the same zeros, which is the only thing an ablation is allowed to differ by."""
+        if key not in self.keys:
+            return
+        if self.tensors is not None:
+            self.tensors[key] = torch.zeros_like(self.tensors[key])
+        self.zeroed.add(key)
+
+    def to_(self, device):
+        """Places the split on `device`: eager moves its tensors once, lazy materialises straight onto it."""
+        self.device = device
+        if self.tensors is not None:
+            self.tensors = {key: value.to(device) for key, value in self.tensors.items()}
+
+    def _positions(self, index):
+        """Turns whatever the caller indexed with into pair positions, because a lazy split indexes files
+        rather than tensors and cannot slice a list of names."""
+        if isinstance(index, slice):
+            return list(range(*index.indices(self.count)))
+        if isinstance(index, torch.Tensor):
+            return [int(value) for value in index.flatten()]
+        if isinstance(index, (list, tuple, range, np.ndarray)):
+            return [int(value) for value in index]
+        return [int(index)]
+
+    def batch(self, index):
+        """The pairs at `index` as one dict of tensors, on this split's device.
+
+        Eager slices what is already in memory; lazy reads those pairs from disk now, which is the whole
+        difference between the two. Nothing else about a batch depends on which path produced it.
+        """
+        if self.tensors is not None:
+            return {key: self.tensors[key][index] for key in self.keys}
+        pieces = []
+        for position in self._positions(index):
+            with np.load(self.paths[position]) as pair:
+                pieces.append(pair_from_npz(pair))
+        batch = {}
+        for key in self.keys:
+            value = torch.cat([piece[key] for piece in pieces], dim=0)
+            if key in self.zeroed:
+                value = torch.zeros_like(value)
+            batch[key] = value.to(self.device)
+        return batch
+
+    def materialise(self):
+        """The whole split as one dict of tensors. Used by the driver for validation, whose every pair has to
+        be forwarded to produce the held-out number."""
+        if self.tensors is not None:
+            return self.tensors
+        return self.batch(slice(0, self.count))
+
+    def frame_shape(self):
+        """(height, width) of the low-resolution input grid, from the first pair and without materialising the
+        split, so the augmentation arguments can be checked against it before training starts."""
+        if self.tensors is not None:
+            return tuple(self.tensors["color"].shape[-2:])
+        with np.load(self.paths[0]) as pair:
+            return (int(pair["input"].shape[0]), int(pair["input"].shape[1]))
+
+
+def load_dataset(data_dir, lazy=False):
+    """Loads the manifest and the pairs it names.
+
+    Returns (manifest, dataset) where dataset["train"] and dataset["val"] are Split objects, sizes[split] is
+    that split's pair count, and has_history / has_jitter say whether the pairs carry a previous frame and a
+    sampling offset.
+
+    `lazy` reads the *training* split's files per batch instead of concatenating the whole split into memory
+    first. Which optional inputs a dataset has is decided from the files either way, so a mixture of captured
+    and procedural pairs is refused before any of them is read, not discovered halfway through training."""
     manifest_path = os.path.join(data_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise SystemExit("%s has no manifest.json - run tools/gen_training_pairs.py first" % data_dir)
     with open(manifest_path, encoding="utf-8") as handle:
         manifest = json.load(handle)
 
-    buckets = {"train": [], "val": []}
+    entries = {"train": [], "val": []}
+    pairs = []
     for entry in manifest["pairs"]:
         path = os.path.join(data_dir, entry["file"])
-        with np.load(path) as pair:
-            item = {
-                "color": torch.from_numpy(pair["input"].transpose(2, 0, 1)[None].copy()),
-                "depth": torch.from_numpy(pair["depth"][None, None].copy()),
-                "motion": torch.from_numpy(pair["motion"].transpose(2, 0, 1)[None].copy()),
-                "target": torch.from_numpy(pair["target"].transpose(2, 0, 1)[None].copy())}
-            # history and validity exist in captures (tools/pack_godot_pairs.py) but not in procedural
-            # pairs. Their absence is not an error - a run that does not ask for them must still work - and
-            # their presence is what makes the history comparison possible at all.
-            if "history" in pair:
-                item["history"] = torch.from_numpy(pair["history"].transpose(2, 0, 1)[None].copy())
-            # Jitter is the sub-pixel offset this frame's low-resolution sample was taken at, in
-            # low-resolution pixels, +x right +y down. It is one 2-vector per frame but is broadcast to a
-            # plane here, because a convolution cannot consume a 2-vector and the whole point of telling the
-            # model where the frame was sampled is so it can correct for it. Without this a temporal model
-            # trained on jittered captures cannot know its own sampling grid, which is the information that
-            # separates a jitter-aware temporal resolve from an unaware one.
-            if "jitter" in pair:
-                height, width = pair["input"].shape[0], pair["input"].shape[1]
-                item["jitter"] = torch.from_numpy(pair["jitter"].astype(np.float32)) \
-                    .view(1, 2, 1, 1).expand(1, 2, height, width).clone()
-            buckets[entry["split"]].append(item)
+        # np.load reads a zip archive's directory to answer this, not the arrays, so asking which optional
+        # inputs a pair carries costs almost nothing and does not depend on the pair being materialised.
+        with np.load(path) as file:
+            present = set(file.files)
+        pairs.append((entry, path, present))
+        entries[entry["split"]].append(pairs[-1])
 
     for split in ("train", "val"):
-        if not buckets[split]:
+        if not entries[split]:
             raise SystemExit(
                 "the dataset has no %s pairs (train=%d, val=%d) - regenerate with a smaller "
-                "--val-every, or more pairs" % (split, len(buckets["train"]), len(buckets["val"])))
+                "--val-every, or more pairs" % (split, len(entries["train"]), len(entries["val"])))
+
+    def uniform(key):
+        """Whether every pair in the dataset carries `key`. Its absence is not an error - a run that does not
+        ask for it must still work - but a mixture is refused rather than half-supported, because the two
+        kinds concatenate different channel counts together."""
+        flags = {key in present for _, _, present in pairs}
+        if len(flags) > 1:
+            raise SystemExit("the dataset mixes pairs with and without %s; use one capture per dataset" % key)
+        return flags == {True}
 
     keys = ["color", "depth", "motion", "target"]
-    # A dataset is either captured (every pair has history) or procedural (none does): a mixture would
-    # concatenate different channel counts together, so it is refused rather than half-supported.
-    history_counts = {("history" in item) for items in buckets.values() for item in items}
-    if len(history_counts) > 1:
-        raise SystemExit("the dataset mixes pairs with and without history; use one capture per dataset")
-    has_history = history_counts == {True}
+    # Whether history is there is decided before anything is loaded, and the same way for both loaders: it is
+    # what makes the history comparison possible at all.
+    has_history = uniform("history")
     if has_history:
         keys.append("history")
-
-    # Same rule for jitter: a dataset is either all-jittered or not, never a mixture, because the two would
-    # concatenate different key sets together.
-    jitter_counts = {("jitter" in item) for items in buckets.values() for item in items}
-    if len(jitter_counts) > 1:
-        raise SystemExit("the dataset mixes pairs with and without jitter; use one capture per dataset")
-    has_jitter = jitter_counts == {True}
+    has_jitter = uniform("jitter")
     if has_jitter:
         keys.append("jitter")
 
-    dataset = {"has_history": has_history, "has_jitter": has_jitter}
-    for split, items in buckets.items():
-        dataset[split] = {key: torch.cat([item[key] for item in items], dim=0) for key in keys}
-    dataset["sizes"] = {split: len(items) for split, items in buckets.items()}
+    dataset = {"has_history": has_history, "has_jitter": has_jitter,
+               "sizes": {split: len(items) for split, items in entries.items()}}
+    for split, items in entries.items():
+        if lazy and split == "train":
+            # Only the training split takes this path: validation is forwarded in full to produce the
+            # held-out number, so laziness there would save a third of a split that is already a small
+            # fraction of the data, and would complicate the metric path for nothing.
+            dataset[split] = Split(keys, paths=[path for _, path, _ in items])
+        else:
+            loaded = []
+            for _, path, _ in items:
+                with np.load(path) as pair:
+                    loaded.append(pair_from_npz(pair))
+            dataset[split] = Split(keys, tensors={key: torch.cat([item[key] for item in loaded], dim=0)
+                                                  for key in keys})
     return manifest, dataset
+
+
+def augment_scale(height, width, crop_sizes, generator):
+    """The crop size this batch is trained at, drawn once per batch from `crop_sizes`.
+
+    Per batch and not per sample, because a batch is one tensor: samples cropped to different sizes cannot be
+    stacked into the tensor a convolution consumes. This was measured, not reasoned about - the first run with
+    two crop sizes died on torch.cat with "expected size 96 but got size 112" - and it is the standard shape of
+    the lever anyway: the tier varies between batches, while each sample in the batch still gets its own
+    window and its own mirrors below. So multi-scale training is many tiers over an epoch, not one tier per
+    sample within a step.
+    """
+    if not crop_sizes:
+        return height, width
+    side = int(crop_sizes[int(torch.randint(len(crop_sizes), (1,), generator=generator))])
+    crop_h = max(min(side, height), 1)
+    # Width follows the frame's aspect ratio, so --crop-sizes names a height and a non-square capture is
+    # cropped rather than squashed.
+    crop_w = max(min(int(round(side * width / float(height))), width), 1)
+    return crop_h, crop_w
+
+
+def augment_draw(height, width, crop_h, crop_w, flip, generator):
+    """One sample's mirror and crop position, drawn from `generator`.
+
+    Kept apart from the application below so a test can hand-build a decision - "mirror horizontally, crop
+    here" - and check what the application does with it, rather than hoping a random draw happened to produce
+    the case under test."""
+    if flip:
+        # The two axes are drawn independently: a horizontal and a vertical mirror are different transforms
+        # with different consequences for the direction fields below (one negates x, the other y), and a
+        # single draw for both would leave them unexercised apart.
+        flip_h = bool(torch.randint(2, (1,), generator=generator))
+        flip_v = bool(torch.randint(2, (1,), generator=generator))
+    else:
+        flip_h = flip_v = False
+    offset_y = int(torch.randint(height - crop_h + 1, (1,), generator=generator)) if crop_h < height else 0
+    offset_x = int(torch.randint(width - crop_w + 1, (1,), generator=generator)) if crop_w < width else 0
+    return {"flip_h": flip_h, "flip_v": flip_v, "crop_h": crop_h, "crop_w": crop_w,
+            "offset_y": offset_y, "offset_x": offset_x}
+
+
+def _mirror(piece, plan):
+    """The mirror half of a plan, applied to a tensor shaped (N, C, H, W)."""
+    if plan["flip_h"]:
+        piece = torch.flip(piece, dims=(-1,))
+    if plan["flip_v"]:
+        piece = torch.flip(piece, dims=(-2,))
+    return piece
+
+
+def augment_sample(pair, plan, scale_y, scale_x):
+    """Applies one plan to one pair, whose tensors are each shaped (1, C, H, W).
+
+    Why a mirrored pair is still a real pair: every transform that makes one is equivariant under a mirror.
+    The images carry over unchanged - history is on the same grid as the input and was warped into that grid
+    before it was saved, so mirroring the input and the history together mirrors the pair - and a crop is
+    aligned by construction, since the target is the input's grid at `scale`. What does *not* carry over
+    untouched is the sign of the direction fields: motion and jitter point along +x/+y (frame_contract.md
+    4.3), so a horizontal mirror negates their x component and a vertical mirror negates their y. Training on
+    pairs whose motion points the wrong way is worse than not augmenting at all.
+    """
+    out = {}
+    for key, value in pair.items():
+        if key in ("motion", "jitter"):
+            continue                      # signed direction fields, cropped and mirrored below
+        if key == "target":
+            # The target is the higher-resolution grid, so it is cropped at the same place *in image terms*:
+            # the low-resolution window multiplied by the scale. Cropping it at the same pixel offset instead
+            # would take it from a different part of the image, and the model would be trained to reproduce
+            # an offset pair.
+            piece = value[..., plan["offset_y"] * scale_y:(plan["offset_y"] + plan["crop_h"]) * scale_y,
+                          plan["offset_x"] * scale_x:(plan["offset_x"] + plan["crop_w"]) * scale_x]
+        else:
+            piece = value[..., plan["offset_y"]:plan["offset_y"] + plan["crop_h"],
+                          plan["offset_x"]:plan["offset_x"] + plan["crop_w"]]
+        out[key] = _mirror(piece, plan)
+    for key in ("motion", "jitter"):
+        if key not in pair:
+            continue
+        # Both are on the low-resolution grid and are cropped by the same window as everything else. For
+        # jitter that changes no *value* - it is one offset broadcast over the frame - but it is not optional:
+        # the model concatenates the jitter plane with the input's own features, so a full-sized jitter plane
+        # against a cropped input is a shape mismatch, which is exactly how this was found ("96 must match
+        # 128"). A broadcast input is still an input.
+        piece = pair[key][..., plan["offset_y"]:plan["offset_y"] + plan["crop_h"],
+                          plan["offset_x"]:plan["offset_x"] + plan["crop_w"]]
+        piece = _mirror(piece, plan)
+        # Channel 0 is x and channel 1 is y, both pointing +right/+down: a mirror reverses the component
+        # along the axis it mirrors and leaves the other one alone.
+        if plan["flip_h"]:
+            piece = torch.cat([-piece[:, 0:1], piece[:, 1:2]], dim=1)
+        if plan["flip_v"]:
+            piece = torch.cat([piece[:, 0:1], -piece[:, 1:2]], dim=1)
+        out[key] = piece
+    return out
+
+
+def augment_batch(batch, crop_sizes, flip, generator):
+    """Augments a training batch: one crop tier per batch, one window and mirror per sample.
+
+    The crop size is drawn once for the whole batch because samples cropped to different sizes cannot be
+    stacked into one tensor (see augment_scale), but the offset and the mirror are drawn per sample, because a
+    batch is a stack of unrelated frames and a single mirror for all four is a much smaller change than it
+    looks. `generator` is the training loop's own generator, which is why an augmented run is still pinned by
+    --deterministic.
+    """
+    color = batch["color"]
+    height, width = int(color.shape[-2]), int(color.shape[-1])
+    target = batch.get("target")
+    if target is None:
+        raise SystemExit("augmentation needs the target: there is nothing to align a crop against")
+    scale_y = target.shape[-2] // height
+    scale_x = target.shape[-1] // width
+    if target.shape[-2] != height * scale_y or target.shape[-1] != width * scale_x:
+        raise SystemExit(
+            "the target is %dx%d against a %dx%d input, which is not an integer scale, so a crop of the pair "
+            "cannot be aligned to the same part of the image"
+            % (target.shape[-2], target.shape[-1], height, width))
+    crop_h, crop_w = augment_scale(height, width, crop_sizes, generator)
+    pieces = []
+    for index in range(color.shape[0]):
+        plan = augment_draw(height, width, crop_h, crop_w, flip, generator)
+        pieces.append(augment_sample({key: value[index:index + 1] for key, value in batch.items()},
+                                     plan, scale_y, scale_x))
+    return {key: torch.cat([piece[key] for piece in pieces], dim=0) for key in batch}
 
 
 def take(batch, index, keys):
@@ -311,13 +566,33 @@ def _sha256(path):
 
 def run(args, log):
     manifest_path = os.path.join(args.data, "manifest.json")
-    manifest, dataset = load_dataset(args.data)
+    manifest, dataset = load_dataset(args.data, lazy=args.lazy)
     summary = manifest.get("summary", {})
     log("  dataset: %d train / %d val pairs; manifest margin min %.4f, noise %.4f, detail ratio max %.3f"
         % (dataset["sizes"]["train"], dataset["sizes"]["val"],
            summary.get("margin", {}).get("min", float("nan")),
            summary.get("noise", {}).get("max", float("nan")),
            summary.get("detail_ratio", {}).get("max", float("nan"))))
+    log("  loading: %s" % ("lazy, the training split is read per batch"
+                           if args.lazy else "eager, every split is concatenated into memory once"))
+
+    # Augmentation is off unless asked for, and deliberately so: every number this repository has recorded
+    # was produced without it, so turning a transform on by default would silently invalidate all of them.
+    crop_sizes = tuple(sorted({int(value) for value in args.crop_sizes.split(",") if value.strip()}))
+    frame_height, _ = dataset["train"].frame_shape()
+    for size in crop_sizes:
+        if size < 8:
+            raise SystemExit("--crop-sizes %d is smaller than 8 pixels, which is not a crop of a frame but a "
+                             "cropout of it" % size)
+        if size > frame_height:
+            raise SystemExit("--crop-sizes %d is larger than the dataset's %d-pixel frames, so it would do "
+                             "nothing at all" % (size, frame_height))
+    augment = None
+    if crop_sizes or args.augment_flip:
+        augment = {"crop_sizes": crop_sizes, "flip": bool(args.augment_flip)}
+        log("  augmentation: %s, crops %s (every mirror negates the matching motion and jitter component)"
+            % ("mirror each sample on both axes at random" if args.augment_flip else "no mirror",
+               "/".join(str(size) for size in crop_sizes) if crop_sizes else "none"))
 
     requested = ["color"] + [name.strip() for name in args.inputs.split(",") if name.strip()]
     available = {"color"} | {key for key in ("depth", "motion", "history", "jitter") if key in dataset["train"]}
@@ -337,14 +612,15 @@ def run(args, log):
         # like for like. Measuring what an input is worth is the only way to tell a model that fails to
         # use it apart from data on which it cannot be used.
         for split in ("train", "val"):
-            dataset[split][zeroed] = torch.zeros_like(dataset[split][zeroed])
+            dataset[split].zero(zeroed)
         log("  ablation: '%s' is zeroed for training and validation" % zeroed)
 
     device, device_facts = resolve_device(args.device, log)
-    # The split is moved to the device once, not per batch: the dataset is small enough to live there
-    # whole, and a transfer per step would dominate a model this size.
+    # Each split is placed on the device once rather than per batch: an eager split is small enough to live
+    # there whole and a transfer per step would dominate a model this size, while a lazy split materialises
+    # each batch onto the device as it reads it.
     for split in ("train", "val"):
-        dataset[split] = {key: value.to(device) for key, value in dataset[split].items()}
+        dataset[split].to_(device)
     if device.type == "cuda":
         # cuDNN autotuning picks a convolution algorithm by timing candidates, so two runs of the *same* seed
         # can take different arithmetic paths and drift apart - measured here, not assumed: the same
@@ -372,7 +648,8 @@ def run(args, log):
                                                      ssim_weight=args.ssim_weight,
                                                      lr_schedule=args.lr_schedule,
                                                      detail_weight=args.detail_weight,
-                                                      jitter_channels=args.jitter_channels)
+                                                      jitter_channels=args.jitter_channels,
+                                                      augment=augment)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -385,7 +662,7 @@ def run(args, log):
                torch.cuda.max_memory_allocated() / (1 << 20)))
     log("  training: %.1f s total, %.1f ms/epoch" % (seconds, seconds / max(args.epochs, 1) * 1000.0))
 
-    val = dataset["val"]
+    val = dataset["val"].materialise()
     full = measure(model, val, chunk=args.measure_batch)
     keys = list(val.keys())
 
@@ -455,6 +732,11 @@ def run(args, log):
               "detail_weight": args.detail_weight,
               "deterministic": bool(args.deterministic),
               "zeroed_input": zeroed,
+              # Recorded because a metric is only comparable to one produced the same way: a run with
+              # augmentation and a run without are two configurations, so the report has to say which it was.
+              "loading": "lazy" if args.lazy else "eager",
+              "augmentation": ({"flip": augment["flip"], "crop_sizes": list(augment["crop_sizes"])}
+                               if augment else None),
               "device": device_facts,
               "gpu": gpu_usage or {"samples": 0,
                                    "note": "not a CUDA run, so utilization was not sampled"},
@@ -791,6 +1073,128 @@ def self_test():
     check_ok = abs(float(w_rng.mean()) - 1.0) < 0.01
     print("  %-44s %s" % ("detail weight has mean ~1 on a textured target", "OK" if check_ok else "FAIL"))
     problems += 0 if check_ok else 1
+
+    # Lazy loading against eager loading, on real pair files rather than on tensors in memory: the claim is
+    # that --lazy changes *when* a pair is read and nothing else, and the file is what the lazy path reads.
+    workdir = tempfile.mkdtemp(prefix="nrr-selftest-")
+    pairs_dir = os.path.join(workdir, "pairs")
+    os.makedirs(pairs_dir)
+    rng = np.random.RandomState(7)
+    files = []
+    for index in range(3):
+        path = os.path.join(pairs_dir, "pair_%03d.npz" % index)
+        np.savez(path,
+                 input=rng.rand(16, 12, 3).astype(np.float32),
+                 depth=rng.rand(16, 12).astype(np.float32),
+                 motion=rng.rand(16, 12, 2).astype(np.float32),
+                 target=rng.rand(32, 24, 3).astype(np.float32),
+                 history=rng.rand(16, 12, 3).astype(np.float32),
+                 jitter=np.array([0.25, -0.5], np.float32))
+        files.append(path)
+    with open(os.path.join(pairs_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as handle:
+        json.dump({"pairs": [{"file": os.path.basename(path), "split": "val" if index == 1 else "train"}
+                             for index, path in enumerate(files)]}, handle)
+    _, eager = load_dataset(pairs_dir)
+    _, lazily = load_dataset(pairs_dir, lazy=True)
+    keys = list(eager["train"].keys)
+    positions = torch.tensor([1, 0], dtype=torch.long)
+    eager_batch = eager["train"].batch(positions)
+    lazy_batch = lazily["train"].batch(positions)
+    check_ok = (lazily["train"].keys == keys
+                and keys == ["color", "depth", "motion", "target", "history", "jitter"]
+                and lazily["train"].count == eager["train"].count
+                and lazily["sizes"] == eager["sizes"]
+                and all(bool(torch.equal(lazy_batch[key], eager_batch[key])) for key in keys))
+    print("  %-44s %s" % ("lazy loading matches eager pair for pair",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # The zeroed-input ablation has to mean the same thing on both loaders, or an --lazy ablation run would not
+    # be comparable to the eager run it is quoted against.
+    eager["train"].zero("motion")
+    lazily["train"].zero("motion")
+    eager_zeroed = eager["train"].batch(positions)["motion"]
+    lazy_zeroed = lazily["train"].batch(positions)["motion"]
+    check_ok = bool(torch.equal(eager_zeroed, lazy_zeroed)) and float(eager_zeroed.abs().max()) == 0.0
+    print("  %-44s %s" % ("zeroing an input agrees between the two loaders", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    with np.load(files[0]) as handle:
+        sample = pair_from_npz(handle)
+    # The target is rebuilt as a nearest-neighbour upsample of the input, so "the crop is aligned" becomes a
+    # property that can be checked rather than asserted: if the two windows were taken from different parts of
+    # the image, the equality below fails.
+    sample["target"] = sample["color"].repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
+    flat = {"flip_h": False, "flip_v": False, "crop_h": 8, "crop_w": 6, "offset_y": 3, "offset_x": 2}
+    cropped = augment_sample(sample, flat, 2, 2)
+    check_ok = (tuple(cropped["color"].shape[-2:]) == (8, 6)
+                and tuple(cropped["target"].shape[-2:]) == (16, 12)
+                and bool(torch.allclose(cropped["target"],
+                                        sample["color"][..., 3:11, 2:8].repeat_interleave(2, dim=-2)
+                                        .repeat_interleave(2, dim=-1)))
+                and bool(torch.allclose(cropped["motion"], sample["motion"][..., 3:11, 2:8]))
+                # Jitter is cropped like any other input. Its values are unchanged - it is one offset spread
+                # over the frame - but its *shape* has to follow the input, because the model concatenates the
+                # two grids.
+                and bool(torch.allclose(cropped["jitter"], sample["jitter"][..., 3:11, 2:8]))
+                and tuple(cropped["jitter"].shape[-2:]) == tuple(cropped["color"].shape[-2:])
+                and bool(torch.allclose(cropped["history"], sample["history"][..., 3:11, 2:8])))
+    print("  %-44s %s" % ("a crop keeps the target on the same part of the image",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # The mirrors. This is the part of augmentation that is easy to get wrong and silently harmful: a mirrored
+    # pair whose motion was not also mirrored has motion pointing the wrong way, which teaches the model
+    # something false about its own input. Both axes are checked separately because they negate different
+    # components, and each also has to leave the other one alone.
+    whole = {"flip_h": True, "flip_v": False, "crop_h": 16, "crop_w": 12, "offset_y": 0, "offset_x": 0}
+    sideways = augment_sample(sample, whole, 2, 2)
+    check_ok = (bool(torch.equal(sideways["color"], torch.flip(sample["color"], dims=(-1,))))
+                and bool(torch.allclose(sideways["motion"][:, 0:1],
+                                        -torch.flip(sample["motion"][:, 0:1], dims=(-1,))))
+                and bool(torch.allclose(sideways["motion"][:, 1:2],
+                                        torch.flip(sample["motion"][:, 1:2], dims=(-1,))))
+                and bool(torch.allclose(sideways["jitter"][:, 0:1], -sample["jitter"][:, 0:1]))
+                and bool(torch.allclose(sideways["jitter"][:, 1:2], sample["jitter"][:, 1:2])))
+    print("  %-44s %s" % ("a horizontal mirror negates motion and jitter x only",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    upright = {"flip_h": False, "flip_v": True, "crop_h": 16, "crop_w": 12, "offset_y": 0, "offset_x": 0}
+    vertical = augment_sample(sample, upright, 2, 2)
+    check_ok = (bool(torch.equal(vertical["color"], torch.flip(sample["color"], dims=(-2,))))
+                and bool(torch.allclose(vertical["motion"][:, 1:2],
+                                        -torch.flip(sample["motion"][:, 1:2], dims=(-2,))))
+                and bool(torch.allclose(vertical["motion"][:, 0:1],
+                                        torch.flip(sample["motion"][:, 0:1], dims=(-2,))))
+                and bool(torch.allclose(vertical["jitter"][:, 1:2], -sample["jitter"][:, 1:2]))
+                and bool(torch.allclose(vertical["jitter"][:, 0:1], sample["jitter"][:, 0:1])))
+    print("  %-44s %s" % ("a vertical mirror negates motion and jitter y only", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # --deterministic has to pin an augmented run too. If the draw were not seeded, the augmentation arguments
+    # would make a seed stop meaning anything, which is the exact failure the flag exists to prevent.
+    batch = eager["train"].batch(torch.tensor([0, 1], dtype=torch.long))
+    drawn = [augment_batch(batch, (8, 12), True, torch.Generator().manual_seed(11)) for _ in range(2)]
+    check_ok = all(bool(torch.equal(drawn[0][key], drawn[1][key])) for key in drawn[0])
+    # One batch, one crop tier. This is the regression test for a bug this file actually had: the crop size was
+    # drawn per sample, so a batch whose samples drew 96 and 112 could not be stacked into the tensor a
+    # convolution consumes, and the run died inside torch.cat. The loop is over seeds because the bug only
+    # appears when two samples in the same batch draw different sizes, and the assertion is on the invariant
+    # rather than on one expected shape, because *which* tier a batch gets is the random part: every
+    # low-resolution input must end up on the colour input's grid, and the target on the grid above it.
+    allowed = {(8, 6), (12, 9)}    # --crop-sizes 8 or 12 on a 16x12 frame, width following the aspect ratio
+    check_ok = True
+    for seed in range(8):
+        tier = augment_batch(batch, (8, 12), True, torch.Generator().manual_seed(seed))
+        grid = tuple(tier["color"].shape[-2:])
+        if grid not in allowed or tuple(tier["target"].shape[-2:]) != (grid[0] * 2, grid[1] * 2):
+            check_ok = False
+        for key, value in tier.items():
+            if key != "target" and tuple(value.shape[-2:]) != grid:
+                check_ok = False
+    print("  %-44s %s" % ("a cropped batch stacks at every tier and seed", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
     return 1 if problems else 0
 
 
@@ -848,6 +1252,22 @@ def main(argv):
                         choices=("none", "depth", "motion", "history", "jitter"),
                         help="ablation run: zero this input for training and validation, to measure "
                              "what it is worth")
+    parser.add_argument("--lazy", action="store_true",
+                        help="read the training split's npz files per batch instead of concatenating the "
+                             "whole split into memory first. Same pairs, the same order and the same numbers; "
+                             "the difference is that a dataset larger than RAM can be trained on at all. "
+                             "Validation is still loaded whole, because the held-out number forwards every "
+                             "val pair anyway")
+    parser.add_argument("--augment-flip", action="store_true",
+                        help="mirror each training sample horizontally and/or vertically at random, negating "
+                             "the motion and jitter component that points along the mirrored axis so the pair "
+                             "stays internally consistent. Off by default: every number recorded in this "
+                             "repository was produced without it")
+    parser.add_argument("--crop-sizes", default="",
+                        help="comma-separated input heights to crop training samples to, one drawn per "
+                             "sample, which is the multi-scale lever - a model trained at a single frame size "
+                             "has seen one tier of it. Width follows the frame's aspect ratio and the target "
+                             "is cropped to the matching window. Empty (the default) trains on whole frames")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv[1:])
     if args.self_test:
@@ -1148,7 +1568,7 @@ def measure(model, batch, zero=None, chunk=32):
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
           history_channels, learning_rate, warmup_epochs, seed, device, log,
           loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup", detail_weight=0.0,
-          jitter_channels=8):
+          jitter_channels=8, augment=None):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      jitter_channels, inputs=inputs).to(device)
@@ -1157,10 +1577,9 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
         % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate,
            loss_name, lr_schedule))
 
-    keys = list(dataset["train"].keys())
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     train_split = dataset["train"]
-    count = dataset["sizes"]["train"]
+    count = train_split.count
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     generator = torch.Generator().manual_seed(seed)
     first_loss = last_loss = None
     first_plain = last_plain = None
@@ -1177,7 +1596,12 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
         model.train()
         total, plain_total, batches = 0.0, 0.0, 0
         for start in range(0, count, batch_size):
-            batch = take(train_split, order[start:start + batch_size], keys)
+            batch = train_split.batch(order[start:start + batch_size])
+            # Augmentation lives here, in the training loop, and not in the loader: a validation batch must
+            # never be transformed, or the held-out number would be measured on pictures the model was allowed
+            # to have seen mirrored.
+            if augment is not None:
+                batch = augment_batch(batch, augment["crop_sizes"], augment["flip"], generator)
             optimizer.zero_grad()
             # The loss is on the correction the skip cannot supply, not on the whole image: the skip
             # already carries the low frequencies, and weighting those equally would let the model coast

@@ -30,8 +30,7 @@ def trace(seed, dataset, epochs, channels, batch_size, learning_rate):
     torch.manual_seed(seed)
     model = T.Upscaler(channels, 8, 8, 8, inputs=("color",))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    keys = list(dataset["train"].keys())
-    count = dataset["sizes"]["train"]
+    count = dataset["train"].count
     generator = torch.Generator().manual_seed(seed)
     rows = []
     for epoch in range(1, epochs + 1):
@@ -41,7 +40,7 @@ def trace(seed, dataset, epochs, channels, batch_size, learning_rate):
         feature_magnitude = 0.0
         gradient_norm = 0.0
         for start in range(0, count, batch_size):
-            batch = T.take(dataset["train"], order[start:start + batch_size], keys)
+            batch = dataset["train"].batch(order[start:start + batch_size])
             optimizer.zero_grad()
             captured = {}
             handle = model.block2.register_forward_hook(

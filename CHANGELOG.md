@@ -14,6 +14,55 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The trainer could only train what fit in RAM, and its augmentation had to be *correct* or it was worse than none
+
+`tools/train_nrr.py` concatenated every split into one tensor per key before the first epoch, so a dataset
+larger than memory was not slow - it was impossible, and the capture factory this milestone is about produces
+exactly that kind of dataset. The loader now returns a `Split` that is either eager (concatenated, as before)
+or lazy (the pair files, read per batch), and both answer the same questions, so the training loop does not
+know or care which it was handed. On godot-v4 (949 train / 800 val pairs):
+
+| loading | training split held in RAM | held-out numbers |
+|---|---|---|
+| eager | 1430.5 MB | val L1 0.01422, drift 0.00455, ablations depth 0.00005 / motion 0.00000 / history 0.00013 / jitter 0.00454 |
+| `--lazy` | 0.0 MB | identical to the last digit - the reports' `measured` and `gates` blocks compare equal |
+
+Three things about that are worth stating rather than implying. Validation is still loaded whole, because the
+held-out number needs every output and every baseline in memory at once, so laziness there would save a third
+of a split that is by construction a small fraction of the data - on godot-v4 it is 1205.9 MB either way,
+which is the measured reason the flag is called `--lazy` and not "low memory mode". The identical numbers are
+a *result* rather than a hope: `--lazy` changes when a pair is read and nothing else, which is why both paths
+share one `pair_from_npz()` and the self-test compares them pair for pair on real files on disk. And the
+zeroed-input ablation has to mean the same thing on both loaders, or a lazy ablation run could not be quoted
+against an eager one it is being compared to.
+
+**Augmentation that is correct, not merely plausible.** `--augment-flip` mirrors each sample on both axes, and
+that is a real augmentation only because every transform that makes a pair is equivariant under a mirror:
+history sits on the input's grid and was warped into that grid before it was saved, so it mirrors with the
+input, and the target is cropped to the scale of the input's window. What does *not* carry over untouched is
+the sign of the direction fields - motion and jitter point along +x/+y, so a horizontal mirror negates their x
+component and a vertical mirror negates their y - and a pair whose motion points the wrong way teaches the
+model something false about its own input, which is worse than not augmenting. Both axes are checked
+separately in the self-test, each also having to leave the other component alone.
+
+**Multi-scale, and the two bugs that came with it.** `--crop-sizes 96,112` draws the crop tier once per
+*batch* and the window and mirror once per *sample*. The first version drew the size per sample, and the first
+two-tier run died inside `torch.cat` with "expected size 96 but got size 112": samples cropped to different
+sizes cannot be stacked into the tensor a convolution consumes. Per batch is also the standard shape of the
+lever - many tiers over an epoch rather than one tier per step. The next run then died in the model's own
+concat with "96 must match 128", which is how the second bug was found: the jitter plane is one offset
+broadcast over the frame, so cropping it changes none of its *values*, and it still has to be cropped, because
+it is an input on the input's grid. Both are regression-tested now - a batch is checked to stack at every tier
+and every seed, with every low-resolution input on the colour input's grid and the target on the grid above it.
+
+All three flags are off by default and recorded in the run's JSON, because a metric is only comparable to one
+produced the same way and every number this repository has recorded was produced without them. Seven
+self-tests were added (lazy against eager, the shared ablation, crop alignment against a nearest-neighbour
+target, both mirror signs, draw determinism under `--deterministic`, and the stacking invariant);
+`--self-test` passes, and the two diagnostic tools that consumed the old dict-shaped split
+(`tools/stall_diag.py`, `tools/diagnose_training.py`) were moved onto the new interface.
+
+
 ### One unit for the motion magnitude, and the two accumulators measured together at last
 
 Two incoherences, and they turned out to be the same mistake: one number carrying two meanings, and a
