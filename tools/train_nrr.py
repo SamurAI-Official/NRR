@@ -180,6 +180,13 @@ def pair_from_npz(pair):
         height, width = pair["input"].shape[0], pair["input"].shape[1]
         item["jitter"] = torch.from_numpy(pair["jitter"].astype(np.float32)) \
             .view(1, 2, 1, 1).expand(1, 2, height, width).clone()
+    # Validity is the capture's own mask on the history it carries: 1 where this pixel's history is
+    # trustworthy, 0 where the reprojection left the frame, where the previous frame held something nearer, or
+    # where there is no geometry at all (sky). It is loaded as an *input* rather than as metadata because a
+    # model that is not told which of its history samples to trust has to infer it from pixels and geometry,
+    # and that inference is exactly what the first temporal arms measured badly.
+    if "validity" in pair:
+        item["validity"] = torch.from_numpy(pair["validity"][None, None].copy())
     return item
 
 
@@ -320,8 +327,14 @@ def load_dataset(data_dir, lazy=False):
     has_jitter = uniform("jitter")
     if has_jitter:
         keys.append("jitter")
+    # Validity follows the same all-or-nothing rule: it is the mask that says which of those history samples
+    # can be trusted, and a dataset that had it for some pairs and not others would mean something different
+    # per pair.
+    has_validity = uniform("validity")
+    if has_validity:
+        keys.append("validity")
 
-    dataset = {"has_history": has_history, "has_jitter": has_jitter,
+    dataset = {"has_history": has_history, "has_jitter": has_jitter, "has_validity": has_validity,
                "sizes": {split: len(items) for split, items in entries.items()}}
     for split, items in entries.items():
         if lazy and split == "train":
@@ -498,7 +511,8 @@ def check_gates(numbers, zeroed=None, inputs=("color", "depth", "motion")):
         failures.append(
             "is the baseline: its output differs from the bilinear upscale by only %.6f (needs > "
             "%.4f), so nothing was learned" % (numbers["drift"], BASELINE_FLOOR))
-    for field in ("depth_ablation", "motion_ablation", "history_ablation", "jitter_ablation"):
+    for field in ("depth_ablation", "motion_ablation", "history_ablation", "jitter_ablation",
+                  "validity_ablation"):
         name = field.split("_")[0]
         if name not in inputs or (zeroed and field.startswith(zeroed)):
             continue
@@ -533,8 +547,8 @@ def export_onnx(model, out_path, size, inputs, opset=17):
     values - "found at least two devices, cuda:0 and cpu" - and the export died for a model whose training
     had completed and passed every gate. ONNX tracing needs no accelerator, and the runtime that consumes
     this graph runs it on the CPU, so the CPU is also the honest place to trace it."""
-    widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2}
-    signature = ("color", "depth", "motion", "history", "jitter")
+    widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2, "validity": 1}
+    signature = ("color", "depth", "motion", "history", "jitter", "validity")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     example = tuple(torch.zeros(1, widths[name], size, size) if name in inputs else None
                     for name in signature)
@@ -595,14 +609,16 @@ def run(args, log):
                "/".join(str(size) for size in crop_sizes) if crop_sizes else "none"))
 
     requested = ["color"] + [name.strip() for name in args.inputs.split(",") if name.strip()]
-    available = {"color"} | {key for key in ("depth", "motion", "history", "jitter") if key in dataset["train"]}
+    available = {"color"} | {key for key in ("depth", "motion", "history", "jitter", "validity")
+                             if key in dataset["train"]}
     missing = [name for name in requested if name not in available]
     if missing:
         raise SystemExit(
             "this dataset has no %s (it has: %s). A model cannot be given an input the data does not "
             "contain, and inventing zeros for it would measure nothing." % (", ".join(missing),
                                                                            ", ".join(sorted(available))))
-    requested = [name for name in ("color", "depth", "motion", "history", "jitter") if name in requested]
+    requested = [name for name in ("color", "depth", "motion", "history", "jitter", "validity")
+                 if name in requested]
     log("  inputs: %s%s" % (",".join(requested),
                             " (history available)" if dataset["has_history"] else ""))
 
@@ -649,6 +665,7 @@ def run(args, log):
                                                      lr_schedule=args.lr_schedule,
                                                      detail_weight=args.detail_weight,
                                                       jitter_channels=args.jitter_channels,
+                                                      validity_channels=args.validity_channels,
                                                       augment=augment)
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -678,6 +695,7 @@ def run(args, log):
     motion_ablation = ablation("motion")
     history_ablation = ablation("history")
     jitter_ablation = ablation("jitter")
+    validity_ablation = ablation("validity")
     # The metrics a caller checks, not only L1. Computed for the model and for the bilinear baseline on the
     # same held-out frames, so the comparison is like for like and the baseline's score is visible too.
     model_quality = quality_metrics.evaluate(full["output"], val["target"])
@@ -685,6 +703,7 @@ def run(args, log):
     numbers = {"val_l1": full["l1"], "val_baseline_l1": full["baseline_l1"], "drift": full["drift"],
                "depth_ablation": depth_ablation, "motion_ablation": motion_ablation,
                "history_ablation": history_ablation, "jitter_ablation": jitter_ablation,
+               "validity_ablation": validity_ablation,
                "ssim": model_quality["ssim"], "psnr_db": model_quality["psnr_db"],
                "ms_ssim": model_quality["ms_ssim"],
                "baseline_ssim": baseline_quality["ssim"],
@@ -702,7 +721,8 @@ def run(args, log):
         % (numbers["val_l1"], numbers["val_baseline_l1"], numbers["improvement"] * 100.0,
            numbers["drift"]))
     log("  ablations (how much the output moves when the input is zeroed): depth %.5f, motion %.5f, "
-        "history %.5f, jitter %.5f" % (depth_ablation, motion_ablation, history_ablation, jitter_ablation))
+        "history %.5f, jitter %.5f, validity %.5f"
+        % (depth_ablation, motion_ablation, history_ablation, jitter_ablation, validity_ablation))
     log("  quality: ssim %.4f psnr %.2f dB against the bilinear baseline's ssim %.4f psnr %.2f dB"
         % (numbers["ssim"], numbers["psnr_db"], numbers["baseline_ssim"],
            numbers["baseline_psnr_db"]))
@@ -773,7 +793,7 @@ def run(args, log):
         import onnxruntime
         session = onnxruntime.InferenceSession(args.out, providers=["CPUExecutionProvider"])
         other = args.size + 32
-        widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2}
+        widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2, "validity": 1}
         produced = list(session.run([OUTPUT_NAME], {
             name: np.zeros((1, widths[name], other, other), np.float32)
             for name in model.inputs})[0].shape)
@@ -808,7 +828,7 @@ def verify_export(model, out_path, batch):
     import onnx
     onnx.checker.check_model(onnx.load(out_path))
     session = onnxruntime.InferenceSession(out_path, providers=["CPUExecutionProvider"])
-    signature = ("color", "depth", "motion", "history", "jitter")
+    signature = ("color", "depth", "motion", "history", "jitter", "validity")
     keys = [name for name in signature if name in model.inputs]
     # .cpu() because the batch lives on the model's device and numpy cannot read a CUDA tensor; onnxruntime
     # is happiest with plain host arrays.
@@ -945,7 +965,7 @@ def self_test():
     # makes its ablation compare two identical forward passes and return exactly 0.0, which reads as "the model
     # ignores this input" and sent the earlier investigation after the architecture when the harness had simply
     # never zeroed the tensor. Pinned by asking a jitter-consuming model to move when the harness zeroes jitter.
-    probe = Upscaler(4, 2, 2, 2, 4, inputs=("color", "motion", "history", "jitter")).eval()
+    probe = Upscaler(4, 2, 2, 2, 4, inputs=("color", "motion", "history", "jitter", "validity")).eval()
     # The output convolution is zero-initialised so an untrained model is exactly the bilinear baseline, which
     # makes the residual branch identically zero at init. Every input that only feeds the residual would then
     # measure exactly 0.0 no matter whether the harness can reach it - the test would pass for the wrong reason
@@ -959,13 +979,14 @@ def self_test():
         "motion": torch.rand(2, 2, 16, 16),
         "history": torch.rand(2, 3, 16, 16),
         "jitter": torch.full((2, 2, 16, 16), 0.25),
+        "validity": torch.full((2, 1, 16, 16), 0.75),
         "target": torch.rand(2, 3, 32, 32),
     }
     loss_cases += [
         ("the ablation harness can zero every consumed input",
          all(float((measure(probe, probe_batch)["output"]
                     - measure(probe, probe_batch, zero=name)["output"]).abs().mean()) > 0.0
-             for name in ("depth", "motion", "history", "jitter")
+             for name in ("depth", "motion", "history", "jitter", "validity")
              if name in probe.inputs)),
     ]
 
@@ -1089,6 +1110,7 @@ def self_test():
                  motion=rng.rand(16, 12, 2).astype(np.float32),
                  target=rng.rand(32, 24, 3).astype(np.float32),
                  history=rng.rand(16, 12, 3).astype(np.float32),
+                 validity=rng.rand(16, 12).astype(np.float32),
                  jitter=np.array([0.25, -0.5], np.float32))
         files.append(path)
     with open(os.path.join(pairs_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as handle:
@@ -1101,7 +1123,7 @@ def self_test():
     eager_batch = eager["train"].batch(positions)
     lazy_batch = lazily["train"].batch(positions)
     check_ok = (lazily["train"].keys == keys
-                and keys == ["color", "depth", "motion", "target", "history", "jitter"]
+                and keys == ["color", "depth", "motion", "target", "history", "jitter", "validity"]
                 and lazily["train"].count == eager["train"].count
                 and lazily["sizes"] == eager["sizes"]
                 and all(bool(torch.equal(lazy_batch[key], eager_batch[key])) for key in keys))
@@ -1217,10 +1239,14 @@ def main(argv):
     parser.add_argument("--jitter-channels", type=int, default=8,
                         help="width of the branch that consumes the frame's sub-pixel sampling offset; "
                              "only built when 'jitter' is in --inputs")
+    parser.add_argument("--validity-channels", type=int, default=8,
+                        help="width of the branch that consumes the capture's trust mask on the history it "
+                             "carries; only built when 'validity' is in --inputs")
     parser.add_argument("--inputs", default="depth,motion",
                         help="comma-separated inputs besides color, which is always first: a subset of "
-                             "depth,motion,history. This is the comparison - a model given history is a "
-                             "different model from one that is not, and the run reports which is better")
+                             "depth,motion,history,jitter,validity. This is the comparison - a model given "
+                             "history is a different model from one that is not, and the run reports which is "
+                             "better")
     parser.add_argument("--learning-rate", type=float, default=2e-3)
     parser.add_argument("--loss", default="l1", choices=("l1", "charbonnier", "l1ssim"),
                         help="P3 lever 2: the training loss. l1 is the measured gate; charbonnier and "
@@ -1249,7 +1275,7 @@ def main(argv):
                              "workload, because autotuning picks convolution algorithms by timing them. "
                              "Slower, and the honest choice for any run whose number will be compared")
     parser.add_argument("--zero-input", default="none",
-                        choices=("none", "depth", "motion", "history", "jitter"),
+                        choices=("none", "depth", "motion", "history", "jitter", "validity"),
                         help="ablation run: zero this input for training and validation, to measure "
                              "what it is worth")
     parser.add_argument("--lazy", action="store_true",
@@ -1356,7 +1382,7 @@ class Upscaler(nn.Module):
     not between a model and its own zeroed inputs."""
 
     def __init__(self, channels=32, depth_channels=8, motion_channels=8, history_channels=8,
-                 jitter_channels=8, inputs=("color", "depth", "motion")):
+                 jitter_channels=8, inputs=("color", "depth", "motion"), validity_channels=8):
         super().__init__()
         self.inputs = tuple(inputs)
         # Leaky throughout, for the same measured reason as ResidualBlock: a feature map that is exactly
@@ -1380,6 +1406,12 @@ class Upscaler(nn.Module):
             # rather than only as something appended to a feature map.
             self.jitter = conv(2, jitter_channels)
             fused += jitter_channels
+        if "validity" in self.inputs:
+            # One channel: the capture's own mask on the history, so the network does not have to infer from
+            # pixels whether a history sample is a reprojection artefact. A temporal model that has to learn
+            # disocclusion implicitly is what the first temporal arms measured badly.
+            self.validity = conv(1, validity_channels)
+            fused += validity_channels
         self.fusion = conv(fused, channels * 4)
         self.shuffle = nn.PixelShuffle(2)
         self.refine = nn.Sequential(conv(channels, channels), nn.LeakyReLU(0.01, inplace=True))
@@ -1401,13 +1433,13 @@ class Upscaler(nn.Module):
         """
         return dejitter(color, jitter) if "jitter" in self.inputs else color
 
-    def residual(self, color, depth=None, motion=None, history=None, jitter=None):
+    def residual(self, color, depth=None, motion=None, history=None, jitter=None, validity=None):
         """The correction alone, from the raw inputs. This is what training optimises (the bilinear skip
         carries the low frequencies, so the loss is on what the model adds), so it prepares the frame
         itself rather than assuming someone already did."""
-        return self._residual_prepared(self.prepare(color, jitter), depth, motion, history, jitter)
+        return self._residual_prepared(self.prepare(color, jitter), depth, motion, history, jitter, validity)
 
-    def _residual_prepared(self, color, depth, motion, history, jitter):
+    def _residual_prepared(self, color, depth, motion, history, jitter, validity=None):
         features = self.feature(color)
         parts = [features]
         if "depth" in self.inputs:
@@ -1418,13 +1450,16 @@ class Upscaler(nn.Module):
             parts.append(self.history(history))
         if "jitter" in self.inputs:
             parts.append(self.jitter(jitter))
+        if "validity" in self.inputs:
+            parts.append(self.validity(validity))
         features = self.refine(self.shuffle(self.fusion(torch.cat(parts, dim=1))))
         features = self.block2(self.block1(features))
         return self.output(features)
 
-    def forward(self, color, depth=None, motion=None, history=None, jitter=None):
+    def forward(self, color, depth=None, motion=None, history=None, jitter=None, validity=None):
         corrected = self.prepare(color, jitter)
-        return self.skip(corrected) + self._residual_prepared(corrected, depth, motion, history, jitter)
+        return self.skip(corrected) + self._residual_prepared(corrected, depth, motion, history, jitter,
+                                                              validity)
 
 
 def baseline_upscale(color):
@@ -1537,6 +1572,7 @@ def measure(model, batch, zero=None, chunk=32):
         motion = batch.get("motion")
         history = batch.get("history")
         jitter = batch.get("jitter")
+        validity = batch.get("validity")
         if zero == "depth" and depth is not None:
             depth = torch.zeros_like(depth)
         if zero == "motion" and motion is not None:
@@ -1548,6 +1584,10 @@ def measure(model, batch, zero=None, chunk=32):
         # made the earlier architecture look like it ignored jitter when the harness had never tested it.
         if zero == "jitter" and jitter is not None:
             jitter = torch.zeros_like(jitter)
+        # And the mask, for the same reason: an input the harness does not zero is an input the ablation
+        # reports as unused without ever having withheld it.
+        if zero == "validity" and validity is not None:
+            validity = torch.zeros_like(validity)
         pieces = []
         for start in range(0, color.shape[0], chunk):
             end = start + chunk
@@ -1555,7 +1595,8 @@ def measure(model, batch, zero=None, chunk=32):
                                 depth[start:end] if depth is not None else None,
                                 motion[start:end] if motion is not None else None,
                                 history[start:end] if history is not None else None,
-                                jitter[start:end] if jitter is not None else None))
+                                jitter[start:end] if jitter is not None else None,
+                                validity[start:end] if validity is not None else None))
         output = torch.cat(pieces, dim=0)
         baseline = baseline_upscale(color)
         return {"l1": float(torch.nn.functional.l1_loss(output, batch["target"])),
@@ -1568,10 +1609,10 @@ def measure(model, batch, zero=None, chunk=32):
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
           history_channels, learning_rate, warmup_epochs, seed, device, log,
           loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup", detail_weight=0.0,
-          jitter_channels=8, augment=None):
+          jitter_channels=8, validity_channels=8, augment=None):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
-                     jitter_channels, inputs=inputs).to(device)
+                     jitter_channels, inputs=inputs, validity_channels=validity_channels).to(device)
     parameters = sum(p.numel() for p in model.parameters())
     log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g, loss=%s, schedule=%s"
         % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate,
@@ -1607,7 +1648,7 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             # already carries the low frequencies, and weighting those equally would let the model coast
             # on the baseline and still report a small number.
             prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
-                                        batch.get("history"), batch.get("jitter"))
+                                        batch.get("history"), batch.get("jitter"), batch.get("validity"))
             skip = baseline_upscale(batch["color"])
             truth = batch["target"] - skip
             weight = detail_weight_map(batch["target"], detail_weight) if detail_weight > 0.0 else None

@@ -128,6 +128,20 @@ Controls temporal history influence. 0 = no influence, 1 = full accumulation.
 
 Number of previous frames in history buffer.
 
+### 4.7 History Trust Mask
+
+Optional, and **currently unsupplied by every engine binding** - recorded here because the data path has run
+ahead of the contract. One plane at the render resolution: 1 where the reprojected history at that pixel is
+trustworthy, 0 where it is not, for any reason - the source left the frame, the previous frame held a nearer
+surface (disocclusion), or there is no geometry at all (sky).
+
+For a model trained to consume it, this is a required *input*, not metadata: `tools/pack_godot_pairs.py`
+computes it per pair, `tools/train_nrr.py --inputs=...,validity` consumes it, and the runtime exposes no way to
+produce or receive one. The measurement that makes the contract change worth making is in M10.4: on the
+godot-v4 captures ~86% of pixels are sky, so most of the history a temporal model is handed is either
+meaningless (no geometry for an MVP-derived motion field to be about) or already correct but not
+reprojectable, and without the mask the model cannot say which of the two it is looking at.
+
 ---
 
 ## 5. MaterialBuffer

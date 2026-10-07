@@ -14,6 +14,59 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The warp the temporal arm was missing buys one percent, and the mask it was missing covers 86% of the frame
+
+M10.4's premise was that the temporal arms lost because history was handed to them unwarped, so a small
+convolution was being asked to learn reprojection and disocclusion implicitly. The warp is now real:
+`tools/pack_godot_pairs.py --history warped` reproduces the runtime's own rule rather than a well-behaved
+cousin of it - backward reprojection by the *current* frame's motion field, bilinear, with the source clamped
+into the frame, which is what `runtime/nrr_temporal.cpp::warp_previous_output` does before a model sees history
+at inference time. It is checkable, and checked: the packer grew a `--self-test` that builds frames by moving
+content a known amount and requires the warp to recover them (zero motion is the identity; +1 px samples one
+pixel left, and one pixel up; half a pixel interpolates instead of picking a neighbour; both frame edges clamp
+rather than going black; a fractional shift in both axes matches an independently written sampler in the
+interior). Writing those checks caught two conventions in the runtime worth knowing: it clamps the sample
+coordinate *before* taking its fractional part, so at the border its weight is zero and it repeats the edge
+texel, and the displacement `x - dx` is exactly `(x + 0.5)/w - u` converted back, so the packer's UV field and
+the runtime's pixel arithmetic are the same computation rather than two that happen to agree.
+
+The capture frames behind godot-v4 are not kept, so `tools/warp_history_dataset.py` derives the warped dataset
+from the packed pairs: it calls the same function, refuses a dataset that is already warped rather than warping
+it twice, re-records each file's hash beside the one it replaced, and carries the source manifest's hash into
+the new one, so the derived dataset's provenance is a chain rather than a fresh claim. It also refuses to
+recompute `validity` and says why - a packed pair has no previous-frame depth to recompute it from.
+
+Then the measurement contradicted the premise, which is the useful part (`tools/history_reuse_probe.py`):
+
+| what | measured on godot-v4 |
+|---|---|
+| geometry | 21.6% of pixels; validity trusts 21.0% |
+| mean motion where the field is meaningful | **0.70 px per frame** - phase correlation, an instrument that never reads the field, puts the dominant shift at a few tenths of a pixel |
+| mean motion over the whole frame | **12.70 px per frame**, because 86% of these captures is sky, where an MVP-derived field has nothing to be about |
+| reprojection against no reprojection | **0.9% closer** to the current frame where geometry is; **109% further** over the whole frame |
+
+A correct warp is worth about one percent here, and ungated it is a large regression: over the sky it moves
+pixels that already agreed to 0.022, and over geometry the camera barely moves. The new information is the
+**mask** - which pixels' history is meaningless in the first place - so the data change is gated by it (warp
+only where the pair's mask trusts the history *and* the source is inside the frame, keeping the previous
+frame's own pixel everywhere else), and the comparison runs four arms rather than two: colour only, warped
+history, warped history with the mask, and raw history with the mask, each against the pre-registered rule.
+
+The trainer consumes the mask as a real input now: `pair_from_npz` loads it, `--inputs=...,validity` builds a
+convolutional branch for it (one channel on the input grid, symmetric with depth), and `--zero-input validity`
+plus the ablation report cover it - and after **two epochs** the mask is already measurably used, zeroing it
+moving the output by 0.00054 against the 1e-4 conditioning floor in a model where history moves it by
+0.00231. Its integration run on the warped dataset refuses for the expected reason (two epochs do not clear the
+10% progress bar), which is the gate doing its job rather than a failure.
+
+One thing this made explicit rather than assumed: **the mask cannot exist at runtime yet.** No engine binding
+supplies one and the runtime cannot receive one, so §4.7 of `specification/frame_contract.md` records it as a
+required contract change - an arm that wins on the mask wins against a pipeline that has to be extended, while
+the warp needs no such change because the runtime already reprojects. And if the content is the real limit
+here - 86% sky, 0.7 px of camera motion, consecutive frames that differ by aliasing rather than by
+displacement - then the lever is M10.3's captures, not this one, and M10.4 now says so.
+
+
 ### The trainer could only train what fit in RAM, and its augmentation had to be *correct* or it was worse than none
 
 `tools/train_nrr.py` concatenated every split into one tensor per key before the first epoch, so a dataset

@@ -1367,19 +1367,41 @@ matter too.
       what the lazy path removes is the *training* split's footprint, which is the one that grows with data.
       Seven self-tests cover it, including both mirror signs and the stacking invariant
 
-### M10.4 - Temporal v2: warp the history in the data, not in the model
+### M10.4 - Temporal v2: the measurement says the mask, not the warp, is the missing piece
 
-The temporal arms lost, and the inputs say why: `history` was the previous frame's input, unwarped and
-unmasked, so a model with a hundred thousand parameters was being asked to learn reprojection and
-disocclusion implicitly. `tools/pack_godot_pairs.py` already computes `validity` (a pixel is invalid when
-its reprojection left the frame or when the previous frame held something nearer; sky is 0) - the missing
-piece is the warp.
+The plan was that the temporal arms lost because `history` was the previous frame unwarped and unmasked, so a
+small convolution was being asked to learn reprojection and disocclusion implicitly. The warp is now built -
+`tools/pack_godot_pairs.py --history warped`, reproducing the runtime's own rule
+(`runtime/nrr_temporal.cpp::warp_previous_output`: backward reprojection by the current frame's motion field,
+bilinear, with the source clamped into the frame), checked against ground truth by the packer's `--self-test`,
+and applied to godot-v4 by `tools/warp_history_dataset.py` because the capture frames behind it are not kept.
+**And the measurement refutes the plan's premise** (`tools/history_reuse_probe.py`):
 
-- [ ] The packer also emits the **warped** history: bilinear reprojection of the previous input by the
-      motion field, the same operation the runtime's accumulator performs, plus the mask as an input
-- [ ] Re-run the two-arm comparison on the same seeds against the **same pre-registered rule** in
-      `docs/evaluation-protocol.md` (beat colour-only by 5 points *and* beat the zeroed control). A lever
-      is not re-judged because the first attempt lost
+| what | measured on godot-v4 |
+|---|---|
+| geometry | 21.6% of pixels; validity trusts 21.0% |
+| mean motion where the field is meaningful | **0.70 px per frame**; phase correlation - an instrument that never reads the field - puts the dominant shift at a few tenths of a pixel, so both say the camera barely moves |
+| mean motion over the whole frame | **12.70 px per frame**, because 86% of these captures is sky, where an MVP-derived field has nothing to be about |
+| reprojecting the previous frame | **0.9% closer** to the current frame where geometry is - and **109% further** over the whole frame, because it moves a sky that already agreed to 0.022 |
+
+So a correct warp buys about one percent here, and applying it *without* the mask is a large regression: where
+there is no motion to speak of, the history is already right and warping it destroys it. The new information is
+the **mask** - which pixels' history is meaningless in the first place - so the sweep tests that, with the
+warp's marginal contribution beside it, in four arms rather than two.
+
+- [x] The packer emits the warped history and the trainer consumes the mask as an input
+      (`--inputs=color,motion,history,validity`, plus `--zero-input validity` for its control), with the warp's
+      effect on real data measured rather than assumed
+- [ ] The four-arm comparison (`tools/run_m10_history_arms.ps1`, the pre-registered config and seeds: colour /
+      warped history / warped history + mask / raw history + mask, plus the zeroed controls), judged by the
+      rule in `docs/evaluation-protocol.md` - a lever is not re-judged because the first attempt lost
+- [ ] **The mask needs a contract change before it can exist at runtime.** §4.7 of
+      `specification/frame_contract.md` now records it, and no engine binding supplies one: an arm that wins on
+      the mask wins against a pipeline that has to be extended. The warp needs no such change - the runtime
+      already reprojects - which is why both stay in the sweep
+- [ ] If the content is the real limit, the answer is M10.3's captures rather than this: a slow camera over
+      mostly-empty scenes cannot exercise a temporal model, and 86% sky with 0.7 px of motion is exactly that.
+      Less sky, movers, and faster camera motion is the direct response to the numbers above
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item
