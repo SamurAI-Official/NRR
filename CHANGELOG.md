@@ -2749,3 +2749,49 @@ existing pre-registered rule; RCAS after the model to answer the detail bar (Fid
 vendored, so this may clear without any retraining); commit the model with its provenance; the
 Blender/CC0 factory; then the engine capture mirrors and, last, the injection benchmark - which
 measures NRR over an already-reconstructed frame and is offline research only.
+
+### The DLSS seam, built: a snapshot of the last frame the upscaler evaluated, and a module that reports it
+
+`NVIDIA-RTX/godot`'s `nvidia-pt-dlss` branch already computes the two inputs NRR's temporal path wants - the
+sub-pixel offset and a per-pixel motion field - and keeps both inside the RD renderer. Reading its source
+settled six things that shaped the patch, two of which only became visible by looking:
+
+* The context is owned by a render buffer (`RenderForwardClustered::RenderBufferDataForwardClustered::
+  dlss_context`), created lazily and `memdelete`d with it, so the record has to be a *value* snapshot rather
+  than a pointer: an RID goes invalid when the buffer is freed, a pointer dangles.
+* `DLSSContext::last_parameters` already retains what the last evaluated frame was given, written by
+  `upscale()` - the inputs were *stored*, not in need of plumbing out of the call site.
+* `params.jitter` is `taa_jitter * internal_size * 0.5`, i.e. internal-grid pixels - the unit
+  `NRRFrameInput::temporal.jitter` takes.
+* **The velocity buffer could not be read back.** `get_velocity_usage_bits()` forwards to
+  `get_color_usage_bits()`, which sets `CAN_COPY_FROM` only on the MSAA and resolve paths, so
+  `texture_get_data()` on the field DLSS is given would have failed. `fsr2.cpp` sets that bit for every UAV
+  resource it is handed (`ffx_usage_to_rd_usage_flags`), so it is an omission rather than a decision.
+* **The fork is Godot 4.8.0-dev**, while the addon here is built against godot-cpp's 4.7 dump
+  (`compatibility_minimum = "4.7"`), so a live run should rebuild the addon rather than reuse it.
+* `Image::FORMAT_RG_HALF` does not exist in that tree (`FORMAT_RGH` is the name) - which the first draft of
+  the bridge had wrong, and a build would have caught.
+
+The patch is three engine files (`effects/dlss.{h,cpp}`, `storage_rd/render_scene_buffers_rd.cpp`) plus
+`modules/nrr_dlss_bridge/`, an engine singleton `NRRDLSS` reporting `jitter()`, `internal_size()`,
+`delta_time()`, `velocity_image()` (RG16F, copied out of device memory) and a `status()` dictionary. It is
+guarded by `__has_include` of the fork's effect header, so the same module compiles in stock Godot and reports
+itself **absent** there instead of fabricating a zero that reads like a measurement; `GDScriptLanguage` picks
+the singleton up from `Engine::get_singleton()->get_singletons()`, so `NRRDLSS` is in scope as a global the
+same way `OS` and `Time` are. Writing the snapshot after the effect's early-outs matters: `upscale()` returns
+during its four-frame warmup, and a value recorded before those returns would report a jitter for a frame DLSS
+never evaluated.
+
+`NRR.gd` gains `dlss_bridge()`, `has_dlss_temporal_inputs()` and `dlss_status()`; `NRRPostProcess` takes its
+offset and field from the bridge when DLSS has actually run (`use_dlss_inputs`), falls back to
+`jitter_offset`/`motion_vectors` otherwise, and records which source it used in its stats - because "wired up"
+and "actually fed values" are different claims. No extra one-frame lag is applied to the bridge values:
+`last_parameters` describes the same frame the node submits.
+
+Verified: both patches apply to and reverse-apply from a pristine `nvidia-pt-dlss` checkout at `135dff3`; the
+verification project still prints `RESULT: PASS` (exit 0) and `benchmark_temporal.gd` reproduces its recorded
+baseline exactly (no-jitter frame-to-frame change 0.1219, jitter+magnitude 0.0836, edge/plain
+0.470125/0.467932), so the stock-Godot fallback is unchanged. Not verified: the fork has not been built or run
+here - scons, the non-redistributable Streamline runtime, and a godot-cpp at the fork's version are the gating
+items - so no live DLSS jitter has been measured yet, and the temporal numbers in
+`docs/nvidia-streamline-godot.md` stay labelled as the synthesised ones.

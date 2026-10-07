@@ -1,0 +1,97 @@
+diff --git a/servers/rendering/renderer_rd/effects/dlss.cpp b/servers/rendering/renderer_rd/effects/dlss.cpp
+index de6aeba..472310f 100644
+--- a/servers/rendering/renderer_rd/effects/dlss.cpp
++++ b/servers/rendering/renderer_rd/effects/dlss.cpp
+@@ -48,6 +48,16 @@ using namespace RendererRD;
+ static constexpr uint64_t DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY = 5;
+ static constexpr uint64_t DLSS_D3D12_RESOURCE_STATE_NON_PIXEL_SR = 0x40;
+ static constexpr float DLSS_OPTIMAL_MODE_MAX_DISTANCE = 1000000.0f;
++
++// NRR bridge (see modules/nrr_dlss_bridge). Written by upscale() only after the early-outs, so it
++// describes a frame DLSS actually evaluated rather than one it declined (the four-frame warmup
++// returns above this point, and claiming a jitter there would be a lie the benchmark would believe).
++static DLSSEffect::LastFrame nrr_last_frame;
++
++DLSSEffect::LastFrame DLSSEffect::get_last_frame() {
++	return nrr_last_frame;
++}
++
+ namespace RendererRD {
+ class DLSSContextInner : public DLSSContext {
+ public:
+@@ -227,6 +237,14 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
+ 	context->last_parameters = p_params;
+ 	context->last_effect = this;
+ 
++	// NRR bridge: the same values this frame is about to be evaluated with.
++	nrr_last_frame.valid = true;
++	nrr_last_frame.internal_size = p_params.internal_size;
++	nrr_last_frame.velocity = p_params.velocity;
++	nrr_last_frame.jitter = p_params.jitter;
++	nrr_last_frame.delta_time = p_params.delta_time;
++	nrr_last_frame.frame++;
++
+ 	// Decode mvecs
+ 	{
+ 		RD::get_singleton()->draw_command_begin_label("Decode Invalid Motion Vectors");
+@@ -581,6 +599,11 @@ bool DLSSEffect::is_ready(DLSSContext *p_context) {
+ #else
+ DLSSEffect::DLSSEffect() {}
+ DLSSEffect::~DLSSEffect() {}
++DLSSEffect::LastFrame DLSSEffect::get_last_frame() {
++	// No Streamline in this build, so nothing was ever evaluated. Reported as absent rather than
++	// as a zero jitter, which is a different statement.
++	return DLSSEffect::LastFrame();
++}
+ DLSSContext *DLSSEffect::create_context(Size2i p_internal_size, Size2i p_target_size) {
+ 	return nullptr;
+ }
+diff --git a/servers/rendering/renderer_rd/effects/dlss.h b/servers/rendering/renderer_rd/effects/dlss.h
+index a15efd8..9a16231 100644
+--- a/servers/rendering/renderer_rd/effects/dlss.h
++++ b/servers/rendering/renderer_rd/effects/dlss.h
+@@ -83,6 +83,24 @@ public:
+ 		RID mvec_decode_pipeline;
+ 	} shaders;
+ 
++	// NRR bridge (see modules/nrr_dlss_bridge): what the last *evaluated* frame was handed, so a
++	// consumer outside the renderer can pick up the same jitter and velocity field DLSS is being
++	// given instead of having to synthesise them or estimate them from pixels.
++	//
++	// A copy of the values, deliberately, not a pointer to the context: the context is owned by a
++	// render buffer (RenderForwardClustered::RenderBufferDataForwardClustered::dlss_context) and is
++	// memdelete'd with it, so a pointer would dangle. The RIDs go invalid instead of dangling, and
++	// the reader checks them.
++	struct LastFrame {
++		bool valid = false;
++		Size2i internal_size;
++		RID velocity;
++		Vector2 jitter;
++		float delta_time = 0.0f;
++		uint64_t frame = 0;
++	};
++	static LastFrame get_last_frame();
++
+ 	DLSSEffect();
+ 	~DLSSEffect();
+ 	DLSSContext *create_context(Size2i p_internal_size, Size2i p_target_size);
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+index 101ccef..bf50584 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+@@ -849,7 +849,14 @@ RD::DataFormat RenderSceneBuffersRD::get_velocity_format() {
+ }
+ 
+ uint32_t RenderSceneBuffersRD::get_velocity_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
+-	return get_color_usage_bits(p_resolve, p_msaa, p_storage);
++	// The colour bits do not include a readback for the non-MSAA, non-resolve case this buffer
++	// normally takes, so the field could not be copied out of device memory. That matters beyond
++	// debugging: DLSS is handed exactly these vectors, and a consumer outside the renderer (see
++	// modules/nrr_dlss_bridge) is handed the same field instead of estimating one from pixels.
++	// FSR2's RD back-end sets the same bit for every UAV resource it is given
++	// (effects/fsr2.cpp, ffx_usage_to_rd_usage_flags), so reading a motion-vector field back is
++	// in line with that path rather than a new idea.
++	return get_color_usage_bits(p_resolve, p_msaa, p_storage) | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+ }
+ 
+ RD::DataFormat RenderSceneBuffersRD::get_vrs_format() {

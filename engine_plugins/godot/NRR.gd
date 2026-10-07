@@ -26,6 +26,11 @@ signal render_completed(image: Image)
 ## Name of the native class the GDExtension registers.
 const NATIVE_CLASS := "NRRNative"
 
+## Name of the engine singleton the fork bridge module registers (see
+## engine_plugins/godot_fork_patch). Only present in a build of the NVIDIA fork
+## carrying that module; `Engine.has_singleton` is the test.
+const DLSS_SINGLETON := "NRRDLSS"
+
 ## Native handle, or null when the extension is absent.
 var available: bool = false
 
@@ -334,13 +339,42 @@ func is_binding_present() -> bool:
 	return _native_if_available() != null
 
 
+## The fork's DLSS bridge, or null when this engine build has none (engine_plugins/godot_fork_patch).
+## Stock Godot never has it, and neither does a fork build with the module disabled.
+static func dlss_bridge() -> Object:
+	if Engine.has_singleton(DLSS_SINGLETON):
+		return Engine.get_singleton(DLSS_SINGLETON)
+	return null
+
+
+## True when DLSS has actually evaluated a frame in this process, so the offset and the motion field it
+## was given are available to submit. Deliberately not the same question as "the bridge is present": a
+## fork build with no viewport using the DLSS scaling mode answers false here, which is honest, whereas
+## a zero offset would read as a measurement of a still frame.
+static func has_dlss_temporal_inputs() -> bool:
+	var bridge := dlss_bridge()
+	if bridge == null:
+		return false
+	return bool(bridge.call("has_last_frame"))
+
+
+## What the DLSS path last did, as a Dictionary (empty when there is no bridge at all). Carries the
+## jitter, the internal size and a sentence naming which of the three states it is in - "no hatch",
+## "hatch but DLSS has not run", "DLSS ran" - because those are three different answers.
+static func dlss_status() -> Dictionary:
+	var bridge := dlss_bridge()
+	if bridge == null:
+		return {}
+	var value: Variant = bridge.call("status")
+	return value if value is Dictionary else {}
+
+
 ## The native handle, instantiating a probe instance when none exists yet.
 ## Probing is safe: NRRNative allocates no device until initialize().
 func _native_if_available() -> Object:
 	if _native != null:
 		return _native
 	return _instantiate_native()
-
 
 func _instantiate_native() -> Object:
 	if not ClassDB.class_exists(NATIVE_CLASS):

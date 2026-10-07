@@ -41,20 +41,45 @@ print(nrr.temporal_state())                   # what the runtime decided, includ
 
 The seam is that the fork keeps `velocity` and `jitter` **inside** the RD renderer: there is no
 GDExtension-visible accessor for them (the reference Godot renderer has the same property for its FSR2 motion
-vectors). Using them therefore needs a small patch in the fork, not in this repository:
+vectors). Closing it needs a small patch in the fork rather than anything in this repository - and that patch
+now exists, in `engine_plugins/godot_fork_patch/`. Reading `nvidia-pt-dlss` at `135dff3` settled six things
+that shaped it, two of which only became visible by looking:
 
-1. Add a viewport/RenderingServer accessor that hands out the two fields with the rest of the DLSS
-   parameters - e.g. `RenderingServer::viewport_get_dlss_motion_vectors(viewport) -> RID` and
-   `viewport_get_dlss_jitter(viewport) -> Vector2`, reading the same `DLSSContext::Parameters` that
-   `DLSSEffect::upscale()` is called with (the motion-vector RID is already rendered by the RD renderer for
-   DLSS itself, so nothing new has to be produced).
-2. Bind them (`ClassDB::bind_method`) so GDScript sees them, then hand them to the calls above - the
-   `NRRPostProcess` node already has `jitter_offset`/`jitter_enabled`/`motion_vectors` exports for exactly
-   this.
+* The context belongs to a render buffer, not to a global:
+  `RenderForwardClustered::RenderBufferDataForwardClustered::dlss_context`, created lazily by `ensure_dlss()`
+  and `memdelete`d with its owner - so the record has to be a *value* snapshot rather than a pointer. An RID
+  goes invalid when the buffer is freed; a pointer dangles.
+* `DLSSContext::last_parameters` already retains what the last evaluated frame was given, written by
+  `upscale()` - the inputs are *stored*, not in need of a new `RenderingServer` accessor.
+* `params.jitter` is `taa_jitter * internal_size * 0.5`, i.e. internal-grid pixels: the unit
+  `NRRFrameInput::temporal.jitter` takes.
+* **The velocity buffer had no readback.** `get_velocity_usage_bits()` forwards to `get_color_usage_bits()`,
+  which sets `CAN_COPY_FROM` only on the MSAA and resolve paths, so `texture_get_data()` on the field DLSS is
+  given would have failed. `fsr2.cpp` sets that bit for every UAV resource it is handed
+  (`ffx_usage_to_rd_usage_flags`), so this is an omission rather than a design decision - and it is part of
+  the patch.
+* **The fork is Godot 4.8.0-dev**, while the addon here targets godot-cpp's 4.7 API dump
+  (`compatibility_minimum = "4.7"`). A GDExtension built for an older API can load into a newer engine, but a
+  call whose signature changed in between fails at call time, so a live run should rebuild the addon.
+* `Image::FORMAT_RG_HALF` does not exist in that tree - the name there is `FORMAT_RGH`, which the first draft
+  of the bridge had wrong.
 
-That patch is a bridge, not a port: NRR does not call Streamline, and DLSS does not need NRR. What the two
-share is the *inputs*, which is why NRR can run the phase-aligned integration on a sequence that DLSS (or
-TAA, or FSR2) is jittering - and why the comparison below is meaningful.
+The patch is three engine files (`effects/dlss.{h,cpp}`, `storage_rd/render_scene_buffers_rd.cpp`) plus
+`modules/nrr_dlss_bridge/`, registering an engine singleton `NRRDLSS` that exposes `jitter()`,
+`internal_size()`, `delta_time()`, `velocity_image()` (RG16F, copied out of device memory) and a `status()`
+dictionary. It is guarded by `__has_include` of the fork's effect header, so one module serves both trees: in
+stock Godot it compiles and reports itself **absent** rather than fabricating a zero that would read like a
+measurement. `GDScriptLanguage` picks the singleton up from `Engine::get_singleton()->get_singletons()`, the
+same route `OS` and `Time` take, so `NRRDLSS` is simply in scope. `NRR.gd` wraps it as `NRR.dlss_bridge()`,
+`has_dlss_temporal_inputs()` and `dlss_status()`, and `NRRPostProcess` prefers it when DLSS has actually run
+(`use_dlss_inputs`), falling back to `jitter_offset`/`motion_vectors` and reporting which source it used. The
+snapshot is written after the effect's early-outs on purpose: `upscale()` returns during its four-frame
+warmup, and a value recorded before that would report a jitter for a frame DLSS never evaluated.
+
+It is a bridge, not a port: NRR does not call Streamline, and DLSS does not need NRR. What the two share is
+the *inputs*, which is why NRR can run the phase-aligned integration on a sequence that DLSS (or TAA, or
+FSR2) is jittering - and why the comparison below is meaningful. No extra one-frame lag is needed for the
+bridge values: `last_parameters` and the post-process node's read-back describe the same frame.
 
 ## The benchmark
 
@@ -89,10 +114,20 @@ docs/roadmap.md; the harness needs no change when one arrives.
 
 ## Honest status
 
-* The fork was not built here (it is a full Godot tree plus Streamline); the accessor patch above is
-  specified from its source, not from a local build.
+* The patches are written and verified to *apply* - forward and reverse, against a pristine checkout at
+  `135dff3` - but the fork has **not been built or run** here. That needs scons, the non-redistributable
+  Streamline runtime, and a godot-cpp at the fork's version for the addon to load cleanly, so the two numbers
+  above are still the synthesised-jitter ones.
+* Absence is reported rather than faked: `NRRDLSS.is_available()` answers "does this build have the hatch"
+  and `has_last_frame()` answers "has DLSS actually run". Stock Godot answers false to both, and the
+  verification project plus the benchmark above still pass unchanged on it - the benchmark reproduces its
+  recorded baseline exactly (0.1219 and 0.0836), which is how the fallback was checked.
+* `velocity_image()` returns the field as *DLSS* receives it: the fork's decode pass rewrites the velocity
+  buffer in place, so it is the internal-grid, DLSS-sense field, which may be the opposite sense to the one
+  `tools/godot_capture/` writes. That gets pinned by measurement, not assumption.
 * The addon's intake is in place and exercised: `set_jitter` / `set_motion_magnitude` / `temporal_state`
   exist, the post-process node drives them, and the benchmark above runs them against the shipped model.
 * The phase-aligned integration stays *declined* until a caller supplies jitter - which on the fork is
   DLSS/Streamline and on stock Godot is whatever the project uses (TAA, FSR2). That is the designed
+  behaviour, not a gap in the plumbing.
   behaviour, not a gap in the plumbing.

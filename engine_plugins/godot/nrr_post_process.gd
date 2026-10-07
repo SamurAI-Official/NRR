@@ -63,6 +63,12 @@ signal stats_updated(stats: Dictionary)
 @export var jitter_offset: Vector2 = Vector2.ZERO
 @export var jitter_enabled: bool = false
 
+## Take the offset and the motion field from the engine's own DLSS path when it has them: the NVIDIA fork
+## with the bridge module (engine_plugins/godot_fork_patch) and a viewport using the DLSS scaling mode.
+## "Has them" is `has_last_frame`, not "the bridge is present" - a fork build with no DLSS viewport
+## answers false, and a zero offset would then read as a real measurement.
+@export var use_dlss_inputs: bool = true
+
 ## Optional per-pixel motion field for the submitted frame (RG half float, in pixels per frame, on the
 ## render grid), e.g. a DLSS velocity buffer. This is the field the phase-aligned pass warps by and the
 ## blend reprojects with; without it both fall back to the whole-frame magnitude.
@@ -140,7 +146,22 @@ func _process(delta: float) -> void:
 	# at, and how far the scene moved. Both are *lagged* by one frame on purpose - the read-back is the last
 	# completed frame, so the camera state and jitter that belong to it are the previous ones, and reporting
 	# this frame's would misdescribe the frame the runtime is actually being handed.
-	_nrr.set_jitter(_submitted_jitter, jitter_enabled)
+	#
+	# The engine's DLSS path is the exception in one respect and the same in another: it also describes the
+	# last completed frame, so it needs no extra lag here, but it *replaces* the caller's offset rather than
+	# adding to it. Which source was used is reported in the stats, because "wired up" and "actually fed
+	# values" are different claims and a silent fallback would conflate them.
+	var submitted_jitter := _submitted_jitter
+	var jitter_on := jitter_enabled
+	var motion_image: Image = null
+	var temporal_source := "caller"
+	if use_dlss_inputs and NRR.has_dlss_temporal_inputs():
+		var bridge := NRR.dlss_bridge()
+		submitted_jitter = bridge.call("jitter")
+		jitter_on = true
+		motion_image = bridge.call("velocity_image")
+		temporal_source = "dlss"
+	_nrr.set_jitter(submitted_jitter, jitter_on)
 	var magnitude := motion_magnitude_override
 	if magnitude <= 0.0 and measure_motion:
 		magnitude = NRR.measure_camera_motion(
@@ -156,8 +177,8 @@ func _process(delta: float) -> void:
 		_previous_camera_projection = camera.get_camera_projection()
 		_has_previous_camera = true
 
-	var motion_image: Image = null
-	if motion_vectors != null:
+	# The caller's own field, when DLSS did not supply one.
+	if motion_image == null and motion_vectors != null:
 		motion_image = motion_vectors.get_image()
 		if motion_image != null:
 			motion_image.convert(Image.FORMAT_RGH)
@@ -181,6 +202,7 @@ func _process(delta: float) -> void:
 		"passthrough": false,
 		"backend": _nrr.backend_name(),
 		"render_time_ms": _nrr.last_render_time_ms(),
+		"temporal_inputs": temporal_source,
 	}
 	# What the runtime decided, so a caller can tell "the integration ran" from "it declined" from "it is
 	# off" - which is the difference between a working temporal path and one that looks configured.

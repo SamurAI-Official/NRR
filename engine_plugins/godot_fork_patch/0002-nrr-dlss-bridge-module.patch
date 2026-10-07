@@ -1,0 +1,269 @@
+diff --git a/modules/nrr_dlss_bridge/config.py b/modules/nrr_dlss_bridge/config.py
+new file mode 100644
+index 0000000..d1b015e
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/config.py
+@@ -0,0 +1,9 @@
++def can_build(env, platform):
++    # Builds everywhere, including stock Godot: the module detects the fork's DLSS effect with
++    # __has_include and reports itself unavailable when it is not there. That is what lets the
++    # GDScript side be written and tested before the fork is built.
++    return True
++
++
++def configure(env):
++    pass
+diff --git a/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp b/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp
+new file mode 100644
+index 0000000..c89c4b3
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/nrr_dlss_bridge.cpp
+@@ -0,0 +1,136 @@
++#include "nrr_dlss_bridge.h"
++
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++#include "servers/rendering/renderer_rd/effects/dlss.h"
++#include "servers/rendering/rendering_device.h"
++#endif
++
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++static RendererRD::DLSSEffect::LastFrame _nrr_last_frame() {
++	return RendererRD::DLSSEffect::get_last_frame();
++}
++#endif
++
++bool NRRDLSS::is_available() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	return true;
++#else
++	return false;
++#endif
++}
++
++bool NRRDLSS::has_last_frame() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	return _nrr_last_frame().valid;
++#else
++	return false;
++#endif
++}
++
++Vector2 NRRDLSS::jitter() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	const RendererRD::DLSSEffect::LastFrame last = _nrr_last_frame();
++	if (!last.valid) {
++		return Vector2();
++	}
++	return last.jitter;
++#else
++	return Vector2();
++#endif
++}
++
++Vector2i NRRDLSS::internal_size() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	const RendererRD::DLSSEffect::LastFrame last = _nrr_last_frame();
++	if (!last.valid) {
++		return Vector2i();
++	}
++	return last.internal_size;
++#else
++	return Vector2i();
++#endif
++}
++
++float NRRDLSS::delta_time() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	const RendererRD::DLSSEffect::LastFrame last = _nrr_last_frame();
++	if (!last.valid) {
++		return 0.0f;
++	}
++	return last.delta_time;
++#else
++	return 0.0f;
++#endif
++}
++
++int NRRDLSS::frame_count() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	return int(_nrr_last_frame().frame);
++#else
++	return 0;
++#endif
++}
++
++Ref<Image> NRRDLSS::velocity_image() const {
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	const RendererRD::DLSSEffect::LastFrame last = _nrr_last_frame();
++	if (!last.valid || last.velocity.is_null()) {
++		return Ref<Image>();
++	}
++
++	RenderingDevice *rd = RenderingDevice::get_singleton();
++	if (rd == nullptr || !rd->texture_is_valid(last.velocity)) {
++		// The render buffer that owned the field was freed between the last evaluated frame and
++		// this read. An invalid RID is a truthful answer here; a stale copy would not be.
++		return Ref<Image>();
++	}
++
++	RD::TextureFormat format = rd->texture_get_format(last.velocity);
++	if (format.format != RD::DATA_FORMAT_R16G16_SFLOAT) {
++		// Not the field this bridge was written for (the fork's get_velocity_format()); refuse
++		// rather than reinterpret bytes as something they are not.
++		return Ref<Image>();
++	}
++
++	Vector<uint8_t> data = rd->texture_get_data(last.velocity, 0);
++	if (data.is_empty()) {
++		return Ref<Image>();
++	}
++
++	return Image::create_from_data(format.width, format.height, false, Image::FORMAT_RGH, data);
++#else
++	return Ref<Image>();
++#endif
++}
++
++Dictionary NRRDLSS::status() const {
++	Dictionary d;
++	d["available"] = is_available();
++	d["has_last_frame"] = has_last_frame();
++	d["jitter"] = jitter();
++	d["internal_size"] = internal_size();
++	d["delta_time"] = delta_time();
++	d["frame_count"] = frame_count();
++#ifdef NRR_DLSS_BRIDGE_HAS_FORK
++	const RendererRD::DLSSEffect::LastFrame last = _nrr_last_frame();
++	d["velocity_available"] = last.valid && !last.velocity.is_null();
++	d["note"] = last.valid
++			? String("the jitter and velocity field DLSS was last given, taken from the same parameters the effect is evaluated with")
++			: String("DLSS has not evaluated a frame in this process (no viewport is using the DLSS scaling mode, or Streamline is not initialised)");
++#else
++	d["velocity_available"] = false;
++	d["note"] = String("this engine build has no DLSS effect to read from; the bridge module is present but reports absent rather than fabricating a value");
++#endif
++	return d;
++}
++
++void NRRDLSS::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("is_available"), &NRRDLSS::is_available);
++	ClassDB::bind_method(D_METHOD("has_last_frame"), &NRRDLSS::has_last_frame);
++	ClassDB::bind_method(D_METHOD("jitter"), &NRRDLSS::jitter);
++	ClassDB::bind_method(D_METHOD("internal_size"), &NRRDLSS::internal_size);
++	ClassDB::bind_method(D_METHOD("delta_time"), &NRRDLSS::delta_time);
++	ClassDB::bind_method(D_METHOD("frame_count"), &NRRDLSS::frame_count);
++	ClassDB::bind_method(D_METHOD("velocity_image"), &NRRDLSS::velocity_image);
++	ClassDB::bind_method(D_METHOD("status"), &NRRDLSS::status);
++}
+diff --git a/modules/nrr_dlss_bridge/nrr_dlss_bridge.h b/modules/nrr_dlss_bridge/nrr_dlss_bridge.h
+new file mode 100644
+index 0000000..99e487f
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/nrr_dlss_bridge.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include "core/object/object.h"
++#include "core/variant/variant.h"
++
++// The fork's DLSS effect header exists only in NVIDIA-RTX/godot, and only in a build made with
++// STREAMLINE_ENABLED does upscale() ever run. Detecting it here rather than at build-flag level is
++// what makes one module serve both trees: in stock Godot the include is absent, the methods below
++// compile to "unavailable", and the GDScript that consumes them still runs and still says so.
++#if defined(__has_include)
++#if __has_include("servers/rendering/renderer_rd/effects/dlss.h")
++#define NRR_DLSS_BRIDGE_HAS_FORK 1
++#endif
++#endif
++
++/* Reports what the fork's DLSS path is doing with the frame it last evaluated.
++
++   Why this exists: NRR's temporal path wants (a) the sub-pixel offset the frame was sampled at and
++   (b) the per-pixel motion field. A temporal upscaler has both already - DLSS is given exactly those
++   two when it is called (see RenderForwardClustered::_render_3d_upscaling) - but they live inside the
++   RD renderer, and the upstream renderer has the same property for FSR2's motion vectors. So the
++   values are exposed here rather than synthesised by the consumer, which would be measuring a
++   different thing.
++
++   Nothing here calls Streamline, and DLSS does not need NRR: what the two share is the inputs. */
++class NRRDLSS : public Object {
++	GDCLASS(NRRDLSS, Object);
++
++public:
++	// True when this engine build has the fork's DLSS effect and the bridge compiled against it.
++	bool is_available() const;
++	// True when a frame has actually been evaluated by DLSS (not merely configured). "Configured",
++	// "declined during warmup" and "ran" are three different answers.
++	bool has_last_frame() const;
++	// The jitter DLSS was given, in pixels on the internal (render) grid - the same quantity
++	// NRRFrameInput::temporal.jitter takes. Zero when has_last_frame() is false, alongside the
++	// explicit false flag rather than as a stand-in for it.
++	Vector2 jitter() const;
++	Vector2i internal_size() const;
++	float delta_time() const;
++	int frame_count() const;
++	// The motion-vector field DLSS was given, copied out of device memory as an RG16F image (the
++	// buffer is created with the colour usage bits, so it is readable). Empty when unavailable.
++	//
++	// Convention note: this is the field as *DLSS* receives it, which is the internal grid and the
++	// previous-to-current sense the fork's decode pass produces - not necessarily the sense NRR's
++	// own capture path writes. It is reported unmassaged so the measurement can pin the convention
++	// rather than assume it.
++	Ref<Image> velocity_image() const;
++	// One dictionary with everything above, so a caller can log the whole state in one line.
++	Dictionary status() const;
++
++protected:
++	static void _bind_methods();
++};
+diff --git a/modules/nrr_dlss_bridge/register_types.cpp b/modules/nrr_dlss_bridge/register_types.cpp
+new file mode 100644
+index 0000000..98d1183
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/register_types.cpp
+@@ -0,0 +1,33 @@
++#include "register_types.h"
++
++#include "nrr_dlss_bridge.h"
++
++#include "core/config/engine.h"
++#include "core/object/class_db.h"
++
++static NRRDLSS *nrr_dlss_bridge_singleton = nullptr;
++
++void initialize_nrr_dlss_bridge_module(ModuleInitializationLevel p_level) {
++	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
++		return;
++	}
++
++	ClassDB::register_class<NRRDLSS>();
++
++	nrr_dlss_bridge_singleton = memnew(NRRDLSS);
++	// Registering it as an engine singleton is what puts `NRRDLSS` in scope for GDScript:
++	// GDScriptLanguage::init() walks Engine::get_singleton()->get_singletons() and adds each one
++	// as a named global, which is the same route OS/Engine/Time take.
++	Engine::get_singleton()->add_singleton(Engine::Singleton("NRRDLSS", nrr_dlss_bridge_singleton));
++}
++
++void uninitialize_nrr_dlss_bridge_module(ModuleInitializationLevel p_level) {
++	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
++		return;
++	}
++
++	if (nrr_dlss_bridge_singleton) {
++		memdelete(nrr_dlss_bridge_singleton);
++		nrr_dlss_bridge_singleton = nullptr;
++	}
++}
+diff --git a/modules/nrr_dlss_bridge/register_types.h b/modules/nrr_dlss_bridge/register_types.h
+new file mode 100644
+index 0000000..9e38e5e
+--- /dev/null
++++ b/modules/nrr_dlss_bridge/register_types.h
+@@ -0,0 +1,6 @@
++#pragma once
++
++#include "modules/register_module_types.h"
++
++void initialize_nrr_dlss_bridge_module(ModuleInitializationLevel p_level);
++void uninitialize_nrr_dlss_bridge_module(ModuleInitializationLevel p_level);
