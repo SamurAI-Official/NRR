@@ -36,6 +36,12 @@ enum class TensorRole {
      * history is what a temporal model is built around. A resolve given the current
      * frame as its own history sees no motion and no accumulation at all. */
     History,
+    /* The history trust mask: one channel over the input grid, 1 where the history at that pixel can be
+     * believed. The runtime computes it itself (compute_history_trust_mask in nrr_temporal.h) from the two
+     * depth fields and this frame's motion, so no binding has to supply one - which is the point: an input
+     * that every engine must produce is an input that exists only where someone has implemented it. The role
+     * exists so a model that declares it is fed the mask, instead of falling through to the colour path. */
+    Validity,
     Other,
 };
 

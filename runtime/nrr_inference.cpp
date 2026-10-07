@@ -42,6 +42,18 @@ TensorRole classify_tensor_role(const std::string& name) {
      * offset plane is named precisely enough that matching it first cannot collide,
      * whereas matching color first would swallow a name like "jittered_input" and
      * hand a two-channel offset plane to the three-channel colour path. */
+    /* The trust mask is matched before history, for the reason jitter is matched before colour: natural names
+     * for it contain a history word ("history_valid", "prev_trust"), and matching history first would hand a
+     * three-channel history image to a one-channel input. Deliberately narrow - "valid" and "trust", plus the
+     * two exact names - because "mask" alone is a common word in other models' input sets (a material or
+     * stencil mask) and a false positive here would quietly feed a one-channel plane to a three-channel path,
+     * which is the class of silent corruption these roles exist to prevent. An unrecognised name stays on the
+     * colour path, as before. */
+    if (n.find("valid") != std::string::npos ||
+        n.find("trust") != std::string::npos ||
+        n == "mask" || n == "history_mask") {
+        return TensorRole::Validity;
+    }
     if (n.find("jitter") != std::string::npos ||
         n == "subpixel" || n == "sub_pixel" || n.find("offset") != std::string::npos) {
         return TensorRole::Jitter;

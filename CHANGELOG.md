@@ -14,6 +14,44 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The mask a model needs at inference is now built by the runtime, so no engine has to supply one
+
+The data path moved ahead of the contract earlier in this release: the trainer consumes a history trust mask,
+`--inputs=...,validity`, while the runtime had no notion of one and the frame contract had no field for it. The
+obvious fix was to add a field and make every engine binding fill it, which would have produced an input that
+exists only where someone has implemented it - and this is the input that most needs to be there, since 86% of
+a godot-v4 frame is sky and about 21% of its pixels are trustworthy.
+
+So the runtime derives it instead. `runtime/nrr_temporal.cpp::compute_history_trust_mask()` implements the
+packer's rule - geometry, source inside the frame, nothing clearly nearer in front - from the current depth, the
+previous frame's depth and this frame's motion field, all of which it already holds. The previous depth is
+recorded beside the previous input render by `TemporalAccumulator::record_depth()`, by bytes rather than
+converted, and forgotten with it through one `forget_previous_frame()` helper that replaced five separate
+clearing sites: a mask built from the previous *scene's* depth would mark trustworthy precisely the pixels a cut
+invalidates, and one place that clears both is how that cannot happen again.
+
+The rule is the packer's, constant for constant and comparison for comparison, because a mask computed
+differently at inference from the one the model was trained on is a different input wearing the same name. Its
+inputs arrive in the unit the model's own tensors use: the backend converts both depth fields with the same
+`texture_to_nchw()` the model's `depth` input goes through, so the mask cannot be built from a second decode of
+the same attachment down a different path, and the motion field is the UV field the model is given.
+
+A model declares the mask by name. `TensorRole::Validity` joins the role classifier, matched before history
+because "history_validity" is a natural name for it and history would otherwise claim it, and matched narrowly -
+`valid`, `trust`, or exactly `mask` - because `mask` alone is a common word in other models' input sets and a
+false positive would feed a one-channel plane to a three-channel path, which is the class of silent corruption
+these roles exist to prevent. The CPU backend builds the mask on first demand and caches it for the frame, so a
+model that consumes no `validity` pays nothing for it, and zero-fills when it cannot be built - no depth
+attachment, or the first frame of a sequence - which is exactly the tensor a zeroed-control run gets.
+
+Five tests pin it: a hand-computed 4x3 fixture with one rejection reason planted per pixel (sky, occlusion, an
+out-of-frame source) and the trusted pixel whose previous depth is merely *equal* to its own, so a fixture with
+inverted comparisons cannot pass; a source moved onto the occluder, which distinguishes truncating from
+rounding; the size guards; the depth living and dying with the previous frame; and the narrow side of the naming
+rule. The runtime suite is 171/171 against 166 before, and ctest 6/6. Nothing crosses the C API: the mask is
+built inside the render path, so this is not an ABI change for a caller.
+
+
 ### The warp the temporal arm was missing buys one percent, and the mask it was missing covers 86% of the frame
 
 M10.4's premise was that the temporal arms lost because history was handed to them unwarped, so a small

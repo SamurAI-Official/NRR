@@ -42,6 +42,40 @@ constexpr float TEMPORAL_BASE_ALPHA = 0.7f;       /* history weight for low moti
 constexpr float TEMPORAL_ALPHA_MOTION_GATE_PX = 1.0f;
 constexpr float TEMPORAL_ALPHA_MOTION_FULL_PX = 7.0f;
 
+/* The history *trust mask*: one plane over the input grid, 1 where the history a model is handed at a pixel
+ * can be believed and 0 where it cannot - the reprojection's source left the frame, the previous frame held
+ * something nearer (disocclusion), or there is no geometry at all (sky).
+ *
+ * It is not something an engine has to supply. The runtime holds both depth fields and this frame's motion
+ * field, which is everything the rule needs, so it builds the mask itself (compute_history_trust_mask below)
+ * and feeds it to a model that declares a `validity` input. That is deliberate: requiring every binding to
+ * produce a mask would make the input available only where someone had implemented it, and the mask is the
+ * part of a temporal model's input that most needs to be there - on the godot-v4 captures 86% of the frame is
+ * sky and only about 21% of pixels are trustworthy, so most of the history handed to a model is either
+ * meaningless or already correct-but-unreprojectable.
+ *
+ * The rule below is the one tools/pack_godot_pairs.py writes into the training pairs, constant for constant
+ * and comparison for comparison, because a mask computed differently at inference from the one the model was
+ * trained against is a different input wearing the same name. See docs/roadmap.md M10.4 for the measurements.
+ */
+constexpr float HISTORY_TRUST_NO_GEOMETRY = 1e-6f;      /* depth at or below this is sky: nothing to trust */
+constexpr float HISTORY_TRUST_OCCLUSION_MARGIN = 0.05f; /* view-distance units, the packer's margin */
+
+/* Builds that mask. `current_depth` and `previous_depth` are the two frames' view distances over width x
+ * height, row-major; `motion_uv` is this frame's motion field in *UV units*, two floats per pixel, +x right
+ * +y down, current frame to previous - the packing convention and the unit the model's own `motion` input
+ * carries, so a caller passes the field it already converted rather than a second version of it.
+ *
+ * Returns false when the inputs disagree about their size, in which case no mask is produced and a caller
+ * zero-fills its `validity` tensor - the same treatment an absent depth or motion already gets, and the same
+ * thing a model sees when it is run as its own zeroed control.
+ */
+bool compute_history_trust_mask(const std::vector<float>& current_depth,
+                                const std::vector<float>& previous_depth,
+                                const std::vector<float>& motion_uv,
+                                uint32_t width, uint32_t height,
+                                std::vector<float>& out_mask);
+
 /* Reporting convention for NRRRenderStats::temporal_stability: the mean
  * per-channel change between consecutive displayed frames, as a fraction of the
  * full [0,1] range, that is reported as zero stability (100 = frame unchanged). */
@@ -502,6 +536,21 @@ public:
      * Call `record_input_frame` after a frame has been rendered and
      * `previous_input_frame` before the next one binds its tensors. Ordering is the
      * caller's responsibility and is the natural order: bind, infer, then record. */
+    /* This frame's depth, at the input grid, for the *next* frame's trust mask. Call it beside
+     * record_input_frame() and for the same reason: the mask needs two consecutive depth fields, and the
+     * accumulator is what holds a frame across the boundary.
+     *
+     * Stored by bytes, not converted - again like record_input_frame. Converting every frame whether or not
+     * the model consumes `validity` would cost a full-frame pass for nothing on a model that does not, and a
+     * memcpy per frame is not a cost worth optimising away: the conversion happens once, lazily, when a
+     * `validity` input actually has to be filled. */
+    void record_depth(const uint8_t* depth, uint32_t width, uint32_t height, NRRTextureFormat format);
+    /* The previous frame's depth, false when none has been recorded - the first frame of a sequence, and every
+     * frame after a reset or a scene change. A caller that gets false zero-fills `validity`. */
+    bool previous_depth_frame(std::vector<uint8_t>& out_depth,
+                              uint32_t& out_width, uint32_t& out_height,
+                              NRRTextureFormat& out_format) const;
+
     void record_input_frame(const uint8_t* rgb8, uint32_t width, uint32_t height,
                             NRRTextureFormat format);
     /* False when there is no previous frame, which is the first frame of a sequence
@@ -536,6 +585,19 @@ private:
     uint32_t previous_input_width_;
     uint32_t previous_input_height_;
     NRRTextureFormat previous_input_format_;
+
+    /* The previous frame's depth, for the trust mask above - the bytes as recorded, one frame, like the
+     * history the model consumes. */
+    std::vector<uint8_t> previous_depth_;
+    uint32_t previous_depth_width_ = 0;
+    uint32_t previous_depth_height_ = 0;
+    NRRTextureFormat previous_depth_format_ = NRR_TEXTURE_FORMAT_R32F;
+
+    /* Forgets the previous frame entirely: the input render and the depth that goes with it. One place, so
+     * that a path which clears the input cannot leave a stale depth behind it - a mask built from the previous
+     * *scene's* depth would mark trustworthy exactly the pixels a cut invalidates, which is the failure the
+     * clearing exists to prevent in the first place. */
+    void forget_previous_frame();
 };
 
 /* What a rendered frame's phase-aligned pass may use, derived from the frame and the model's input set.

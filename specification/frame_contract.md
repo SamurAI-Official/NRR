@@ -130,17 +130,26 @@ Number of previous frames in history buffer.
 
 ### 4.7 History Trust Mask
 
-Optional, and **currently unsupplied by every engine binding** - recorded here because the data path has run
-ahead of the contract. One plane at the render resolution: 1 where the reprojected history at that pixel is
-trustworthy, 0 where it is not, for any reason - the source left the frame, the previous frame held a nearer
-surface (disocclusion), or there is no geometry at all (sky).
+**Not a caller input: the runtime computes it, and this section records the rule.** One plane over the input
+grid, 1 where the reprojected history at that pixel can be believed and 0 where it cannot, for any reason - the
+source left the frame, the previous frame held a nearer surface (disocclusion), or there is no geometry at all
+(sky, which is most of a game frame).
 
-For a model trained to consume it, this is a required *input*, not metadata: `tools/pack_godot_pairs.py`
-computes it per pair, `tools/train_nrr.py --inputs=...,validity` consumes it, and the runtime exposes no way to
-produce or receive one. The measurement that makes the contract change worth making is in M10.4: on the
-godot-v4 captures ~86% of pixels are sky, so most of the history a temporal model is handed is either
-meaningless (no geometry for an MVP-derived motion field to be about) or already correct but not
-reprojectable, and without the mask the model cannot say which of the two it is looking at.
+It is derived rather than supplied because the runtime already holds everything the rule needs: the current
+depth, the previous frame's depth (recorded beside the previous input render, and forgotten with it on a cut or
+a resolution change) and this frame's motion field. An input every engine binding has to produce is an input
+that exists only where someone has implemented it, and the measurements in `docs/roadmap.md` M10.4 make this
+the input that most needs to be there: on the godot-v4 captures 86% of the frame is sky and only about 21% of
+pixels are trustworthy, so most of the history a temporal model is handed is either meaningless or already
+correct but unreprojectable.
+
+The rule is `runtime/nrr_temporal.cpp::compute_history_trust_mask()`, and it is the **packer's** rule, constant
+for constant and comparison for comparison (`tools/pack_godot_pairs.py`): a mask computed differently at
+inference from the one the model was trained on is a different input wearing the same name. A model declares it
+by naming an input `validity` (or `trust`, or `mask`); the runtime feeds it, and zero-fills it when it cannot be
+built - no depth attachment, or the first frame of a sequence - which is the same tensor a model sees when it is
+run as its own zeroed control. Nothing here is an ABI change for a caller: the mask is built, consumed inside
+the render path, and never crosses the C API.
 
 ---
 

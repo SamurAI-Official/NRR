@@ -1395,13 +1395,23 @@ warp's marginal contribution beside it, in four arms rather than two.
 - [x] The packer emits the warped history and the trainer consumes the mask as an input
       (`--inputs=color,motion,history,validity`, plus `--zero-input validity` for its control), with the warp's
       effect on real data measured rather than assumed
-- [ ] The four-arm comparison (`tools/run_m10_history_arms.ps1`, the pre-registered config and seeds: colour /
+- [~] The four-arm comparison (`tools/run_m10_history_arms.ps1`, the pre-registered config and seeds: colour /
       warped history / warped history + mask / raw history + mask, plus the zeroed controls), judged by the
-      rule in `docs/evaluation-protocol.md` - a lever is not re-judged because the first attempt lost
-- [ ] **The mask needs a contract change before it can exist at runtime.** §4.7 of
-      `specification/frame_contract.md` now records it, and no engine binding supplies one: an arm that wins on
-      the mask wins against a pipeline that has to be extended. The warp needs no such change - the runtime
-      already reprojects - which is why both stay in the sweep
+      rule in `docs/evaluation-protocol.md` - a lever is not re-judged because the first attempt lost. **First
+      results, seed 20261020: colour-only 8.79%, warped history 14.72% - +5.93 points, which clears the
+      5-point bar on that seed.** That does not contradict the probe's "a correct warp is worth about one
+      percent": alignment is not information. Warping removes the *displacement* between two frames and leaves
+      the aliased sub-pixel samples, and those samples are what a temporal model is looking for - the probe
+      measured how well the previous frame matches the current one, not how much it adds. Seed 20261021 and the
+      zeroed controls were still running when this was written, and adoption needs both seeds and the control
+- [x] **The mask needs no contract change: the runtime computes it.** §4.7 of `specification/frame_contract.md`
+      records the rule, and `runtime/nrr_temporal.cpp::compute_history_trust_mask()` carries it out - geometry,
+      source inside the frame, nothing clearly nearer before - from the current depth, the previous frame's
+      depth (recorded beside the previous input render, and forgotten with it on a cut or a resolution change)
+      and this frame's motion field. A model declares it by naming an input `validity` (or `trust`, or `mask`);
+      the CPU backend builds it on demand and feeds it, and zero-fills it when it cannot be built, which is the
+      tensor a zeroed control gets. Five tests pin it, including a hand-computed fixture with one rejection
+      reason per pixel and the narrow side of the naming rule; the suite is 171/171 and ctest is 6/6
 - [ ] If the content is the real limit, the answer is M10.3's captures rather than this: a slow camera over
       mostly-empty scenes cannot exercise a temporal model, and 86% sky with 0.7 px of motion is exactly that.
       Less sky, movers, and faster camera motion is the direct response to the numbers above

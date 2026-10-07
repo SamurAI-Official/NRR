@@ -25,6 +25,7 @@
 #include "unit/test_quality_metric.cpp"
 #include "unit/test_quality_parity.cpp"
 #include "unit/test_jitter.cpp"
+#include "unit/test_history_mask.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
@@ -217,6 +218,12 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_state_manager_policy);
     NRR_RUN_TEST(test_temporal_record_frame);
     NRR_RUN_TEST(test_temporal_blend_frame);
+    std::cout << "\n--- History Trust Mask (the runtime's own input to a temporal model) ---\n";
+    NRR_RUN_TEST(test_history_mask_plants_every_rejection_reason);
+    NRR_RUN_TEST(test_history_mask_matches_the_packer_on_a_moving_source);
+    NRR_RUN_TEST(test_history_mask_refuses_fields_that_disagree);
+    NRR_RUN_TEST(test_history_mask_depth_lives_and_dies_with_the_previous_frame);
+    NRR_RUN_TEST(test_validity_input_name_classifies_as_its_own_role);
     NRR_RUN_TEST(test_temporal_blend_reprojects_history);
     NRR_RUN_TEST(test_conditioning_weights_and_domains);
     NRR_RUN_TEST(test_conditioning_prepare_and_apply);

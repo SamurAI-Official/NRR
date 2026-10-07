@@ -538,18 +538,90 @@ static float mean_abs_difference(const std::vector<float>& a,
 // TemporalAccumulator
 // ============================================================================
 
+bool compute_history_trust_mask(const std::vector<float>& current_depth,
+                                const std::vector<float>& previous_depth,
+                                const std::vector<float>& motion_uv,
+                                uint32_t width, uint32_t height,
+                                std::vector<float>& out_mask) {
+    if (width == 0 || height == 0) return false;
+    const size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (current_depth.size() != pixels || previous_depth.size() != pixels ||
+        motion_uv.size() != pixels * 2) {
+        return false;
+    }
+    out_mask.assign(pixels, 0.0f);
+    const float fw = static_cast<float>(width);
+    const float fh = static_cast<float>(height);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t index = static_cast<size_t>(y) * width + x;
+            const float depth = current_depth[index];
+            /* Not > rather than <=, so a NaN depth is treated as no geometry rather than as geometry with a
+             * depth of NaN to compare against. Sky is exactly this case and the packer writes 0 for it. */
+            if (!(depth > HISTORY_TRUST_NO_GEOMETRY)) continue;
+            /* The packer's reprojection, in its own units: prev_uv = cur_uv - motion, and the source read at
+             * the pixel that *contains* that position - truncation, not rounding, which is the packer's
+             * astype(int). Then the same two comparisons: inside the frame, and nothing clearly nearer in
+             * front of what is here now. */
+            const float prev_u = (static_cast<float>(x) + 0.5f) / fw - motion_uv[index * 2];
+            const float prev_v = (static_cast<float>(y) + 0.5f) / fh - motion_uv[index * 2 + 1];
+            if (!(prev_u > 0.0f && prev_u < 1.0f && prev_v > 0.0f && prev_v < 1.0f)) continue;
+            uint32_t px = static_cast<uint32_t>(prev_u * fw);
+            uint32_t py = static_cast<uint32_t>(prev_v * fh);
+            if (px >= width) px = width - 1;
+            if (py >= height) py = height - 1;
+            const float previous_here = previous_depth[static_cast<size_t>(py) * width + px];
+            if (previous_here > 0.0f && depth > previous_here + HISTORY_TRUST_OCCLUSION_MARGIN) continue;
+            out_mask[index] = 1.0f;
+        }
+    }
+    return true;
+}
+
+void TemporalAccumulator::record_depth(const uint8_t* depth, uint32_t width, uint32_t height,
+                                      NRRTextureFormat format) {
+    if (!depth || width == 0 || height == 0) {
+        previous_depth_.clear();
+        previous_depth_width_ = 0;
+        previous_depth_height_ = 0;
+        return;
+    }
+    const size_t bytes = accel_texture_bytes(width, height, format);
+    previous_depth_.assign(depth, depth + bytes);
+    previous_depth_width_ = width;
+    previous_depth_height_ = height;
+    previous_depth_format_ = format;
+}
+
+bool TemporalAccumulator::previous_depth_frame(std::vector<uint8_t>& out_depth, uint32_t& out_width,
+                                               uint32_t& out_height, NRRTextureFormat& out_format) const {
+    if (previous_depth_.empty()) return false;
+    out_depth = previous_depth_;
+    out_width = previous_depth_width_;
+    out_height = previous_depth_height_;
+    out_format = previous_depth_format_;
+    return true;
+}
+
 TemporalAccumulator::TemporalAccumulator()
     : seen_frame_(false), last_frame_index_(0),
       last_width_(0), last_height_(0),
       previous_input_width_(0), previous_input_height_(0),
       previous_input_format_(NRR_TEXTURE_FORMAT_RGB8) {}
 
+void TemporalAccumulator::forget_previous_frame() {
+    previous_input_.clear();
+    previous_input_width_ = 0;
+    previous_input_height_ = 0;
+    previous_depth_.clear();
+    previous_depth_width_ = 0;
+    previous_depth_height_ = 0;
+}
+
 void TemporalAccumulator::record_input_frame(const uint8_t* rgb8, uint32_t width,
                                             uint32_t height, NRRTextureFormat format) {
     if (!rgb8 || width == 0 || height == 0) {
-        previous_input_.clear();
-        previous_input_width_ = 0;
-        previous_input_height_ = 0;
+        forget_previous_frame();
         return;
     }
     /* Stored by bytes, not converted: the tensor binding converts it on demand, and
@@ -586,9 +658,7 @@ void TemporalAccumulator::initialize() {
     last_frame_index_ = 0;
     last_width_ = 0;
     last_height_ = 0;
-    previous_input_.clear();
-    previous_input_width_ = 0;
-    previous_input_height_ = 0;
+    forget_previous_frame();
 }
 
 void TemporalAccumulator::shutdown() {
@@ -599,9 +669,7 @@ void TemporalAccumulator::shutdown() {
     last_frame_index_ = 0;
     last_width_ = 0;
     last_height_ = 0;
-    previous_input_.clear();
-    previous_input_width_ = 0;
-    previous_input_height_ = 0;
+    forget_previous_frame();
 }
 
 void TemporalAccumulator::reset() {
@@ -621,9 +689,7 @@ void TemporalAccumulator::reset() {
      * that matters: after a cut it belongs to a scene that is no longer on screen,
      * and a resolve fed it would composite the old scene into the new one. Cleared
      * alongside the accumulated output for exactly that reason. */
-    previous_input_.clear();
-    previous_input_width_ = 0;
-    previous_input_height_ = 0;
+    forget_previous_frame();
 }
 
 TemporalAccumulator::Result TemporalAccumulator::apply(
@@ -651,9 +717,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
          * so the frame that triggered the cut was already blended against it - the
          * existing policy, and the reason a cut costs one blended frame. Dropping it
          * here is what stops the *next* frame inheriting it. */
-        previous_input_.clear();
-        previous_input_width_ = 0;
-        previous_input_height_ = 0;
+        forget_previous_frame();
     }
 
     /* One conversion for both consumers: the history weight (compute_state) and the phase-aligned gate below

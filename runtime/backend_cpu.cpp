@@ -443,6 +443,43 @@ NRRResult BackendCPU::execute_model(
     const uint32_t in_w = color_img.width;
     const uint32_t in_h = color_img.height;
 
+    /* The history trust mask, built on first demand and cached for the frame: it is a per-pixel pass over two
+     * depth fields, so a model that does not declare a `validity` input must not pay for it - the same argument
+     * the history comment above makes about converting the input every frame.
+     *
+     * Empty means "could not be built": no depth attachment, no previous depth yet (the first frame of a
+     * sequence), or a resolution that does not match the input grid. A validity tensor is then zero-filled,
+     * which is both the treatment an absent depth already gets and exactly what a model is fed when it is run
+     * as its own zeroed control.
+     *
+     * Both fields are converted with the same texture_to_nchw() the model's own `depth` tensor uses, so the
+     * mask is built from the numbers the model is given rather than from a second decode of the same
+     * attachment down a different path. */
+    std::vector<float> trust_mask;
+    bool trust_mask_built = false;
+    auto history_trust_mask = [&]() -> const std::vector<float>& {
+        if (!trust_mask_built) {
+            trust_mask_built = true;
+            std::vector<uint8_t> previous_bytes;
+            uint32_t previous_w = 0, previous_h = 0;
+            NRRTextureFormat previous_format = NRR_TEXTURE_FORMAT_R32F;
+            std::vector<float> current_depth, previous_depth, motion_uv;
+            const bool have_fields =
+                depth_img != nullptr && depth_img->width == in_w && depth_img->height == in_h &&
+                temporal_.previous_depth_frame(previous_bytes, previous_w, previous_h, previous_format) &&
+                previous_w == in_w && previous_h == in_h &&
+                texture_to_nchw(depth_img->pixels.data(), in_w, in_h, depth_img->format, 1, current_depth) &&
+                texture_to_nchw(previous_bytes.data(), previous_w, previous_h, previous_format, 1,
+                                previous_depth);
+            if (have_fields && motion_img != nullptr &&
+                motion_img->width == in_w && motion_img->height == in_h &&
+                texture_to_nchw(motion_img->pixels.data(), in_w, in_h, motion_img->format, 2, motion_uv)) {
+                compute_history_trust_mask(current_depth, previous_depth, motion_uv, in_w, in_h, trust_mask);
+            }
+        }
+        return trust_mask;
+    };
+
     // ---- Build model input tensors (matched by role) ------------------------
     std::vector<TensorInput> tensors;
     tensors.reserve(static_cast<size_t>(ort->get_input_count()));
@@ -470,6 +507,8 @@ NRRResult BackendCPU::execute_model(
              * a two-channel offset tensor was filled with the *colour image* - a silent
              * corruption that renders and looks plausible while being nonsense. */
             case TensorRole::Jitter: channels = 2; break;
+            /* One channel: the trust mask the runtime computes for itself. */
+            case TensorRole::Validity: channels = 1; break;
             default:                 channels = 3; break;
         }
 
@@ -501,6 +540,31 @@ NRRResult BackendCPU::execute_model(
                                name + "'");
                 return NRR_ERROR_RENDER_FAILED;
             }
+            tensors.push_back(std::move(t));
+            continue;
+        }
+
+        /* The mask is built rather than converted from an attachment: no caller supplies one, which is the
+         * point of computing it here. Zero-filled when it could not be built - an absent depth, or the first
+         * frame of a sequence - so a model's validity input is always satisfied and the zeroed-control case is
+         * the same code path. */
+        if (role == TensorRole::Validity) {
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(ort->get_input_shape(i), channels, in_w, in_h, shape)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("model input '") + name +
+                               "' shape conflicts with the frame resolution");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            const size_t elements = static_cast<size_t>(shape[1]) *
+                                    static_cast<size_t>(shape[2]) *
+                                    static_cast<size_t>(shape[3]);
+            t.data.assign(elements, 0.0f);
+            const std::vector<float>& mask = history_trust_mask();
+            if (mask.size() == elements) t.data = mask;
             tensors.push_back(std::move(t));
             continue;
         }
@@ -607,6 +671,13 @@ NRRResult BackendCPU::execute_model(
      * from the same bytes the model was fed - the history has to be the low-res render
      * itself, not a reconstruction of it. */
     temporal_.record_input_frame(color_img.pixels.data(), in_w, in_h, color_img.format);
+    /* And this frame's depth, so the next frame's trust mask has two consecutive fields to compare. Recorded
+     * unconditionally and by bytes (see record_depth): a caller that supplies no depth gets no mask next
+     * frame, and a model that consumes no `validity` never pays for the conversion. */
+    if (depth_img) {
+        temporal_.record_depth(depth_img->pixels.data(), depth_img->width, depth_img->height,
+                               depth_img->format);
+    }
     const NRRTemporalState tstate = temporal.state;
     const bool blended = temporal.blended;
     const TemporalBlendStats blend_stats = temporal.blend_stats;
