@@ -1,0 +1,8 @@
+# The patches must survive a checkout byte-for-byte: this repository has
+# core.autocrlf=true, and git would otherwise rewrite their LF endings to CRLF on
+# the next touch, which is enough to make `git apply` reject them.
+*.patch -text
+
+# The module sources are copied into a Godot tree, which is an LF tree (and the
+# patch above is generated from those exact bytes).
+module/nrr_dlss_bridge/* text eol=lf
