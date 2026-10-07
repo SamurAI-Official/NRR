@@ -134,6 +134,47 @@ def warp_history_bilinear(previous, motion):
     return top + (bottom - top) * fy, inside
 
 
+def temporal_reference_margins(pair, previous_clean, previous_jitter, motion_low):
+    """The two margins a temporal pair can be judged by: the single-frame baseline's, and the one a *reference*
+    temporal resolve achieves.
+
+    Why this exists: the data gate requires that a bilinear 2x upscale of the input be far from the target, and
+    a temporal capture fails that test almost everywhere for a reason that is not a defect - a wall filling the
+    frame at the distance that gives the capture its motion is coarse on screen, so bilinear reproduces it and
+    the pair is refused (measured: 782 of 800 frames of the `temporal` scenes). But the value of such a pair is
+    *temporal*: each frame carries aliased sub-pixel samples of the same surface, sampled at a different
+    position, and that is what a temporal resolve fuses. The gate was asking a spatial question of temporal data.
+
+    So the reference resolve is built from existing definitions rather than invented here: `train_nrr.dejitter`
+    places each frame on the nominal (un-jittered) grid - the same function the model is trained with - and
+    `warp_history_bilinear()` above reprojects the previous one onto this frame's grid, which is the same
+    function the history is packed with. Their mean is the runtime's own accumulation rule in its two-frame
+    form, and the pair's temporal value is how much that beats the single frame against the target.
+
+    Both margins are measured on the *clean* low-resolution frame, not the noisy input the model receives, so a
+    gain cannot come from averaging noise away: `history` in this dataset is the previous frame's clean render,
+    and measuring against the noisy input would credit the history with denoising the current frame.
+    """
+    import torch                      # imported here, not at module scope: packing without temporal gating
+    import train_nrr as trainer       # should not require the training environment
+
+    def placed(lowres, jitter):
+        """The frame resampled onto the nominal grid, so two frames with different jitter share one grid."""
+        height, width = lowres.shape[:2]
+        tensor = torch.from_numpy(np.ascontiguousarray(lowres.transpose(2, 0, 1)))[None]
+        offsets = torch.tensor([jitter[0], jitter[1]], dtype=torch.float32)
+        plane = offsets.view(1, 2, 1, 1).expand(1, 2, height, width)
+        return trainer.dejitter(tensor, plane)[0].numpy().transpose(1, 2, 0)
+
+    current = placed(np.asarray(pair["input_clean"], dtype=np.float32), pair["jitter"])
+    previous = placed(np.asarray(previous_clean, dtype=np.float32), previous_jitter)
+    previous, _ = warp_history_bilinear(previous, motion_low)
+    fused = 0.5 * (current + previous)
+    single = float(np.mean(np.abs(gen._upscale2x(pair["input_clean"]) - pair["target"])))
+    fused_margin = float(np.mean(np.abs(gen._upscale2x(fused) - pair["target"])))
+    return {"single": single, "fused": fused_margin, "gain": single - fused_margin}
+
+
 def downscale2(image):
     """Area average by 2. Deliberately not a point sample: a runtime's low-resolution frame holds the
     average of what the higher resolution contained, not one sample of it."""

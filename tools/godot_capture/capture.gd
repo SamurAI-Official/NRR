@@ -75,28 +75,48 @@ const SCENES := {
 		# 0.05 units per frame against a wall 2.0 away is about 2.4 px per frame on a 128-wide input grid. Over
 		# a 400-frame capture that is 20 units of travel: the camera approaches the wall without reaching it, and
 		# the objects sit between the two so occlusion and disocclusion actually happen.
-		"camera_velocity": Vector3(0.05, 0.02, 0.0),
-		# The checker frequency is 48 and not 6, and the reason is the data gate rather than taste: the wall sits
-		# 4x closer than the seven earlier scenes' (2 units against 8), so the same texture is 4x coarser on
-		# screen, a bilinear upscale of the input reproduced the target to 0.0025 against the gate's 0.0100 and
-		# 783 of 800 frames were refused as pairs with nothing for an upscaler to do. Finer texture at the same
-		# distance puts the detail back below the input's Nyquist limit, which is what makes a pair a pair.
-		"checker": 96,
-		# Wide enough to stay in front of the camera for the whole 400-frame dolly: the camera travels 20 units
-		# laterally, so a 24-unit wall left the frame after ~40 frames and the capture's yield collapsed to 5
-		# pairs in 400 (a pair needs a margin over 0.0100, and a frame with no geometry has none).
+		# v4's proportions, and that is the point: three large objects a few units out passed the gate at 79% of
+		# frames, while three attempts at inventing proportions here (a flat close wall, fine texture, a corridor
+		# of small props) all failed - the gate's margin is a *frame mean*, so detail that occupies a tenth of the
+		# frame is diluted below the floor however sharp it is. So: objects at v4's distances and scales, a wall
+		# behind them for geometry coverage (which v4's scenes never had in the motion pass at all), and a faster
+		# camera than v4's 0.004-0.006 per frame, because 0.7 px of motion is what M10.4 measured as too little to
+		# exercise a temporal model.
+		"camera_velocity": Vector3(0.03, 0.01, 0.0),
+		"checker": 8,
 		"backdrop_size": Vector2(200.0, 60.0),
-		"backdrop_z": -2.0,
+		"backdrop_z": -4.5,
 		"objects": [
-			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.40,
-				"orbit": 0.35, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.0, "spin": 0.0,
-				"position": Vector3(-0.60, 0.10, -1.10)},
-			{"shape": "box", "color": Color(0.25, 0.55, 0.90), "scale": 0.35,
-				"orbit": 0.25, "axis": Vector3(0.0, 0.0, 1.0), "phase": 1.1, "spin": 0.9,
-				"position": Vector3(0.55, -0.25, -1.45)},
-			{"shape": "sphere", "color": Color(0.90, 0.85, 0.30), "scale": 0.22,
-				"orbit": 0.45, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.3, "spin": 0.0,
-				"position": Vector3(0.10, 0.35, -0.95)},
+			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 1.20,
+				"orbit": 6.6, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.0, "spin": 0.0,
+				"position": Vector3(0.0, 0.0, -2.8)},
+			{"shape": "box", "color": Color(0.25, 0.55, 0.90), "scale": 1.30,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 0.8,
+				"position": Vector3(-2.60, 0.20, -3.4)},
+			{"shape": "torus", "color": Color(0.90, 0.85, 0.30), "scale": 1.15,
+				"orbit": 3.9, "axis": Vector3(0.0, 0.0, 1.0), "phase": 1.7, "spin": 1.2,
+				"position": Vector3(2.70, -0.30, -2.4)},
+			{"shape": "sphere", "color": Color(0.40, 0.80, 0.50), "scale": 1.25,
+				"orbit": 6.6, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.0, "spin": 0.0,
+				"position": Vector3(5.40, 0.10, -3.0)},
+			{"shape": "box", "color": Color(0.95, 0.60, 0.25), "scale": 1.35,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 1.5,
+				"position": Vector3(8.10, -0.20, -3.3)},
+			{"shape": "torus", "color": Color(0.65, 0.45, 0.95), "scale": 1.10,
+				"orbit": 4.2, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.9, "spin": 0.9,
+				"position": Vector3(10.80, 0.25, -2.6)},
+			{"shape": "sphere", "color": Color(0.30, 0.85, 0.85), "scale": 1.28,
+				"orbit": 6.6, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.2, "spin": 0.0,
+				"position": Vector3(13.50, -0.15, -3.2)},
+			{"shape": "box", "color": Color(0.90, 0.40, 0.60), "scale": 1.32,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 1.9,
+				"position": Vector3(16.20, 0.20, -2.9)},
+			{"shape": "torus", "color": Color(0.75, 0.75, 0.35), "scale": 1.18,
+				"orbit": 4.1, "axis": Vector3(0.0, 0.0, 1.0), "phase": 2.6, "spin": 1.1,
+				"position": Vector3(18.90, -0.10, -3.5)},
+			{"shape": "sphere", "color": Color(0.35, 0.65, 0.95), "scale": 1.22,
+				"orbit": 6.6, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.5, "spin": 0.0,
+				"position": Vector3(21.60, 0.15, -2.7)},
 		],
 	},
 	# The held-out companion to "temporal": same idea, different everything that matters - colours, layout, wall
@@ -105,19 +125,40 @@ const SCENES := {
 	# which is still short of the wall, and the objects sit between the two again so disocclusion happens.
 	"temporal2": {
 		"camera_velocity": Vector3(-0.07, 0.03, 0.0),
-		"checker": 88,
+		"checker": 8,
 		"backdrop_size": Vector2(240.0, 72.0),
-		"backdrop_z": -3.0,
+		"backdrop_z": -5.0,
 		"objects": [
-			{"shape": "torus", "color": Color(0.35, 0.80, 0.45), "scale": 0.55,
-				"orbit": 0.30, "axis": Vector3(0.0, 1.0, 0.0), "phase": 0.7, "spin": 1.3,
-				"position": Vector3(0.70, 0.20, -1.80)},
-			{"shape": "box", "color": Color(0.90, 0.55, 0.25), "scale": 0.48,
-				"orbit": 0.22, "axis": Vector3(0.0, 0.0, 1.0), "phase": 2.0, "spin": 1.7,
-				"position": Vector3(-0.75, -0.35, -2.30)},
-			{"shape": "sphere", "color": Color(0.55, 0.55, 0.95), "scale": 0.30,
-				"orbit": 0.40, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.4, "spin": 0.0,
-				"position": Vector3(0.05, 0.45, -1.50)},
+			{"shape": "torus", "color": Color(0.35, 0.80, 0.45), "scale": 1.25,
+				"orbit": 5.4, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.7, "spin": 1.3,
+				"position": Vector3(0.90, 0.20, -2.9)},
+			{"shape": "box", "color": Color(0.90, 0.55, 0.25), "scale": 1.35,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 1.7,
+				"position": Vector3(-2.10, -0.30, -3.6)},
+			{"shape": "sphere", "color": Color(0.55, 0.55, 0.95), "scale": 1.15,
+				"orbit": 6.0, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.4, "spin": 0.0,
+				"position": Vector3(-5.20, 0.25, -2.6)},
+			{"shape": "box", "color": Color(0.85, 0.30, 0.55), "scale": 1.30,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 0.8,
+				"position": Vector3(-8.30, -0.20, -3.2)},
+			{"shape": "torus", "color": Color(0.40, 0.90, 0.70), "scale": 1.20,
+				"orbit": 5.1, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.1, "spin": 1.1,
+				"position": Vector3(-11.40, 0.15, -2.7)},
+			{"shape": "sphere", "color": Color(0.95, 0.75, 0.30), "scale": 1.28,
+				"orbit": 5.7, "axis": Vector3(1.0, 0.0, 0.0), "phase": 0.3, "spin": 0.0,
+				"position": Vector3(-14.50, -0.25, -3.4)},
+			{"shape": "box", "color": Color(0.45, 0.70, 0.95), "scale": 1.32,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 1.4,
+				"position": Vector3(-17.60, 0.20, -3.0)},
+			{"shape": "sphere", "color": Color(0.80, 0.40, 0.85), "scale": 1.18,
+				"orbit": 6.3, "axis": Vector3(1.0, 0.0, 0.0), "phase": 1.9, "spin": 0.0,
+				"position": Vector3(-20.70, -0.15, -2.5)},
+			{"shape": "torus", "color": Color(0.30, 0.85, 0.40), "scale": 1.30,
+				"orbit": 4.8, "axis": Vector3(1.0, 0.0, 0.0), "phase": 2.8, "spin": 1.8,
+				"position": Vector3(-23.80, 0.30, -3.3)},
+			{"shape": "box", "color": Color(0.95, 0.45, 0.35), "scale": 1.24,
+				"orbit": 0.0, "axis": Vector3(0.0, 0.0, 1.0), "phase": 0.0, "spin": 1.0,
+				"position": Vector3(-26.90, -0.10, -2.8)},
 		],
 	},
 	# More training content. Capacity is measured to be cheap in latency (eight times the parameters cost

@@ -14,6 +14,51 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The data gate needed content, not a temporal arm, and the warp is worth fifteen percent once it has any
+
+The gate that refused 782 of 800 frames was not asking the wrong question, which is what this was supposed to
+find out. A temporal arm was implemented and calibrated - `tools/pack_godot_pairs.py` now computes, per pair,
+the margin a *reference* two-frame resolve achieves beside the single-frame baseline's, using only existing
+definitions (`train_nrr.dejitter` places each frame on the nominal grid, `warp_history_bilinear` reprojects the
+previous one, their mean is the runtime's own accumulation in its two-frame form) - and the calibration said
+not to ship it as an admitting rule:
+
+  - the frames the spatial gate refused had `single = fused = 0.00000`: the wall is mipmap-flattened to a
+    constant colour at that distance, so bilinear reproduces it and there is nothing there for *any* resolve,
+    temporal included. The gate was right, three times, while three scene redesigns tried to work around it.
+  - where the frames do carry detail, the reference fusion does *not* beat the single frame (gain -0.0018 to
+    +0.00005). A mean is not a learned blend: a model can exploit history that a fixed average of two frames
+    cannot, so a gate built on the reference's gain would reject pairs a trained resolve can still use.
+
+So the arm became a *measurement* rather than a gate, and the fix went where the evidence pointed: the scenes
+were rebuilt on the *seven original scenes' own proportions* - three to ten large objects 2.4 to 3.5 units out,
+which is the recipe that passes the gate at 79% - with the wall behind them and, unlike those scenes, visible to
+the motion pass at last. Three attempts at inventing proportions (a close flat wall, fine texture, a corridor
+of small props) all failed because the gate's margin is a *frame mean*: detail occupying a tenth of a frame is
+diluted below the floor however sharp it is.
+
+godot-v5, from 400 frames each of `temporal` and `temporal2`, now measures against godot-v4:
+
+| | godot-v4 | godot-v5 |
+|---|---|---|
+| pairs (of 800 / 1200 captured) | 949 | 175 |
+| geometry | 21.6% | **100%** |
+| valid (trustworthy of geometry) | 21.0% | **95.3%** |
+| disocclusion | 1.77% | **3.44%** |
+| mean motion | 0.70 px/frame | 0.87 px/frame |
+| **what the warp is worth** | **0.9% closer** | **15.7% closer** |
+
+That last row is the point of the whole exercise: reprojecting the previous frame brought it 0.9% closer to the
+current one on godot-v4 and brings it **15.7%** closer on godot-v5, because there is finally motion to
+reproject. Every temporal arm in the earlier sweep was measured on data where the mechanism they depend on was
+worth one percent.
+
+The comparison is running (`tools/run_m10_v5_arms.ps1`: colour-only, warped history, and warped history with
+history zeroed - the shortest set that answers the rule's two conditions). Stated rather than hidden: 175 pairs
+against 949 means the seed noise is larger than the sigma the pre-registered rule was calibrated on, so a null
+result here is weak evidence of absence while a win would be strong evidence of presence.
+
+
 ### A coherent temporal capture, and the data gate's premise questioned by it
 
 With both capture bugs fixed the scenes finally produce what a temporal model needs, and the full run was made:
