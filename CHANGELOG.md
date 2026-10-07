@@ -14,6 +14,31 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The rebuilt dataset's baseline cannot beat bilinear, because what is missing is phase rather than resolution
+
+The first two arms of the godot-v5 comparison are in, and they say something about the dataset rather than about
+the lever: **colour-only reaches 0.53% and 0.25% improvement over bilinear**, against 8.79% and 10.44% on
+godot-v4 - and both runs were refused by the trainer's gates ("does not beat the baseline"), which is the gate
+working as designed.
+
+The margin is not the explanation: godot-v5's pairs measure 0.0100-0.0229, the same range as godot-v4's
+0.0103-0.0173, so bilinear is as far from the target as before. What changed is *why* it is far. The new scenes
+are smooth large objects at 2.4-3.5 units, so what bilinear cannot recover is not high-frequency detail but the
+**sub-pixel phase** of a jittered render against an un-jittered target - a displacement the model cannot know
+from one frame, because the phase is not in that frame. A colour-only model has no `jitter` input and no
+history, so it can only learn the average of every phase, which is to say nothing. On godot-v4 the same model
+could improve because 79% of the frame was sky and the geometry it did have carried recoverable detail.
+
+That is a *good* sign for the temporal arms and a problem for the rule's baseline: the information the arms need
+is present (sub-pixel samples that differ frame to frame, and a reprojection worth 15.7%), but the bar those
+arms are judged against - "beat colour-only by 5 points" - was calibrated on data where colour-only could reach
+9%. On this data it reaches half a percent, so the bar is either trivially clearable by anything that can see
+the phase, or meaningless. The four remaining arms are still running and are still worth having, because the
+*warped-history* arm's improvement over bilinear (not over colour) is now a measurable presence claim; but the
+pre-registered rule needs a baseline that can at least reach parity, which means a jitter-aware colour arm as
+the reference, and that is the next decision rather than an assumption.
+
+
 ### The data gate needed content, not a temporal arm, and the warp is worth fifteen percent once it has any
 
 The gate that refused 782 of 800 frames was not asking the wrong question, which is what this was supposed to
