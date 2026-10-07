@@ -1342,11 +1342,17 @@ matter too.
 - [ ] **Real textured content in those scenes.** The procedural primitive-and-checkerboard look has
       already tripped the detail gate once ("almost no high-frequency content"), and it is the most
       likely cause of the thin margin between NRR and bilinear on structure
-- [ ] A Blender headless factory: `bpy` renders the target plus a jittered half-resolution pass, and its
-      Z (depth) and Vector (motion) passes, over CC0 scenes. It needs the same *probe-and-pin* treatment
-      `tools/godot_capture/shaders/motion.gdshader` needed for its convention (sign, scale,
-      current-to-previous or not) - an unpinned convention is how a comparison ends up measuring the
-      wrong thing
+- [~] A Blender headless factory - **probed before it was built, and the probe changed it.**
+      `tools/blender_capture/` measures what the passes actually contain, against Blender's own projection
+      rather than against the pass being checked: the **Z pass is metric metres** (3.0 and 4.0 for a cube face
+      at 3.0 m and a plane at 4.0 m, exactly), and the **Vector pass is internal-grid pixels with the inverted
+      sign** (-2.0 px on the plane, -2.664 on the cube's face, for a +2.0 px content shift - the 4/3 ratio is
+      what proves pixels rather than a normalised unit). But the Vector pass is **not reliable** in Blender
+      4.2.3 headless: later runs of the same settings returned zeros with the keyframes provably applied, and
+      every run aborts with an access violation during compositing *after* the EXR is written. So the factory
+      is designed on the confirmed depth pass plus the camera matrices - the primitive `tools/godot_capture/`
+      already uses, and exact for camera motion over static geometry - and the Y sign is recorded as
+      **unmeasured** rather than assumed
 - [ ] Trainer changes a dataset of that size needs: lazy npz loading and crop/flip augmentation (today
       every pair is concatenated into RAM), and multi-scale training from captures at 256 -> 512 so the
       model is not tier-overfit at 128 -> 256 when the runtime scores at 540p -> 1080p and 1080p -> 4K

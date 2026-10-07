@@ -2827,3 +2827,29 @@ Still gated: the Streamline runtime binaries are NVIDIA-licensed and not present
 `STREAMLINE_ENABLED`, no viewport can take the DLSS scaling mode, and no live DLSS jitter has been measured -
 so the temporal figures in `docs/nvidia-streamline-godot.md` remain the synthesised-jitter ones.
 `tools/fetch_streamline.ps1` is the next step on that thread.
+
+### Blender's motion pass is not a foundation to build a capture on, measured before anything was built on it
+
+M10.3 had Blender as the "real content" factory: `bpy` renders a target plus a jittered half-resolution pass,
+with depth and motion for conditioning, over CC0 scenes. Before any of that was built,
+`tools/blender_capture/probe_convention.py` measured what the two passes actually contain, against a ground
+truth from Blender's own projection (`world_to_camera_view`) rather than from the pass being checked:
+
+* **The Z pass is metric and usable**: 3.0 m and 4.0 m for a cube face at 3.0 m and a plane at 4.0 m - metres,
+  camera-space, neither normalised nor inverse nor logarithmic.
+* **The Vector pass is in internal-grid pixels, with the sign inverted** relative to the content's
+  displacement: -2.0 px on the plane and -2.664 px on the cube's face for a +2.0 px content shift, and the
+  4/3 ratio is what proves the unit is pixels rather than normalised. It points previous-minus-current, the
+  opposite of the field `tools/godot_capture/` writes, so a packer would have to negate it.
+* **And it is not reliable.** Identical runs afterwards wrote zeros, with the camera keyframes provably applied
+  (`camera_location_frame2 = -0.045`, projection truth still 2.0 px), and Blender 4.2.3 aborts with
+  `EXCEPTION_ACCESS_VIOLATION` during compositing on every run - after the File Output has written the EXR, so
+  the pass lands on disk and the process dies (exit 11). The probe now flushes its ground truth to JSON before
+  rendering and reads the EXR in a second process, which is a workaround rather than a fix.
+
+So the design changes before a scene library exists: derive motion from the camera matrices plus the confirmed
+depth pass - the primitive the Godot capture already uses, exact for camera motion over static geometry - and
+revisit the Vector pass only if object motion is genuinely needed. The **Y sign is deliberately left
+unmeasured**: a horizontal pan has G = 0 everywhere, so it cannot speak to it, and a mirrored Y is a field that
+looks plausible and is wrong. Nothing here is committed as training data; the investigation and its numbers
+are in `tools/blender_capture/README.md`.
