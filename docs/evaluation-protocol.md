@@ -142,6 +142,13 @@ it is the first data here that can answer the question at all.
 Runs that trip the trainer's own gates (no progress, ignores an input it was given, does not beat the
 baseline) are recorded as refusals, not silently dropped and not averaged in - a refused run is a result.
 
+Every arm compared under this rule is run with the **same data path**: the same loader, the same augmentation
+settings, the same seed. `--augment-flip` and `--crop-sizes` change what the model is trained on, so an arm
+trained with either cannot be compared against one without it, which is why both are recorded in every run's
+JSON and why they are off by default. `--lazy` is the exception that is checked rather than assumed: it reads
+the same pairs in the same order, and its held-out numbers are identical to the eager run's, digit for digit
+(`models/p5` reports, and the trainer's self-test compares the two loaders pair for pair).
+
 ### Detail bar: what it measures, and a correction to an earlier explanation
 
 The bar is the mean-absolute-Laplacian ratio against the truth. When it failed on three of the four scenes
