@@ -1441,9 +1441,27 @@ warp's marginal contribution beside it, in four arms rather than two.
       the CPU backend builds it on demand and feeds it, and zero-fills it when it cannot be built, which is the
       tensor a zeroed control gets. Five tests pin it, including a hand-computed fixture with one rejection
       reason per pixel and the narrow side of the naming rule; the suite is 171/171 and ctest is 6/6
-- [ ] If the content is the real limit, the answer is M10.3's captures rather than this: a slow camera over
-      mostly-empty scenes cannot exercise a temporal model, and 86% sky with 0.7 px of motion is exactly that.
-      Less sky, movers, and faster camera motion is the direct response to the numbers above
+- [x] **The lever works on coherent data, measured against a baseline that can see what is being measured.**
+      godot-v5 (175 pairs, 100% geometry, 3.44% disocclusion, a reprojection worth 15.7% where godot-v4's was
+      worth 0.9%) answers the question the old dataset could not. Same seeds, same config:
+
+      | arm | 20261020 | 20261021 |
+      | --- | --- | --- |
+      | colour-only (the rule's old reference) | +0.53% | +0.25% |
+      | jitter-aware (the reference now) | +1.02% | +1.09% |
+      | warped history + jitter | **+2.33%** | **+2.06%** |
+      | that arm with history zeroed | -0.36% | +1.10% |
+
+      The arm beats the reference by 1.31 and 0.97 points and its own control by 2.69 and 0.96, against
+      within-arm spreads of 0.07-0.27, and the control lands on the reference to a tenth of a point. So the
+      temporal signal is real *and* attributable to history. `docs/evaluation-protocol.md` now judges the
+      lever against the jitter-aware reference rather than colour-only, because a phase-blind reference cannot
+      measure a phase-carrying lever - on godot-v5 colour-only scores 0.25-0.53% where it scored 9% on v4, and
+      the 5-point bar calibrated there would refuse a working lever
+- [ ] **The next step is scale, not the lever.** 175 pairs of uniformly hard content leaves every arm inside
+      2.5%: the effect is consistent but small, and the absolute numbers say the dataset is the limit now. More
+      scenes (the capture script holds two) and longer captures, at the same proportions, with the rule as
+      rewritten - and the same three-arm comparison, which is a few minutes per arm at this dataset size
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item

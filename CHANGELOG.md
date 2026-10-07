@@ -14,6 +14,43 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The lever works once the baseline can see what the lever carries, and the rule is rewritten around that
+
+Ten arms on godot-v5, and the first honest answer this project has had to its own temporal question. Same seeds,
+same config, improvement over bilinear:
+
+| arm | seed 20261020 | seed 20261021 |
+| --- | --- | --- |
+| colour-only (the rule's old reference) | +0.53% | +0.25% |
+| jitter-aware (the reference now) | +1.02% | +1.09% |
+| warped history alone | -0.01% | -0.40% |
+| **warped history + jitter** | **+2.33%** | **+2.06%** |
+| that arm with history zeroed | -0.36% | +1.10% |
+
+The arm beats the jitter-aware reference by **1.31 and 0.97 points** and its own retrained zeroed control by
+**2.69 and 0.96**, against within-arm spreads of 0.07-0.27. Two things make that more than a small number. The
+ordering holds on *both* seeds, which the godot-v4 arms never did; and the control - the same model with its
+history zeroed - lands on the jitter-aware reference to within a tenth of a point, which is the internal check
+that zeroing history removes exactly the lever being tested and nothing else. Meanwhile warped history *without*
+the jitter input is no better than bilinear, because on a jittered capture a model that cannot see the phase
+cannot use a reprojection that is worth 15.7%.
+
+**The rule is rewritten**, in `docs/evaluation-protocol.md`, because the old one could not have found this
+answer. It compared arms against colour-only and demanded 5 points, which was calibrated where colour-only
+scored 8.79-10.44% on godot-v4. On godot-v5 the same arm scores 0.53% and 0.25%: the capture jitters the
+low-resolution render, so what bilinear misses is a sub-pixel *phase* that no single-frame model without the
+offset can know - a phase-blind reference measures the dataset's jitter rather than the lever, and anything that
+can see the phase clears its bar by construction. The reference is now `--inputs=color,jitter`, the one baseline
+that can see what the lever carries, and the fixed 5-point bar is replaced by the rule's own logic - a gap
+larger than the seed spread, on both seeds - because on 175 pairs of harder content every arm lands inside 2.5%
+and a 5-point bar would refuse a demonstrably working lever.
+
+What that leaves is scale rather than mechanism: the effect is consistent and attributable, but it is two
+percent on 175 pairs of uniformly hard content, where godot-v4's arms moved nine points because most of its
+frames were sky. More scenes and longer captures at the same proportions, judged by the rule as rewritten, is
+the next step - and it is minutes per arm at this size, not hours.
+
+
 ### The rebuilt dataset's baseline cannot beat bilinear, because what is missing is phase rather than resolution
 
 The first two arms of the godot-v5 comparison are in, and they say something about the dataset rather than about
