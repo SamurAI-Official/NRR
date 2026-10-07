@@ -31,9 +31,13 @@ void vertex() {
 	// With skip_vertex_transform, VERTEX arrives in model space, so both transforms are explicit here.
 	cur_clip = cur_mvp * vec4(VERTEX, 1.0);
 	prev_clip = prev_mvp * vec4(VERTEX, 1.0);
-	POSITION = cur_clip;
-	// Leave VERTEX in view space, which is what Godot expects after this render_mode skipped its own
-	// transform - otherwise clipping and depth drawing use a vertex in the wrong space.
+	// One source of truth for the position: VERTEX in view space, which Godot then projects. Both POSITION and
+	// VERTEX used to be written, and they are equal only while cur_mvp == PROJECTION_MATRIX * VIEW_MATRIX *
+	// MODEL_MATRIX - true of the matrices this capture hands the shader, but the rasterizer uses one output and
+	// the depth prepass the other, so any disagreement between them shows up as geometry that is drawn where
+	// the depth buffer does not have it. That was measured: with a wall in the pass, every pixel of the depth
+	// channel read the *wall's* distance and none read an object's, while the same objects rendered correctly
+	// in colour. Writing one output makes the two agree by construction rather than by coincidence.
 	VERTEX = (VIEW_MATRIX * MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 }
 

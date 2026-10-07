@@ -14,6 +14,35 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The motion pass could only hold one layer, so no capture ever contained disocclusion
+
+The second data-corrupting bug in the capture scenes, and it is the one that explains the mask arm's failure.
+`tools/godot_capture/shaders/motion.gdshader` wrote **both** position outputs: `POSITION` (clip space, from the
+motion matrices) and `VERTEX` (view space, for the engine). They are equal exactly while
+`cur_mvp == PROJECTION_MATRIX * VIEW_MATRIX * MODEL_MATRIX`, which is true of the matrices the capture hands the
+shader - but the rasterizer uses one output and the depth prepass the other, so geometry was drawn where the
+depth buffer did not have it. Measured on a 4-frame capture of the new `temporal` scene, once a wall was in the
+pass (see the entry above): every pixel of the depth channel read the *wall's* distance (2.000, uniform) and
+none read an object's, while the same objects rendered correctly in the colour pass and their motion never
+appeared in the motion field either. Two ordering hypotheses were tested first and rejected - `render_priority`
+at -1 and at +1 on the wall's material, both leaving the depth uniform.
+
+Writing one output fixed it by construction: the depth channel now spans **0.367 to 2.000** with **7.79% of
+pixels nearer than the wall**, and the motion field carries **two layers** - the wall at 2.77 px per frame and
+the objects at **10.12 px** - where before it carried one value everywhere. Through the packer, on the same
+frame, the *disocclusion* the validity mask can mark went from **0.00%** of geometry (the objects were
+invisible to the depth pass, so there was nothing for the occlusion test to find) to **1.45%**, with the
+remaining untrusted pixels accounted for by sources leaving the frame (5.5%).
+
+That number is the point of the whole exercise, because it is measurable on the existing dataset too: of the
+geometry in godot-v4, **97.2% is trusted, 1.77% is occluded by a nearer surface last frame and 1.0% had its
+source leave the frame** (tools/history_reuse_probe.py, which now reports the three separately). Occlusion is
+the only part of the mask a model cannot see for itself - sky and out-of-frame sources are visible in the
+colour frame, disocclusion is not - and at 1.77% of geometry it is close to constant. That is what an input
+worth nothing looks like: the raw-history-plus-mask arm measured 8.99% on its one valid seed against
+colour-only's 9.6% mean, which is no help at all, and the reason is now a number rather than a mystery.
+
+
 ### The capture scenes' motion pass was missing the wall, so 80% of every frame was "sky" in the temporal inputs
 
 The M10.4 measurements said the content was the limit - 86% of a godot-v4 frame is sky and the geometry that

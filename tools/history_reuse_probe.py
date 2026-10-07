@@ -66,7 +66,8 @@ def main(argv):
         raise SystemExit("no train_*.npz under %s" % args.data)
 
     totals = {"pixels": 0, "sky": 0, "trusted": 0, "motion_all": 0.0, "motion_trusted": 0.0,
-              "difference_all": 0.0, "difference_geometry": 0.0, "dy": 0.0, "dx": 0.0, "peak": 0.0}
+              "difference_all": 0.0, "difference_geometry": 0.0, "dy": 0.0, "dx": 0.0, "peak": 0.0,
+              "geometry": 0, "geometry_inside": 0, "occluded": 0, "source_left": 0}
     considered = 0
     print("%-6s %-26s %-28s %s" % ("pair", "phase correlation (dy,dx)", "field mean (dy,dx) px", "peak"))
     for path in paths:
@@ -103,6 +104,23 @@ def main(argv):
         totals["dx"] += dx
         totals["peak"] += peak
 
+        # How much of a capture is *disocclusion* - geometry the packer marks untrusted because the previous
+        # frame held something nearer there, rather than because the pixel is sky or its source left the frame.
+        # Computed from the packed pair alone: the reprojection is the packer's rule (uv - motion, the pixel
+        # that contains it), so `inside` here is its `inside`, and what validity withholds from the geometry
+        # whose source was inside is the occlusion. This is the number the mask input is worth to a model, and
+        # it is separable from sky and from out-of-frame sources, which are both visible in the colour frame.
+        height, width = depth.shape[:2]
+        ys, xs = np.mgrid[0:height, 0:width]
+        prev_u = (xs + 0.5) / float(width) - motion[..., 0]
+        prev_v = (ys + 0.5) / float(height) - motion[..., 1]
+        inside = (prev_u > 0.0) & (prev_u < 1.0) & (prev_v > 0.0) & (prev_v < 1.0)
+        geometry = depth > 1e-6
+        totals["geometry"] += int(geometry.sum())
+        totals["geometry_inside"] += int((geometry & inside).sum())
+        totals["occluded"] += int((geometry & inside & ~trusted).sum())
+        totals["source_left"] += int((geometry & ~inside).sum())
+
     count = max(considered, 1)
     pixels = max(totals["pixels"], 1)
     print("")
@@ -116,6 +134,13 @@ def main(argv):
     print("  phase correlation: mean shift (dy %.2f, dx %.2f), mean peak %.3f - read the peak as how much of "
           "the change is one translation at all" % (totals["dy"] / count, totals["dx"] / count,
                                                       totals["peak"] / count))
+    geometry = max(totals["geometry"], 1)
+    print("  what the capture's mask can tell a model, as a fraction of its geometry:")
+    print("    trusted %.1f%%, occluded by a nearer surface last frame %.2f%%, source left the frame %.1f%%"
+          % (totals["trusted"] / geometry * 100.0, totals["occluded"] / geometry * 100.0,
+             totals["source_left"] / geometry * 100.0))
+    print("    (occlusion is the part a model cannot see for itself: sky and out-of-frame sources are visible in"
+          " the colour frame, while disocclusion is not)")
     return 0
 
 
