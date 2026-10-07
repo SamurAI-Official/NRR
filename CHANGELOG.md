@@ -14,6 +14,51 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### Three datasets, one pattern: the history input has never beaten both bars on both seeds
+
+The redundancy hypothesis said history was worthless because at ~1 px/frame the previous frame is almost the same
+view, and that it would pay once consecutive frames differed. It was tested the same way as the phase
+hypothesis - by building the data that would show it. The same six scenes at **five times the camera speed**,
+200 frames each: motion **3.7 px/frame** against 1.0, disocclusion **7.20%** of geometry against 3.50%, and a
+reprojection worth **35.5%** against 15.2%. The previous frame is genuinely not the same view any more.
+
+| arm | 20261020 | 20261021 | progress |
+| --- | --- | --- | --- |
+| colour-only | -0.55% | -0.00% | 9.6% / 4.1% |
+| jitter-aware (the reference) | **+1.76%** | +0.39% | 13.9% / 6.1% |
+| warped history + jitter (the arm) | +1.22% | +0.44% | 15.9% / 5.9% |
+| the arm, history zeroed (its control) | +0.39% | +0.39% | 1.1% / 5.4% |
+
+Condition 1 fails (-0.54 and +0.05 against the reference), condition 2 passes on one seed (+0.83) and ties on
+the other, and five of the eight runs sit under the progress bar - the dataset is 130 pairs rather than 745,
+because a faster camera leaves each corridor's objects behind sooner. So the hypothesis is **not confirmed**:
+more temporal content in the data did not make history pay. The one thing that did move is that the jitter-only
+arm is now the best single arm, which is the same statement from the other side.
+
+The pattern across all three is worth more than any one of them:
+
+| dataset | pairs | motion | disocclusion | arm vs reference | arm vs its own control |
+| --- | --- | --- | --- | --- | --- |
+| godot-v5 | 175 | 1.0 px | 3.44% | +1.31 / +0.97 (both seeds) | +2.69 / +0.96 |
+| godot-v6 | 745 | 1.0 px | 3.50% | +1.24 / +1.53 | **+0.13** / +1.53 |
+| godot-v7 | 130 | 3.7 px | 7.20% | **-0.54** / +0.05 | +0.83 / +0.05 |
+
+Only one run of the three - the smallest, where the effects were also smallest - clears both bars on both seeds,
+and it stops clearing them when the dataset quadruples. That is what an effect at the edge of the measurement
+looks like, and it is now the result rather than a suspicion: **a history plane fed to this convolution stack
+delivers, at best, about one point of held-out improvement, and it is not reproducible across datasets.**
+Neither of the two explanations tried (misalignment, redundancy at low motion) accounts for that, and the phase
+one was refuted directly.
+
+What that leaves is the architectural move the roadmap already carries, and it is worth stating why the
+evidence now points there: if neither the alignment of the history nor the amount of motion in the data changes
+the outcome, then the limit is how the model *consumes* the samples - a conv stack over planes cannot reason
+about where a sample sits, and history's whole content is *where* its samples sit. Either the samples need a
+representation that carries that (sub-pixel placement, a warped-and-placed pyramid) or the target should change
+to what the roadmap lists next: the runtime's own accumulated output and a **residual refinement** on top of it,
+which is a much easier target and the thing M1's open item actually asks for.
+
+
 ### The phase-alignment hypothesis for why history does not pay: derived, tested three ways, refuted
 
 The obvious explanation for "history is live and buys nothing" was that the history was misaligned, and the

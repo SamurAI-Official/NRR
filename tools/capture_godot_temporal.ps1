@@ -23,8 +23,8 @@ $godot = "G:\godot\Godot_v4.7.2-stable_win64_console.exe"
 # temporal5 are the training split, temporal2 and temporal6 the held-out one. They differ in wall distance,
 # checker frequency, dolly direction and speed, object count, shape mix and palette, because a validation split
 # has to be different *content* rather than the training content at a different index.
-$frames = @{ "temporal" = 400; "temporal3" = 400; "temporal4" = 400; "temporal5" = 400
-             "temporal2" = 400; "temporal6" = 400 }
+$frames = @{ "temporal" = 200; "temporal3" = 200; "temporal4" = 200; "temporal5" = 200
+             "temporal2" = 200; "temporal6" = 200 }
 $order = @("temporal", "temporal3", "temporal4", "temporal5", "temporal2", "temporal6")
 $failed = @()
 foreach ($scene in $order) {

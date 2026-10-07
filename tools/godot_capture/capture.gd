@@ -82,7 +82,7 @@ const SCENES := {
 		# behind them for geometry coverage (which v4's scenes never had in the motion pass at all), and a faster
 		# camera than v4's 0.004-0.006 per frame, because 0.7 px of motion is what M10.4 measured as too little to
 		# exercise a temporal model.
-		"camera_velocity": Vector3(0.03, 0.01, 0.0),
+		"camera_velocity": Vector3(0.15, 0.05, 0.0),
 		"checker": 8,
 		"backdrop_size": Vector2(200.0, 60.0),
 		"backdrop_z": -4.5,
@@ -124,7 +124,7 @@ const SCENES := {
 	# at a different index. A wall at 3 units with a faster dolly (0.07/frame) crosses 28 units over 400 frames,
 	# which is still short of the wall, and the objects sit between the two again so disocclusion happens.
 	"temporal2": {
-		"camera_velocity": Vector3(-0.07, 0.03, 0.0),
+		"camera_velocity": Vector3(-0.35, 0.15, 0.0),
 		"checker": 8,
 		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -5.0,
@@ -164,7 +164,7 @@ const SCENES := {
 	"temporal3": {
 		# Generated on the recipe in tools/_gen_temporal_scenes.py, kept as literals so the scene data
 		# is readable here rather than computed at load.
-		"camera_velocity": Vector3(0.04, 0.01, 0.0),
+		"camera_velocity": Vector3(0.20, 0.05, 0.0),
 		"checker": 7,
 		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -4.0,
@@ -198,7 +198,7 @@ const SCENES := {
 	"temporal4": {
 		# Generated on the recipe in tools/_gen_temporal_scenes.py, kept as literals so the scene data
 		# is readable here rather than computed at load.
-		"camera_velocity": Vector3(-0.05, 0.02, 0.0),
+		"camera_velocity": Vector3(-0.25, 0.10, 0.0),
 		"checker": 10,
 		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -5.0,
@@ -235,7 +235,7 @@ const SCENES := {
 	"temporal5": {
 		# Generated on the recipe in tools/_gen_temporal_scenes.py, kept as literals so the scene data
 		# is readable here rather than computed at load.
-		"camera_velocity": Vector3(0.02, -0.03, 0.0),
+		"camera_velocity": Vector3(0.10, -0.15, 0.0),
 		"checker": 9,
 		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -3.6,
@@ -269,7 +269,7 @@ const SCENES := {
 	"temporal6": {
 		# Generated on the recipe in tools/_gen_temporal_scenes.py, kept as literals so the scene data
 		# is readable here rather than computed at load.
-		"camera_velocity": Vector3(0.06, 0.0, 0.0),
+		"camera_velocity": Vector3(0.30, 0.0, 0.0),
 		"checker": 11,
 		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -5.5,
