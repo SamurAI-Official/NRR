@@ -68,6 +68,14 @@ def main(argv):
                          "twice" % (args.data, recorded))
 
     os.makedirs(args.out, exist_ok=True)
+    # The phase each pair's *history* was sampled at, from the source manifest's own entries: every entry
+    # carries the jitter its frame was rendered with, so the previous frame's is one lookup away by (scene,
+    # frame - 1). Back-filling it here means a dataset packed before the key existed still gains the one fact a
+    # history plane cannot carry - and it is read from the capture's record rather than recomputed, so the
+    # sequence is the capture's and not a consumer's reconstruction of it.
+    phase_by_frame = {}
+    for entry in source["pairs"]:
+        phase_by_frame[(entry.get("scene"), entry["frame"])] = entry.get("jitter", [0.0, 0.0])
     entries = []
     # Counters for the report below. The validity field and the warp's own inside-mask are two different
     # statements - validity also encodes occlusion and "no geometry at all", which a warp cannot know - so the
@@ -91,6 +99,9 @@ def main(argv):
             if key not in data:
                 raise SystemExit("%s has no '%s', so its history cannot be reprojected" % (source_path, key))
         warped, inside = pack.warp_history_bilinear(data["history"], data["motion"])
+        if "history_jitter" not in data:
+            previous = phase_by_frame.get((entry.get("scene"), entry["frame"] - 1), [0.0, 0.0])
+            data["history_jitter"] = np.asarray(previous, dtype=np.float32)
         trusted = (data["validity"] > 0.5) if "validity" in data else np.ones(inside.shape, dtype=bool)
         if args.gate == "validity":
             gate = inside & trusted

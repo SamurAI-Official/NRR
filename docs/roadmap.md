@@ -1503,6 +1503,25 @@ warp's marginal contribution beside it, in four arms rather than two.
       redundancy at low motion, refuted here) accounts for it. The limit is how the samples are *consumed*: a
       conv stack over planes cannot represent where a sample sits, and placement is history's entire content.
       That is the case for the architectural move below rather than another data pass
+- [x] **The placement hypothesis, built and refuted: `history_jitter`.** The third explanation, and the model-side
+      one: the model is told the current frame's phase and not the previous frame's, so it cannot relate the two
+      sampling grids. `history_jitter` now travels with every pair (the packer emits it from the capture's log,
+      the derive tool back-fills it onto older datasets from the manifest's per-frame entries), and the trainer
+      consumes it as a real input with its own branch, ablation and `--zero-input history_jitter` control.
+      Measured on godot-v6-phase (745 pairs, the dataset where the arm previously tied its control):
+
+      | arm | 20261020 | 20261021 | history_jitter ablation |
+      | --- | --- | --- | --- |
+      | arm, without the phase | +3.00% | +2.35% | - |
+      | arm, told the phase | +2.39% | +2.11% | 0.00114 / 0.00094 |
+      | arm, phase zeroed | **+3.27%** | **+3.02%** | - |
+
+      Paired deltas: phase -0.61 / -0.24, its own control +0.27 / +0.67. The input is live and buys nothing.
+      Three mechanisms (misalignment, redundancy at low motion, missing placement) have now each been
+      implemented and measured, all negative - and the arms without the phase reproduce godot-v6 exactly
+      (0.01699 and 0.01710), which is what says the back-fill changed nothing else. The limit is therefore the
+      architecture rather than the data or the inputs, which is the case for the residual-refinement item below
+      rather than another data or input pass
 - [ ] Second arm, and the more interesting one: feed the runtime's own *accumulated* output and learn a
       **residual refinement** - a temporal post-filter rather than a temporal upscaler. It is a much
       easier target, it improves the path that already exists, and it is what M1's open item

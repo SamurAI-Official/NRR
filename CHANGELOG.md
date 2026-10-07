@@ -14,6 +14,52 @@ actually printed rather than estimates.
 
 ## [Unreleased] - 1.0.0-dev
 
+### The third explanation for history, built and refuted: telling the model where the samples sit
+
+Three explanations for "history is live and buys nothing" have now been implemented and measured, and all three
+are negative. The first two were data-side: the history was phase-misaligned (refuted by measuring alignment
+three ways, where the existing warp was best), and it was redundant because consecutive frames barely differ
+(refuted by building captures at 3.7 px/frame, which did not make history pay). The third is model-side, and it
+is the one the user asked for: **a history representation that carries sub-pixel placement.**
+
+Nothing touches the pixels this time - the refutation of the first hypothesis showed the existing warp is
+already the best pixel alignment, so the claim being tested is different: that the model cannot *use* history
+because it is told the current frame's phase and not the previous frame's, leaving it unable to relate the two
+sampling grids. So `history_jitter` now travels with every pair - the phase the history was sampled at, in
+low-resolution pixels, zeros when there is no history, exactly the encoding `history` and `validity` already use
+for that case. The packer emits it from the capture's own jitter log, the derive tool back-fills it onto
+datasets packed before the key existed (from the manifest's per-frame entries, so the sequence is the capture's
+and not a reconstruction), and the trainer consumes it as a real input: a two-channel branch, an ablation, a
+`--zero-input history_jitter` control, and a `--history-jitter-channels` width.
+
+Measured on godot-v6-phase - the 745-pair dataset, the largest and the one where the arm previously *tied* its
+own history-zeroed control, so it is where a genuine contribution has to show:
+
+| arm | seed 20261020 | seed 20261021 | history_jitter ablation |
+| --- | --- | --- | --- |
+| arm, without the phase | +3.00% | +2.35% | - |
+| **arm, told the phase** | +2.39% | +2.11% | 0.00114 / 0.00094 |
+| arm, phase zeroed (its control) | **+3.27%** | **+3.02%** | - |
+
+Paired against the same arm on the same seeds, the phase input is **-0.61 and -0.24**, and its own zeroed
+control is **+0.27 and +0.67** - that is, the model attends to the input (the ablation is four orders of
+magnitude above the conditioning floor) and is no better for it, on both seeds, against the very dataset chosen
+because it was the most likely place for an effect to appear.
+
+So the placement fact is not what history was missing either. Three specific mechanisms, each implemented rather
+than argued, each measured, each refuted - and one dataset-level verification fell out of it worth keeping:
+the arms without the phase reproduce godot-v6's numbers exactly (val L1 0.01699 and 0.01710 to five decimals),
+which is what says the back-fill changed nothing else.
+
+What is left is the architectural claim the roadmap already carries, and the evidence for it is now an
+elimination rather than a preference: the alignment is right, the motion is enough, and the placement is
+supplied - so a convolution over history planes cannot exploit a second sampling of the same scene, which is
+history's entire content. Either the samples need an architecture that reasons about placement (a learned
+resampling at the sub-pixel offset, or a warped-and-placed pyramid rather than a plane), or the target should
+change to the roadmaps's other item - the runtime's own accumulated output with a **residual refinement** on
+top, which is a much easier problem and the thing M1's open item actually asks for.
+
+
 ### Three datasets, one pattern: the history input has never beaten both bars on both seeds
 
 The redundancy hypothesis said history was worthless because at ~1 px/frame the previous frame is almost the same

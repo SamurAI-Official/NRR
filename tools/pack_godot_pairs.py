@@ -200,8 +200,21 @@ def downscale2(image):
     return reshaped[..., 0] if single_plane else reshaped
 
 
+def history_phase(jitter_log, frame, use_lowres=True):
+    """The phase the history of `frame` was sampled at: the previous frame's offsets, in low-resolution pixels.
+
+    The other half of this file's temporal job. The history's pixels say *what* was sampled and only this says
+    *where* the samples sat, so it is packed alongside `history` rather than left for a consumer to infer. A
+    frame with no history reports zeros, which is the same encoding `history` and `validity` already use for
+    that case, and so does a capture that has no low-resolution pass to have offsets from.
+    """
+    if not use_lowres or frame <= 0 or frame > len(jitter_log):
+        return (0.0, 0.0)
+    return tuple(float(value) for value in jitter_log[frame - 1])
+
+
 def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 0.0), use_lowres=True,
-               history_mode="raw"):
+               history_mode="raw", previous_jitter=(0.0, 0.0)):
     """One training pair, in the layout tools/train_nrr.py reads.
 
     `previous_frame` is None for the first frame of a capture, which legitimately has no history - the same
@@ -262,6 +275,15 @@ def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 
             "target": color.astype(np.float32), "depth": distance_low.astype(np.float32),
             "motion": motion_low.astype(np.float32), "history": history.astype(np.float32),
             "validity": validity.astype(np.float32),
+            # The phase the *history* was sampled at, in low-resolution pixels, +x right +y down - and zeros
+            # when there is no history, which is the same encoding `history` and `validity` already use for
+            # that case. Why it belongs in the data rather than being derived: the model is told the current
+            # frame's phase and nothing about the previous frame's, so the two frames' samples sit at an offset
+            # it cannot recover - which is the one part of a history plane's content that a convolution cannot
+            # read off the pixel values. Measured first, so the claim is not assumed: moving the history pixels
+            # by that difference does not improve their alignment (see the note in warp_history_bilinear), so
+            # this is not a repair to the pixels - it is telling the model where they sit.
+            "history_jitter": np.asarray(previous_jitter, dtype=np.float32),
             "jitter": np.asarray(jitter, dtype=np.float32)}, warped_fraction
 
 
@@ -305,8 +327,11 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
     seed = seed_base + (0 if split == "train" else 100000)
     for frame in range(frames):
         jitter = jitter_log[frame] if use_lowres else (0.0, 0.0)
+        # The previous frame's phase, for the `history_jitter` key: the capture recorded it and the model
+        # cannot derive it, so it travels with the pair.
+        previous_jitter = history_phase(jitter_log, frame, use_lowres)
         pair, warped_fraction = build_pair(capture_dir, manifest, frame, frame - 1 if frame > 0 else None,
-                                           seed + frame, jitter, use_lowres, history_mode)
+                                           seed + frame, jitter, use_lowres, history_mode, previous_jitter)
         name = "%s_%03d.npz" % (split, offset + frame)
         path = os.path.join(out_dir, name)
         try:
@@ -450,6 +475,19 @@ def self_test():
            and bool(np.allclose(warped[interior], expected[interior], atol=1e-6)),
            "max difference %.3e; interior %s of the frame; masks agree %s"
            % (worst, "%.0f%%" % (interior.mean() * 100.0), np.array_equal(interior, inside)))
+    # The phase that travels with a history plane, which is the other half of the temporal job: the pixels say
+    # what was sampled, and only this says where the samples sat. It has two edge cases that would both be
+    # silent if they were wrong - the first frame has no history to have a phase, and a capture with no
+    # low-resolution pass has no offsets to report.
+    log = [[0.25, -0.5], [-0.125, 0.375], [0.0, 0.25]]
+    report("the history's phase is the previous frame's offsets",
+           history_phase(log, 2) == (-0.125, 0.375), "frame 2 gave %s" % (history_phase(log, 2),))
+    report("a frame with no history reports no phase",
+           history_phase(log, 0) == (0.0, 0.0) and history_phase(log, 1, use_lowres=False) == (0.0, 0.0),
+           "frame 0 %s, without a low-res pass %s"
+           % (history_phase(log, 0), history_phase(log, 1, use_lowres=False)))
+    report("the phase is never read past the end of the log",
+           history_phase(log, 9) == (0.0, 0.0), "frame 9 gave %s" % (history_phase(log, 9),))
     return 1 if failures else 0
 
 
@@ -557,7 +595,8 @@ def main(argv):
                              "model-space vertex, so the vector is derived from geometry, not estimated",
                    "convention": load_capture(args.train[0])["motion_convention"],
                    "decode": load_capture(args.train[0])["motion_decode"],
-                   "pairs_layout": "input, input_clean, target, depth, motion, history, validity, jitter"},
+                   "pairs_layout": "input, input_clean, target, depth, motion, history, validity, history_jitter,"
+                                   " jitter"},
         # What `history` is, for the same reason as the input block above: two datasets built from the same
         # scenes with different history are different problems, and which one this is belongs in the file.
         "history": {"source": args.history,
