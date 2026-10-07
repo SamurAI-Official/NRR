@@ -76,8 +76,16 @@ const SCENES := {
 		# a 400-frame capture that is 20 units of travel: the camera approaches the wall without reaching it, and
 		# the objects sit between the two so occlusion and disocclusion actually happen.
 		"camera_velocity": Vector3(0.05, 0.02, 0.0),
-		"checker": 6,
-		"backdrop_size": Vector2(24.0, 14.0),
+		# The checker frequency is 48 and not 6, and the reason is the data gate rather than taste: the wall sits
+		# 4x closer than the seven earlier scenes' (2 units against 8), so the same texture is 4x coarser on
+		# screen, a bilinear upscale of the input reproduced the target to 0.0025 against the gate's 0.0100 and
+		# 783 of 800 frames were refused as pairs with nothing for an upscaler to do. Finer texture at the same
+		# distance puts the detail back below the input's Nyquist limit, which is what makes a pair a pair.
+		"checker": 96,
+		# Wide enough to stay in front of the camera for the whole 400-frame dolly: the camera travels 20 units
+		# laterally, so a 24-unit wall left the frame after ~40 frames and the capture's yield collapsed to 5
+		# pairs in 400 (a pair needs a margin over 0.0100, and a frame with no geometry has none).
+		"backdrop_size": Vector2(200.0, 60.0),
 		"backdrop_z": -2.0,
 		"objects": [
 			{"shape": "sphere", "color": Color(0.85, 0.35, 0.25), "scale": 0.40,
@@ -97,8 +105,8 @@ const SCENES := {
 	# which is still short of the wall, and the objects sit between the two again so disocclusion happens.
 	"temporal2": {
 		"camera_velocity": Vector3(-0.07, 0.03, 0.0),
-		"checker": 11,
-		"backdrop_size": Vector2(30.0, 18.0),
+		"checker": 88,
+		"backdrop_size": Vector2(240.0, 72.0),
 		"backdrop_z": -3.0,
 		"objects": [
 			{"shape": "torus", "color": Color(0.35, 0.80, 0.45), "scale": 0.55,
