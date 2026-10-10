@@ -32,6 +32,23 @@ $env:NRR_EXECUTION_PROVIDER = 'cpu'
 `setup.ps1` prints these commands with the paths filled in. It is the only step that needs the repository: after
 it, the project is self-contained (plugin, library, DLLs and model are all inside `Plugins/`).
 
+**On a machine that has only cloned the repository**, `setup.ps1` is still the one step - but three of the things
+it installs are working state rather than tracked source, and the released model is not in this repository at all
+(`models/phase4/` is gitignored, which is why it is published at
+[SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR)):
+
+```powershell
+pwsh tools/fetch_ort.ps1 -Flavor gpu_cuda12   # onnxruntime.dll and its providers
+pwsh tools/fetch_cuda_runtime.ps1             # the CUDA runtime and cuDNN the CUDA provider needs
+pwsh tools/build.ps1 -Config Release          # nrr.dll, which setup.ps1 installs
+```
+
+`setup.ps1` fetches the model from the Hub by itself when the tree does not have it, and checks what it
+downloaded against the released model's pinned SHA-256 (`39A4701A...`) before installing it - so a truncated
+download, a captive portal answering 200 with a login page, or a different revision fails there with that
+sentence instead of inside the commandlet as `failed to load model`. `-SkipHub` refuses the fetch (offline runs);
+`-ModelFromHub` forces it, which is how the published artifact gets re-verified without disturbing a local copy.
+
 ## What it asserts
 
 * the library loads, and **every entry point of `include/nrr.h` resolves** - the count is printed, along with the

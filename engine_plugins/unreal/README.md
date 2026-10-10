@@ -34,10 +34,16 @@ is exactly what `nrr.h`'s own ABI note warns about.
    rules look) - or set `NRR_INCLUDE_DIR` to a directory containing it.
 3. Put the library and its dependencies in `Plugins/NRRPlugin/Binaries/Win64/`:
    `nrr.dll`, `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `onnxruntime_providers_cuda.dll` (and the
-   CUDA runtime DLLs if the CUDA provider should attach). Build the runtime with
-   `cmake --build build --config Release` and take them from `build/Release` and
-   `third_party/onnxruntime-win-x64-*/lib/`.
-4. Enable the plugin (`Edit -> Plugins -> NRR Neural Rendering`) and restart.
+   CUDA runtime DLLs plus cuDNN if the CUDA provider should attach - they have to sit *beside* `nrr.dll`, not on
+   `PATH`: ONNX Runtime reaches for `cudnn64_9.dll` by bare name at the first Conv node, so `NRRRuntime`
+   pre-loads them by full path itself). Build the runtime with `pwsh tools/build.ps1 -Config Release` and take
+   the DLLs from `build/Release` and `third_party/onnxruntime-win-x64-*/lib/`.
+4. Put a model in `Plugins/NRRPlugin/Models/` - the component resolves a bare model name there, then against the
+   project. The released model is published rather than committed (`models/phase4/` is not in git):
+   `hf download SamurAI-Official/NRR upscale_msreal_scale.onnx --local-dir <plugin>/Models`, or let
+   `engine_plugins/unreal_verify/setup.ps1` do it - it fetches the model when the tree does not have it and
+   checks the download against the released model's pinned SHA-256.
+5. Enable the plugin (`Edit -> Plugins -> NRR Neural Rendering`) and restart.
 
 `engine_plugins/unreal_verify/setup.ps1` does all four steps for the verification project, which is the fastest
 way to see it work. The `.uplugin` declares no content (`CanContainContent: false`) and no modules beyond these

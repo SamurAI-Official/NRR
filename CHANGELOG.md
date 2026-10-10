@@ -118,6 +118,8 @@ provider active the model load *crashes* inside `nrr.dll`
 cuDNN 9 + ONNX Runtime 1.30 + this NVIDIA driver, so the verification sets the runtime's documented
 `NRR_EXECUTION_PROVIDER=cpu` override. The plugin's CUDA path is **unverified on this machine**, and every number
 above is a CPU number.
+
+**The model has a home now, and the setup step fetches it from there.** The released model was never in git (models/phase4/ is working state), so it is published at https://huggingface.co/SamurAI-Official/NRR with a model card that states the graph's real contract (color, jitter, and a scale tier token - 0.0 for 128->256, 1.0 for 256->512) rather than the aspirational 1080p->4K description models/architecture.md still carries. 	ools/push_model_to_hf.ps1 uploads a curated 1.7 MB set: hf upload SamurAI-Official/NRR . would have pushed about 18 GB of build output and CUDA runtime, and the project's own README would have replaced the model card. engine_plugins/unreal_verify/setup.ps1 now fetches the model from the Hub when a checkout does not have it, checking it against the released model's pinned SHA-256 first. Both branches are verified: -ModelFromHub fetches and installs it, the plain run takes the local copy through the same check, and the commandlet then prints RESULT: PASS at all three tiers with exit code 0.
 ### The Godot addon as an upscaler: the token the runtime was not feeding
 
 The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDExtension, `NRR.gd`, and
