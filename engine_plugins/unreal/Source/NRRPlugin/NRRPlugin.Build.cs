@@ -34,12 +34,19 @@ public class NRRPlugin : ModuleRules
             "NRRRuntime"    // the resolved C API; this module never loads a DLL itself
         });
 
-        // Commandlets (the headless verification) are editor-only, and Slate is what an editor surface would
-        // need. Neither is a runtime dependency of a shipped game.
-        PrivateDependencyModuleNames.AddRange(new string[]
+        // A commandlet is an editor object, and Slate is what an editor surface needs. Neither is a runtime
+        // dependency of a shipped game, and this is not a style preference: listing UnrealEd unconditionally is
+        // what made the Game target here compile the engine's editor modules into itself and then fail to link
+        // (`GInternalProjectName`, `GNameBlocksDebug`, ... were never in the runtime modules). The commandlet's
+        // own translation unit is guarded by WITH_EDITOR to match, so a game build compiles it to nothing.
+        if (Target.bBuildEditor)
         {
-            "Slate",
-            "SlateCore"
-        });
+            PrivateDependencyModuleNames.AddRange(new string[]
+            {
+                "UnrealEd",     // UCommandlet: the headless verification
+                "Slate",
+                "SlateCore"
+            });
+        }
     }
 }

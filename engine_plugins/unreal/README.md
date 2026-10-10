@@ -87,16 +87,34 @@ Stated rather than implied, because the roadmap's M5 lists them and none is fake
 library, the ONNX Runtime DLLs and the released model, and the `NRRVerify` commandlet drives the frame path with
 no viewport, no world and no renderer, printing one `RESULT: PASS`/`RESULT: FAIL` line.
 
-**Its status on this machine is "compiles, not yet run", and the reason is the host.** The installed engine is a
-Launcher *Installed* build - `Engine/Binaries/Win64` holds 1239 `.dll` files and **zero `.lib` files** - so:
+**It runs, and prints `RESULT: PASS`** (2026-10-10, UE 5.8.3, on this host's CPU execution provider; exit code 0):
 
-* the standalone *Game* target compiles all four of the plugin's translation units and then cannot link; ten
-  engine symbols stay unresolved (`GInternalProjectName`, `FMemory_Free`, `GNameBlocksDebug`, ...) because their
-  Game-configuration import libraries are not shipped with a Launcher install;
-* the *Editor* target, which is the supported host for an Installed build, fails *before compiling*:
-  `Unable to instantiate module 'SwarmInterface': Could not find NetFxSDK install dir`, because this machine has
-  no .NET Framework 4.6+ SDK.
+```text
+entry_points=51 resolved, 0 missing; the library reports 51, the header declares 51
+seam: plugin module loaded=true
+backend=CPU device=NRR CPU Backend vendor=NRR score=0.150
+model=.../Plugins/NRRPlugin/Models/upscale_msreal_scale.onnx
+texture_conversion=ok (64x48, 0 channel(s) differ)
+tier=128x96->256x192 render_ms=49.167 inference_ms=48.056 mean_abs_diff_vs_nearest=8.434
+tier=192x144->384x288 render_ms=135.402 inference_ms=133.343 mean_abs_diff_vs_nearest=8.262
+tier=256x192->512x384 render_ms=241.360 inference_ms=236.296 mean_abs_diff_vs_nearest=6.813
+RESULT: PASS
+```
 
-Installing that one Visual Studio component (`Microsoft.VisualStudio.Component.NetFxSDK`), or using a source build
-of the engine where the Game target links normally, is the entire remaining step. `unreal_verify/README.md`
-records both failures verbatim, with the commands that produced them.
+It is built as the **Editor** target, which is the supported host on a Launcher *Installed* engine: a standalone
+Game target cannot link there (565 editor import libraries are shipped, 0 game ones), and the editor target needs
+the .NET Framework 4.6+ SDK - one Visual Studio component, `Microsoft.Net.Component.4.8.SDK`, installed elevated.
+`unreal_verify/README.md` records the whole path, including the four host problems that stood between "compiles"
+and that line, and the one this plugin now handles itself: ONNX Runtime loads `cudnn64_9.dll` **by bare name** at
+the first Conv node, so `NRRRuntime` pre-loads the CUDA runtime and cuDNN DLLs by full path (in dependency order)
+and the later load-by-name finds them already loaded.
+
+Two host facts worth knowing before installing this in your own project:
+
+* **the CUDA execution provider crashes on this host**, inside `nrr.dll` during model load, with this repository's
+  cuDNN 9 + ONNX Runtime 1.30 + this driver. The verified run therefore sets the runtime's documented override,
+  `NRR_EXECUTION_PROVIDER=cpu`. The CUDA path is unverified here rather than "working";
+* **a project that enables UE's own `NNERuntimeORT` plugin loads ONNX Runtime 1.24 first**, and `nrr.dll` - built
+  against 1.30 - then fails with `The requested API version [30] is not available`. Disable `NNERuntimeORT` in the
+  project's `.uproject`, and disable anything that requires it (e.g. the default-on `NNEDenoiser`), or it comes
+  straight back.

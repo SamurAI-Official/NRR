@@ -5,6 +5,7 @@
 
 #include "NRRRuntime.h"
 
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/Paths.h"
@@ -17,14 +18,47 @@ namespace
 {
 #if PLATFORM_WINDOWS
 const TCHAR* const GLibraryFileName = TEXT("nrr.dll");
-// Loaded before nrr.dll, in this order. ONNX Runtime resolves onnxruntime_providers_*.dll relative to
-// onnxruntime.dll, so loading these from the library's own directory is what makes them resolve without
-// touching PATH.
+// Loaded before nrr.dll, and in *this* order: onnxruntime.dll first, because the provider DLLs import it by
+// name (loading a provider before anything has loaded it is how the CUDA provider came up missing). ONNX
+// Runtime resolves onnxruntime_providers_*.dll relative to onnxruntime.dll, so loading these from the library's
+// own directory is what makes them resolve without touching PATH.
 const TCHAR* const GSupportFileNames[] = {
+    TEXT("onnxruntime.dll"),
     TEXT("onnxruntime_providers_shared.dll"),
     TEXT("onnxruntime_providers_cuda.dll"),
-    TEXT("onnxruntime.dll"),
 };
+
+/* The CUDA runtime and cuDNN, which ORT resolves by *bare name* - cuDNN lazily, at the moment a Conv node runs.
+ * Neither the application directory nor PATH contains a plugin's Binaries/Win64, so a host that deploys them
+ * right beside the provider still fails with "LoadLibrary failed for cudnn64_9.dll with error 2" (measured).
+ * Loading them by full path first means the later load-by-name finds an already-loaded module.
+ *
+ * Prefixes rather than a fixed list: cuDNN 9 ships ten DLLs and adds or renames them between point releases
+ * (cudnn_engines_precompiled64_9.dll is 500 MB of this repository's third_party/cuda-runtime-cu12 on its own). */
+const TCHAR* const GAcceleratorDllPrefixes[] = {
+    TEXT("cudnn"),
+    TEXT("cudart"),
+    TEXT("cublas"),
+    TEXT("cufft"),
+    TEXT("curand"),
+    TEXT("cusolver"),
+    TEXT("cusparse"),
+    TEXT("nvrtc"),
+    TEXT("nvjitlink"),
+};
+
+/** True for a DLL in the plugin's binaries that the CUDA execution provider will want to load itself. */
+bool IsAcceleratorLibrary(const FString& FileName)
+{
+    for (const TCHAR* Prefix : GAcceleratorDllPrefixes)
+    {
+        if (FileName.StartsWith(Prefix, ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 #elif PLATFORM_LINUX
 const TCHAR* const GLibraryFileName = TEXT("libnrr.so");
 const TCHAR* const GSupportFileNames[] = { TEXT("libonnxruntime.so") };
@@ -98,14 +132,49 @@ bool FNRRRuntimeModule::LoadSupportLibrary(const FString& FullPath)
     if (Handle == nullptr)
     {
         UE_LOG(LogNRR, Warning,
-               TEXT("NRR: could not load %s. nrr.dll imports onnxruntime.dll, so the library will fail to load ")
-               TEXT("unless the ONNX Runtime DLLs are beside it or on PATH."),
+               TEXT("NRR: could not load %s. This is a dependency of the library rather than the library ")
+               TEXT("itself, so it may still work - but a support DLL that fails here fails again when the ")
+               TEXT("runtime needs it, which is usually a missing dependency or a host whose CUDA stack cannot ")
+               TEXT("run."),
                *FullPath);
         return false;
     }
     SupportHandles.Add(Handle);
     UE_LOG(LogNRR, Verbose, TEXT("NRR: loaded %s"), *FullPath);
     return true;
+}
+
+void FNRRRuntimeModule::LoadAcceleratorLibraries(const FString& LibraryDir)
+{
+#if PLATFORM_WINDOWS
+    TArray<FString> DllNames;
+    IFileManager::Get().FindFiles(DllNames, *FPaths::Combine(LibraryDir, TEXT("*.dll")),
+                                  /*bFiles=*/true, /*bDirectories=*/false);
+
+    int32 Candidates = 0;
+    int32 Loaded = 0;
+    for (const FString& DllName : DllNames)
+    {
+        if (!IsAcceleratorLibrary(DllName))
+        {
+            continue;
+        }
+        ++Candidates;
+        if (LoadSupportLibrary(FPaths::Combine(LibraryDir, DllName)))
+        {
+            ++Loaded;
+        }
+    }
+
+    if (Candidates > 0)
+    {
+        UE_LOG(LogNRR, Log,
+               TEXT("NRR: pre-loaded %d of %d CUDA/cuDNN DLL(s) from %s. They are here so that a load by bare ")
+               TEXT("name - which is how ONNX Runtime's CUDA provider reaches cuDNN - finds them already loaded, ")
+               TEXT("rather than searching a path a plugin's binaries are not on."),
+               Loaded, Candidates, *LibraryDir);
+    }
+#endif
 }
 
 void FNRRRuntimeModule::ResolveEntryPoints()
@@ -141,7 +210,15 @@ bool FNRRRuntimeModule::LoadNRRLibrary()
     const bool bFoundOnDisk = ResolveLibraryPath(NRRLibraryPath);
     const FString LibraryDir = FPaths::GetPath(NRRLibraryPath);
 
-    // ONNX Runtime first, from the library's own directory.
+    // The CUDA execution provider's own dependencies first: cuDNN and the CUDA runtime are loaded by name by
+    // ORT (cuDNN lazily, during the first Conv), and a plugin's directory is in nobody's search path. See
+    // LoadAcceleratorLibraries for the measurement that made this necessary.
+    if (bFoundOnDisk)
+    {
+        LoadAcceleratorLibraries(LibraryDir);
+    }
+
+    // ONNX Runtime and its providers, from the library's own directory.
     if (bFoundOnDisk)
     {
         for (const TCHAR* SupportName : GSupportFileNames)

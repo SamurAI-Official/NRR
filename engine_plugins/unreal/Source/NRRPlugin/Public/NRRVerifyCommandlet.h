@@ -12,6 +12,10 @@
 
 #include "CoreMinimal.h"
 
+#if WITH_EDITOR
+// Guarded, not merely documented: a commandlet is an editor object, and a Game target compiles this file to
+// nothing rather than pulling UnrealEd (and, with it, symbol dependencies a runtime-only engine does not have)
+// into a standalone executable. NRRPlugin.Build.cs adds UnrealEd only when Target.bBuildEditor, to match.
 #include "Commandlets/Commandlet.h"
 
 #include "NRRVerifyCommandlet.generated.h"
@@ -27,3 +31,4 @@ public:
 
     virtual int32 Main(const FString& Params) override;
 };
+#endif // WITH_EDITOR

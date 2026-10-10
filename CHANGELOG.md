@@ -69,27 +69,55 @@ comes back as the caller's own. Four new drift guards in `tests/unit/test_engine
 rot silently: the descriptor's module list and load order, the entry-point table against `nrr.h`, the build rule
 that must keep *loading* the library instead of linking it, and the verify project's install step.
 
-**Where it stands, and the three facts that decide it** - all measured on this host, two of them after a full
-build cycle each, and none of them about the plugin's own code:
+**Where it stands: it runs, and prints `RESULT: PASS`** (2026-10-10, UE 5.8.3, Installed engine at
+`G:\Unreal\UE_5.8`, exit code 0; the verbatim output and every failure below are recorded in
+`engine_plugins/unreal_verify/README.md`):
 
-* **the plugin compiles.** All four translation units (`NRRRuntime.cpp`, `NRRPlugin.cpp`, `NRRComponent.cpp`,
-  `NRRVerifyCommandlet.cpp`) build cleanly against UE 5.8.3's headers, for both targets - which is what makes the
-  UHT/DLL/`IMPLEMENT_MODULE`/`decltype` design above *checked* rather than asserted;
-* **an Installed (launcher) engine cannot link a standalone Game target.** `Engine/Binaries/Win64` holds 1239
-  `.dll` files and **zero `.lib` files**: the Game-target link reaches the end and fails with ten *engine*
-  symbols unresolved (`GInternalProjectName`, `FMemory_Free`, `FMemory_Realloc`, `GNameBlocksDebug`,
-  `GObjectArrayForDebugVisualizers`, `GDebuggingState`). The **Editor** target is the supported host for an
-  Installed build;
-* **the Editor target needs the .NET Framework 4.6+ SDK**, which this machine does not have: UBT fails with
-  `Unable to instantiate module 'SwarmInterface': Could not find NetFxSDK install dir` and a `RulesError` before
-  compiling anything. `SwarmInterface` arrives through the editor's own dependency chain (`UnrealEd -> ... ->
-  SourceControl -> Virtualization`), so a project's target rules cannot avoid it.
+```text
+entry_points=51 resolved, 0 missing; the library reports 51, the header declares 51
+seam: plugin module loaded=true
+backend=CPU device=NRR CPU Backend vendor=NRR score=0.150
+model=.../Plugins/NRRPlugin/Models/upscale_msreal_scale.onnx
+texture_conversion=ok (64x48, 0 channel(s) differ)
+tier=128x96->256x192 render_ms=49.167 inference_ms=48.056 mean_abs_diff_vs_nearest=8.434
+tier=192x144->384x288 render_ms=135.402 inference_ms=133.343 mean_abs_diff_vs_nearest=8.262
+tier=256x192->512x384 render_ms=241.360 inference_ms=236.296 mean_abs_diff_vs_nearest=6.813
+RESULT: PASS
+```
 
-**So the verification is built and has not run**, and that is exactly what these pages say. Installing
-`Microsoft.VisualStudio.Component.NetFxSDK` (one Visual Studio component) or building against a non-installed
-engine is the whole remaining step; when it runs, the commandlet prints its `RESULT:` line and that line goes
-here. Until then, the Unreal plugin's executable evidence is "compiles against UE 5.8.3" - not "renders in
-Unreal" - and no row anywhere claims otherwise.
+Getting there took four host-side fixes and two the plugin's own code now carries, and each is measured:
+
+* **an Installed (launcher) engine cannot link a standalone Game target** - `Engine/Binaries/Win64` holds 1239
+  `.dll` files and no engine import libraries, and `Engine/Intermediate/Build/Win64/x64/UnrealEditor` holds 565
+  `.lib` files against `.../UnrealGame`'s **0**. The **Editor** target is the supported host. This repository's own
+  Game-target link failure was compounded by our build rules listing `UnrealEd` unconditionally, which pulled the
+  engine's *editor* modules into a runtime target; `UnrealEd` and `Slate` are behind `Target.bBuildEditor` now, and
+  `NRRVerifyCommandlet.cpp` is guarded by `WITH_EDITOR`;
+* **the Editor target needed the .NET Framework 4.6+ SDK** (`Unable to instantiate module 'SwarmInterface': Could
+  not find NetFxSDK install dir`). One Visual Studio component, `Microsoft.Net.Component.4.8.SDK` - and
+  `setup.exe modify --passive` has to run **elevated**, or it prints `Commands with --quiet or --passive should be
+  run elevated from the beginning.` and exits 5007 having installed nothing;
+* **UBT rejected the runtime dependency** with `FilePatternException: '...\nrr.dll' is listed as a source and
+  target file`: `setup.ps1` deploys the library into the plugin's own `Binaries/Win64`, which *is*
+  `$(BinaryOutputDir)`, so `NRRRuntime.Build.cs` now declares a staging dependency only when the file is not
+  already there;
+* **`LogNRR` was not exported** - defined in the `NRRRuntime` module and used from the second DLL, so the link
+  failed with `unresolved external symbol "struct FLogCategoryLogNRR LogNRR"` until the declaration carried
+  `NRRRUNTIME_API`;
+* **`cudnn64_9.dll` is loaded by bare name** by the CUDA execution provider (lazily, at the first Conv node), so a
+  plugin's `Binaries/Win64` is in nobody's search path however completely it is deployed. `NRRRuntime` pre-loads
+  the CUDA runtime and cuDNN DLLs by full path in dependency order, so the later load-by-name finds them loaded;
+* **two ONNX Runtimes in one process**: the editor's `NNERuntimeORT` plugin ships ORT 1.24 and loaded first, so
+  `nrr.dll` (built against 1.30) failed with `The requested API version [30] is not available, only API versions
+  [1, 24] are supported in this build. Current ORT Version is: 1.24.3`. `NRRVerify.uproject` disables
+  `NNERuntimeORT` *and* `NNEDenoiser`, because the latter is enabled by default and requires the former.
+
+**The run is on the CPU execution provider, and that is a host result rather than a plugin one:** with the CUDA
+provider active the model load *crashes* inside `nrr.dll`
+(`nrr.dll!UnknownFunction <- UnrealEditor-NRRPlugin.dll!UNRRComponent::LoadModel()`) with this repository's
+cuDNN 9 + ONNX Runtime 1.30 + this NVIDIA driver, so the verification sets the runtime's documented
+`NRR_EXECUTION_PROVIDER=cpu` override. The plugin's CUDA path is **unverified on this machine**, and every number
+above is a CPU number.
 ### The Godot addon as an upscaler: the token the runtime was not feeding
 
 The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDExtension, `NRR.gd`, and

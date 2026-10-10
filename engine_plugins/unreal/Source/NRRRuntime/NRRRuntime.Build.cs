@@ -17,9 +17,11 @@
  *    every declaration in nrr.h an import symbol the linker insists on resolving; without it the header is
  *    exactly what this module needs - a description of an ABI that is resolved at run time.
  *
- * The DLLs are declared as runtime dependencies *when they exist* so a packaged game stages them next to the
- * module. Missing ones are not a build error: the loader reports what it could not find, in the log, at load
- * time - which is the difference between "this machine has no CUDA runtime" and "this plugin is broken".
+ * The DLLs are declared as runtime dependencies *when they exist*, and only when they are not already sitting in
+ * this plugin's own `Binaries/<Platform>` - a copy there IS the destination, and UBT refuses to stage a file onto
+ * itself (measured: `FilePatternException: '...\nrr.dll' is listed as a source and target file`). Missing ones are
+ * not a build error either: the loader reports what it could not find, in the log, at load time - which is the
+ * difference between "this machine has no CUDA runtime" and "this plugin is broken".
  */
 
 using System;
@@ -93,6 +95,13 @@ public class NRRRuntime : ModuleRules
     private void AddRuntimeDependency(string FileName, params string[] Roots)
     {
         string Destination = "$(BinaryOutputDir)/" + FileName;
+
+        // $(BinaryOutputDir) of a plugin module is the plugin's own Binaries/<Platform>, so a copy that is already
+        // sitting there is the destination itself. UBT rejects that ("is listed as a source and target file") and
+        // there would be nothing to stage: that directory is the first place the loader looks at run time. Only a
+        // copy found somewhere *else* (the checkout's build/Release, an ONNX Runtime package, NRR_LIBRARY_DIR) is
+        // worth declaring.
+        string StagedDir = Path.GetFullPath(Path.Combine(PluginDirectory, "Binaries", Target.Platform.ToString()));
         foreach (string Root in Roots)
         {
             if (String.IsNullOrEmpty(Root))
@@ -100,11 +109,16 @@ public class NRRRuntime : ModuleRules
                 continue;
             }
             string Candidate = Path.GetFullPath(Path.Combine(Root, FileName));
-            if (File.Exists(Candidate))
+            if (!File.Exists(Candidate))
             {
-                RuntimeDependencies.Add(Destination, Candidate);
-                return;
+                continue;
             }
+            if (String.Equals(Path.GetDirectoryName(Candidate), StagedDir, StringComparison.OrdinalIgnoreCase))
+            {
+                return;     // already where the module and the loader expect it
+            }
+            RuntimeDependencies.Add(Destination, Candidate);
+            return;
         }
     }
 

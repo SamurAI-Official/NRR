@@ -29,6 +29,10 @@
 #include "Misc/Parse.h"
 #include "PixelFormat.h"
 
+#if WITH_EDITOR
+// The whole translation unit is editor-only, matching NRRVerifyCommandlet.h and the editor-only UnrealEd
+// dependency in NRRPlugin.Build.cs. A Game build sees an empty file.
+
 namespace
 {
 /** The tiers the released model is exercised at. Widths, not names: 128 is the tier the token is derived
@@ -302,3 +306,5 @@ bool VerifyTier(UNRRComponent& Component, int32 Width, int32 Height)
     return true;
 }
 } // namespace
+#endif // WITH_EDITOR
+

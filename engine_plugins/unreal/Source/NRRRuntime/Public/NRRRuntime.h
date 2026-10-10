@@ -35,7 +35,12 @@
 
 #include "nrr.h"
 
-DECLARE_LOG_CATEGORY_EXTERN(LogNRR, Log, All);
+// The API macro is not decoration. LogNRR is *defined* in NRRRuntime.cpp and used from NRRPlugin, which is a
+// second DLL: without it the symbol is not exported and NRRPlugin.dll fails to link with
+// `unresolved external symbol "struct FLogCategoryLogNRR LogNRR"` (measured, in the editor build). UBT defines
+// NRRRUNTIME_API for this module by itself, which is what turns the declaration into a cross-DLL import rather
+// than two DLLs quietly holding their own copy of the variable.
+NRRRUNTIME_API DECLARE_LOG_CATEGORY_EXTERN(LogNRR, Log, All);
 
 /**
  * Every public entry point of include/nrr.h.
@@ -177,6 +182,19 @@ public:
 private:
     /** Loads one support DLL (ONNX Runtime and its providers) from the directory nrr.dll was found in. */
     bool LoadSupportLibrary(const FString& FullPath);
+
+    /**
+     * Loads the CUDA runtime and cuDNN DLLs sitting beside the library, before anything that imports or
+     * lazily-loads them.
+     *
+     * Both halves of the order were measured failures: the CUDA provider cannot load before `cudart64_12.dll`
+     * (its own import), and the CUDA execution provider asks for `cudnn64_9.dll` by bare name at run time - so a
+     * Conv node failed with "LoadLibrary failed for cudnn64_9.dll with error 2" while all ten cuDNN DLLs were
+     * deployed next to the provider, because a plugin's Binaries/Win64 is not in the search path a bare-name
+     * load uses. A DLL already loaded by full path is found by name afterwards, which is what fixes both.
+     * Windows only: elsewhere the runtime libraries are found through the loader's own path.
+     */
+    void LoadAcceleratorLibraries(const FString& LibraryDir);
 
     /** The search order for nrr.dll, and the path it resolved to. */
     bool ResolveLibraryPath(FString& OutPath);

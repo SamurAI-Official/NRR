@@ -8,6 +8,14 @@
 		{
 			"Name": "NRRPlugin",
 			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeORT",
+			"Enabled": false
+		},
+		{
+			"Name": "NNEDenoiser",
+			"Enabled": false
 		}
 	]
 }
