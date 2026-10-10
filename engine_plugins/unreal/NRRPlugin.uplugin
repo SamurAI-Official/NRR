@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "NRR Neural Rendering",
+	"Description": "Drives the NRR runtime (nrr.dll) from Unreal: the full public C API resolved at run time, a SceneComponent that submits frames, and Blueprint access to both. The library is not linked, so the same plugin works against any NRR revision whose entry points it finds.",
+	"Category": "Rendering",
+	"CreatedBy": "NRR",
+	"CreatedByURL": "",
+	"DocsURL": "docs/roadmap.md",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "NRRRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "PreDefault"
+		},
+		{
+			"Name": "NRRPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": []
+}

@@ -1,6 +1,6 @@
 /**
  * @file NRRPlugin.h
- * @brief Main header for NRR Unreal Plugin
+ * @brief The Unreal-facing module of the NRR plugin.
  */
 
 #pragma once
@@ -8,29 +8,30 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 
+class FNRRRuntimeModule;
+
 /**
  * The public interface to the NRR plugin module.
+ *
+ * Deliberately thin: everything that talks to the library lives in NRRRuntime, so a caller that wants the raw C
+ * API can depend on that module alone and skip the component and the Blueprint surface.
  */
-class INRRPluginModule : public IModuleInterface
+class NRRPLUGIN_API INRRPluginModule : public IModuleInterface
 {
 public:
     /** IModuleInterface implementation */
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
 
-    /** Get the NRR runtime module */
+    /** The NRR runtime module - the object that owns the loaded library and its resolved entry points. */
     FNRRRuntimeModule& GetRuntimeModule();
 
-    /** Check if NRR is available */
+    /** The library is loaded and every entry point include/nrr.h declares resolved. */
     bool IsNRRAvailable() const;
 
-    /** Get NRR version string */
+    /** The library's own version string (nrr_get_version()), not this plugin's. */
     FString GetNRRVersion() const;
 
-    /** Get NRR specification version */
+    /** The specification the library implements (nrr_get_specification_version()). */
     FString GetNRRSpecificationVersion() const;
-
-private:
-    /** NRR runtime module instance */
-    TSharedPtr<FNRRRuntimeModule> RuntimeModule;
 };

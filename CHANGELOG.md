@@ -13,6 +13,83 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The Unreal plugin becomes real: a run-time-loaded library, a frame path, and a headless verification
+
+`docs/roadmap.md`'s own status row said it plainly - "**Not real**: headers plus `NRRPlugin.Build.cs` only - no
+`.cpp` anywhere and no `IMPLEMENT_MODULE`, so nothing builds or loads NRR" - and Unreal 5.8.3 is installed on this
+machine now, so the M5 gate is gone and the plugin is implemented. Four files became eleven. Three of the four
+declarations the skeleton shipped could not have compiled, and each is worth naming because the failure was not
+"missing code" but "code that cannot exist":
+
+* **`NRRCapabilityState` was declared twice** - once as a `UENUM` in `NRRComponent.h`, once by `include/nrr.h`.
+  Two types with one name in one translation unit is a compile error, and it is the first thing that would have
+  happened. It is `ENRRCapabilityState` now.
+* **`RenderFrame(const FTexture2DResource&, ...)` cannot be a `UFUNCTION`**: UHT rejects a parameter type that is
+  not a UStruct or a UObject. It takes `UTexture2D*` now, and `Depth`/`Motion` default to `nullptr` and are
+  *refused with a message* when passed - this component does not reach Unreal's depth or motion buffers yet
+  (`FSceneView` is the pass-level integration that is still M5's remaining work), and silently accepting a
+  conditioning input it does not submit would be a lie a caller cannot see.
+* **a member called `NRRDevice` of type `NRRDevice*`** hides the *type* inside the class: every later use of the
+  type in that header resolves to the member instead. The handles are `Device`/`Model`/`Reference` now.
+* `PrivateRuntimeDependencyModuleNames` is not an API `ModuleRules` has, and the `NRRRuntime` module it named did
+  not exist. Both are real now: two modules, `NRRRuntime` (PreDefault) and `NRRPlugin` (Default).
+
+**The library is loaded, never linked.** `NRRRuntime` calls `GetDllHandle`/`GetDllExport` and resolves **all 51
+entry points of `include/nrr.h`**. The function-pointer table is *typed from the header* - `decltype(&nrr_render)`
+and friends are unevaluated operands, so the module compiles against a description of the ABI with nothing to
+link, and a signature that drifts from the library's is a compile error rather than a stack corruption. A plugin
+that linked the runtime would need rebuilding for every NRR revision and would turn a library mismatch into an
+unresolved symbol inside Unreal's start-up. Three guards make that verifiable rather than asserted: the loader
+names any entry point it could not resolve and *fails* (a null render pointer is a crash, not an error a caller
+can handle), compares the DLL's own `nrr_test_entry_point_count()` against `NRR_ENTRY_POINT_COUNT` and says so in
+one line when they disagree, and `tests/unit/test_engine_plugins.cpp` now checks the loader's `NRR_ENTRY_POINTS`
+list against the header's declarations - a name missing from that list resolves to null on a machine with Unreal,
+which is exactly what a suite that needs no Unreal cannot otherwise see.
+
+**The frame path is one function, and both entry points go through it.** `UNRRComponent` owns a device and a
+model, submits frames, and reports what came back. `RenderFrame` (a `UTexture2D`) and `RenderFrameFromPixels`
+(RGBA8 bytes, no RHI, no world) both end in the same `SubmitColorFrame`, so the headless verification exercises
+*the path a game takes* rather than a parallel one built for tests. Two details are not incidental:
+
+* **a passthrough is detected by comparing bytes, and is reported.** A passthrough frame *is* the caller's own
+  frame - that is what the accelerator kernel's lossless fallback returns - so after downloading the displayed
+  frame the component compares it with the input: identical means no model ran, and `LastRenderWasPassthrough()`
+  says so. The download was happening anyway; the comparison is what keeps "the neural pass ran" from being an
+  assumption; and the per-frame stats (`NeuralInferenceTimeMs`, `QualityMetric`, `DebugInfo`) come back with it,
+  with 0.0 in the quality field meaning *not measured* rather than "worst possible";
+* **the conversions at the boundary are named.** The runtime's `NRR_TEXTURE_FORMAT_RGBA8` is RGBA in memory; UE's
+  canonical 8-bit format is `PF_B8G8R8A8`, which is BGRA. Both directions are swapped once, at the boundary, with
+  a comment saying why - a mis-ordered channel produces a frame that renders and is wrong.
+
+**`engine_plugins/unreal_verify/` is the harness**, mirroring `godot_verify`: a UE 5.8 project whose `setup.ps1`
+installs the plugin, `nrr.dll`, the ONNX Runtime DLLs, a copy of `nrr.h` (the packaged-header case the build rules
+support) and the released model, and whose `NRRVerify` commandlet loads the library, creates a device, loads
+`upscale_msreal_scale.onnx`, and renders at three tiers (128x96, 192x144, 256x192) - failing the run if a frame
+comes back as the caller's own. Four new drift guards in `tests/unit/test_engine_plugins.cpp` hold the parts that
+rot silently: the descriptor's module list and load order, the entry-point table against `nrr.h`, the build rule
+that must keep *loading* the library instead of linking it, and the verify project's install step.
+
+**Where it stands, and the three facts that decide it** - all measured on this host, two of them after a full
+build cycle each, and none of them about the plugin's own code:
+
+* **the plugin compiles.** All four translation units (`NRRRuntime.cpp`, `NRRPlugin.cpp`, `NRRComponent.cpp`,
+  `NRRVerifyCommandlet.cpp`) build cleanly against UE 5.8.3's headers, for both targets - which is what makes the
+  UHT/DLL/`IMPLEMENT_MODULE`/`decltype` design above *checked* rather than asserted;
+* **an Installed (launcher) engine cannot link a standalone Game target.** `Engine/Binaries/Win64` holds 1239
+  `.dll` files and **zero `.lib` files**: the Game-target link reaches the end and fails with ten *engine*
+  symbols unresolved (`GInternalProjectName`, `FMemory_Free`, `FMemory_Realloc`, `GNameBlocksDebug`,
+  `GObjectArrayForDebugVisualizers`, `GDebuggingState`). The **Editor** target is the supported host for an
+  Installed build;
+* **the Editor target needs the .NET Framework 4.6+ SDK**, which this machine does not have: UBT fails with
+  `Unable to instantiate module 'SwarmInterface': Could not find NetFxSDK install dir` and a `RulesError` before
+  compiling anything. `SwarmInterface` arrives through the editor's own dependency chain (`UnrealEd -> ... ->
+  SourceControl -> Virtualization`), so a project's target rules cannot avoid it.
+
+**So the verification is built and has not run**, and that is exactly what these pages say. Installing
+`Microsoft.VisualStudio.Component.NetFxSDK` (one Visual Studio component) or building against a non-installed
+engine is the whole remaining step; when it runs, the commandlet prints its `RESULT:` line and that line goes
+here. Until then, the Unreal plugin's executable evidence is "compiles against UE 5.8.3" - not "renders in
+Unreal" - and no row anywhere claims otherwise.
 ### The Godot addon as an upscaler: the token the runtime was not feeding
 
 The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDExtension, `NRR.gd`, and

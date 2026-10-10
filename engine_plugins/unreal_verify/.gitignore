@@ -1,0 +1,17 @@
+# engine_plugins/unreal_verify - build output and the copied plugin
+#
+# Plugins/ is a copy of ../unreal plus the library, the ONNX Runtime DLLs and the model (see setup.ps1), and none
+# of it is source. Binaries/, Intermediate/, Saved/ and DerivedDataCache/ are Unreal's build output; the .sln and
+# .vs are what UBT generates for a project with a C++ plugin.
+Plugins/
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln
+*.vsconfig
+*.suo
+*.opensdf
+*.sdf
+*.VC.db

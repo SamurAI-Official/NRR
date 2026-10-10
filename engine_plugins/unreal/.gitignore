@@ -1,0 +1,12 @@
+# engine_plugins/unreal - keep the plugin's SOURCE directory source
+#
+# Nothing here is built in place: a project copies the plugin into <Project>/Plugins/NRRPlugin/ and UnrealBuildTool
+# writes Intermediate/, Binaries/ and Saved/ there (unreal_verify/.gitignore covers that copy). These patterns are
+# here so that a build run from inside this directory - which happens the first time someone opens the plugin
+# directly - cannot leave working-tree noise behind.
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln

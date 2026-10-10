@@ -1,0 +1,13 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "Runs the NRR Unreal plugin headless and asserts the frame path renders.",
+	"Modules": [],
+	"Plugins": [
+		{
+			"Name": "NRRPlugin",
+			"Enabled": true
+		}
+	]
+}

@@ -1,13 +1,20 @@
 /**
  * @file NRRPlugin.Build.cs
- * @brief NRR Unreal Engine Plugin Build Script
+ * @brief Build rules for the Unreal-facing module: the component, the Blueprint surface and the verify
+ *        commandlet.
  *
- * Build configuration for the NRR Unreal Plugin.
+ * Three things were wrong with the version of this file that shipped as "structure defined", and each is a
+ * build failure rather than a style question:
+ *
+ *  - `PrivateRuntimeDependencyModuleNames.AddRange(new[] { "NRRRuntime" })` names an API that ModuleRules does
+ *    not have, and referred to a module with no directory behind it. A module dependency is a
+ *    Public/PrivateDependencyModuleNames entry, and the module has to exist; NRRRuntime now does.
+ *  - `NRR_USING_DLL` is deliberately NOT defined. It turns NRR_API in nrr.h into __declspec(dllimport), and
+ *    this module does not link NRR at all - the library is loaded at run time by NRRRuntime.
+ *  - the include path for the runtime's headers is resolved by NRRRuntime's own build rules and reaches this
+ *    module through the dependency, so exactly one place decides where nrr.h comes from.
  */
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using UnrealBuildTool;
 
 public class NRRPlugin : ModuleRules
@@ -16,41 +23,23 @@ public class NRRPlugin : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        // Public dependencies
         PublicDependencyModuleNames.AddRange(new string[]
         {
             "Core",
             "CoreUObject",
-            "Engine",
-            "RenderCore",
-            "RHI",
-            "Projects"
+            "Engine",       // USceneComponent and UTexture2D: the component is an Actor component
+            "RenderCore",   // the pixel formats a submitted frame arrives in
+            "RHI",          // reading a texture's bytes back
+            "Projects",     // FPaths and the plugin's own directory, for models and the library
+            "NRRRuntime"    // the resolved C API; this module never loads a DLL itself
         });
 
-        // NRR library path (would be configured per-platform)
-        // PublicAdditionalLibraries.AddRange(new string[]
-        // {
-        //     "nrr"
-        // });
-
-        // Include paths for NRR headers
-        // PublicIncludePaths.AddRange(new string[]
-        // {
-        //     Path.Combine(ModuleDirectory, "ThirdParty", "NRR", "include")
-        // });
-
-        // Private dependencies for rendering
+        // Commandlets (the headless verification) are editor-only, and Slate is what an editor surface would
+        // need. Neither is a runtime dependency of a shipped game.
         PrivateDependencyModuleNames.AddRange(new string[]
         {
-            "RenderFreeType",
             "Slate",
             "SlateCore"
-        });
-
-        // Runtime dependencies
-        PrivateRuntimeDependencyModuleNames.AddRange(new string[]
-        {
-            "NRRRuntime"  // Custom module for NRR runtime
         });
     }
 }
