@@ -95,4 +95,8 @@ addon is verified end to end (`CHANGELOG.md`). Those runs are on a host where th
 *crashes* during model load - a host/driver result, recorded in that README - so the numbers there are CPU
 numbers.
 
+One description in the repository does **not** match this model: `models/architecture.md` there still describes an
+aspirational 1080p -> 4K color+depth+motion network, which is not what is published here. The contract above is
+this graph's real one, read from the model.
+
 Licence: MIT - see `LICENSE`.
