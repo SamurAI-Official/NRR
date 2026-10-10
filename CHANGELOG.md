@@ -20,15 +20,25 @@ The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDE
 the model adopted above declares `color,jitter,scale`, and the runtime's input-role classifier had no rule for
 `scale`, so the name fell through to the colour path.
 
-**What that did, measured rather than reasoned.** The expected failure - three channels of colour against a
-declared one-channel input - is *not* what happens: an input the classifier does not recognise is
-**zero-filled and the frame renders**. Renaming the token input in a copy of the model (to `zzz_unknown`, so it
-classifies as Other) and running `nrr_bench` produces a normal timing line: `128x128->256x256: wall=3.02ms ...
-provider CUDAExecutionProvider`. Zero is, by coincidence, *exactly the reference tier's token value*, so the
-released model would have been told "these samples came off the 128px grid" at every resolution - in the engine,
-in Godot, everywhere - while `tools/compare_upscalers.py` derived log2(width/128) and every Python-side number
-stayed green. Two different values under one input name, and the engine's was wrong at every tier above the
-reference one.
+**What that did, measured rather than reasoned - and measured twice, because the two paths differ.** The
+expected failure - three channels of colour against a declared one-channel input - is a **refusal** on the CPU
+backend and a **bypass** on the accelerator, and neither of them is a fill:
+
+* `nrr_bench --provider CPU` on a copy of the model whose token input is renamed `zzz_unknown` (so it
+  classifies as Other) returns `input 'zzz_unknown' has 196608 elements but its shape needs 65536` and renders
+  nothing: the classifier put the name on the colour path, three channels were built against a one-channel
+  declaration, and the runtime's element-count check stopped the frame there.
+* The same frame on the accelerator path **renders**. `nrr_render` returns success and the caller gets its own
+  frame back at the input size, pixel for pixel - measured at `256x256`, byte 230 (the frame's own colour) where
+  the token would be 64. That is `accel_kernel.cpp`'s lossless passthrough when the session cannot be run, and it
+  is why an earlier revision of this entry (commit `4779165d`) recorded this case as "zero-filled and the frame
+  renders": its probe ran on the accelerated path, and a passthrough frame looks like a frame.
+
+So nothing is zero-filled, and the consequence is worse than the zero-fill this entry first claimed: on the path
+a game actually runs, the model is not in the output at all, at every resolution, with no error raised - no
+upscale, and output that looks plausible *because it is the input*. Both behaviours are pinned by
+`tests/unit/test_scale_token.cpp`, which renders these fixtures rather than describing them
+(`test_the_cpu_backend_refuses_an_unrecognised_input_name`, and the control beside it).
 
 **The fix is a role and a derivation, not a caller obligation.** `TensorRole::Scale` is matched by *exact* name
 (`scale`, `scale_token`, `resolution_token`) because "scale" is a substring of ordinary input names
@@ -56,19 +66,68 @@ Godot exposes neither is real for other models and costs nothing here.
 did not render", which sent the reader around the binary to the test suite to find out what the runtime had
 said. It prints `nrr_get_last_error()` now.
 
-Two limits on this work, recorded rather than glossed:
+Two limits were recorded here when that work landed. Both are now closed, and one of them because its premise was
+wrong:
 
-* **The token's *value* is pinned by unit tests, not by an end-to-end assertion.** The C API has no texture
-  readback (`nrr.h` has create/destroy/upload), so a test cannot yet ask "what number did the model receive"
-  after a render. It can assert the derivation, the classification, and that a model declaring the input renders
-  - which is what it does. The harness asserts the same formula independently, in Python.
-* **The latency rows already published were measured by a benchmark binary built before this change**, so they
-  were taken with the token zero-filled. That is sound for a latency row and not for a quality one: a
-  convolution's cost does not depend on its input values, which is the reason `nrr_bench` is allowed to publish
-  from synthetic planes at all. The quality rows come from ONNX Runtime in Python and were never affected.
+* **"The token's *value* is pinned by unit tests, not by an end-to-end assertion."** True then, fixed now. The C
+  API does have a texture readback - `nrr_texture_download`, with `nrr_texture_get_desc` to size the buffer - and
+  what was missing was a fixture whose output *is* the tensor the runtime handed it.
+  `models/nrr_scale_token_probe.onnx` (from `tools/gen_sample_model.py`, mirroring the history-delivery fixture)
+  is that fixture: `scale * 0.25`, three channels, 2x integer replication, so the displayed frame decimates back
+  to the value exactly. `tests/unit/test_scale_token.cpp` renders it at five tiers and reads the bytes back -
+  0 / 37 / 64 / 64 / 128 for tokens 0.0 / 0.585 / 1.0 / 1.0 (a non-square frame, whose token comes from the
+  width) / 2.0 - on the accelerator path and on a forced CPU one.
+* **"The latency rows already published were measured with the token zero-filled."** Unverifiable and immaterial.
+  The same binary reported `inference=9.00ms` at 256 -> 512 in a later run, and a passthrough frame carries no
+  inference time, so the released model really was running for those rows. A convolution's cost does not depend on
+  its input values, which is the reason `nrr_bench` is allowed to publish from synthetic planes at all.
+
+What replaced the wrong half of that record: the pre-fix *mechanism* was not a zero-fill. The entry above said it
+was, on the strength of an accelerated probe; the measurements are a **refusal** on the CPU backend and a
+**bypass** on the accelerator, and `runtime/backend_cpu.cpp`, `runtime/accel_kernel.cpp` and
+`tests/unit/test_scale_token.cpp` now state that in their own comments - where the next reader is - instead of in
+a commit message nobody opens.
 
 
-### Release model adopted: one scale-agnostic artifact, and the two bugs that stood in its way
+### The token, end to end: the value read back, the range past training, and a real Godot render
+
+Three questions were left open by the entry above, and all three are now answered by measurement rather than by
+reading the code.
+
+**1. What value does the model's token input actually carry?** Read back off a rendered frame, on the real path.
+`models/nrr_scale_token_probe.onnx` is a fixture whose output is its own `scale` input times 0.25, three channels,
+2x integer replication - so the byte in the displayed frame *is* the value. Five tiers, both paths, exact:
+
+| input width | token the runtime derives | byte read back |
+| --- | --- | --- |
+| 128 | 0.0 | 0 |
+| 192 | 0.585 | 37 |
+| 256 | 1.0 | 64 |
+| 256 (64 tall) | 1.0, from the width | 64 |
+| 512 | 2.0 | 128 |
+
+The plane is constant across the frame, which is what "one number per frame" means, and the suite's count is
+**200 passed, 0 failed** (`test_the_token_reaches_the_model_as_the_octave_of_the_frame_width`,
+`test_the_cpu_backend_path_feeds_the_same_token`).
+
+**2. What happens past the two tiers it was trained on?** `tools/scale_token_sweep.py` forces each token value on
+the captured 512x512 -> 1024x1024 pairs in `models/training-data/godot-hi` - a tier this model never trained on,
+its own token being 2.0 - and scores against the captured reference: bilinear **29.8251 dB**; token 0.0
+**25.0179**; 1.0 **28.4368**; **2.0 (its own) 30.1389**; **2.907 (what a 960 px frame asks for) 30.2888**. So the
+token is load-bearing (a 5 dB row), the model stays **above the bilinear floor** two octaves out, and the
+extrapolation is monotone rather than divergent: a conditioning knob, not a boundary. Three val frames, so the
+second decimal is noise - and there is still no 960x540 -> 1920x1080 reference set, which is why
+`docs/parity.md`'s 1080p row keeps saying *quality unmeasured*.
+
+**3. Does it work in Godot, with a frame the plugin submits?** Yes, in a real Godot 4.7.2 process.
+`engine_plugins/godot_verify/verify.gd` resolves `NRRPostProcess.RELEASE_MODEL_PATH` inside the project and then
+renders the released model at three tiers (128x96, 192x144, 256x192) through the addon, failing on a passthrough
+frame at any of them. Recorded: `render_ms=187.909 / 43.245 / 50.142`, `mean_abs_dr=0.4936 / 0.4951 / 0.4958`,
+`RESULT: PASS`. `setup.ps1` installs the model into `addons/nrr/models/` as part of the addon copy, so the two
+are installed by one command - the same act the addon README documents for a game, and the reason the driver's
+own check is `FileAccess.file_exists()` rather than `ResourceLoader.exists()` (a `.onnx` is not a Godot resource
+type, and the resource loader answers *no* for every model in a project).
+
 
 **The project's release model is now `models/phase4/upscale_msreal_scale.onnx`**, and it is the baseline every future
 row is compared against. It is the scale-agnostic model from the entry below - the one whose token travels the whole

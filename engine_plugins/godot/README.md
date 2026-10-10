@@ -140,6 +140,40 @@ Cost, measured by `benchmarks/nrr_bench.cpp` on an RTX 4070 Ti with the CUDA pro
 at 960x540 -> 1920x1080 and **451.9 ms** at 1920x1080 -> 3840x2160. That is a quality pass, not a realtime
 one at these grids; the runtime's own limits say the same thing (`docs/roadmap.md`).
 
+**Beyond the two tiers it was trained on.** `960x540` asks for a token of **2.907**, two octaves past anything
+in the dataset, and `docs/parity.md`'s own 1080p row says what is true of that tier: its quality is
+*unmeasured*, because no reference set for 960x540 -> 1920x1080 exists. The nearest thing the repository can
+produce is measured by `tools/scale_token_sweep.py` on the captured 512x512 -> 1024x1024 pairs in
+`models/training-data/godot-hi` - a tier this model also never trained on (its own token is 2.0), against a
+captured reference:
+
+| token | PSNR dB | SSIM | MS-SSIM | detail |
+| --- | --- | --- | --- | --- |
+| bilinear | 29.8251 | 0.93282 | 0.97459 | - |
+| 0.0 (what a 128 px frame asks for) | 25.0179 | 0.84147 | 0.90178 | 1.5262 |
+| 0.585 (what a 192 px frame asks for) | 26.6055 | 0.88187 | 0.93451 | 1.0024 |
+| 1.0 (what a 256 px frame asks for - trained) | 28.4368 | 0.91580 | 0.96106 | 0.7230 |
+| **2.0 (what this 512 px tier asks for - never trained)** | **30.1389** | **0.93875** | **0.97713** | 0.6067 |
+| 2.907 (what a 960 px frame asks for) | 30.2888 | 0.94148 | 0.97976 | 0.6329 |
+
+Three claims, all of them from those runs and only three val frames, so treat the second decimal as noise:
+
+* **the token is load-bearing** - 25.0 dB at 0.0 against 30.1 dB at the tier's own value, so a runtime that fed
+  a wrong or fixed value would be measurably worse, not merely unlabelled;
+* **two octaves past training, the model is still above the bilinear baseline** (30.14 against 29.83 dB, and
+  ahead on SSIM and MS-SSIM as well) - which is the property that decides whether the pass is worth 115 ms;
+* **the extrapolation is monotone** - a 960 px token on a 512 px grid moves along the same axis as the trained
+  ones (a smoother, higher-PSNR, lower-detail output) rather than diverging. The token is a conditioning knob
+  the trainer turned, not a boundary the graph enforces.
+
+**One caveat that is about the model rather than the tier.** If a model's inputs are named in a way the runtime
+does not recognise (`classify_tensor_role` matches colour/jitter/scale/history/depth/motion/validity by name),
+the model is *not* run: the CPU backend refuses the frame and the accelerator path degrades to lossless
+passthrough, handing you back your own frame at your own size. Nothing is filled with a substitute, so it looks
+like a frame - and the node reports it: `stats["passthrough"]` is `true` and `NRR.last_render_was_passthrough`
+is set (the binding detects it exactly, by returning the image it was given). Check it if you install a model
+of your own; the released model declares `color`, `jitter` and `scale`, all of which this addon supplies.
+
 `jitter` is the other input the model expects, and it is a fact about the frame rather than a default: the
 node reports the sub-pixel offset the renderer used (`jitter_offset`/`jitter_enabled` on the node), and a
 caller that supplies none is treated as sampled on the grid - which is what the runtime feeds, explicitly,

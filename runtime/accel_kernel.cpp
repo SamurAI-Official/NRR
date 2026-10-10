@@ -313,7 +313,9 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                                : (role == TensorRole::Validity) ? 1
                                /* One channel, as on the CPU path: the resolution token, derived from the frame's
                                 * own width. Without this case it was three channels of colour against a
-                                * one-channel input, which the session rejected on the element count. */
+                                * one-channel input. This path's answer to that is lossless passthrough - the caller's own frame, at the
+                                * input size, with no model in it - measured by tests/unit/test_scale_token.cpp,
+                                * whose end-to-end case reads the token value back off the displayed frame. */
                                : (role == TensorRole::Scale) ? 1 : 3;
             TextureImpl* src = (role == TensorRole::Depth) ? depth_tex
                              : (role == TensorRole::Motion) ? motion_tex

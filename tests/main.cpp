@@ -231,6 +231,15 @@ void run_all_tests() {
     NRR_RUN_TEST(test_history_mask_from_textures_matches_the_plane_builder);
     NRR_RUN_TEST(test_scale_token_role_is_matched_by_name_and_not_by_substring);
     NRR_RUN_TEST(test_scale_token_plane_carries_the_octave_of_the_input_width);
+    /* What a model's token input actually *holds* - the half the two above cannot see, because they call the
+     * rule rather than the render path. The first two read the value back off the displayed frame of a fixture
+     * whose output is its own token input; the third renders that fixture with the input renamed to something
+     * the classifier does not know, where the frame must be refused by name rather than the input filled from
+     * the colour plane. */
+    NRR_RUN_TEST(test_the_token_reaches_the_model_as_the_octave_of_the_frame_width);
+    NRR_RUN_TEST(test_the_cpu_backend_path_feeds_the_same_token);
+    NRR_RUN_TEST(test_the_cpu_backend_refuses_an_unrecognised_input_name);
+    NRR_RUN_TEST(test_an_unrecognised_input_name_is_never_filled_with_a_substitute);
     /* What a model's `history` input actually holds at inference. The training arms measure a reprojected
      * plane and the runtime is the only thing that can produce the inference-time one, so this is the half of
      * "is the seam a lever or a break?" that the arm results cannot answer for themselves. */

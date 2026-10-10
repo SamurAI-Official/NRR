@@ -52,6 +52,12 @@ pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild
 * `initialize()` -> `available`, `backend_name()`, `native_entry_point_count()`
   and the capability block.
 * `load_model()` on a real `.onnx` in `res://models/`.
+* `NRRPostProcess.RELEASE_MODEL_PATH` resolves inside the project, and the released scale-agnostic model
+  (`upscale_msreal_scale.onnx`, the one `docs/parity.md` measures) **renders at three tiers** - 128x96,
+  192x144 and 256x192, with a passthrough result a failure at each and the pixels required to have changed.
+  Nothing passes the tier to the model: the resolution token is derived from the frame inside the runtime, so
+  this is what says the addon and the released model work together in a real Godot process. `.onnx` is not a
+  Godot resource type, so the probe is `FileAccess.file_exists()`, not `ResourceLoader.exists()`.
 * `render_frame()` on a deterministic RGBA8 image; a **passthrough result is a
   failure**, and the mean absolute difference against the input is printed so the
   output can be seen to have changed.
@@ -67,7 +73,9 @@ pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild
 
 ## Recorded result
 
-Godot 4.7.2-stable, Windows x86_64, 64x48 RGBA8 input, `models/nrr_upscaler_v0.1.onnx`:
+Godot 4.7.2-stable, Windows x86_64. `setup.ps1 -NoBuild -SkipCuda`, so the ORT package is the CUDA one but the
+CUDA *runtime* is not copied into the addon copy; `model_info` still reports `CUDAExecutionProvider` because
+this host's PATH resolves the CUDA runtime, and the upscaler section is what says which provider actually ran.
 
 ```
 class_registered=true          binding_present=true
@@ -81,6 +89,24 @@ reset_temporal_history=true    available_after_shutdown=false
 phase_aligned_supported=true   state_after_off=0   state_after_on=1
 RESULT: PASS
 ```
+
+The upscaler section, added later, on the same host and the same command:
+
+```
+upscaler_release_model_path=res://addons/nrr/models/upscale_msreal_scale.onnx exists=true
+upscaler_model={"path": ".../addons/nrr/models/upscale_msreal_scale.onnx", "provider": "CUDAExecutionProvider",
+                "input_count": 3, "inputs": [color, jitter, scale]}
+upscaler_tier=128x96  render_ms=187.909 mean_abs_dr=0.493575
+upscaler_tier=192x144 render_ms=43.245  mean_abs_dr=0.495079
+upscaler_tier=256x192 render_ms=50.142  mean_abs_dr=0.495807
+RESULT: PASS
+```
+
+The first tier carries the session's own creation for a new shape (the same warm-up effect the single-frame
+timing below has); the second and third are the steady state at those grids. `mean_abs_dr` is against the
+input's red channel at the caller's size, because the binding presents the model's frame at the size it was
+handed - which is what a `CanvasLayer` overdraw needs, and the reason a 2x check belongs in
+`tests/unit/test_scale_token.cpp` rather than here.
 
 (The block above predates the disocclusion guard pair. A fresh run prints three more lines after
 `phase_aligned_supported=...` - `disocclusion_supported=...`, `disocclusion_enabled=...` and

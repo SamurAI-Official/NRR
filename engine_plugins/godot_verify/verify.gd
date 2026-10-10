@@ -202,10 +202,86 @@ func _ready() -> void:
 	nrr.set_disocclusion_rejection(false)
 	print("disocclusion_final_state=%d" % nrr.disocclusion_rejection())
 
+	# --- The released scale-agnostic model, through the addon, at more than one tier ---------------------
+	# This is the integration the addon README documents as "put it on a CanvasLayer and install the
+	# released model", and two of its claims can only be checked from inside a running project: that
+	# installing the addon and installing the model really is one act (NRRPostProcess.RELEASE_MODEL_PATH
+	# resolves here), and that the released model renders a changed frame at a tier the caller named only by
+	# the size of the image it handed over - the resolution token is derived inside the runtime.
+	var post_process = load("res://addons/nrr/nrr_post_process.gd")
+	var release_path: String = ""
+	if post_process != null:
+		release_path = post_process.RELEASE_MODEL_PATH
+	print("upscaler_release_model_path=%s exists=%s"
+		% [release_path, release_path != "" and FileAccess.file_exists(release_path)])
+	if post_process == null:
+		_fail("nrr_post_process.gd did not load from the addon")
+		return
+	# FileAccess rather than ResourceLoader: a .onnx is not a Godot resource type, so ResourceLoader.exists()
+	# answers false for every model in the project, installed or not - which is exactly the kind of "it says
+	# no" this driver exists to not fall for.
+	if release_path == "" or not FileAccess.file_exists(release_path):
+		_fail("the released model is not installed at '%s' - see the addon README's 'Using it as an upscaler'" % release_path)
+		return
+	if not _verify_upscaler(nrr, release_path):
+		return
+
 	nrr.shutdown()
 	print("available_after_shutdown=%s" % nrr.available)
 	print("RESULT: PASS")
 	get_tree().quit(0)
+
+
+# Renders the released model at three tiers through the addon. For each one: the model ran, the frame came back
+# at the caller's size, and the pixels changed. The binding reports a passthrough by returning the caller's own
+# image, so `last_render_was_passthrough` is exact rather than a guess, and a frame presented at the caller's
+# size is the contract a CanvasLayer overdraw needs.
+#
+# The tiers are named by width - 128, 192, 256 - which is how a game gets one: the token that follows from each
+# (0.0, 0.585, 1.0) is derived inside the runtime from the frame itself. 192 is between the two tiers this model
+# was trained on, which is the case a two-tier model has to survive; tests/unit/test_scale_token.cpp is what
+# reads the token's value back off a rendered frame, which GDScript cannot do.
+func _verify_upscaler(nrr: NRR, model_path: String) -> bool:
+	if not nrr.load_model(model_path):
+		_fail("the released model did not load: %s" % nrr.last_error)
+		return false
+	print("upscaler_model=%s" % nrr.model_info())
+	for size: Vector2i in [Vector2i(128, 96), Vector2i(192, 144), Vector2i(256, 192)]:
+		var source := _gradient(size.x, size.y)
+		var output: Image = nrr.render_frame(source)
+		if output == null:
+			_fail("the released model returned no frame at %dx%d" % [size.x, size.y])
+			return false
+		if nrr.last_render_was_passthrough:
+			_fail("the released model passed the %dx%d frame through instead of rendering it: %s"
+				% [size.x, size.y, nrr.last_error])
+			return false
+		if output.get_width() != size.x or output.get_height() != size.y:
+			_fail("the released model returned a %dx%d frame for a %dx%d input, and a caller is presented with a frame at its own size"
+				% [output.get_width(), output.get_height(), size.x, size.y])
+			return false
+		var delta := 0.0
+		for y in size.y:
+			for x in size.x:
+				delta += absf(output.get_pixel(x, y).r - source.get_pixel(x, y).r)
+		var mean := delta / float(size.x * size.y)
+		print("upscaler_tier=%dx%d render_ms=%.3f mean_abs_dr=%.6f"
+			% [size.x, size.y, nrr.last_render_time_ms(), mean])
+		if mean <= 0.0:
+			_fail("the %dx%d frame came back holding the input's own pixels" % [size.x, size.y])
+			return false
+	nrr.reset_temporal_history()
+	return true
+
+
+# The gradient the driver above builds, at any size rather than at one constant.
+func _gradient(width: int, height: int) -> Image:
+	var image := Image.create_empty(width, height, false, Image.FORMAT_RGBA8)
+	for y in height:
+		for x in width:
+			var v := float(x + y) / float(width + height)
+			image.set_pixel(x, y, Color(v, 1.0 - v, 0.5, 1.0))
+	return image
 
 
 func _fail(reason: String) -> void:

@@ -155,6 +155,21 @@ if (Test-Path $modelSrc) {
     Write-Host "[setup] copied models/nrr_upscaler_v0.1.onnx"
 }
 
+# --- 4b. the released model, where the addon looks for it --------------------
+# NRRPostProcess resolves res://addons/nrr/models/upscale_msreal_scale.onnx when model_path is left empty, so
+# installing the addon and installing the model are the same act - and setup.ps1 rebuilds addons/nrr from the
+# source addon on every run, so the model has to be placed here rather than by hand. verify.gd's upscaler
+# section fails loudly if it is missing, and prints the path it looked for.
+$releaseSrc = Join-Path $repo 'models/phase4/upscale_msreal_scale.onnx'
+if (Test-Path $releaseSrc) {
+    $releaseDst = Join-Path $addonDst 'models'
+    New-Item -ItemType Directory -Force $releaseDst | Out-Null
+    Copy-Item $releaseSrc $releaseDst -Force
+    Write-Host "[setup] installed addons/nrr/models/upscale_msreal_scale.onnx (the released upscaler)"
+} else {
+    Write-Host "[setup] note: models/phase4/upscale_msreal_scale.onnx is not in this tree - verify.gd's upscaler section will fail (trace it back through tools/train_nrr.py, or copy a model in by hand)" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "[setup] done. Run the verification with:" -ForegroundColor Green
 Write-Host "  <godot> --headless --import --path `"$here`""

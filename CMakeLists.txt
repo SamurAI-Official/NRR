@@ -708,6 +708,12 @@ if(NRR_BUILD_TESTS)
         # test_history_delivery.cpp can read back the tensor the runtime fed a model. Absolute like the two
         # above, because ctest runs the suite with the build directory as its working directory.
         NRR_HISTORY_PROBE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_history_probe.onnx"
+        # The resolution-token fixtures: the first reports its own `scale` input as its output, so
+        # test_scale_token.cpp can read back the value the runtime fed a model's token input rather than
+        # asserting only the function that derives it; the second is the same graph with that input named
+        # something the classifier does not know, so the refusal is pinned as well as the delivery.
+        NRR_SCALE_TOKEN_PROBE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_scale_token_probe.onnx"
+        NRR_UNRECOGNISED_INPUT_PROBE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_unrecognised_input_probe.onnx"
         # Source root, so the engine-plugin drift guards can read
         # engine_plugins/**/*.cfg / *.gdextension / *.gd / src/*.cpp and check
         # them against include/nrr.h at test time.

@@ -505,7 +505,10 @@ NRRResult BackendCPU::execute_model(
             case TensorRole::Jitter: channels = 2; break;
             /* One channel: the resolution token, derived from the frame's own input width. Without this case it
              * was three channels of *colour* aimed at a one-channel input, which the session rejected on the
-             * element count - a model that renders in the harness and could not render here at all. */
+             * element count on this path, while the accelerator path degrades to lossless passthrough and hands the
+             * caller its own frame back at the input size with no model in it. Both answers are measured by
+             * tests/unit/test_scale_token.cpp, which is also where the value this case produces is read back
+             * off the displayed frame. */
             case TensorRole::Scale:  channels = 1; break;
             /* One channel: the trust mask the runtime computes for itself. */
             case TensorRole::Validity: channels = 1; break;
