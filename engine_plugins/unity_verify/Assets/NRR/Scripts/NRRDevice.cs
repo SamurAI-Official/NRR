@@ -148,6 +148,85 @@ namespace NRR
             return TryGetPhaseAlignedAccumulation(out ignored) == NRRResult.Success;
         }
 
+        /// <summary>
+        /// Chooses what that integration integrates: 0 = the frames the model displayed, at the display grid
+        /// (the default, a temporal denoise of its output, which is what
+        /// <see cref="SetPhaseAlignedAccumulation"/> has always produced); 1 = the low-resolution frames the
+        /// renderer submitted, each placed into the display grid where its samples were taken (a temporal
+        /// upscale, whose resolve *is* the displayed frame, measured 13.9% closer to the display-resolution
+        /// render than a bilinear upsample of the same input - tools/capture_fidelity_probe.py). Selecting the
+        /// second means choosing the runtime's resolve as the picture.
+        ///
+        /// The source belongs to the accumulation rather than to a frame, so changing it discards what has
+        /// been collected: samples placed from the input grid and samples of the display grid describe the
+        /// same scene on two different grids. Throws for an unknown value or a backend that cannot integrate
+        /// (NRR_ERROR_STATE_INVALID), rather than accepting a setting nothing will honour.
+        /// </summary>
+        public void SetPhaseAlignedSource(int source)
+        {
+            NRR.ThrowIfFailed(NRRNative.nrr_device_set_phase_aligned_source(_handle, source),
+                              "nrr_device_set_phase_aligned_source");
+        }
+
+        /// <summary>
+        /// Which frames that integration integrates. Reports the result instead of throwing, for the same
+        /// reason <see cref="TryGetPhaseAlignedAccumulation"/> does: a caller may read this per frame. A
+        /// non-success result means the device has no accumulator at all and leaves
+        /// <paramref name="source"/> 0, so a caller that needs to tell "could not be read" from "displayed"
+        /// must read the returned code, not the value.
+        /// </summary>
+        public NRRResult TryGetPhaseAlignedSource(out int source)
+        {
+            int value = 0;
+            NRRResult r = NRRNative.nrr_device_get_phase_aligned_source(_handle, out value);
+            source = r == NRRResult.Success ? value : 0;
+            return r;
+        }
+
+        /// <summary>
+        /// Turns the reprojection blend's history guard on or off.
+        ///
+        /// The guard rejects the history the runtime's history trust mask refuses (a source that left the
+        /// frame, a surface the previous frame held something nearer than, sky) and clamps the rest to the
+        /// current frame's neighbourhood, so a disoccluded pixel stops smearing the old scene through. Its
+        /// default is the device's own temporal-coherence capability - <see cref="IsDisocclusionRejectionSupported"/>
+        /// says whether the device can hold it at all - so a caller only needs this to override that either
+        /// way. The mask is built from the frame's depth and the previous frame's recorded depth, which the
+        /// renderer supplies when it submits them; a frame with no depth attachment gets no mask and keeps the
+        /// un-guarded blend.
+        ///
+        /// Throws when the backend has no accumulator (NRR_ERROR_STATE_INVALID) rather than accepting a
+        /// setting nothing will honour.
+        /// </summary>
+        public void SetDisocclusionRejection(bool enabled)
+        {
+            NRR.ThrowIfFailed(NRRNative.nrr_device_set_disocclusion_rejection(_handle, enabled ? 1 : 0),
+                              "nrr_device_set_disocclusion_rejection");
+        }
+
+        /// <summary>
+        /// Whether the accumulator that will run this device's frames has the guard on.
+        ///
+        /// Reports the result instead of throwing, like the phase-aligned query: a caller reads it per frame.
+        /// A non-success result means the device has no accumulator at all (no backend, or a backend that
+        /// cannot accumulate) and leaves <paramref name="enabled"/> false - so callers that need to tell
+        /// "off" from "cannot" should read the returned code, not the flag.
+        /// </summary>
+        public NRRResult TryGetDisocclusionRejection(out bool enabled)
+        {
+            int value = 0;
+            NRRResult r = NRRNative.nrr_device_get_disocclusion_rejection(_handle, out value);
+            enabled = r == NRRResult.Success && value != 0;
+            return r;
+        }
+
+        /// <summary>True when this device has an accumulator the guard can be held on.</summary>
+        public bool IsDisocclusionRejectionSupported()
+        {
+            bool ignored;
+            return TryGetDisocclusionRejection(out ignored) == NRRResult.Success;
+        }
+
         // =====================================================================
         // Textures / buffers
         // =====================================================================

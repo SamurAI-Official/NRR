@@ -28,11 +28,10 @@
     Do not fetch the jitter model from the Hub; fail only if it is missing and there is no local copy either.
 
 .PARAMETER SkipPackageSync
-    Leave Assets/NRR alone and only install the library, ONNX Runtime and the model. Use this when the package's
-    working tree is mid-change: the sync mirrors the *working tree*, and on 2026-10-10 that tree did not compile
-    in this project at all (NRRRenderer.cs references NRR.Rendering, and RenderPipeline/NRRRenderFeature.cs does
-    not match URP 17's SetupRenderPasses signature - CS0234 and CS0115 respectively). The mirror as committed does
-    compile and its tests pass; the committed copy is what a run here verifies unless you ask for the working tree.
+    Leave Assets/NRR alone and only install the library, ONNX Runtime and the model. The sync mirrors the
+    package's *working tree*, which is what a run here should verify while you are changing it - but a tree that
+    does not compile yet would take this project's test run down with it, and this switch is how to run the tests
+    against the committed copy instead.
 
 .PARAMETER ProjectPath
     The Unity project. Default: this directory.

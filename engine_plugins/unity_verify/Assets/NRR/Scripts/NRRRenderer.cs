@@ -5,10 +5,7 @@
 // neural output and exposes the last NRRRenderStats.
 // ---------------------------------------------------------------------------
 using UnityEngine;
-// URP render pass deliberately excluded from this verify project: URP 17 removed the
-// ScriptableRenderPass.Execute(ScriptableRenderContext, ref RenderingData) override this
-// pass used, and migrating it to RecordRenderGraph is tracked separately. The tests here
-// drive the native runtime directly, so they do not need it.
+using NRR.Rendering;
 
 namespace NRR
 {
@@ -519,7 +516,7 @@ private void Update()
                 RenderTexture.active = previousActive2;
             }
 
-            // NRRRenderPass.CurrentOutput = Output;  // see the note on the removed using above.
+            NRRRenderPass.CurrentOutput = Output;
         }
 
         private void OnDisable()

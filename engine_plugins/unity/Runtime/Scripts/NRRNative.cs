@@ -53,6 +53,17 @@ namespace NRR
          * cannot tell them apart will believe it enabled something nothing honours. */
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_set_phase_aligned_accumulation(IntPtr device, int enabled);
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_get_phase_aligned_accumulation(IntPtr device, out int out_enabled);
+        /* What that integration integrates: the frames the model displayed (the default) or the caller's
+         * low-resolution input renders placed into the display grid. Two entry points for the same reason as
+         * the pair above - a source could not be read, and "could not be read" must not read as "displayed". */
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_set_phase_aligned_source(IntPtr device, int source);
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_get_phase_aligned_source(IntPtr device, out int out_source);
+        /* The reprojection blend's history guard. Like the phase-aligned pair above, two entry points rather
+         * than one because "off" and "this backend cannot accumulate" are different answers. Its default is
+         * the device's own temporal-coherence capability, so a capable device has the guard on without the
+         * caller asking - this pair is to override that, not only to enable it. */
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_set_disocclusion_rejection(IntPtr device, int enabled);
+        [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_device_get_disocclusion_rejection(IntPtr device, out int out_enabled);
 
         // Texture helpers
         [DllImport(Dll, CallingConvention = Cc)] internal static extern NRRResult nrr_texture_create(IntPtr device, ref NRRTextureDesc desc, out IntPtr out_texture);

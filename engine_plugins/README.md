@@ -117,9 +117,20 @@ a printed `RESULT:` line; the transcript is in `unity_verify/README.md`. That ru
 ships the CPU ONNX Runtime package, so `TheSessionRanOnTheGpuNotACpuFallback` is satisfied only through
 `NRR_REQUIRE_CUDA=0` - the switch that test itself documents - and the GPU path is unverified on this machine.
 `unity_verify/setup.ps1` syncs the package copy, installs `nrr.dll` and ONNX Runtime, and fetches the jitter model
-the tests render with from the Hub (pinned SHA-256). The URP `NRRRenderFeature`/`NRRRenderPass` in the package's
-**working tree** do not currently compile against URP 17 (CS0115 on `SetupRenderPasses`); the committed copy -
-which is what `unity_verify/` compiles, and what the 7 of 7 above ran against - does.
+the tests render with from the Hub (pinned SHA-256).
+
+The URP integration (`NRRRenderFeature`/`NRRRenderPass`) is ported to URP 17.5 and compiles with the rest of the
+package. Three things about that port are worth knowing, and all three were read out of the installed package
+rather than remembered: `ScriptableRendererFeature.SetupRenderPasses` no longer exists; a pass implementing only
+`ScriptableRenderPass.Execute` **does not run** any more - the base `RecordRenderGraph` logs "does not have an
+implementation of the RecordRenderGraph method" and skips the frame, and `Execute` itself is gone in 17.5; and
+`ScriptableRenderer.cameraColorTargetHandle` is gone as well, because render targets belong to RenderGraph. The
+pass now does its work in `RecordRenderGraph` the way URP's own `BlitToRTHandle` sample does, and the blit shader
+follows the core `Blit.hlsl` convention RenderGraph binds (`_BlitTexture`, not the old `_MainTex` quad).
+
+What is **not** claimed: the 7 of 7 above does not exercise the integration - those tests drive the runtime
+directly rather than adding a renderer feature to a camera. It compiles, it is API-correct for 17.5, and no game
+has rendered through it here.
 
 The Unity package provides:
 - Full C# P/Invoke bindings for the NRR C API (`Runtime/Scripts/`)

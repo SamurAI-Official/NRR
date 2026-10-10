@@ -131,8 +131,16 @@ Runtime package, and `NRR_REQUIRE_CUDA=0` - the switch the test itself documents
 so the Unity evidence is a CPU run like the Unreal one. `unity_verify/setup.ps1` syncs the package copy, installs
 `nrr.dll` and ONNX Runtime, and fetches the jitter model the tests render with from the Hub against a pinned
 SHA-256. One finding to finish: the package's working-tree `NRRRenderFeature`/`NRRRenderPass` do not compile
-against URP 17 (CS0115 on `SetupRenderPasses`) and `NRRRenderer.cs` now references `NRR.Rendering`, so that URP
-port is in flight.
+against URP 17 (CS0115 on `SetupRenderPasses`) and `NRRRenderer.cs` now references `NRR.Rendering`. **That port is
+done.** `SetupRenderPasses` is gone from the feature; the pass does its work in `RecordRenderGraph` the way URP's
+own `BlitToRTHandle` sample does, because in 17.5 a pass implementing only `Execute` compiles and silently skips
+every frame ("does not have an implementation of the RecordRenderGraph method") and `Execute` itself was removed
+with compatibility mode; `ScriptableRenderer.cameraColorTargetHandle` is gone too, in favour of RenderGraph-owned
+targets; the blit shader follows the core `Blit.hlsl` convention RenderGraph binds (`_BlitTexture`, not the old
+`_MainTex` quad); and `NRR.Runtime.asmdef` references the core render-pipelines assembly the RenderGraph types
+live in. The package now compiles with the integration in, and the suite is 7 of 7 with no compiler or shader
+errors. What is *not* claimed: those tests drive the runtime directly and never add the renderer feature to a
+camera, so this is "ported and compiling against 17.5" rather than "a game rendered through it here".
 
 
 ### The Godot addon as an upscaler: the token the runtime was not feeding
