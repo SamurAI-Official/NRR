@@ -59,6 +59,7 @@ upscaler, and a timing taken on a host doing other work is a timing on a busy ho
 | `phases/upscale_mid.onnx` | 424,038 | mid-training model, kept because the phase tables compare against it |
 | `phases/upscale_mid_regression.onnx` | 424,038 | the mid model as a regression baseline |
 | `probes/*.onnx` | 790 - 45,082 | the sample model and the small probe graphs the test suite and the plugin drift guards load (`nrr_upscaler_v0.1`, `nrr_passthrough_2x`, `nrr_scale_token_probe`, `nrr_unrecognised_input_probe`, `nrr_history_probe`) |
+| `tests/p4_tjit_20261025.onnx` | 499,854 | the reference model the Unity verification project renders with: its tests score their output against `engine_plugins/unity_verify/Assets/StreamingAssets/smoke_fixture/fixture.json`, whose recorded reference means were produced by this exact file. The tests select the highest-dated `models/p5/p4_tjit_*.onnx`, so this doubles as a real training checkpoint - the first of that history to be published |
 
 ## Using it
 

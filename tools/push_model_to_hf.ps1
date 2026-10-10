@@ -59,6 +59,13 @@ try {
         @{ From = "models/phase3/upscale_subsampled.onnx";      To = "phases/upscale_subsampled.onnx";     What = "the 128->256 model the protocol names" }
     )
 
+    # The Unity verification project's tests take the highest-dated models/p5/p4_tjit_*.onnx and score their
+    # renders against Assets/StreamingAssets/smoke_fixture/fixture.json, whose recorded reference means were
+    # produced by this exact file. models/ is working state, so without it a fresh clone cannot run those tests.
+    $fixtures = @(
+        @{ From = "models/p5/p4_tjit_20261025.onnx"; To = "tests/p4_tjit_20261025.onnx"; What = "the Unity jitter tests' reference model" }
+    )
+
     # Tracked in git, and loaded by tests/ and the Unreal drift guards, so a clean clone can run the suite
     # without the training output.
     $probes = @(
@@ -92,6 +99,15 @@ try {
     $total = 0
     $missing = @()
     foreach ($entry in $release) {
+        if (-not (Test-Path $entry.From)) { $missing += $entry.From; continue }
+        $destination = Join-Path $StagingDir $entry.To
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item $entry.From $destination -Force
+        $size = (Get-Item $destination).Length
+        $total += $size
+        Write-Host ("  {0,10:N0} B  {1}  <- {2}  ({3})" -f $size, $entry.To, $entry.From, $entry.What)
+    }
+    foreach ($entry in $fixtures) {
         if (-not (Test-Path $entry.From)) { $missing += $entry.From; continue }
         $destination = Join-Path $StagingDir $entry.To
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null

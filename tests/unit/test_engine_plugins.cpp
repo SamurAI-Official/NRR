@@ -12,6 +12,11 @@
 //     in include/nrr.h (a binding that drifts from the C ABI is a link error at
 //     best and a silent stub at worst).
 //
+// The Unreal plugin is guarded the same way, in the section at the foot of this file: the descriptor's module
+// list and load order, the loader's entry-point table against include/nrr.h (a name missing there resolves to a
+// null pointer at run time, on a machine that has Unreal), and the build rule that must keep *loading* the
+// library rather than linking it.
+//
 // ShugoCore reads engine_plugins/godot/plugin.cfg directly from this repository
 // (vendored as a submodule) and fails on the XML descriptor, so the format check
 // below and that consumer-side check agree by construction.
@@ -307,6 +312,27 @@ NRR_TEST(test_engine_bindings_expose_phase_aligned_accumulation) {
                      "NRRDevice must expose the result code, not only a bool - \"off\" and \"cannot\" "
                      "are different answers");
 
+    // What that pass integrates, added to the same pass later: a binding that exposed the switch but not the
+    // source would let a caller turn the integration on and be unable to ask for the one that is measured to
+    // beat the models on the input the renderer actually produces.
+    require_contains(header, "nrr_device_set_phase_aligned_source",
+                     "include/nrr.h must declare the source switch");
+    require_contains(header, "nrr_device_get_phase_aligned_source",
+                     "include/nrr.h must declare the source query");
+    require_contains(godot_h, "set_phase_aligned_source", "nrr_godot.h must declare the source switch");
+    require_contains(godot, "nrr_device_set_phase_aligned_source",
+                     "the binding must call the source switch");
+    require_contains(godot, "D_METHOD(\"set_phase_aligned_source\"",
+                     "ClassDB must bind the source switch, or GDScript cannot call it");
+    require_contains(gd, "func set_phase_aligned_source", "NRR.gd must wrap the source switch");
+    require_contains(gd, "func phase_aligned_source", "NRR.gd must wrap the source query");
+    require_contains(cs_native, "nrr_device_set_phase_aligned_source",
+                     "NRRNative must declare the source switch");
+    require_contains(cs_device, "SetPhaseAlignedSource", "NRRDevice must wrap the source switch");
+    require_contains(cs_device, "TryGetPhaseAlignedSource",
+                     "NRRDevice must expose the source query's result code too - \"could not be read\" and "
+                     "\"displayed\" are different answers");
+
     // The verify project consumes a COPY of the bindings, so the copy is compared rather than trusted: a
     // binding that is exercised there but stale here (or the reverse) is the failure this catches.
     for (const char* name : {"NRRNative.cs", "NRRDevice.cs"}) {
@@ -318,7 +344,56 @@ NRR_TEST(test_engine_bindings_expose_phase_aligned_accumulation) {
                    name);
     }
 
-    std::cout << "  phase-aligned switch exposed by the Godot binding and the Unity binding" << std::endl;
+    std::cout << "  phase-aligned switch and its source exposed by the Godot binding and the Unity binding"
+              << std::endl;
+}
+
+/* The disocclusion guard, reachable from both engines - for the same reason the phase-aligned switch above is:
+ * an entry point an engine cannot call leaves the behaviour unfixable from game code. It matters here too
+ * because the guard has a *capability-derived* default rather than an off one, so a binding that offered only
+ * "enable" would leave a caller unable to turn it off on a device that reports temporal coherence, and one
+ * that flattened the query into a bare bool would turn "this backend cannot accumulate" into a silent no-op. */
+NRR_TEST(test_engine_bindings_expose_disocclusion_rejection) {
+    using namespace plugin_files;
+    const std::string header = read("include/nrr.h");
+    const std::string godot = read("engine_plugins/godot/src/nrr_godot.cpp");
+    const std::string godot_h = read("engine_plugins/godot/src/nrr_godot.h");
+    const std::string gd = read("engine_plugins/godot/NRR.gd");
+    const std::string cs_native = read("engine_plugins/unity/Runtime/Scripts/NRRNative.cs");
+    const std::string cs_device = read("engine_plugins/unity/Runtime/Scripts/NRRDevice.cs");
+
+    require_contains(header, "nrr_device_set_disocclusion_rejection",
+                     "include/nrr.h must declare the guard switch");
+    require_contains(header, "nrr_device_get_disocclusion_rejection",
+                     "include/nrr.h must declare the guard query");
+
+    // Godot: declared in the header, called, bound for ClassDB, and wrapped in GDScript.
+    require_contains(godot_h, "set_disocclusion_rejection", "nrr_godot.h must declare the guard switch");
+    require_contains(godot_h, "get_disocclusion_rejection", "nrr_godot.h must declare the guard query");
+    require_contains(godot, "nrr_device_set_disocclusion_rejection",
+                     "the binding must call the guard switch");
+    require_contains(godot, "nrr_device_get_disocclusion_rejection",
+                     "the binding must call the guard query");
+    require_contains(godot, "D_METHOD(\"set_disocclusion_rejection\"",
+                     "ClassDB must bind the guard switch, or GDScript cannot call it");
+    require_contains(godot, "D_METHOD(\"get_disocclusion_rejection\"",
+                     "ClassDB must bind the guard query");
+    require_contains(gd, "func set_disocclusion_rejection", "NRR.gd must wrap the guard switch");
+    require_contains(gd, "func disocclusion_rejection", "NRR.gd must wrap the guard query");
+
+    // Unity: the raw declarations, the managed wrappers, and the query that keeps the two answers apart. (The
+    // phase-aligned test above compares these two files against the verify project's copies, which the same
+    // edit re-copied.)
+    require_contains(cs_native, "nrr_device_set_disocclusion_rejection",
+                     "NRRNative must declare the guard switch");
+    require_contains(cs_native, "nrr_device_get_disocclusion_rejection",
+                     "NRRNative must declare the guard query");
+    require_contains(cs_device, "SetDisocclusionRejection", "NRRDevice must wrap the guard switch");
+    require_contains(cs_device, "TryGetDisocclusionRejection",
+                     "NRRDevice must expose the result code, not only a bool - \"off\" and \"cannot\" "
+                     "are different answers");
+
+    std::cout << "  disocclusion guard exposed by the Godot binding and the Unity binding" << std::endl;
 }
 
 NRR_TEST(test_godot_post_process_is_renderer_agnostic) {
@@ -434,6 +509,99 @@ NRR_TEST(test_c_api_entry_point_count_matches_header) {
     NRR_ASSERT(test_only >= 1, "the test harness entry point must be declared and excluded");
     NRR_EXPECT_EQ(declared - test_only, static_cast<size_t>(NRR_ENTRY_POINT_COUNT),
                   "NRR_ENTRY_POINT_COUNT must match the declarations in include/nrr.h");
+}
+
+/* ---------------------------------------------------------------------------
+ * The Unreal plugin's drift guards.
+ *
+ * Same reasoning as the Godot ones above, plus one that only exists here: NRRRuntime.h carries a macro list of
+ * every entry point (NRR_ENTRY_POINTS) that the loader resolves *by name* at run time. A name added to nrr.h and
+ * not to that list resolves to a null pointer on a machine with Unreal installed - not in this suite - so the
+ * list is compared against the header's own declarations here, where the check costs nothing.
+ * ------------------------------------------------------------------------- */
+
+NRR_TEST(test_unreal_plugin_descriptor_lists_both_modules) {
+    using namespace plugin_files;
+    const std::string descriptor = read("engine_plugins/unreal/NRRPlugin.uplugin");
+
+    require_contains(descriptor, "\"Modules\"", "the plugin descriptor must declare its modules");
+    require_contains(descriptor, "\"NRRRuntime\"", "the library loader must be a module");
+    require_contains(descriptor, "\"NRRPlugin\"", "the component module must be a module");
+    // The loader must be up before the module that uses it, or a device can be asked for before the library is
+    // resolved - which works by luck on a fast machine and not on a slow one.
+    require_contains(descriptor, "\"LoadingPhase\": \"PreDefault\"", "the library must load before the plugin module");
+
+    // Unreal parses this file as JSON: XML is what the Godot descriptor used to be, and JSON has no comments.
+    NRR_ASSERT(!contains(descriptor, "<?xml"), "the descriptor must not be XML");
+    NRR_ASSERT(!contains(descriptor, "//"), "the descriptor must not contain comments - Unreal parses strict JSON");
+}
+
+NRR_TEST(test_unreal_entry_point_list_covers_every_declared_entry_point) {
+    using namespace plugin_files;
+    const std::string header = read("include/nrr.h");
+    const std::string runtime = read("engine_plugins/unreal/Source/NRRRuntime/Public/NRRRuntime.h");
+
+    // Every name in the header's NRR_API declarations: the first nrr_-prefixed identifier before the first '('.
+    // Return types are NRRResult/NRRCapabilityState/uint64_t/const char*/bool/int, none of which start with nrr_.
+    std::vector<std::string> declared;
+    for (size_t pos = header.find("NRR_API "); pos != std::string::npos;
+         pos = header.find("NRR_API ", pos + 1)) {
+        for (size_t cursor = pos; cursor < header.size() && header[cursor] != '('; ++cursor) {
+            if (header.compare(cursor, 4, "nrr_") == 0) {
+                size_t end = cursor;
+                while (end < header.size()
+                       && (std::isalnum(static_cast<unsigned char>(header[end])) || header[end] == '_')) {
+                    ++end;
+                }
+                declared.push_back(header.substr(cursor, end - cursor));
+                break;
+            }
+        }
+    }
+
+    NRR_EXPECT_EQ(declared.size(), static_cast<size_t>(NRR_ENTRY_POINT_COUNT + 1),
+                  "the header declares NRR_ENTRY_POINT_COUNT entry points plus the test hook");
+
+    size_t covered = 0;
+    for (const std::string& name : declared) {
+        if (name == "nrr_test_entry_point_count") continue;   // loaded separately, checked as the ABI guard
+        require_contains(runtime, "X(" + name + ")", "NRR_ENTRY_POINTS must resolve " + name);
+        ++covered;
+    }
+    NRR_EXPECT_EQ(covered, static_cast<size_t>(NRR_ENTRY_POINT_COUNT),
+                  "every entry point in nrr.h must be in the Unreal loader's table");
+}
+
+NRR_TEST(test_unreal_build_rules_load_the_library_rather_than_linking_it) {
+    using namespace plugin_files;
+    const std::string rules = read("engine_plugins/unreal/Source/NRRRuntime/NRRRuntime.Build.cs");
+
+    // The premise of the module: the library is resolved at run time, so nothing may link it and nothing may
+    // define NRR_USING_DLL (which would turn every declaration in nrr.h into an import symbol the linker wants).
+    // Quoted, because the file *names* the macro in the comment that explains why it must not be defined.
+    NRR_ASSERT(!contains(rules, "PublicAdditionalLibraries"),
+               "the runtime module must not link the library: it resolves the entry points at run time");
+    NRR_ASSERT(!contains(rules, "\"NRR_USING_DLL\""),
+               "NRR_USING_DLL must not be defined: the module compiles against a description of the ABI, not a lib");
+
+    // And the header has to be findable in three situations: a copy shipped inside the plugin, this repository,
+    // and an explicit override. A build rule that only knows one of them is a plugin that only works at home.
+    require_contains(rules, "ThirdParty", "the packaged header location must be searched");
+    require_contains(rules, "NRR_INCLUDE_DIR", "the explicit override must be honoured");
+}
+
+NRR_TEST(test_unreal_verify_project_installs_what_the_plugin_needs) {
+    using namespace plugin_files;
+    const std::string setup = read("engine_plugins/unreal_verify/setup.ps1");
+    require_contains(setup, "include/nrr.h", "the verify project must install the header the plugin compiles against");
+    require_contains(setup, "nrr.dll", "and the library it loads at run time");
+    require_contains(setup, "upscale_msreal_scale.onnx", "and the released model, so the run exercises a real one");
+
+    // A project with a C++ plugin needs target rules of its own, or UBT has no project rules assembly to consult.
+    const std::string target = read("engine_plugins/unreal_verify/Source/NRRVerify.Target.cs");
+    require_contains(target, "ExtraModuleNames", "the game target must declare its (empty) module list");
+    const std::string editor_target = read("engine_plugins/unreal_verify/Source/NRRVerifyEditor.Target.cs");
+    require_contains(editor_target, "TargetType.Editor", "the editor target must be an editor target");
 }
 
 } // namespace test

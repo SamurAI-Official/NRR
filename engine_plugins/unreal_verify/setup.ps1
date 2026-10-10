@@ -58,11 +58,52 @@ $pluginDst = Join-Path $here 'Plugins/NRRPlugin'
 
 if (-not (Test-Path $pluginSrc)) { throw "plugin source not found: $pluginSrc" }
 
-# --- 1. copy the plugin -----------------------------------------------------
-if (Test-Path $pluginDst) { Remove-Item -Recurse -Force $pluginDst }
-New-Item -ItemType Directory -Force (Split-Path -Parent $pluginDst) | Out-Null
-Copy-Item -Recurse $pluginSrc $pluginDst
-Write-Host "[setup] copied plugin -> $pluginDst"
+# --- 1. sync the plugin sources ----------------------------------------------
+# The plugin is made to match the source tree in place rather than deleted and re-copied. Deleting it took
+# Binaries/Win64 with it, so every re-run invalidated the built modules and cost a full editor rebuild (13
+# actions, and 500+ seconds of it) to change nothing. What the delete was for still happens: anything under
+# Plugins/NRRPlugin that the source no longer has is removed, so a deleted source file cannot linger and keep
+# compiling. Binaries/Intermediate/Saved are build output and Models/ is the installed model - all four are left
+# alone, and the install steps below fill them in.
+$preserved = @('Binaries', 'Intermediate', 'Saved', 'Models')
+
+function Sync-PluginDirectory([string]$From, [string]$To) {
+    New-Item -ItemType Directory -Force $To | Out-Null
+    $present = @{}
+    foreach ($item in Get-ChildItem -LiteralPath $From -Force) {
+        $present[$item.Name] = $true
+        $target = Join-Path $To $item.Name
+        if ($item.PSIsContainer) {
+            if ($preserved -contains $item.Name) { continue }
+            Sync-PluginDirectory $item.FullName $target
+        } else {
+            Copy-Item -LiteralPath $item.FullName -Destination $target -Force
+        }
+    }
+    foreach ($existing in Get-ChildItem -LiteralPath $To -Force) {
+        if ((-not $present.ContainsKey($existing.Name)) -and ($preserved -notcontains $existing.Name)) {
+            Remove-Item -LiteralPath $existing.FullName -Recurse -Force
+            Write-Host "[setup] removed stale $($existing.FullName.Replace($pluginDst + '\', ''))"
+        }
+    }
+}
+
+function Copy-IfChanged([string]$From, [string]$To) {
+    # Copy-Item preserves the source timestamp, so an unchanged file is recognisable without hashing 2.7 GB of
+    # CUDA runtime on every run. Returns true when it actually copied.
+    if (Test-Path -LiteralPath $To) {
+        $source = Get-Item -LiteralPath $From
+        $destination = Get-Item -LiteralPath $To
+        if (($source.Length -eq $destination.Length) -and ($source.LastWriteTimeUtc -eq $destination.LastWriteTimeUtc)) {
+            return $false
+        }
+    }
+    Copy-Item -LiteralPath $From -Destination $To -Force
+    return $true
+}
+
+Sync-PluginDirectory $pluginSrc $pluginDst
+Write-Host "[setup] synced plugin -> $pluginDst (Binaries/Intermediate/Saved/Models kept in place)"
 
 # UE discovers a plugin by its .uplugin; without one the module sources are inert files.
 $descriptor = Join-Path $pluginDst 'NRRPlugin.uplugin'
@@ -79,7 +120,7 @@ New-Item -ItemType Directory -Force $binDst | Out-Null
 # check - rather than by an unresolved symbol or, worse, by a call through a pointer with the wrong signature.
 $headerDst = Join-Path $pluginDst 'ThirdParty/NRR/include'
 New-Item -ItemType Directory -Force $headerDst | Out-Null
-Copy-Item (Join-Path $repo 'include/nrr.h') $headerDst -Force
+Copy-IfChanged (Join-Path $repo 'include/nrr.h') (Join-Path $headerDst 'nrr.h') | Out-Null
 Write-Host "[setup] installed ThirdParty/NRR/include/nrr.h"
 
 # --- 2. the library the plugin loads ----------------------------------------
@@ -91,7 +132,7 @@ if ($nrrCandidates.Count -eq 0) {
     throw ("nrr.dll not found. Build the runtime first - pwsh tools/build.ps1 -Config Release - or point this " +
            "at a checkout that already has one in build/Release.")
 }
-Copy-Item $nrrCandidates[0] $binDst -Force
+Copy-IfChanged $nrrCandidates[0] (Join-Path $binDst 'nrr.dll') | Out-Null
 Write-Host "[setup] installed $($nrrCandidates[0])"
 
 # ONNX Runtime, preferring the GPU package (it carries the CPU provider as well). ONNX Runtime resolves
@@ -106,7 +147,7 @@ if ($ortRoots.Count -eq 0) {
     foreach ($dll in @('onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'onnxruntime_providers_cuda.dll')) {
         $src = Join-Path $ortRoots[0].FullName "lib\$dll"
         if (Test-Path $src) {
-            Copy-Item $src $binDst -Force
+            Copy-IfChanged $src (Join-Path $binDst $dll) | Out-Null
             Write-Host ("[setup] installed {0} ({1:N0} MB)" -f $dll, ((Get-Item $src).Length / 1MB))
         }
     }
@@ -122,9 +163,12 @@ if (-not $SkipCuda) {
                     "it with: pwsh tools/fetch_cuda_runtime.ps1") -ForegroundColor Yellow
     } else {
         $cudaDlls = @(Get-ChildItem -Path $cudaDirs[0] -Filter '*.dll')
-        foreach ($dll in $cudaDlls) { Copy-Item $dll.FullName $binDst -Force }
-        Write-Host ("[setup] installed {0} CUDA runtime DLL(s), {1:N0} MB" -f `
-            $cudaDlls.Count, (($cudaDlls | Measure-Object -Property Length -Sum).Sum / 1MB))
+        $changed = 0
+        foreach ($dll in $cudaDlls) {
+            if (Copy-IfChanged $dll.FullName (Join-Path $binDst $dll.Name)) { $changed++ }
+        }
+        Write-Host ("[setup] CUDA runtime: {0} of {1} DLL(s) copied or updated, {2:N0} MB in total" -f `
+            $changed, $cudaDlls.Count, (($cudaDlls | Measure-Object -Property Length -Sum).Sum / 1MB))
     }
 } else {
     Write-Host "[setup] -SkipCuda: the CUDA provider will not attach (CPU provider only)"
@@ -151,7 +195,7 @@ function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -Path $Path
 if ($ModelFromHub -or (-not (Test-Path $localModel))) { $useHub = $true } else { $useHub = $false }
 
 if (-not $useHub) {
-    Copy-Item $localModel $stagedModel -Force
+    Copy-IfChanged $localModel $stagedModel | Out-Null
     $localHash = Get-Sha256 $stagedModel
     if ($localHash -eq $modelSha256) {
         Write-Host "[setup] installed Models/$modelName from models/phase4/ (the released upscaler)"
@@ -193,7 +237,7 @@ if (-not $useHub) {
         throw ("the model downloaded from $modelRepo is not the released model: expected sha256 $modelSha256, " +
                "got $fetchedHash. Another revision, or a download that was not the file. Nothing was installed.")
     }
-    Copy-Item $fetched $stagedModel -Force
+    Copy-IfChanged $fetched $stagedModel | Out-Null
     Write-Host "[setup] installed Models/$modelName from $modelRepo (sha256 verified)"
 }
 

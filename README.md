@@ -82,9 +82,10 @@ nrr/
 │   └── platform/                 # Phase 13: Android (NDK/JNI) + iOS (Obj-C++) bridges
 │
 ├── models/                     # Phase 3: sample .onnx fixtures + architecture docs + (generated, not committed) training pairs and trained models
-├── engine_plugins/             # Phase 10-12: Unreal (headers only), Godot (addon + GDExtension, built & run), Unity (code)
+├── engine_plugins/             # Phase 10-12: Unreal (plugin + verification harness, built & run), Godot (addon + GDExtension, built & run), Unity (code)
 ├── tools/                      # build/fetch scripts, gen_sample_model.py, gen_training_pairs.py, train_nrr.py, pack_godot_pairs.py, check_capture.py, godot_capture/ (engine motion-vector capture)
-├── docs/                       # roadmap.md (authoritative status + plan)
+├── benchmarks/                 # nrr_bench.cpp + xess_host/ + dlss_host/: our benchmarker and the two vendor hosts
+├── docs/                       # roadmap.md (authoritative status + plan), parity.md and parity-512.md (generated tables)
 ├── tests/                      # unified suite (main.cpp) + standalone phase tests
 │   ├── unit/                   # API, device, model, reference, backend, inference, mobile
 │   ├── integration/            # frame pipeline, multi-frame, temporal accumulation, reference/conditioning
@@ -258,13 +259,37 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       gone from the ONNX path; the placeholder path without an ONNX session still echoes
       the input and reports a hard-coded stability). Verified by
       `tests/integration/test_temporal_accumulation.cpp` (7 tests, all driving `nrr_render`
-      with a real ONNX model) and `tests/integration/test_multi_frame.cpp` (6 tests on the
+      with a real ONNX model) and `tests/integration/test_multi_frame.cpp` (8 tests on the
       history/state/renderer classes).
 - [x] Temporal blending (alpha compositing) into the output image
 - [ ] Temporal accumulation that improves detail: today it accumulates the *untrained*
       fixture, so it only reduces flicker. Needs M1's trained model.
-- [ ] Disocclusion rejection and clamping (history is currently trusted wherever the
-      motion field says it reprojects)
+- [x] Disocclusion rejection and clamping, defaulted from the device's capability. The history
+      is no longer trusted wherever the motion field says it reprojects: the runtime builds this
+      frame's *history trust mask*
+      itself - from the current depth, the previous frame's recorded depth and this frame's
+      motion, the same rule the packer writes into its training pairs and a model's `validity`
+      input is fed - and hands it to the reprojection blend, which keeps the current frame at
+      the pixels the mask refuses and clamps the reprojected history at the rest to the current
+      frame's neighbourhood (`TEMPORAL_CLAMP_RADIUS`). The guard is on by default wherever the
+      device reports *temporal coherence* (BASIC or better) and off where it does not - decided
+      once from the device's own capability, so a device that can do the temporal work is not
+      left without the guard and a device that cannot is not handed the extra pass - and it is
+      overridable through `nrr_device_set_disocclusion_rejection` (or, from game code,
+      `NRR.set_disocclusion_rejection()`/`NRRDevice.SetDisocclusionRejection`). Every backend that
+      accumulates temporal history reports it, so the guard is live on the CPU backend and the
+      five desktop accelerator backends (NVIDIA, AMD, Intel, Vulkan, RISC-V) that render through
+      the shared kernel; the mobile backends run on a different kernel with no accumulator and
+      are correctly excluded. A frame with no depth
+      attachment or no recorded previous depth gets no mask and keeps the un-guarded blend for
+      that frame, which is also every frame on a device that reports no temporal coherence.
+      Verified by `tests/integration/test_multi_frame.cpp` (rejection and clamp on
+      `blend_frame`), `tests/unit/test_history_mask.cpp` (the mask, and the decode of the raw
+      attachments a binding feeds it), `tests/unit/test_jitter.cpp` (the whole path through the
+      accumulator, guard off vs on), `tests/unit/test_api.cpp` (the C ABI switch and its
+      capability default) and
+      `tests/integration/test_temporal_accumulation.cpp` (the default-on path through the real
+      pipeline, with a depth that has geometry).
 - [ ] Flicker regression gate in CI (the metric is reported and asserted in the suite,
       but not yet compared against a committed quality baseline)
 
@@ -356,17 +381,24 @@ GPU one does. See [docs/roadmap.md](docs/roadmap.md) M2.
 - [ ] Full RISC-V vector backend (RISC-V cross-compilation toolchain + RVV extension)
 - [ ] Vendor plugin isolation (Phase 15)
 
-### Phase 10 - Unreal Integration (not implemented)
-- [x] Plugin Build.cs configuration (engine_plugins/unreal/Source/NRRPlugin/NRRPlugin.Build.cs)
-- [x] Public header declarations (NRRPlugin.h, UNRRComponent, NRRRuntimeModule)
-- [ ] NRRRuntimeModule library loading - the plugin contains no `.cpp` files at all,
-      so no module is implemented, nothing loads `nrr.dll`, and the plugin cannot link
-- [ ] UNRRComponent implementation (the declared UFUNCTIONs have no bodies)
-- [ ] Blueprint-exposed functions (declared only)
-- [ ] UObject wrappers for NRR types
-- [ ] Full C++ ↔ NRR binding
+### Phase 10 - Unreal Integration (implemented, built and verified against UE 5.8.3: `RESULT: PASS`)
+- [x] Plugin descriptor (`NRRPlugin.uplugin`) - Unreal discovers the plugin by this file, and the skeleton had none
+- [x] `NRRRuntimeModule` library loading - `nrr.dll` is loaded at run time and **all 51** entry points of
+      `include/nrr.h` are resolved with `GetDllExport`, with the missing ones named, the whole table typed from the
+      header (`decltype(&nrr_render)`), and the DLL's own entry-point count compared against the header's
+- [x] `UNRRComponent` implementation - device, model, frame submission, capabilities, per-frame stats, and a
+      passthrough flag that says when the model did *not* run
+- [x] Blueprint-exposed functions (the component's whole surface is `BlueprintCallable`/`BlueprintPure`)
+- [x] Full C++ binding to the NRR API (all 51 entry points, resolved rather than linked)
+- [x] Headless verification harness (`engine_plugins/unreal_verify/`: UE 5.8 project, `setup.ps1`, `NRRVerify`
+      commandlet, plus four drift guards in `tests/unit/test_engine_plugins.cpp`)
+- [ ] UObject wrappers for NRR types (the component exposes structs: `FNRRCapabilities`, `FNRRFrameStats`)
 - [ ] Editor UI for model/reference management
-- [ ] Render pass integration
+- [ ] Render pass integration (a `USceneViewExtension`; frames are submitted explicitly today, and depth/motion
+      are refused with a message rather than silently dropped)
+- [ ] **The verification run itself**: the plugin compiles for UE 5.8.3, but a launcher *Installed* engine cannot
+      link a standalone Game target (it ships no import libraries) and its Editor target needs the .NET Framework
+      4.6+ SDK, which this host lacks. One Visual Studio component away - see `engine_plugins/unreal/README.md`
 
 ### Phase 11 - Godot Integration (addon compiled, loaded and rendering in Godot 4.7.2)
 

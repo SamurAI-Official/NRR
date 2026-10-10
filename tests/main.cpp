@@ -314,6 +314,14 @@ NRR_RUN_TEST(test_input_render_resolve_matches_the_derived_plane);
     NRR_RUN_TEST(test_engine_bindings_expose_phase_aligned_accumulation);
     NRR_RUN_TEST(test_engine_bindings_expose_disocclusion_rejection);
     NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
+    /* The Unreal plugin: the descriptor's module list and load order, the loader's entry-point table against
+     * include/nrr.h, the build rule that must keep loading the library instead of linking it, and the verify
+     * project's install step. None of it needs an Unreal install to check - and the entry-point one exists
+     * because a name missing from that table resolves to null at run time, on a machine that has Unreal. */
+    NRR_RUN_TEST(test_unreal_plugin_descriptor_lists_both_modules);
+    NRR_RUN_TEST(test_unreal_entry_point_list_covers_every_declared_entry_point);
+    NRR_RUN_TEST(test_unreal_build_rules_load_the_library_rather_than_linking_it);
+    NRR_RUN_TEST(test_unreal_verify_project_installs_what_the_plugin_needs);
     NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
     NRR_RUN_TEST(test_godot_addon_has_no_nested_project_file);
 

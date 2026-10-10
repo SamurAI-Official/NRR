@@ -47,11 +47,13 @@ engine_plugins/
 
 ## Unreal Engine (M5)
 
-**Status**: implemented, and compiling against UE 5.8.3. The headless verification has not *run* yet, and the
-reason is the host rather than the plugin - see `unreal/README.md`. `NRRRuntime` loads `nrr.dll` at run time and
-resolves all 51 entry points of `include/nrr.h`; `NRRPlugin` provides `UNRRComponent` and the `NRRVerify`
-commandlet; `unreal_verify/` is the UE 5.8 project that runs it. What the plugin deliberately does not do yet (no
-pass-level viewport hook, no depth/motion, no editor UI) is listed in `unreal/README.md`.
+**Status**: **built and run.** `unreal_verify/` builds the plugin as an Unreal editor plugin and its `NRRVerify`
+commandlet renders the released model at three tiers headless, printing `RESULT: PASS` with exit code 0
+(2026-10-10, UE 5.8.3). That run is on this host's **CPU** execution provider, because the CUDA provider crashes
+during model load here; the transcript, and every host failure it took to get there, are in
+`unreal_verify/README.md`. `NRRRuntime` loads `nrr.dll` at run time and resolves all 51 entry points of
+`include/nrr.h`; `NRRPlugin` provides `UNRRComponent` and the commandlet. What the plugin deliberately does not do
+yet (no pass-level viewport hook, no depth/motion, no editor UI) is listed in `unreal/README.md`.
 
 The Unreal plugin provides:
 - `UNRRComponent` - the Actor component: device, model, frame submission, capabilities and per-frame stats
@@ -107,7 +109,17 @@ See [godot/README.md](godot/README.md) for the build steps and the known limits
 
 ## Unity (Phase 12)
 
-**Status**: Full C# bindings, URP render feature, editor tools, and demo sample
+**Status**: **built and run.** `unity_verify/` is a Unity 6 project (URP 17) whose Unity Test Framework tests render
+real frames through the native plugin and score them - **7 of 7 pass** (2026-10-10, Unity 6000.5.8f1), including a
+URP camera pass and a cross-check of the C# binding against the repository's own Python reference. They measure
+rather than assert liveness, so the evidence is the results XML (`result=Passed`) and Unity's exit code rather than
+a printed `RESULT:` line; the transcript is in `unity_verify/README.md`. That run is a **CPU** run: the project
+ships the CPU ONNX Runtime package, so `TheSessionRanOnTheGpuNotACpuFallback` is satisfied only through
+`NRR_REQUIRE_CUDA=0` - the switch that test itself documents - and the GPU path is unverified on this machine.
+`unity_verify/setup.ps1` syncs the package copy, installs `nrr.dll` and ONNX Runtime, and fetches the jitter model
+the tests render with from the Hub (pinned SHA-256). The URP `NRRRenderFeature`/`NRRRenderPass` in the package's
+**working tree** do not currently compile against URP 17 (CS0115 on `SetupRenderPasses`); the committed copy -
+which is what `unity_verify/` compiles, and what the 7 of 7 above ran against - does.
 
 The Unity package provides:
 - Full C# P/Invoke bindings for the NRR C API (`Runtime/Scripts/`)
@@ -166,3 +178,5 @@ public class NRRRenderer : MonoBehaviour
 - GDNative bindings for Godot 3.x
 - Blueprint function library for Unreal
 - Editor tools for model/reference management
+
+
