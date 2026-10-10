@@ -145,7 +145,7 @@ try {
 
     # The repository may not exist yet. Confirming it here removes the most common way this fails after a
     # successful login, and the message below names the other one.
-    & $hf repo create $RepoId --repo-type model --exist-ok
+    & $hf repos create $RepoId --type model --exist-ok
     if ($LASTEXITCODE -ne 0) {
         throw ("could not create or confirm $RepoId. A token without write access to that organisation reports " +
                "the same way as a repository that does not exist - check which token 'hf auth whoami' is using.")
