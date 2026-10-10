@@ -120,6 +120,21 @@ cuDNN 9 + ONNX Runtime 1.30 + this NVIDIA driver, so the verification sets the r
 above is a CPU number.
 
 **The model has a home now, and the setup step fetches it from there.** The released model was never in git (models/phase4/ is working state), so it is published at https://huggingface.co/SamurAI-Official/NRR with a model card that states the graph's real contract (color, jitter, and a scale tier token - 0.0 for 128->256, 1.0 for 256->512) rather than the aspirational 1080p->4K description models/architecture.md still carries. 	ools/push_model_to_hf.ps1 uploads a curated 1.7 MB set: hf upload SamurAI-Official/NRR . would have pushed about 18 GB of build output and CUDA runtime, and the project's own README would have replaced the model card. engine_plugins/unreal_verify/setup.ps1 now fetches the model from the Hub when a checkout does not have it, checking it against the released model's pinned SHA-256 first. Both branches are verified: -ModelFromHub fetches and installs it, the plain run takes the local copy through the same check, and the commandlet then prints RESULT: PASS at all three tiers with exit code 0.
+**Unity is verified too, and it measured something.** `engine_plugins/unity_verify/` is a Unity 6 project (URP 17)
+whose Unity Test Framework tests render real frames through the native plugin and score them: 7 of 7 pass
+(2026-10-10, Unity 6000.5.8f1), including a URP camera pass and a cross-check of the C# binding against the
+repository's own Python reference. The jitter test reproduces the fixture's recorded number - `mean=3.2880`
+against `reference.correct = 3.2880878...`, a 0.04% reproduction of a measurement taken when the fixture was
+captured - which is the difference between "it rendered" and "it rendered what it should". Run with defaults the
+same suite gives 6 of 7: `TheSessionRanOnTheGpuNotACpuFallback` fails because this project ships the CPU ONNX
+Runtime package, and `NRR_REQUIRE_CUDA=0` - the switch the test itself documents - is what the passing run sets,
+so the Unity evidence is a CPU run like the Unreal one. `unity_verify/setup.ps1` syncs the package copy, installs
+`nrr.dll` and ONNX Runtime, and fetches the jitter model the tests render with from the Hub against a pinned
+SHA-256. One finding to finish: the package's working-tree `NRRRenderFeature`/`NRRRenderPass` do not compile
+against URP 17 (CS0115 on `SetupRenderPasses`) and `NRRRenderer.cs` now references `NRR.Rendering`, so that URP
+port is in flight.
+
+
 ### The Godot addon as an upscaler: the token the runtime was not feeding
 
 The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDExtension, `NRR.gd`, and
