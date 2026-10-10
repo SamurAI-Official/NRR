@@ -262,6 +262,8 @@ Ref<Image> NRRNative::render_frame(const Ref<Image> &p_color,
 		state["history_frames"] = static_cast<int64_t>(output.temporal.history_frames);
 		state["jitter_enabled"] = jitter_enabled_;
 		state["phase_aligned_enabled"] = get_phase_aligned_accumulation();
+		state["phase_aligned_source"] = get_phase_aligned_source();
+		state["disocclusion_rejection"] = get_disocclusion_rejection();
 		state["debug_info"] = godot::String(output.stats.debug_info);
 		last_temporal_state_ = state;
 	}
@@ -309,6 +311,66 @@ int NRRNative::get_phase_aligned_accumulation() {
 	int enabled = 0;
 	if (nrr_device_get_phase_aligned_accumulation(device_, &enabled) != NRR_SUCCESS) {
 		fail("nrr_device_get_phase_aligned_accumulation");
+		return -1;
+	}
+	return enabled != 0 ? 1 : 0;
+}
+
+bool NRRNative::set_phase_aligned_source(int p_source) {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return false;
+	}
+	if (nrr_device_set_phase_aligned_source(device_, p_source) != NRR_SUCCESS) {
+		/* The runtime refuses an unknown value rather than clamping it onto the default, and refuses a
+		 * backend with no accumulator rather than accepting a setting nothing will honour - the same two
+		 * reasons the switch above reports through last_error(). */
+		fail("nrr_device_set_phase_aligned_source");
+		return false;
+	}
+	return true;
+}
+
+int NRRNative::get_phase_aligned_source() {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return -1;
+	}
+	int source = 0;
+	if (nrr_device_get_phase_aligned_source(device_, &source) != NRR_SUCCESS) {
+		fail("nrr_device_get_phase_aligned_source");
+		return -1;
+	}
+	return source;
+}
+
+bool NRRNative::set_disocclusion_rejection(bool p_enabled) {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return false;
+	}
+	if (nrr_device_set_disocclusion_rejection(device_, p_enabled ? 1 : 0) != NRR_SUCCESS) {
+		/* As for the phase-aligned switch: the runtime's message keeps "device is not initialized" apart
+		 * from "this backend has no accumulator", and the second is the one a caller could mistake for a
+		 * successful disable. */
+		fail("nrr_device_set_disocclusion_rejection");
+		return false;
+	}
+	return true;
+}
+
+int NRRNative::get_disocclusion_rejection() {
+	last_error_ = String();
+	if (!initialized_ || device_ == nullptr) {
+		set_error("no NRR device; call initialize() first");
+		return -1;
+	}
+	int enabled = 0;
+	if (nrr_device_get_disocclusion_rejection(device_, &enabled) != NRR_SUCCESS) {
+		fail("nrr_device_get_disocclusion_rejection");
 		return -1;
 	}
 	return enabled != 0 ? 1 : 0;
@@ -513,6 +575,14 @@ void NRRNative::_bind_methods() {
 	                            &NRRNative::set_phase_aligned_accumulation);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_phase_aligned_accumulation"),
 	                            &NRRNative::get_phase_aligned_accumulation);
+	godot::ClassDB::bind_method(godot::D_METHOD("set_phase_aligned_source", "source"),
+	                            &NRRNative::set_phase_aligned_source);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_phase_aligned_source"),
+	                            &NRRNative::get_phase_aligned_source);
+	godot::ClassDB::bind_method(godot::D_METHOD("set_disocclusion_rejection", "enabled"),
+	                            &NRRNative::set_disocclusion_rejection);
+	godot::ClassDB::bind_method(godot::D_METHOD("get_disocclusion_rejection"),
+	                            &NRRNative::get_disocclusion_rejection);
 	godot::ClassDB::bind_method(godot::D_METHOD("set_motion_magnitude", "magnitude"),
 	                            &NRRNative::set_motion_magnitude);
 	godot::ClassDB::bind_method(godot::D_METHOD("get_motion_magnitude"),

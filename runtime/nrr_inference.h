@@ -42,10 +42,30 @@ enum class TensorRole {
      * that every engine must produce is an input that exists only where someone has implemented it. The role
      * exists so a model that declares it is fed the mask, instead of falling through to the colour path. */
     Validity,
+    /* The resolution token: which grid these samples were drawn on, as an octave measure - log2(input_width /
+     * 128), constant over the input plane. A scale-agnostic model declares it (trained on more than one tier,
+     * with the token as its only description of which tier it is looking at). Without a role the name fell
+     * through to the colour path: three channels of image into a one-channel input, whose element count the
+     * session then rejected, so such a model could not render at all. The value is *derived* from the frame
+     * rather than supplied, for the reason the trust mask is computed here rather than asked for - a token no
+     * engine has to produce is a token no engine can get wrong. It must stay in step with
+     * tools/compare_upscalers.py's build_feed_from_image(), which derives the same number for the harness. */
+    Scale,
     Other,
 };
 
 TensorRole classify_tensor_role(const std::string& name);
+
+/* The input width the resolution token measures octaves from: log2(width / this) is 0.0 at the reference tier,
+ * 1.0 at twice it, 2.0 at four times. Named rather than inlined because it is a claim about the training data
+ * (the lowest tier the released model saw) and not an arbitrary normalisation. */
+constexpr float kScaleReferenceWidth = 128.0f;
+
+/* Builds the resolution token plane: log2(width / kScaleReferenceWidth), repeated over the input grid (one
+ * channel, NCHW). It is one number per frame rather than per pixel - the plane's shape is what lets a
+ * convolution read it, not its content. Returns false for a zero-sized frame, which is a caller error rather
+ * than a token. */
+bool build_scale_plane(uint32_t width, uint32_t height, std::vector<float>& out_nchw);
 
 /* Fills the dynamic dimensions (-1) of a model's 4-D NCHW input shape with
  * concrete values (1, channels, height, width). An EMPTY model_shape means the

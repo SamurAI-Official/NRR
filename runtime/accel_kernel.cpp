@@ -54,7 +54,8 @@ AcceleratorExecutionKernel::AcceleratorExecutionKernel()
     : initialized_(false), preferred_ep_(AccelEP::CPU),
       active_model_(nullptr), frame_references_(nullptr), current_frame_(0),
       current_memory_usage_(0), peak_memory_usage_(0),
-      current_memory_usage_bytes_(0), peak_memory_usage_bytes_(0) {
+      current_memory_usage_bytes_(0), peak_memory_usage_bytes_(0),
+      disocclusion_rejection_default_(false) {
     std::memset(&accel_caps_, 0, sizeof(accel_caps_));
     accel_caps_.preferred_ep = AccelEP::CPU;
 }
@@ -85,6 +86,10 @@ bool AcceleratorExecutionKernel::initialize(
     /* Temporal accumulation is part of the render path, not an optional extra: the
      * CPU backend has always done it and this path must match it. */
     temporal_.initialize();
+    /* A default the device derived from this backend's temporal-coherence capability, set before the kernel
+     * existed, is applied the moment the accumulator does - so a vendor backend that claims temporal
+     * coherence gets the disocclusion guard without its caller asking, exactly as the CPU backend does. */
+    temporal_.set_disocclusion_rejection_enabled(disocclusion_rejection_default_);
     initialized_ = true;
     return true;
 }
@@ -183,19 +188,58 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         return NRR_ERROR_INVALID_ARGUMENT;
     TextureImpl* depth_tex = reinterpret_cast<TextureImpl*>(input.depth);
     TextureImpl* motion_tex = reinterpret_cast<TextureImpl*>(input.motion_vectors);
-    /* The previous frame's low-resolution render, for a temporal model's `history`
-     * input. Supplied by the caller as a texture, because unlike the CPU backend this
-     * kernel does not own an accumulator to ask. `previous_output` is deliberately not
-     * used: that is the displayed frame at *output* resolution, twice the size, and
-     * feeding it where the model expects a same-resolution low-res render would be a
+    /* The previous frame's low-resolution render, as this kernel's *own* accumulator recorded it. The comment
+     * here used to say the kernel "does not own an accumulator to ask" - it does (temporal_), and not asking it
+     * was this path's half of the history seam docs/roadmap.md records: a temporal model was fed a zero-filled
+     * history on the path that ships on a desktop accelerator, while every dataset it was trained on carried
+     * the reprojected plane. A caller may still supply one itself (input.temporal.history_input), and that
+     * wins. `previous_output` is deliberately not used: that is the displayed frame at *output* resolution,
+     * twice the size, and feeding it where the model expects a same-resolution low-res render would be a
      * mismatch a dynamic graph accepts silently. */
     TextureImpl* history_tex = reinterpret_cast<TextureImpl*>(input.temporal.history_input);
+    std::vector<uint8_t> previous_frame_bytes;
+    uint32_t previous_frame_w = 0;
+    uint32_t previous_frame_h = 0;
+    NRRTextureFormat previous_frame_format = NRR_TEXTURE_FORMAT_RGB8;
+    const bool have_previous_frame = temporal_.previous_input_frame(
+        previous_frame_bytes, previous_frame_w, previous_frame_h, previous_frame_format);
     const uint32_t w = in_tex->width;
     const uint32_t h = in_tex->height;
 
     ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
 
     const auto t_start = std::chrono::steady_clock::now();
+
+    /* ---- 0. Per-frame scratch the input builder and the record below share ---- */
+    /* The thresholds, caches and byte-level downloads this frame needs. Declared here, before the colour
+     * conversion, because the colour bytes are one of them: what this frame records as the *next* frame's
+     * history is the very buffer the model's colour tensor was built from. */
+    /* The history trust mask, built on first demand and cached: it is a per-pixel pass over two depth fields,
+     * so a model that declares no `validity` input must not pay for the downloads it needs. */
+    std::vector<float> trust_mask;
+    bool trust_mask_built = false;
+    /* This frame's depth and motion, downloaded on first demand and cached for the same reason - and the depth
+     * is kept until after the frame is finished, because it is what the *next* frame's mask compares against. */
+    std::vector<uint8_t> depth_frame_bytes;
+    bool depth_frame_loaded = false;
+    std::vector<uint8_t> motion_frame_bytes;
+    bool motion_frame_loaded = false;
+    /* The colour bytes the model was fed, so this frame can be recorded as the next frame's history. */
+    std::vector<uint8_t> color_frame_bytes;
+    auto download_bytes = [&](TextureImpl* tex, std::vector<uint8_t>& out) -> bool {
+        if (!tex || !tex->backend_texture || !download) return false;
+        const size_t bytes = accel_texture_bytes(tex->width, tex->height, tex->format);
+        if (bytes == 0) return false;
+        out.assign(bytes, 0);
+        return download(tex->backend_texture, out.data(), bytes) == NRR_SUCCESS;
+    };
+    auto frame_motion = [&]() -> const std::vector<uint8_t>* {
+        if (!motion_frame_loaded) {
+            motion_frame_loaded = true;
+            if (!download_bytes(motion_tex, motion_frame_bytes)) motion_frame_bytes.clear();
+        }
+        return motion_frame_bytes.empty() ? nullptr : &motion_frame_bytes;
+    };
 
     /* ---- 1. Convert the color frame to an NCHW tensor ------------------- */
     /* Read through the backend's own primitives, so a vendor SDK that keeps data in
@@ -213,13 +257,19 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
             return texture_to_nchw(scratch.data(), tex->width, tex->height,
                                    tex->format, channels, data);
         };
-        if (!download_nchw(in_tex, 3, color_nchw)) {
+        if (download_nchw(in_tex, 3, color_nchw)) {
+            /* The bytes the colour tensor was just built from, kept for record_input_frame() below: the history
+             * the *next* frame is fed has to be the low-resolution render itself rather than a reconstruction
+             * of it - it is what the CPU backend records, and what this path never recorded at all. */
+            color_frame_bytes = scratch;
+        } else {
             /* Unreadable color texture: fall back to a neutral frame rather than
              * failing the whole render, matching the historical behaviour. */
             std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 128u);
             if (!texture_to_nchw(rgba.data(), w, h, NRR_TEXTURE_FORMAT_RGBA8, 3,
                                  color_nchw))
                 return NRR_ERROR_RENDER_FAILED;
+            color_frame_bytes.clear();
         }
     }
 
@@ -255,7 +305,16 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
              * that the CPU path does not have and that no accelerator test covered. */
             const int channels = (role == TensorRole::Depth) ? 1
                                : (role == TensorRole::Motion) ? 2
-                               : (role == TensorRole::Jitter) ? 2 : 3;
+                               : (role == TensorRole::Jitter) ? 2
+                               /* One channel, as on the CPU path: the runtime computes the mask itself. Without
+                                * this case a `validity` input was declared at three channels and filled from the
+                                * *colour* image, which is the same silent corruption the jitter case below was
+                                * added for - and no accelerator test covered it. */
+                               : (role == TensorRole::Validity) ? 1
+                               /* One channel, as on the CPU path: the resolution token, derived from the frame's
+                                * own width. Without this case it was three channels of colour against a
+                                * one-channel input, which the session rejected on the element count. */
+                               : (role == TensorRole::Scale) ? 1 : 3;
             TextureImpl* src = (role == TensorRole::Depth) ? depth_tex
                              : (role == TensorRole::Motion) ? motion_tex
                              : (role == TensorRole::History) ? history_tex
@@ -285,6 +344,62 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
             } else if (role == TensorRole::Color) {
                 /* Already converted above; its shape is the texture's own size. */
                 data = color_nchw;
+            } else if (role == TensorRole::Scale) {
+                /* Derived from this frame's input width, exactly as the CPU path and the harness derive it: one
+                 * channel, constant. It is not downloaded from any texture, because no engine supplies it. */
+                if (!build_scale_plane(w, h, data)) return false;
+            } else if (role == TensorRole::Validity) {
+                /* The mask was not built on this path at all, so a model declaring `validity` was fed the
+                 * colour image through a three-channel tensor. Built here from this frame's depth and motion
+                 * and the accumulator's own record of the previous depth, through the one function the CPU path
+                 * calls (compute_history_trust_mask_from_textures), so the two paths cannot disagree about what
+                 * the mask is. Zero-filled when any of the three is missing - the treatment every absent
+                 * optional input gets, and what a model's own zeroed control is fed. */
+                const size_t elements = static_cast<size_t>(shape[1]) *
+                                        static_cast<size_t>(shape[2]) *
+                                        static_cast<size_t>(shape[3]);
+                data.assign(elements, 0.0f);
+                if (!trust_mask_built) {
+                    trust_mask_built = true;
+                    uint32_t previous_w = 0, previous_h = 0;
+                    NRRTextureFormat previous_format = NRR_TEXTURE_FORMAT_R32F;
+                    std::vector<uint8_t> previous_depth_bytes;
+                    const std::vector<uint8_t>* field = frame_motion();
+                    depth_frame_loaded = download_bytes(depth_tex, depth_frame_bytes);
+                    if (depth_frame_loaded && field != nullptr &&
+                        temporal_.previous_depth_frame(previous_depth_bytes, previous_w, previous_h,
+                                                       previous_format)) {
+                        compute_history_trust_mask_from_textures(
+                            depth_frame_bytes.data(), depth_tex->width, depth_tex->height, depth_tex->format,
+                            previous_depth_bytes.data(), previous_w, previous_h, previous_format,
+                            field->data(), motion_tex->width, motion_tex->height, motion_tex->format,
+                            trust_mask);
+                    }
+                }
+                if (trust_mask.size() == elements) data = trust_mask;
+            } else if (role == TensorRole::History && history_tex == nullptr) {
+                /* No plane from the caller: this kernel's own record of the previous frame, reprojected by
+                 * this frame's motion field - the same call the CPU backend makes, so one model is served one
+                 * plane whichever path executes it. Without a field there is nothing to reproject with and the
+                 * previous render passes through unwarped, which is what the CPU path does too. */
+                if (!have_previous_frame) {
+                    zero_filled_optional = true;
+                    data.assign(static_cast<size_t>(shape[1]) * static_cast<size_t>(shape[2]) *
+                                    static_cast<size_t>(shape[3]),
+                                0.0f);
+                } else {
+                    const std::vector<uint8_t>* field = frame_motion();
+                    const bool warped = field != nullptr &&
+                        warp_input_history_to_nchw(previous_frame_bytes.data(), previous_frame_w,
+                                                   previous_frame_h, previous_frame_format,
+                                                   field->data(), motion_tex->width, motion_tex->height,
+                                                   motion_tex->format, input.temporal.motion_vectors_scale,
+                                                   channels, data);
+                    if (!warped && !texture_to_nchw(previous_frame_bytes.data(), previous_frame_w,
+                                                    previous_frame_h, previous_frame_format, channels, data)) {
+                        return false;
+                    }
+                }
             } else {
                 bool loaded = false;
                 if (src && src->backend_texture && download) {
@@ -386,9 +501,53 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         return field;
     };
 
+    /* This frame's depth, fetched the same way and only when the disocclusion guard asks for it, so a
+     * sequence that has the guard off never pays for the copy. The bytes land in the shared cache above, and
+     * that is a fix as much as a refactor: this path used to download the depth, use it and drop it, so
+     * record_depth() was never called here - the guard had nothing to compare against after the first frame,
+     * and the mask a model declares `validity` for could never be built at all. */
+    auto depth_source = [&]() -> TemporalAccumulator::MotionImage {
+        TemporalAccumulator::MotionImage field;
+        if (!depth_tex || depth_tex->width == 0 || depth_tex->height == 0) return field;
+        depth_frame_loaded = download_bytes(depth_tex, depth_frame_bytes);
+        if (!depth_frame_loaded) return field;
+        field.pixels = depth_frame_bytes.data();
+        field.width = depth_tex->width;
+        field.height = depth_tex->height;
+        field.format = depth_tex->format;
+        return field;
+    };
+
+    /* What the pass may use, including which frames it is being given: the source is held by the shared
+     * accumulator, so the election and the accumulator cannot disagree about it. */
+    TemporalAccumulator::PhaseAlignedFrame phase_elected = phase_aligned_frame_for(
+        input, model_uses_jitter, w, h, out_w, out_h, temporal_.phase_aligned_source());
+    if (phase_elected.from_input_render && !color_frame_bytes.empty() && in_tex != nullptr) {
+        /* The bytes the colour tensor was built from, so what gets placed is what the renderer wrote and not
+         * a reconstruction of it. Left unset when they could not be read, and the pass then integrates
+         * nothing and says so rather than quietly integrating the other source. */
+        phase_elected.input_render.pixels = color_frame_bytes.data();
+        phase_elected.input_render.width = w;
+        phase_elected.input_render.height = h;
+        phase_elected.input_render.format = in_tex->format;
+    }
+
     const TemporalAccumulator::Result temporal = temporal_.apply(
-        input, rgb8, out_w, out_h, motion_source,
-        phase_aligned_frame_for(input, model_uses_jitter, w, h, out_w, out_h));
+        input, rgb8, out_w, out_h, motion_source, phase_elected, depth_source);
+
+    /* Record this frame's low-resolution input render and its depth, exactly as BackendCPU does and for the
+     * same reason: the *next* frame's `history` and `validity` tensors are built from them. This path recorded
+     * neither, which is the whole of why it served a model a zero-filled history and could not build a mask -
+     * the tensors were being filled from the caller's optional texture and from nothing. Recorded after
+     * inference, when the input pixels are final, and from the bytes the model was actually fed rather than
+     * from a reconstruction of them. */
+    if (!color_frame_bytes.empty()) {
+        temporal_.record_input_frame(color_frame_bytes.data(), w, h, in_tex->format);
+    }
+    if (depth_frame_loaded && depth_tex != nullptr) {
+        temporal_.record_depth(depth_frame_bytes.data(), depth_tex->width, depth_tex->height,
+                               depth_tex->format);
+    }
 
     /* ---- 6. Publish the output texture ---------------------------------- */
     TextureImpl* out_tex = nullptr;
@@ -506,6 +665,72 @@ void AcceleratorExecutionKernel::set_phase_aligned_accumulation(bool enabled) {
 
 bool AcceleratorExecutionKernel::is_phase_aligned_enabled() const {
     return temporal_.is_phase_aligned_enabled();
+}
+
+NRRResult Backend::set_phase_aligned_source(NRRPhaseAlignedSource source) {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) return NRR_ERROR_STATE_INVALID;
+    return kernel->set_phase_aligned_source(source);
+}
+
+bool Backend::phase_aligned_source(NRRPhaseAlignedSource* out_source) const {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) return false;
+    return kernel->phase_aligned_source(out_source);
+}
+
+NRRResult AcceleratorExecutionKernel::set_phase_aligned_source(NRRPhaseAlignedSource source) {
+    temporal_.set_phase_aligned_source(source);
+    return NRR_SUCCESS;
+}
+
+bool AcceleratorExecutionKernel::phase_aligned_source(NRRPhaseAlignedSource* out_source) const {
+    if (out_source == nullptr) return false;
+    *out_source = temporal_.phase_aligned_source();
+    return true;
+}
+
+NRRResult Backend::set_disocclusion_rejection(bool enabled) {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) {
+        /* No accumulator to switch: say so instead of accepting a setting nothing will honour. */
+        return NRR_ERROR_STATE_INVALID;
+    }
+    kernel->set_disocclusion_rejection(enabled);
+    return NRR_SUCCESS;
+}
+
+bool Backend::is_disocclusion_rejection_enabled() const {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr || !kernel->is_initialized()) return false;
+    return kernel->is_disocclusion_rejection_enabled();
+}
+
+NRRResult Backend::apply_disocclusion_rejection_default() {
+    /* The default this backend's accumulator should start from, from its own temporal-coherence claim. The
+     * shared kernel may not be up yet - a vendor kernel starts lazily, on its first frame or model load - so it
+     * is told the default and applies it when it starts; get_accel_kernel() creates the kernel object if it
+     * does not exist yet, which is why this can be answered before any frame has run. */
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr) return NRR_ERROR_STATE_INVALID;
+    kernel->set_disocclusion_rejection_default(
+        disocclusion_rejection_default(get_capabilities().temporal_coherence));
+    return NRR_SUCCESS;
+}
+
+void AcceleratorExecutionKernel::set_disocclusion_rejection(bool enabled) {
+    temporal_.set_disocclusion_rejection_enabled(enabled);
+}
+
+bool AcceleratorExecutionKernel::is_disocclusion_rejection_enabled() const {
+    return temporal_.is_disocclusion_rejection_enabled();
+}
+
+void AcceleratorExecutionKernel::set_disocclusion_rejection_default(bool enabled) {
+    /* Remember it, so a default set before the kernel started is applied when it does (see initialize()), and
+     * apply it now if the accumulator is already up. */
+    disocclusion_rejection_default_ = enabled;
+    if (initialized_) temporal_.set_disocclusion_rejection_enabled(enabled);
 }
 
 void AcceleratorExecutionKernel::set_memory_limit(size_t bytes) {

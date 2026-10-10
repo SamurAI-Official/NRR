@@ -14,6 +14,7 @@ this file and the runnable project is `../godot_verify/`.
 | --- | --- |
 | `plugin.cfg` (INI descriptor) | **Verified.** Godot parses this shape; it previously shipped the Godot 3 XML variant, which Godot 4 never reads. |
 | `NRR.gd` runtime API | **Verified** - `initialize`/`load_model`/`render_frame`/`reset_temporal_history`/`set_phase_aligned_accumulation`/`phase_aligned_accumulation` all exercised in Godot. |
+| `NRR.gd` disocclusion guard | **Source-level verified** - `set_disocclusion_rejection`/`disocclusion_rejection` are wrapped, bound for `ClassDB`, called through the C API, and round-tripped by `../godot_verify/verify.gd`; the recorded transcript below predates the pair. |
 | `nrr_plugin.gd` editor plugin | **Source-level verified** (`extends EditorPlugin`, entry symbol matches the descriptor). The status menu item has not been clicked in the editor UI. |
 | `nrr_post_process.gd` | **Source-level verified.** Renderer-agnostic (CanvasLayer overdraw); not yet rendered on screen. |
 | `nrr.gdextension` | **Verified** in Godot 4.7.2 (debug variant, Windows x86_64). |
@@ -101,6 +102,54 @@ absent, no model is loaded, or the pass fails - and it records why in
 `last_error`. Check `available` / `last_render_was_passthrough`; never assume a
 returned image is neural output. `is_binding_present()` distinguishes "the
 extension is missing" from "`initialize()` has not run yet".
+
+## Using it as an upscaler
+
+`NRRPostProcess` is the whole integration for the common case: put it on a `CanvasLayer`, point it at a
+model (or install the released one and leave the path empty), and it presents the upscaled viewport. It is
+renderer-agnostic on purpose - a `CanvasLayer` overdraw works under `forward_plus`, `mobile` and
+`gl_compatibility`, including the Compatibility path that has no compute hook at all.
+
+**The released model is one graph for every tier.** `models/phase4/upscale_msreal_scale.onnx` in the NRR
+tree is trained across two tiers at once and declares three inputs: `color`, `jitter`, and a **resolution
+token**. The token is `log2(input_width / 128)` - 0.0 at a 128px input, 1.0 at 256, 2.0 at 512 - and the
+runtime derives it from the frame, so a caller cannot supply the wrong one. Install it with a copy, and
+leave `model_path` empty:
+
+```powershell
+# in the NRR tree, into your project's copy of the addon
+copy models\phase4\upscale_msreal_scale.onnx <your project>\addons\nrr\models\
+```
+
+With nothing installed there, the node logs that the released model is missing and runs as passthrough
+rather than pretending. What it measures, on the two tiers in `docs/parity.md` and `docs/parity-512.md`
+(`same_frames: yes` for every row, so these are like-for-like):
+
+| tier | arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 128 -> 256 | bilinear | 26.3563 | 0.87165 | 0.95257 | 0.1025 | 0.2732 | 36.793 | 0.2634 |
+| 128 -> 256 | **NRR** | 26.4320 | 0.88151 | 0.95515 | **0.0570** | **0.1609** | 43.374 | 0.5616 |
+| 128 -> 256 | XeSS (balanced) | 26.7147 | 0.87228 | 0.95586 | 0.1319 | 0.2718 | 31.847 | 0.1774 |
+| 128 -> 256 | DLSS | 26.6829 | 0.88217 | **0.96077** | 0.1047 | 0.2576 | **52.253** | 0.2378 |
+| 256 -> 512 | bilinear | 28.2823 | 0.91760 | 0.96791 | 0.0578 | 0.2301 | 43.207 | 0.3629 |
+| 256 -> 512 | **NRR** | **28.4203** | **0.92238** | **0.96817** | **0.0421** | **0.1724** | 46.999 | 0.5182 |
+| 256 -> 512 | XeSS (balanced) | 28.2281 | 0.91483 | 0.96497 | 0.0717 | 0.2352 | 36.463 | 0.3038 |
+| 256 -> 512 | DLSS | 26.8949 | 0.88509 | 0.94800 | 0.0983 | 0.2767 | 33.745 | 0.2097 |
+
+Cost, measured by `benchmarks/nrr_bench.cpp` on an RTX 4070 Ti with the CUDA provider: **114.8 ms** per frame
+at 960x540 -> 1920x1080 and **451.9 ms** at 1920x1080 -> 3840x2160. That is a quality pass, not a realtime
+one at these grids; the runtime's own limits say the same thing (`docs/roadmap.md`).
+
+`jitter` is the other input the model expects, and it is a fact about the frame rather than a default: the
+node reports the sub-pixel offset the renderer used (`jitter_offset`/`jitter_enabled` on the node), and a
+caller that supplies none is treated as sampled on the grid - which is what the runtime feeds, explicitly,
+rather than a silently different measurement.
+
+**This model is the first release that the Godot path can drive without a handicap.** It declares no depth and
+no motion input, so the limitation in "Known limits" below - that Godot exposes no portable depth or
+motion-vector buffer, so `render_frame()` calls with colour only - does not cost anything on this artifact:
+`color`, `jitter` and a derived token is the whole input set. Models that want depth and motion still wait on
+the M6/M7 work in `docs/roadmap.md`.
 
 ## Build the native binding
 
@@ -200,8 +249,12 @@ RESULT: PASS
 ```
 
 `entry_point_count` reads `NRR_ENTRY_POINT_COUNT` from the linked runtime and follows it as the
-C ABI grows (44 at the time of the recorded block above, 47 now that the phase-aligned pair is
-exported); the two `phase_aligned_*` lines are the switch being round-tripped through the extension.
+C ABI grows (44 at the time of the recorded block above, 51 now: the phase-aligned pair, then the
+disocclusion guard pair); the two `phase_aligned_*` lines are the switch being round-tripped through the
+extension. The same script now round-trips the disocclusion guard as well, printing
+`disocclusion_supported=...`, `disocclusion_enabled=...` and `disocclusion_final_state=...` where the block
+above ends - a fresh run is the only thing that has not happened, which is why that pair is recorded as
+source-level verified in the table rather than verified.
 
 `render_time_ms` varies between runs: 2.926 ms and 3.166 ms were observed for the same
 input, so treat it as "~3 ms on this machine", not a benchmark. Everything else is
@@ -212,5 +265,5 @@ Reading it honestly: `backend=CPU` is the deterministic auto-selection;
 `mean_abs_dr_vs_input=0.489112` means the output genuinely differs from the input
 - it is not a passthrough - and the size of that difference is what the untrained
 identity fixture from `tools/gen_sample_model.py` produces, not evidence of
-detail. `NRR_ENTRY_POINT_COUNT` (47) matches what the library exports.
+detail. `NRR_ENTRY_POINT_COUNT` (49) matches what the library exports.
 

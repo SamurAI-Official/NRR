@@ -26,6 +26,8 @@
 #include "unit/test_quality_parity.cpp"
 #include "unit/test_jitter.cpp"
 #include "unit/test_history_mask.cpp"
+#include "unit/test_scale_token.cpp"
+#include "unit/test_history_delivery.cpp"
 #include "unit/test_backend_override.cpp"
 #ifndef _WIN32
 #include "mobile/test_android.cpp"
@@ -54,6 +56,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_c_api_entry_point_count_matches_header);
     NRR_RUN_TEST(test_api_texture_desc);
     NRR_RUN_TEST(test_api_phase_aligned_accumulation_switch);
+    NRR_RUN_TEST(test_api_phase_aligned_source_switch);
+    NRR_RUN_TEST(test_api_disocclusion_rejection_switch);
     NRR_RUN_TEST(test_api_device_create_null);
     NRR_RUN_TEST(test_api_device_destroy_null);
     NRR_RUN_TEST(test_api_get_capabilities_null);
@@ -202,6 +206,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_device_capabilities_track_measured_provider);
     NRR_RUN_TEST(test_accel_kernel_accumulates_temporal_history);
     NRR_RUN_TEST(test_accel_phase_aligned_integration_runs_through_the_kernel);
+    NRR_RUN_TEST(test_disocclusion_default_is_applied_when_a_lazy_kernel_starts);
 
     std::cout << "\n--- Capability Claim Tests ---\n";
     /* Nothing here is asserted from a flag: fp16 is the EXECUTION claim and must be
@@ -223,8 +228,29 @@ void run_all_tests() {
     NRR_RUN_TEST(test_history_mask_matches_the_packer_on_a_moving_source);
     NRR_RUN_TEST(test_history_mask_refuses_fields_that_disagree);
     NRR_RUN_TEST(test_history_mask_depth_lives_and_dies_with_the_previous_frame);
+    NRR_RUN_TEST(test_history_mask_from_textures_matches_the_plane_builder);
+    NRR_RUN_TEST(test_scale_token_role_is_matched_by_name_and_not_by_substring);
+    NRR_RUN_TEST(test_scale_token_plane_carries_the_octave_of_the_input_width);
+    /* What a model's `history` input actually holds at inference. The training arms measure a reprojected
+     * plane and the runtime is the only thing that can produce the inference-time one, so this is the half of
+     * "is the seam a lever or a break?" that the arm results cannot answer for themselves. */
+    NRR_RUN_TEST(test_input_frame_is_delivered_to_the_next_frame_verbatim);
+    NRR_RUN_TEST(test_history_is_absent_before_a_frame_has_been_recorded);
+    NRR_RUN_TEST(test_reset_forgets_the_input_frame_with_the_depth);
+    NRR_RUN_TEST(test_a_restarted_sequence_delivers_the_post_cut_frame);
+    /* And the same claims measured through the whole path, with a fixture whose output is the `history` plane it
+     * was handed - the only way to observe the tensor rather than the rule. Each is run twice: once on a frame
+     * with no motion field, where the plane is the previous render, and once with a field, where the plane is
+     * that render reprojected. Both backends are asked for the same two, because the seam this closes was that
+     * the answer depended on which one executed the frame. */
+    NRR_RUN_TEST(test_the_cpu_backend_delivers_the_previous_render_as_history);
+    NRR_RUN_TEST(test_the_cpu_backend_reprojects_the_history_it_delivers);
+    NRR_RUN_TEST(test_the_default_backend_delivers_the_history_its_path_owns);
+    NRR_RUN_TEST(test_the_default_backend_reprojects_the_history_it_delivers);
     NRR_RUN_TEST(test_validity_input_name_classifies_as_its_own_role);
     NRR_RUN_TEST(test_temporal_blend_reprojects_history);
+    NRR_RUN_TEST(test_temporal_blend_rejects_untrusted_history);
+    NRR_RUN_TEST(test_temporal_blend_clamps_drifted_history);
     NRR_RUN_TEST(test_conditioning_weights_and_domains);
     NRR_RUN_TEST(test_conditioning_prepare_and_apply);
     NRR_RUN_TEST(test_provenance_permissions);
@@ -239,6 +265,9 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_scene_change_discards_history);
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
+    NRR_RUN_TEST(test_phase_aligned_input_render_source_through_the_device);
+NRR_RUN_TEST(test_input_render_resolve_matches_the_derived_plane);
+    NRR_RUN_TEST(test_disocclusion_guard_on_still_accumulates_through_the_pipeline);
     NRR_RUN_TEST(test_execution_paths_produce_the_same_frames);
 
     std::cout << "\n--- Frame Quality Tests (measured, not assumed) ---\n";
@@ -274,6 +303,7 @@ void run_all_tests() {
     NRR_RUN_TEST(test_godot_binding_references_only_declared_c_api_entry_points);
     NRR_RUN_TEST(test_godot_binding_exposes_temporal_history_reset);
     NRR_RUN_TEST(test_engine_bindings_expose_phase_aligned_accumulation);
+    NRR_RUN_TEST(test_engine_bindings_expose_disocclusion_rejection);
     NRR_RUN_TEST(test_godot_post_process_is_renderer_agnostic);
     NRR_RUN_TEST(test_godot_addon_build_and_docs_wiring);
     NRR_RUN_TEST(test_godot_addon_has_no_nested_project_file);
@@ -296,11 +326,16 @@ void run_all_tests() {
      * tools/regen_aa_fixture.py, and ordered against the de-jitter alternative it replaces. */
     NRR_RUN_TEST(test_aa_accumulator_places_each_frame_where_it_was_sampled);
     NRR_RUN_TEST(test_aa_accumulator_integrates_distinct_subpixel_samples);
+    NRR_RUN_TEST(test_aa_accumulator_fills_pixels_no_sample_reached);
     NRR_RUN_TEST(test_aa_accumulator_refuses_mixed_grids_and_bad_shapes);
     NRR_RUN_TEST(test_aa_upsample_is_the_identity_at_native_resolution);
     /* The phase-aligned pass in the render path: the policy that decides which frames may be integrated,
      * the gate that stops it when the scene moves, and the offset rule both backends derive. */
     NRR_RUN_TEST(test_phase_aligned_pass_is_off_until_asked);
+    NRR_RUN_TEST(test_phase_aligned_source_integrates_the_input_render_when_asked);
+    NRR_RUN_TEST(test_phase_aligned_source_change_discards_the_accumulation);
+NRR_RUN_TEST(test_input_render_offset_is_the_frame_grid_one_add_frame_documents);
+    NRR_RUN_TEST(test_disocclusion_guard_rejects_all_sky_through_the_accumulator);
     NRR_RUN_TEST(test_phase_aligned_pass_places_each_frame_by_its_own_offset);
     NRR_RUN_TEST(test_phase_aligned_pass_resets_when_the_scene_moves);
     NRR_RUN_TEST(test_phase_aligned_pass_declines_without_distinct_phases);

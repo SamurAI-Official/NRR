@@ -128,6 +128,25 @@ func _ready() -> void:
 			% off_state)
 		return
 
+	# What that integration integrates. 0 (the displayed frames) is what the switch above has always
+	# produced, so it has to be the default; 1 (the input renders) is the temporal upscale. Same invariant as
+	# the switch: accepted means the accumulator holds it, refused means -1 rather than a source.
+	var source_default := nrr.phase_aligned_source()
+	print("phase_aligned_default_source=%d" % source_default)
+	if source_default != 0 and source_default != -1:
+		_fail("the default source must be 0 (displayed frames) or -1 (cannot ask); got %d" % source_default)
+		return
+	var source_ok := nrr.set_phase_aligned_source(1)
+	var source_after := nrr.phase_aligned_source()
+	print("phase_aligned_set_source=%s source_after_set=%d" % [source_ok, source_after])
+	if source_ok and source_after != 1:
+		_fail("the source was accepted but the accumulator reports %d" % source_after)
+		return
+	if not source_ok and source_after != -1:
+		_fail("the source was refused but the accumulator reports %d instead of -1 (cannot)" % source_after)
+		return
+	nrr.set_phase_aligned_source(source_default)
+
 	var on_ok := nrr.set_phase_aligned_accumulation(true)
 	var on_state := nrr.phase_aligned_accumulation()
 	print("phase_aligned_enabled=%s state_after_on=%d" % [on_ok, on_state])
@@ -152,6 +171,36 @@ func _ready() -> void:
 			return
 	nrr.set_phase_aligned_accumulation(false)
 	print("phase_aligned_final_state=%d" % nrr.phase_aligned_accumulation())
+
+	# The disocclusion guard, the same way and for the same reason: an invariant rather than a success,
+	# because whether this host's backend accumulates is not something the driver can know, and because the
+	# guard's default is the device's temporal-coherence capability rather than off - so the point is that
+	# "off" and "cannot" never get confused, and that an accepted setting is one the accumulator holds.
+	var guard_off_ok := nrr.set_disocclusion_rejection(false)
+	var guard_off_state := nrr.disocclusion_rejection()
+	print("disocclusion_supported=%s state_after_off=%d" % [guard_off_ok, guard_off_state])
+	if guard_off_ok and guard_off_state != 0:
+		_fail("the guard switch was accepted but the accumulator does not report it off (state %d)"
+			% guard_off_state)
+		return
+	if not guard_off_ok and guard_off_state != -1:
+		_fail("the guard switch was refused but the accumulator reports state %d instead of -1 (cannot)"
+			% guard_off_state)
+		return
+
+	var guard_on_ok := nrr.set_disocclusion_rejection(true)
+	var guard_on_state := nrr.disocclusion_rejection()
+	print("disocclusion_enabled=%s state_after_on=%d" % [guard_on_ok, guard_on_state])
+	if guard_on_ok and guard_on_state != 1:
+		_fail("the guard switch was accepted but the accumulator does not report it on (state %d)"
+			% guard_on_state)
+		return
+	if not guard_on_ok and guard_on_state != -1:
+		_fail("enabling the guard was refused but the accumulator reports state %d instead of -1 (cannot)"
+			% guard_on_state)
+		return
+	nrr.set_disocclusion_rejection(false)
+	print("disocclusion_final_state=%d" % nrr.disocclusion_rejection())
 
 	nrr.shutdown()
 	print("available_after_shutdown=%s" % nrr.available)

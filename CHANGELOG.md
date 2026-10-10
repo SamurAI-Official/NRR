@@ -13,6 +13,1236 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The Godot addon as an upscaler: the token the runtime was not feeding
+
+The Godot addon (`engine_plugins/godot/`) already existed and was verified - GDExtension, `NRR.gd`, and
+`NRRPostProcess`, the renderer-agnostic CanvasLayer upscaler. What it could not do was drive *this* release:
+the model adopted above declares `color,jitter,scale`, and the runtime's input-role classifier had no rule for
+`scale`, so the name fell through to the colour path.
+
+**What that did, measured rather than reasoned.** The expected failure - three channels of colour against a
+declared one-channel input - is *not* what happens: an input the classifier does not recognise is
+**zero-filled and the frame renders**. Renaming the token input in a copy of the model (to `zzz_unknown`, so it
+classifies as Other) and running `nrr_bench` produces a normal timing line: `128x128->256x256: wall=3.02ms ...
+provider CUDAExecutionProvider`. Zero is, by coincidence, *exactly the reference tier's token value*, so the
+released model would have been told "these samples came off the 128px grid" at every resolution - in the engine,
+in Godot, everywhere - while `tools/compare_upscalers.py` derived log2(width/128) and every Python-side number
+stayed green. Two different values under one input name, and the engine's was wrong at every tier above the
+reference one.
+
+**The fix is a role and a derivation, not a caller obligation.** `TensorRole::Scale` is matched by *exact* name
+(`scale`, `scale_token`, `resolution_token`) because "scale" is a substring of ordinary input names
+(`upscale_factor`, `scale_bias`) and a false positive feeds a one-channel token into a three-channel path - the
+corruption the jitter and validity roles were each added to fix. `build_scale_plane()` computes
+log2(width / 128) as a constant one-channel plane, and both backends (CPU and the accelerator kernel) build it
+from the frame's own input width rather than reading it from any attachment. No engine binding has to supply it,
+which is the same reasoning that put the trust mask in the runtime: an input every engine must produce is an
+input that exists only where someone has implemented it.
+
+`tests/unit/test_scale_token.cpp` pins it: the role by name and not by substring, and the plane's values as
+**literals** - 128 -> 0.0, 256 -> 1.0, 512 -> 2.0, 192 -> 0.585 (a tier between the trained ones is a fraction,
+not a snapped label), a non-square frame taking its token from the width so it agrees with the harness, and a
+zero-sized frame refused. Suite: **196 passed, 0 failed**.
+
+**The addon change is one fallback and one honest warning.** `NRRPostProcess` leaves `model_path` empty by
+default and now resolves `res://addons/nrr/models/upscale_msreal_scale.onnx`; when that is absent it pushes the
+reason and runs as passthrough instead of silently rendering nothing. The README gains a "Using it as an
+upscaler" section: the one-command install, the per-tier numbers from `docs/parity.md` and `docs/parity-512.md`,
+the frame cost, and the `jitter` contract. Worth stating plainly there: **this is the first release the Godot
+path can drive without a handicap**, because it declares no depth and no motion input - the limitation that
+Godot exposes neither is real for other models and costs nothing here.
+
+`benchmarks/nrr_bench.cpp` also stops hiding the runtime's reason: a refusal used to print only "the probe frame
+did not render", which sent the reader around the binary to the test suite to find out what the runtime had
+said. It prints `nrr_get_last_error()` now.
+
+Two limits on this work, recorded rather than glossed:
+
+* **The token's *value* is pinned by unit tests, not by an end-to-end assertion.** The C API has no texture
+  readback (`nrr.h` has create/destroy/upload), so a test cannot yet ask "what number did the model receive"
+  after a render. It can assert the derivation, the classification, and that a model declaring the input renders
+  - which is what it does. The harness asserts the same formula independently, in Python.
+* **The latency rows already published were measured by a benchmark binary built before this change**, so they
+  were taken with the token zero-filled. That is sound for a latency row and not for a quality one: a
+  convolution's cost does not depend on its input values, which is the reason `nrr_bench` is allowed to publish
+  from synthetic planes at all. The quality rows come from ONNX Runtime in Python and were never affected.
+
+
+### Release model adopted: one scale-agnostic artifact, and the two bugs that stood in its way
+
+**The project's release model is now `models/phase4/upscale_msreal_scale.onnx`**, and it is the baseline every future
+row is compared against. It is the scale-agnostic model from the entry below - the one whose token travels the whole
+path - and it is exported *qualified*, not by exception: its report carries no gate failure at all.
+
+| | |
+| --- | --- |
+| artifact | `models/phase4/upscale_msreal_scale.onnx`, 112,907 parameters |
+| data | `models/training-data/godot-multiscale-real` (399 train / 400 val, both tiers real renders, tokens `[0.0, 1.0]`) |
+| inputs | `color,jitter,scale` |
+| how | 60 epochs, lr 0.002, batch 4, `--lr-schedule cosine`, seed default |
+| val L1 | **0.01605** against the baseline's 0.01701 - **5.65% better** (gate: 5%) |
+| training progress | 0.01367 -> 0.00907 unweighted residual L1 - **33.7%** (gate: 10%) |
+| ms-ssim | 0.9630 against 0.9614 |
+| token ablation | **0.00030** (jitter's is 0.01058), so the token is doing work, not being carried |
+| export | onnxruntime 1.23.2 agrees with PyTorch to 4.8e-04; dynamic H/W verified at 288 -> 576 |
+
+The previous entry ended with the token 1.2 points short of the gate, and the two changes that close that gap are
+worth separating from the promotion itself.
+
+**1. A refused run could leave its artifact behind, and one had.** Before anything was promoted, the model
+directory was found holding `upscale_msreal_scale.onnx` (written 23:17) beside a report that described a different,
+later run (23:50): the file had been written by a run that failed *verification* after writing it, and the later
+refusals overwrote only the report. The directory therefore contained an unverified graph under a filename that reads
+like a deliverable. The export now writes to `<out>.staged`, verifies it, checks dynamic H/W, and only then moves it
+into place; a failure removes the staged file and exports nothing. This is the same discipline the parity harness
+already applies in the other direction - on this run it **refused its own benchmark report** with *"ignoring
+nrr-bench.json: it is older than upscale_msreal_scale.onnx, so its rows describe weights that were replaced"*.
+
+**2. `export_onnx` passed its example tensors in an order that only worked until `scale` existed.**
+`forward(self, color, depth=None, motion=None, history=None, jitter=None, validity=None, history_jitter=None,
+naive=None, scale=None)` puts the token *after* `naive`, while the export's hardcoded `signature` tuple ended at
+`scale`. The tuple is passed positionally, so the token was bound to `naive`'s slot, `scale` arrived as `None`, and
+the export died in `conv2d` with `received NoneType` - *after* training had finished and passed every gate. The order
+is now read from `inspect.signature(model.forward)`, so a new parameter shifts the list with it, and the self-test
+pins the property by exporting a token model and checking the token **moves the graph's output** (0.0141), not merely
+that its input is declared: a declared-but-unconnected token exports cleanly and would measure as a model that
+ignores its own scale.
+
+**3. The last variable was the schedule, and the honest reading of it is a lever rather than a gate.** The same
+configuration, data and token under the default `--lr-schedule linear-warmup` reports 1.01% val and 0.1% progress and
+is refused as degenerate - but its own epoch trace shows 31.7% progress at epoch 48 and 0.01367 again at epoch 60.
+It trains, and then the final epoch oscillates with the learning rate held at full, so the *shipped* weights are the
+bad ones. `--lr-schedule cosine` anneals to 1e-3 of base and keeps them. The progress gate reads the weights that are
+actually exported, which is the right quantity to read; the finding is that a held-learning-rate run can throw away a
+good model in its last epoch, which is worth knowing before a schedule choice is made.
+
+The five-percent gate was **not** lowered to make this pass, and `--export-unqualified` was added rather than
+loosening a check: it exists so a baseline or candidate can be exported deliberately, and it stamps the artifact's
+report with the failures, the flag that permitted the export, and a sentence saying the file does not pass the
+release gates. Nothing was promoted through it.
+
+**Scored at both tiers with the one artifact** (`tools/run_parity.ps1 -Model models/phase4/upscale_msreal_scale.onnx`,
+then the same with `-Suffix '-512' -Data models/training-data/godot-mid`; both runs report `0 failure(s)`):
+
+| tier | arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 128 -> 256 | bilinear | 26.3563 | 0.87165 | 0.95257 | 0.1025 | 0.2732 | 36.793 | 0.2634 |
+| 128 -> 256 | **nrr** | 26.4320 | 0.88151 | 0.95515 | **0.0570** | **0.1609** | 43.374 | 0.5616 |
+| 128 -> 256 | xess (balanced) | 26.7147 | 0.87228 | 0.95586 | 0.1319 | 0.2718 | 31.847 | 0.1774 |
+| 128 -> 256 | dlss | 26.6829 | 0.88217 | **0.96077** | 0.1047 | 0.2576 | **52.253** | 0.2378 |
+| 256 -> 512 | bilinear | 28.2823 | 0.91760 | 0.96791 | 0.0578 | 0.2301 | 43.207 | 0.3629 |
+| 256 -> 512 | **nrr** | **28.4203** | **0.92238** | **0.96817** | **0.0421** | **0.1724** | 46.999 | 0.5182 |
+| 256 -> 512 | xess (balanced) | 28.2281 | 0.91483 | 0.96497 | 0.0717 | 0.2352 | 36.463 | 0.3038 |
+| 256 -> 512 | dlss | 26.8949 | 0.88509 | 0.94800 | 0.0983 | 0.2767 | 33.745 | 0.2097 |
+
+So the release model is **first on five of seven metrics at 256x256 -> 512x512** and first on the two perceptual
+metrics (LPIPS, DISTS) at 128x128 -> 256x256, with DLSS ahead on PSNR, SSIM, MS-SSIM and VMAF at the low tier - which
+is where a 128th of the frame is being invented from a single 128x128 grid.
+
+**The release model is also three times cheaper per frame than the artifact it replaces.** `nrr_bench` on the same
+tiers and provider measures it at **114.839 ms** end-to-end at 960x540 -> 1920x1080 and **451.875 ms** at
+1920x1080 -> 3840x2160 (p50 112.62 / 457.09, p99 142.68 / 562.31), against **379.369 ms** and **1405.136 ms** for
+`models/phase3/upscale_subsampled.onnx` - the rows the table carried before. The promotion therefore costs quality
+only at the high tier, and buys speed at both.
+
+**The price of one artifact instead of two is measured rather than assumed.** The tier-matched
+`models/phase4/upscale_mid.onnx` is first on all seven metrics at 256x256 -> 512x512 at 29.2989 dB, so the release
+model gives up about **0.88 dB** at the high tier in exchange for holding a single graph that also serves the low
+tier. That is the trade a released baseline makes; both artifacts stay in the tree so either can be measured again.
+
+### The scale-agnostic binary, verified: the token is wired, used, and 1.2 points short
+
+Finishing the wiring turned the previous entry's "one call site" into a complete, measured answer. The token now
+travels the whole path - packed `scale` field (or the width-derived fallback) -> `pair_from_npz` -> the split's
+key list -> the model's input vocabulary -> a `scale_channels` convolution in the architecture -> `residual` ->
+`forward` -> `_residual_prepared` -> `measure` -> the training loop -> `verify_export` -> the export's declared
+inputs -> the harness, which derives it from the image. Four places had to be found and fixed, and every one of
+them was caught by something in this repository rather than by a wrong number getting out:
+
+* **`scale` sat in the middle of the split's key list.** The pinned self-test that asserts the key list exactly
+  (`lazy loading matches eager pair for pair`) failed on it. It is last now, because the model's signature ends
+  there and the export and verification read both positionally;
+* **`measure`, the training loop, `residual` and `verify_export` each passed a fixed argument list** that did not
+  include the token - `verify_export` kept its own local copy of the signature tuple. They surfaced as
+  `conv2d() received NoneType` and `residual() takes from 2 to 9 positional arguments but 10 were given`, which
+  is the good kind of failure: loud, immediate, and naming the line;
+* **the ablation line did not report the token at all**, so "does this model use it" was unanswerable. It now
+  measures `scale` like every other input.
+
+The trainer's own self-test passes with **0 real failures** after all of it (the only "failed" lines are the gate
+tests that are supposed to fail).
+
+**What the verification says**, every row measured this session on the same seed, epochs and learning rate:
+
+| data | inputs | progress | val L1 vs baseline | outcome |
+| --- | --- | --- | --- | --- |
+| `godot-mid` (256 tier) | `color,jitter` | 14.8% | **+12.53%** | **exported** |
+| `godot-mid` (256 tier) | `color,jitter,scale` | 2.3% | -0.43% | refused |
+| `godot-multiscale` (derived inputs) | `color,jitter` | -4.4% | -10.2% | refused |
+| `godot-multiscale` (derived inputs) | `color,jitter,scale` | -0.3% | -4.53% | refused |
+| `godot-multiscale-real` (both real) | `color,jitter` | 30.9% | -0.19% | refused (baseline gate only) |
+| `godot-multiscale-real`, 240 epochs | `color,jitter` | 0.1% | -1.06% | refused |
+| **`godot-multiscale-real`** | **`color,jitter,scale`** | **31.8%** | **-3.8%** | refused (1.2 points short) |
+| `godot-multiscale-real`, crops 96/128 + mirror | `color,jitter,scale` | 1.1% | -1.06% | refused |
+
+Three conclusions, none of them a claim:
+
+1. **The token is used.** Its ablation - how far the output moves when it is zeroed - is **0.00031**, against
+   jitter's 0.01095 and 0.00000 for every input the model does not consume. A non-zero ablation is the only
+   evidence that separates "the token is doing something" from "the token is along for the ride", and it is
+   non-zero. Zero also happens to be the reference tier's token value, so that number is simultaneously the
+   answer to "does this model change its behaviour when told the frame is from the 128 grid". It does, slightly.
+2. **Properly wired, the token helps the merged model** - val goes from -0.19% without it to **-3.8%** with it at
+   the same budget - **and under this schedule it does not clear the 5% gate**. *Superseded by the entry above:* the
+   same configuration, data and token clear it under `--lr-schedule cosine`, and that is the artifact now released.
+   The configuration that was exported before that was tier-matched, and it is first on all
+   seven metrics at 256x256 -> 512x512. The earlier 5.5% figure for a token run was measured *before* the key
+   ordering was fixed; 31.8% is the real number for a correctly wired run.
+3. **The crop-plus-mirror augmentation degenerates this mixture** (1.1% progress), which is worth recording so it
+   is not tried again without a reason: the multi-scale lever that the trainer documents is measured against
+   *one* tier's statistics, and here the model is already fitting two.
+
+The methodological point this exposes, and the next thing to fix rather than loosen: **the 5% gate is computed on
+a val split that pools both tiers, so it asks one number to prove two things at once** - beat the 128 tier's
+bilinear baseline *and* the 256 tier's. The parity harness scores each tier separately, which is the right
+instrument for a multi-scale model; the trainer's gate is blunt by construction. Reading the gate per tier, or
+scoring a merged run through the harness instead, is the change that would let a scale-agnostic model be judged
+on what it is for - and it should be a *per-tier* gate, not a lower one.
+
+### The real-render merge: the mixture was the problem, and the token's plumbing ends at one call site
+
+The previous entry pre-registered this experiment: merge two tiers that are *both* real renders, so scale is the
+only variable the token has to explain. It ran, and it settles the question the earlier merge raised.
+
+`tools/merge_scale_datasets.py --low models/training-data/godot-v6-warp --high models/training-data/godot-mid
+--out models/training-data/godot-multiscale-real` produced **799 pairs (399 train / 400 val) at a common
+128x128 -> 256x256 with scale tokens `[0.0, 1.0]`** (`history_jitter` dropped, as before, because the low tier
+does not carry it and a dataset must be uniform).
+
+**Training on it works, where the derived-input merge did not:**
+
+| data | inputs | val L1 vs baseline | measured progress |
+| --- | --- | --- | --- |
+| `godot-multiscale` (subsampled + mid) | `color,jitter` | -10.2% | **-4.4%** (refused) |
+| `godot-multiscale-real` (warp + mid) | `color,jitter,scale` | **+6.21%** | **+32.0%** |
+
+The diagnosis from last time holds: the earlier merge was untrainable because `godot-v6-subsampled`'s `input` is
+a *sampling of its own target*, while `godot-mid`'s is a real render - two different input-to-target relations
+in one loss. With both tiers as real renders the same architecture, seed and epoch count reaches **32.0%
+measured progress**, the strongest training signal this project has recorded on a merged set.
+
+**And that is where this turn stops, with the gap named exactly.** The token is now:
+in the data (per-pair `scale`, `[0.0, 1.0]`); in the token reader (`pair_from_npz` prefers the packed field over
+the width-derived value, so the same code serves merged and unmerged sets); in the model's input vocabulary;
+in the architecture (a `scale_channels` convolution beside `jitter`/`validity`/`history_jitter`, built only when
+`scale` is requested); in `forward`/`_residual_prepared`; in the export signature; and derived by the harness
+from the image so it cannot be fed wrong. One link is missing: **the training loop's batch-to-model call passes
+a fixed argument list that does not include `scale`**, so the token arrives as `None`. Before the architecture
+branch existed that mis-wiring was *silent* - the run trained, ignoring a declared input - and it was only
+caught by the export verification refusing `Invalid input name: scale`. Now it fails at the first step with
+`conv2d() received NoneType`, which is the better failure: loud, immediate, and pointing at the one call site.
+Runs that do not ask for `scale` are unaffected.
+
+So the current best measured configuration remains a model trained at the tier it is judged at
+(`models/phase4/upscale_mid.onnx`: first on all seven metrics at 256x256 -> 512x512), and the scale-agnostic
+binary is one call-site edit plus one retrain away from its first honest test.
+
+### The two-dataset merge, executed: the token is dynamic now, and the mixture is what fails
+
+The previous entry ended with a plan: the resolution token is inert with one tier of data because it is a
+constant channel, so the two tiers have to be merged into one training set with two distinct token values. That
+merge has now been run, and it produced a negative result with a diagnosed cause rather than a win.
+
+**The merge is built and its arithmetic is checked.** `tools/merge_scale_datasets.py` (new) writes
+`models/training-data/godot-multiscale` from the 128 tier (`godot-v6-subsampled`) and the 256 tier
+(`godot-mid`) as **799 pairs (399 train / 400 val) at a common 128x128 -> 256x256, carrying scale tokens
+`[0.0, 1.0]`**. It works by centre crop, and that is the load-bearing decision: a 128x128 window cut out of a
+256-wide render shows half the field of view at the *same pixels per world unit*, so the retained pairs keep the
+larger tier's detail statistics - which is exactly what the token is supposed to describe. `train_nrr.py` reads
+the token from the packed `scale` field when a pair carries it and otherwise derives it from the tensor's width,
+so a merged dataset is genuinely multi-scale while an unmerged one is unchanged. The merger also keeps only the
+keys *both* tiers carry (`history_jitter` is dropped here, and recorded in the manifest under `dropped_keys`)
+because the loader refuses a dataset that mixes pairs with and without an optional key - which is the check that
+caught this merge's first attempt.
+
+**And it does not train.** Four runs, same seed, same 60 epochs, same learning rate, differing only in the data
+and the inputs:
+
+| data | inputs | val L1 vs baseline | measured progress | gate |
+| --- | --- | --- | --- | --- |
+| `godot-mid` (256 tier only) | `color,jitter` | **0.01109 vs 0.01267, +12.53%** | **+14.8%** | **exported** |
+| `godot-mid` (256 tier only) | `color,jitter,scale` | 0.01273 vs 0.01267, -0.43% | +2.3% | refused |
+| `godot-multiscale` (both tiers) | `color,jitter,scale` | 0.01506 vs 0.01440, -4.53% | -0.3% | refused |
+| `godot-multiscale` (both tiers) | `color,jitter` | 0.01587 vs 0.01440, -10.2% | **-4.4%** | refused |
+
+**The last row is the one that matters, because it separates two explanations.** The merged set fails with the
+token *and without it*, and fails worse without - so this is not the token degrading a good mixture; it is the
+**mixture itself being untrainable**. The most likely reason is visible in this project's own history:
+`godot-v6-subsampled`'s `input` is *derived* - it is a sampling of its own target, the caveat that arm has always
+carried - while `godot-mid`'s is a real render of a real scene. Putting both in one loss asks a single residual
+function to fit two different input-to-target relationships, and with 399 pairs the model settles for fitting
+neither: residual L1 *rose* over training in both merged runs.
+
+So the honest status of the scale-agnostic binary is: **the plumbing is complete and verified end to end** - token
+in the trainer, in the exported graph, derived by the harness from the image so it cannot be fed wrong, dynamic
+across two tiers in the merged set - **and it has not been shown to help**. The configuration that has been shown
+to work is a model trained at the tier it is judged at: that is `models/phase4/upscale_mid.onnx`, first on all
+seven metrics at 256x256 -> 512x512.
+
+The next experiment is pre-registered by this result and is one command: **merge two tiers that are both real
+renders** - `godot-v6-warp` (128 tier, real renders) with `godot-mid` (256 tier, real renders) - so the only
+variable the token has to explain is scale. If that run trains, the token has a fair test; if it does not, the
+token's value as a scale mechanism is in doubt on evidence rather than on suspicion.
+
+### The 256->512 deficit was the training tier, and it is now fixed and measured
+
+The previous entry ended with a caveat and a plan: NRR scored 1.10 dB *below* bilinear at 256x256->512x512 because
+`upscale_subsampled.onnx` had only ever seen 128x128 inputs, and the fix was a model trained at that tier. That
+has now been done, and the deficit is gone.
+
+A real training split was captured for the tier first - four scenes at 512x512 (`temporal`, `temporal3`,
+`temporal4`, `temporal5`, 40 frames each) packed with the same validation scene as before, so the comparison is
+against the identical 14 frames: **`godot-mid` now carries 54 pairs (40 train / 14 val) of 256x256 -> 512x512**.
+
+| arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 28.2823 | 0.91760 | 0.96791 | 0.0578 | 0.2301 | 43.207 | 0.3629 |
+| **nrr** (`upscale_mid.onnx`) | **29.2989** | **0.93483** | **0.97519** | **0.0503** | **0.2106** | **49.433** | **0.3793** |
+| **xess** | 28.2281 | 0.91483 | 0.96497 | 0.0717 | 0.2352 | 36.463 | 0.3038 |
+| **dlss** | 26.8949 | 0.88509 | 0.94800 | 0.0983 | 0.2767 | 33.745 | 0.2097 |
+
+**NRR is first on all seven metrics at this tier** - +1.02 dB over bilinear, +1.07 dB over XeSS, +2.41 dB over
+DLSS, and the best LPIPS, DISTS, VMAF and detail retention. Training it took 33.4 s on this GPU
+(`tools/train_nrr.py --data models/training-data/godot-mid --inputs=color,jitter --epochs 60 --learning-rate
+0.002 --seed 20261020`, 103,611 parameters), and the trainer's own gates were the ones that certified it: val L1
+0.01109 against the bilinear baseline's 0.01267, **12.53% better**, with 14.8% measured training progress.
+
+**The resolution token is implemented, and it needs more than one tier to be anything but a liability.** The
+token is a new input plane carrying `log2(input_width / 128)` - 0.0 at the tier the first models were trained at,
+1.0 at 256, 2.0 at 512 - broadcast to a one-channel plane, because a fully convolutional stack can *run* at any
+resolution but is otherwise never told which one it is running at. It is implemented in the trainer
+(`--inputs=color,jitter,scale`), in the exported graph, and in the harness, which *derives* it from the image's own
+width so a caller cannot feed the wrong one. Measured with a single tier in the data, it **hurt**: the same seed
+and epoch count that produced a 12.53%-better model produced val L1 0.01273 (-0.43% against the baseline) with
+2.3% progress, and the trainer refused to export it. That is the honest result and it is the useful one: with one
+tier's data the token is a *constant channel*, and a constant is not a conditioning signal - the network is given a
+free input that carries no information about the task. The token earns its place when a run sees two tiers at once
+(so it has two values to distinguish), which needs the two datasets merged into one training set; that merge is the
+next step, and the token is already in place, fed and scored for it.
+
+Two defects were produced by the attempt and fixed:
+
+- **the packer now refuses an emptied split** instead of crashing. Verified against the real case that found it -
+  the 1024x1024 captures the data gate rejects: `every train frame was skipped by the data gate (8 of 8): this
+  capture has no pair with enough recoverable detail at this resolution`, exit 1, no traceback. Silent acceptance
+  of a detail-free split is exactly how a training pipeline poisons its own weights;
+- **a refused training run crashed while writing its report**, because the export (which creates the output
+  directory) never ran: `FileNotFoundError: models/phase4/upscale_mid_scale.report.json`. The report path is now
+  created before the report is written, so a refusal reports *why* it refused instead of raising.
+
+### Two tiers measured: where NRR actually stands, and what the gap is
+
+The previous step left one honest caveat attached to every row: 128x128 input is far below where DLSS and XeSS
+are designed to operate, so "NRR is competitive" was a statement about a tier nobody ships at. That caveat is
+now measured rather than repeated - by capturing a second, four-times-larger tier and running the same table on
+it.
+
+`models/training-data/godot-mid` is a fresh Godot capture at `--size 512`: **256x256 input -> 512x512 target**,
+the same 2.00x ratio, 14 validation frames that survived the packer's data gate. The whole pipeline ran on it
+with one command:
+
+```powershell
+powershell -File tools\run_parity.ps1 -Suffix '-512' -Data models/training-data/godot-mid -Limit 24 \
+    -XessOurFrames -DlssOurFrames      # -> work/parity/report-512.json + docs/parity-512.md
+```
+
+`-Suffix` was added because a second tier needs its own arms root: without it the two tiers would have read one
+another's `arm.json` files. The report and the table are suffixed too, and every row of both tables now carries
+a **`tier`** column (`256x256->512x512`), because a table whose rows do not say which grid produced them is a
+table that will eventually be read across two grids.
+
+At 256x256 -> 512x512, 14 frames of `temporal6`, all arms scored against the same targets:
+
+| arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | **28.2823** | **0.91760** | **0.96791** | 0.0578 | 0.2301 | 43.207 | 0.3629 |
+| lanczos | 27.5099 | 0.91065 | 0.96311 | 0.0730 | 0.2499 | 50.416 | 0.5811 |
+| **nrr** | 27.1771 | 0.90710 | 0.96086 | **0.0529** | **0.1964** | 42.756 | 0.8582 |
+| **xess** | 28.2281 | 0.91483 | 0.96497 | 0.0717 | 0.2352 | 36.463 | 0.3038 |
+| **dlss** | 26.8949 | 0.88509 | 0.94800 | 0.0983 | 0.2767 | 33.745 | 0.2097 |
+
+**What this establishes.** At the tier NRR's model was trained for (128->256) it beats both vendors on four of
+seven metrics. At this tier it is behind *bilinear* on PSNR by 1.10 dB and on SSIM/MS-SSIM, while leading the
+perceptual pair LPIPS and DISTS outright and retaining far more detail than either vendor (0.858 against XeSS's
+0.304 and DLSS's 0.210). The cause is not architecture: `upscale_subsampled.onnx` has never seen a 256px input -
+it was trained at 128->256 on a different dataset - so this row measures a model used outside the only
+configuration it was trained for. The next measurement that matters is a model trained at this tier, and the
+table is now the thing that will judge it.
+
+**The vendors do not beat bilinear here either** (XeSS 28.2281 vs bilinear 28.2823; DLSS 1.4 dB below), which is
+a statement about the content: at 512x512 the packer's gate rejected 10 of 24 frames because a bilinear upscale
+of the input already lands within 0.0100 of the target, and at 1024x1024 it rejected **45 of 48** (within
+0.0063). The captured scenes carry most of their detail well above a 2x upscale's reach at these sizes, so a
+comparison at 1024x1024 needs finer content and not just a bigger capture - which is the honest version of the
+resolution caveat.
+
+Three smaller things the attempt produced:
+
+- **the packer crashed instead of refusing** when the data gate emptied a split (`IndexError: list index out of
+  range` on `train_entries[0]`). It now raises a sentence naming the split, the counts and the reason - the same
+  refusal the val side of a 1024x1024 capture deserves;
+- **the tier is derived from the dataset, not its file name**: `manifest["size"]` is the input grid and a 2x
+  pack makes the target twice it, so the column cannot drift from the data;
+- **XeSS's DP4a path is not a caveat that can be fixed, only stated**: this GPU has no Intel XMX units, so the
+  number in the row is what any NVIDIA user gets from XeSS. The arm's backend field says
+  `Vulkan, DP4a (no XMX on this GPU)`, and it is the fair comparison for a product whose target hardware is
+  NVIDIA.
+
+### DLSS joins the table: all three commercial upscalers measured on our own frames
+
+The previous step gave XeSS a quality row by driving its library over our captured frames. DLSS was still a
+blocker in a row, and the blocker turned out to be two things, neither of them the one the row claimed.
+
+**What was actually missing was not the interposer.** The `-Dlss` check had been reporting "the Streamline
+runtime is absent", and a search of the whole machine found the runtime: Manor Lords ships StreamlineCore 2.7.30
+(`sl.interposer.dll`, `sl.common.dll`, `sl.reflex.dll`, `sl.pcl.dll`, `sl.dlss_g.dll`). What no application ships
+is Streamline's DLSS Super Resolution plugin itself - `sl.dlss.dll` lives in the *engine's* plugin directory and
+is not redistributed with a game, so the Streamline route is closed here. The direct NGX route is not: the
+vendored Streamline clone carries the **NGX SDK** (`external/ngx-sdk/include/nvsdk_ngx*.h`, API 1.5.0, plus the
+import lib), and `nvngx_dlss.dll` exports the `NVSDK_NGX_*` entry points themselves.
+
+So DLSS gets the same treatment XeSS did, by a different door:
+
+- `benchmarks/dlss_host/dlss_host.cpp` (new) runs DLSS over our frames through NGX on D3D12. It is a D3D12
+  program with no renderer in it - a device, four textures, two staging buffers, one command list per frame - and
+  it takes from NVIDIA only the runtime: `nvngx_dlss.dll` is staged from the Unity install (54 MB, 310.5.3.0,
+  the runtime this repository already documents) and NGX finds it beside the executable. Every call site that
+  could be guessed is instead asked about: ngx's own `GetScratchBufferSize` reports zero bytes (so DLSS needs
+  none), and the create-flags are printed in the report because a wrong one produces a plausible image;
+- `tools/dlss_over_our_frames.py` (new) mirrors the XeSS orchestration - same exporter, same manifest, same
+  frame order, same `same_frames: true` arm - and `tools/run_parity.ps1 -DlssOurFrames` is the one command.
+
+The complete head-to-head, on `godot-v6-warp` (48 frames, 2 val scenes, 128x128 -> 256x256, every arm scored
+against the same targets):
+
+| arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 26.3563 | 0.87165 | 0.95257 | 0.1025 | 0.2732 | 36.793 | 0.2634 |
+| fsr1 | 24.6755 | 0.84641 | 0.93548 | 0.0947 | 0.2958 | 42.255 | 0.7668 |
+| **nrr** | 26.6128 | **0.89045** | 0.95717 | **0.0546** | **0.1921** | 47.174 | **0.5713** |
+| **dlss** | 26.6829 | 0.88217 | **0.96077** | 0.1047 | 0.2576 | **52.253** | 0.2378 |
+| **xess** (balanced) | **26.7147** | 0.87228 | 0.95586 | 0.1319 | 0.2718 | 31.847 | 0.1774 |
+
+**NRR wins four of the seven metrics outright** - SSIM, LPIPS (1.9x closer than DLSS), DISTS and detail
+retention - while DLSS takes MS-SSIM and VMAF and XeSS takes PSNR by 0.03 dB over DLSS. That is the baseline
+this milestone was for: not an argument by reputation, but five upscalers and three baselines scored by one
+harness against one set of targets.
+
+Four findings, each of which changed the code:
+
+- **the application id is the gate, and the library says so.** `NVSDK_NGX_D3D12_Init(0, ...)` *succeeds* and then
+  `CreateFeature` is refused with `UnableToInitializeFeature` (0xbad0000b) - a difference between "the library
+  loaded" and "the feature is licensed to run" that no amount of D3D12 debugging would have found. The id that
+  works is the one our own fork passes for exactly this purpose
+  (`G:\godot-nvpt\drivers\streamline\streamline_context.cpp`, `pref.applicationId = 0x90d07004`), and the host
+  tries it first, prints every attempt's result, and takes it from `--app-id`;
+- **the scratch query is not a setup error.** `GetScratchBufferSize` refuses DLSS and reports 0 bytes: DLSS in
+  this NGX version needs no scratch buffer. A host that treated the refusal as fatal would refuse to run a
+  feature that works, so the refusal is printed and the loop continues;
+- **NGX has no preset parameter, and that is a fact worth recording.** DLSS's mode *is* the input/output ratio,
+  so a 128->256 run is the 2x mode by construction; the arm's `preset` field says so instead of inventing a name;
+- **the `-Dlss` row and the `dlss` row are different claims.** The status check now writes `dlss-fork` (the Godot
+  fork's ability to drive Streamline, still blocked on `sl.dlss.dll`) so it cannot overwrite the quality arm's
+  `arm.json`, and its reason says which of the two it is talking about.
+
+Deep-learning upscaler status across the three: DLSS 26.68 dB / MS-SSIM 0.9608 / VMAF 52.3, XeSS 26.71 dB /
+SSIM 0.872 / VMAF 31.8, NRR 26.61 dB / SSIM 0.890 / LPIPS 0.055 - at 128x128 input, which is far below where the
+vendors' upscalers are designed to operate, and on a DP4a path for XeSS rather than XMX. Both caveats are
+carried in the rows themselves.
+
+### XeSS has a quality row on our own frames: the parity table becomes a comparison
+
+The table could say what XeSS costs and never what it looks like on our content, because Intel's samples render
+*their* scene and cannot dump their frames. That gap is now closed, and the fix was not to ask Intel for
+anything - the SDK ships a library, so this repository wrote the host:
+
+- `benchmarks/xess_host/xess_host.cpp` (new) runs **libxess.dll over our captured frames**, through XeSS's
+  public Vulkan API. It is a headless Vulkan program - one device, four images, one command buffer per frame -
+  and it takes from Intel only the library: the sample's scene, formats and command buffers are all replaced on
+  purpose, because the point is to feed XeSS *our* pixels;
+- `tools/export_xess_inputs.py` (new) writes a dataset's validation frames as raw planes (RGBA16F colour, R32F
+  depth, RG16F motion) **in the order the harness pools its references**, because frame N there is scored
+  against reference N here and a reordering would compare every frame with the wrong target;
+- `tools/xess_over_our_frames.py` (new) runs the host, converts its output to the harness's PNG layout, and
+  writes the arm's `arm.json` with `same_frames: true` - the claim that makes its row a quality comparison
+  rather than a capability note. `tools/run_parity.ps1 -XessOurFrames` does the whole chain.
+
+The result, on `godot-v6-warp` (48 frames, 2 val scenes, 128x128 -> 256x256, the dataset's own 2x):
+
+| arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 26.3563 | 0.87165 | 0.95257 | 0.1025 | 0.2732 | 36.793 | 0.2634 |
+| fsr1 | 24.6755 | 0.84641 | 0.93548 | 0.0947 | 0.2958 | 42.255 | 0.7668 |
+| **nrr** | 26.6128 | **0.89045** | **0.95717** | **0.0546** | **0.1921** | **47.174** | **0.5713** |
+| **xess** (balanced) | **26.7147** | 0.87228 | 0.95586 | 0.1319 | 0.2718 | 31.847 | 0.1774 |
+
+**XeSS wins PSNR by 0.10 dB and loses the other six metrics**: SSIM, MS-SSIM, LPIPS (2.4x worse), DISTS, VMAF
+and detail retention. Read with the caveat attached: 128x128 is far below XeSS's operating point, which is
+where a DLSS/XeSS-class upscaler is built to run, and this is a DP4a path on an NVIDIA GPU rather than XMX. What
+the row establishes is a *measured* baseline on identical content instead of an argument by reputation - and it
+is the row that future NRR work gets judged against.
+
+Five findings, each of which changed the code rather than being noted and forgotten:
+
+- **the preset that can consume these frames is not the one the SDK documents.** `xessGetInputResolution`
+  answered 112x112 for a 256x256 output at "performance" - a ratio of 2.2857, not the documented 2.0 - so
+  feeding it our 128x128 frames would have been a configuration mismatch. The host now carries
+  `--probe-qualities`, which printed the table of what each preset *actually* asks for (2.98 / 2.29 / **2.00** /
+  1.70 / 1.50 / 1.30 / 1.00) and `balanced` is the one whose measured ratio is exactly the dataset's;
+- **XeSS tells the host which extensions and features it needs, and the host asks.** Instance extensions, the
+  minimum API version, device extensions and a device-feature chain all come from the library
+  (`xessVKGetRequiredInstanceExtensions` / `...DeviceExtensions` / `...DeviceFeatures`), with the chain going
+  into `pNext` and `pEnabledFeatures` left null as the SDK documents - not from a list copied out of a sample;
+- **the layouts are part of the contract and XeSS does not transition for you.** Inputs must be in
+  `SHADER_READ_ONLY_OPTIMAL` and the output in `GENERAL` when `xessVKExecute` is recorded into *our* command
+  buffer, so every barrier in the host is written out at the call site rather than hidden behind defaults;
+- **history has to reset at the capture's scene boundaries**, or XeSS blends the last frame of one scene into
+  the first frame of the next. `resetHistory` is set on the first frame and whenever the scene name changes;
+- **the harness had a latent hole that only a shared-frame arm could expose**: `evaluate_arm_online` scored a
+  `same_frames` arm against a *single* parity scene's references, so a 48-frame arm was compared against 24
+  references and reported "below the 4-frame floor". It now picks the pooled reference list when the arm's
+  frame count matches the pool and the single scene otherwise, records which one it used in the row, and
+  summarises an online arm exactly as an offline arm is summarised (the console printer then failed on a
+  measured online row, which is how the shape mismatch was caught).
+
+One naming change that follows from having two real measurements of one product: the vendor sample's
+capability/latency arm is now called **`xess-sample`**, and the quality row from our own frames keeps the name
+**`xess`**. One product, two rows, each name saying what was actually measured.
+
+### NRR gets a benchmarker, and the head-to-head stops being an estimate
+
+The parity table could name XeSS's cost and NRR's cost but not *compare* them: XeSS was measured by running
+Intel's sample application at a chosen tier, while NRR's `end-to-end-frame` numbers came out of the unified
+test suite - 194 tests, no filter, five samples. Two numbers of the same kind, from differently shaped runs.
+
+`benchmarks/nrr_bench.cpp` (new; `build/Release/nrr_bench.exe`) is the counterpart: a standalone binary that
+drives the runtime's real frame path at a chosen tier over a chosen frame count and reports the statistics
+XeSS's own benchmark reports, into artifacts of the same shape.
+
+```
+nrr_bench --model models/phase3/upscale_subsampled.onnx --tier 960x540 --tier 1920x1080 \
+          --frames 30 --motion 0 --csv work/parity/nrr-bench --json work/parity/nrr-bench.json
+```
+
+It prints the suite's machine-readable line, extended with the distribution, and named input -> output:
+
+```
+  960x540->1920x1080: wall=381.95ms  reported=379.37ms  (inference=84.94ms, host overhead=294.43ms)  p50=390.20ms  p99=396.81ms  fps=2.6
+```
+
+`tools/run_parity.ps1 -Nrr` builds it (Release - a Debug frame is not the frame anyone ships), puts the CUDA
+runtime DLLs on PATH, runs it at the table's own tiers, and the harness ingests the JSON. With XeSS measured
+at the same tier names, the table's two rows are finally the same measurement:
+
+| arm | tier | `end-to-end-frame` | p50 | p99 | provenance |
+| --- | --- | --- | --- | --- | --- |
+| xess | 960x540->1920x1080 | **0.704 ms** | 0.673 | 1.458 | its own sample scene, 14 208 frames, release binary |
+| nrr | 960x540->1920x1080 | **379.369 ms** | 390.20 | 396.81 | 30 frames, CUDAExecutionProvider, release build |
+| xess | 1920x1080->3840x2160 | **2.026 ms** | 1.965 | 3.440 | its own sample scene, 4 940 frames |
+| nrr | 1920x1080->3840x2160 | **1405.136 ms** | 1410.75 | 1478.11 | 30 frames, CUDAExecutionProvider |
+
+NRR is **539x** slower at 1080p and **694x** at 4K, and the split in the row says why: at 1080p the inference
+is 84.9 ms of a 379 ms frame, and at 4K it is 189.8 ms of 1405 ms. **The host data path is ~75-85% of the
+frame**, because the engine boundary hands the runtime host memory - the texture download, NCHW conversion,
+RGB8 conversion and the temporal blend are all CPU work - while the XeSS sample is handed GPU textures and
+tensor cores that a general convolution on the CUDA EP does not use. That is the comparison the table existed
+to make possible, and it redirects the work: the model is not the bottleneck the frame is.
+
+Three findings that the instrument produced before it produced that number:
+
+- **the first measurements were of a *non-temporal* frame.** The runtime's own debug string read
+  `temporal alpha=0 (motion above threshold)` and refused to accumulate, because the benchmark handed it
+  textures containing whatever the allocator left there (`change=0.0052` on planes it never wrote). The
+  benchmarker now seeds all three planes deterministically through `nrr_texture_upload` - a still structured
+  colour pattern, a depth ramp, and a zeroed motion field - and the same string now reads
+  `temporal accumulated: alpha=0.700`. The cost of the frame it was *supposed* to measure is 4x the one it
+  was accidentally measuring (89 ms -> 379 ms at 1080p), which is why the debug string travels into the row
+  and is printed verbatim in `docs/parity.md` rather than being summarised away;
+- **a GPU benchmark silently became a CPU one.** ONNX Runtime could not load
+  `onnxruntime_providers_cuda.dll` (it needs `cublasLt64_12.dll`, which is fetched into
+  `third_party/cuda-runtime-cu12/bin` but is not on PATH) and fell back to `CPUExecutionProvider`: 2 240 ms
+  per frame at 1080p instead of 379 ms. `-Nrr` now puts that directory on PATH itself, and the row cites the
+  provider the runtime *reported* rather than the one that was requested;
+- **the tier name was doing damage in both directions.** The sample is handed its output size and derives the
+  input from the preset, while NRR is handed its input grid, so the same tier was "1080p" at one end and the
+  other in the two arms. Every tier is now named input -> output (`960x540->1920x1080`) once, in one table, and
+  both arms are measured from it.
+
+One more guard, because a benchmark's numbers outlive the thing they measured: the harness refuses a
+`nrr-bench.json` older than the model it names, so a row from before a retrain cannot be read as current.
+
+### The parity table: the instrument before the opinion
+
+DLSS and XeSS have been "next" for several milestones. What was missing was not a position on our quality
+but the instrument that makes the comparison possible, so this step built the instrument first, and used it
+to turn one arm into a number and the other into an exact, one-download-away blocker.
+
+- `tools/parity_harness.py` (new; 23 self-test checks) - one table over every arm, with the rule that
+  decides what a row may be *used* for written into the row itself: **`same-frames`**. `yes` means the arm
+  was driven from this scene's own frames and scored against this scene's own targets (bilinear, bicubic,
+  lanczos, FSR 1.0, the exported model), so its row is a quality comparison; `no` means the arm ran in its
+  own runtime on its own content, so its row is a capability and latency measurement and its quality cells
+  are empty *by construction*. No sentence about quality may span a mixed pair, and the two latency kinds
+  (`inference-only`, an ONNX session; `end-to-end-frame`, the runtime's whole frame) are never averaged
+  together;
+- `tools/run_parity.ps1` (new) - the one command. It *runs* each online arm first, and each deposits
+  `work/parity/arms/<name>/arm.json`: identity, resolution, preset, cost, and the reason for anything it
+  could not measure. The harness then ingests those directories and writes `docs/parity.md`. An arm that
+  could not run still gets a row, and that row carries the reason;
+- **the XeSS arm is measured**: SDK 3.0.2's Vulkan sample run at two tiers, 14 055 and 4 844 frames,
+  **0.712 ms** at 540p->1080p and **2.065 ms** at 1080p->4K (Performance preset, RTX 4070 Ti, driver 610.88
+  decoded from the sample's own `VkPhysicalDeviceProperties.driverVersion`). Its quality columns are empty
+  and its row says why: the sample renders its own scene and cannot dump its frames. The DX12 sample is not
+  scriptable at all (it reports FPS only in its window title), so the Vulkan sample is the only runnable
+  XeSS-SR here;
+- **the DLSS arm's blocker is now exact rather than assumed.** The fork at `G:\godot-nvpt` *has* the
+  integration - `drivers/streamline/streamline_context.cpp` calls `LoadLibraryA("sl.interposer.dll")` and the
+  built exe names it - and `nvngx_dlss.dll` is staged in `third_party/dlss-unity`. What is missing is
+  Streamline's *runtime* redistributable: the fork's `thirdparty/streamline` ships headers only, so there is
+  no `sl.interposer.dll` / `sl.common.dll` beside the exe. That is one download from a real DLSS row, and
+  the row states it instead of being absent. (The first version of this check searched the Steam library and
+  reported "interposer not found" - a wrong reason pointing at a wrong place. It now reads the fork's driver
+  source and looks beside the exe.)
+
+The first table, on `godot-v6-warp` (48 frames over the 2 val scenes), with the model's declared inputs printed
+beside its row because the same weights fed a different input set are a different arm:
+
+| arm | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | VMAF | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 26.3563 | 0.87165 | 0.95257 | 0.1025 | 0.2732 | 36.793 | 0.2634 |
+| bicubic | 25.7689 | 0.86524 | 0.94596 | 0.0936 | 0.2795 | 40.399 | 0.4258 |
+| lanczos | 25.4109 | 0.85991 | 0.94447 | 0.1025 | 0.2846 | 40.912 | 0.4459 |
+| fsr1 | 24.6755 | 0.84641 | 0.93548 | 0.0947 | 0.2958 | 42.255 | 0.7668 |
+| **nrr** (`color,jitter`) | **26.6128** | **0.89045** | **0.95717** | **0.0546** | **0.1921** | **47.178** | 0.5713 |
+
+Read it with its caveat attached, which is the caveat this milestone exists to expose: that row is the
+sampled-input arm (`upscale_subsampled.onnx`), whose input plane is a *sampling of its own target*, so its
+margin over bilinear - **+0.26 dB and 47% better LPIPS** - is not yet a margin over any upscaler that works
+from an independent render. Measuring *that* is what the reference and preset work in P1 is for, and the
+`same-frames` rule is what will keep the two measurements from being quoted as one.
+
+Two defects found on the way, both by refusing to accept a number at face value:
+
+- **the harness's first feed was wrong, and the model said so.** The export declares `color` *and* `jitter`;
+  the bare-image feed supplied only `color` (`ValueError: Required inputs (['jitter']) are missing from input
+  feed (['color'])`). Zeros are not a neutral default here - they claim the frame was sampled on the grid, a
+  different phase rather than no phase - so `build_feed_from_image` now takes the frame's own offset,
+  broadcasts it to a plane exactly as `train_nrr.py` does, and *refuses* a jitter-aware model given none;
+- **`Start-Process -ArgumentList` does not quote an argument containing a space.** This repository lives
+  under `G:\Program Prototype\NRR`, so the XeSS sample received `G:\Program` as its results-file path, wrote
+  nothing anywhere, and still reported a successful benchmark - the arm directory came out empty while the
+  numbers looked fine. The runner now uses the call operator (which quotes for native commands), and the
+  harness reads PowerShell's BOM-prefixed JSON, with a self-test check of its own for that BOM because the
+  runner writes through `-Encoding UTF8`.
+
+
+
+### The refinement step: two defects fixed, the view it needed added, and then the measurement that ends the search
+
+Eight more runs, each changing one thing, and then the oracle interrogation that settles why none of them could
+win. The two defects first, both pre-existing and both costing real numbers:
+
+- **every refine arm was trained from a plane that had been de-jittered twice.** `prepare()` de-jitters `color`
+  because an upscaling task's render sits on the grid it was sampled on, but a phase-aligned plane *is* the placed
+  resolve - so de-jittering it moved the whole frame by the phase it was placed with. Measured: the plane alone
+  0.01462, the same plane de-jittered again **0.01589, 8.7% worse**. `PLACED_SOURCES` and `Upscaler.de_jitter` now
+  keep the phase as conditioning and leave the frame alone, so an untrained model is *exactly* the plane again;
+- **a refine crop took the colour plane's window from every tensor** - 256 pixels wide against a render-grid
+  `depth`/`motion`/`history`/`validity` of 128, so the window ran off the end and each sample clamped at a
+  different place (`RuntimeError: ... Expected size 89 but got size 60`). Every key is now cropped by its own
+  grid's share of the plan, the rule `target` always had.
+
+Then the architecture, on a measurement rather than a guess: `tools/refinement_headroom_probe.py` (new) reports
+that the best **single** mixture of the placed samples and the renderer's own reconstruction is the placed samples
+themselves (-0.0%) while the best **per-pixel** mixture is 0.00928 against 0.01462 - a **36.6% oracle** - so the
+missing information is a spatially varying choice between the two views. That is now an input (`naive`) and an
+architecture (`--refine-blend`: a per-pixel gate over the two views plus a residual, zero-initialised so an
+untrained model is still exactly the plane).
+
+| run (same split, same budget, against each run's own plane) | val L1 | vs its plane | `naive` ablation |
+| --- | --- | --- | --- |
+| plane only, double de-jitter (the failed gate run) | 0.01533 | -15.6% | - |
+| plane + jitter, de-jitter fixed | 0.01441 | -8.7% | - |
+| + `naive` | 0.01438 | -8.4% | 0.00009 |
+| + blend, saturated gate | **0.01348** | **-1.7%** | 0.00009 |
+| + blend, linear gate | 0.01485 | -11.9% | 0.02212 |
+| + blend, linear, crops 128/192, mirrors | 0.01447 | -9.1% | 0.01506 |
+
+**The more the model learns the mixture, the worse it generalises** - and augmentation, the standard answer to the
+359-pair overfitting the earlier runs diagnosed, does not change the sign. The linear gate also turned out to be
+unbounded in a way that matters: on the augmented recoverable run it **diverged** (training residual
+0.01072 -> 0.04097, val 0.09817 against the plane's 0.01218), so the gate is `tanh` now - zero at initialisation
+with a full gradient *and* bounded. The reason for the whole pattern is measured: average the
+oracle's own per-pixel weight over a neighbourhood - which is what any function of the two views can do, since it
+cannot know the target at a pixel - and the 36.6% **evaporates at 2x2** (0.00969 at 1x1 becomes 0.01736, i.e.
+16.1% *worse* than the plane, and it stays worse at 4x4, 8x8 and 32x32). The oracle's advantage is per-pixel
+target knowledge, not a learnable weighting field, so what every trained refiner learned was the average of an
+unlearnable decision. Nothing was exported and nothing was wired, as the pre-registration requires.
+
+**The configuration that does clear the bar was re-run, so the number is live.** The upscaling task on
+`godot-v6-subsampled` - whose input is a sampling of the target - at the recorded budget:
+**val L1 0.01374 against the bilinear baseline's 0.01487, +7.57%**, training progress **+30.3%**, every gate
+passed, **exported** (103,611 parameters, 212 s; ONNX Runtime matches PyTorch to 1.9e-04). The earlier recorded run
+was +9.45% on its own split. Both clear the 5% bar; this one is reproducible from the command in the roadmap, and
+its caveat is the control dataset's whole purpose: its input carries samples of the image it targets, which the
+engine's own low-resolution raster does not.
+
+
+
+Three 60-epoch runs at the recorded budget (32 channels = 69k parameters, batch 16, lr 0.002, seed 20261020,
+`--inputs=color,jitter`, `tools/run_phase3_refinement.ps1`; 359 train / 386 val pairs, each dataset's manifest
+hash in its report), each judged by the pre-registered bar - beat *your own base plane* on the held-out split,
+not bilinear:
+
+| run | its own base plane (val L1) | the refiner | against its plane | progress | gates |
+| --- | --- | --- | --- | --- | --- |
+| arm - the input-render resolve, `godot-v6-warp` | 0.01326 | 0.01533 | **-15.6%** | +14.9% | 1 failed |
+| control - the naive plane (`--alpha 0`), same data | 0.01541 | 0.01523 | +1.2% | +2.7% | 2 failed |
+| recoverable control - the target-sampling resolve, `godot-v6-subsampled` | 0.01218 | 0.01370 | **-12.5%** | +4.5% | 2 failed |
+
+All three refused to export, so the pre-registered rule fired and **nothing was wired**: the runtime post-filter
+stays unbuilt and M1's "accumulation that improves detail" stays open with the measurement beside it.
+
+The numbers, read in the order that matters:
+
+- **the plane is the best of the four.** The two runs on the product's own raster land at 0.01533 and 0.01523 -
+  within 0.0001 of each other and of the naive path's 0.01541 - whichever plane they start from, while the plane
+  they were correcting measures 0.01326. A refiner trained this way does not build on the arrangement; it
+  converges to about bilinear and erases the arrangement's 14% advantage;
+- **the ceiling is not the explanation.** The recoverable control loses by 12.5% on a dataset whose input *is* a
+  sampling of the target, where 100% of the task is a resampling relationship (against 53% on the engine's own
+  raster). What is left is the objective and the budget: training residual falls 4.5-14.9% while held-out error
+  rises *above* the plane's, an overfit gap on 359 pairs with 69k parameters;
+- **and the model did learn something** - SSIM and PSNR improve on the plane in every run (0.9307/29.28 dB against
+  0.9203/27.83 dB; 0.9393/30.59 against 0.9367/30.27) while L1 worsens. That is a filter sharpening toward
+  plausible detail rather than recovering the target's samples, which is what a plain L1 objective's optimum for
+  detail the input never carried asks for, against a bar (the plane) that already beats bilinear;
+- **and the control reproduces the previous refinement attempt to 0.03 of a percentage point** (-1.21% now,
+  -1.18% then, on the same naive plane), which is the reproducibility these numbers need before any of them is
+  quoted.
+
+The runner (`tools/run_phase3_refinement.ps1`), the naive-plane control dataset
+(`refinement_base_dataset.py --alpha 0`), and the three reports in `models/phase3/` are the artifacts; the
+roadmap records the three levers a next attempt would spend instead of the base plane.
+
+
+
+`--input-source phase-aligned` is the trainer's half of the pre-registered refinement step (docs/roadmap.md,
+M10.4): the plane the model corrects is the resolve of the caller's own low-resolution render for that frame,
+placed by the phase the dataset recorded, built per pair from the dataset itself rather than read from a derived
+dataset - so there is no second copy of the placement to drift, and the rule that is validated against two other
+statements of itself and pinned against the runtime byte for byte (`tools/export_runtime_plane_case.py`) is the
+one the training input comes from. `--refine` accepts either base plane now, and the log line and the report both
+name the plane, because which plane a run corrects is what the run *is*.
+
+Verified on the held-out split rather than asserted: over the 386 val pairs of `godot-v6-warp` the naive path is
+0.01541 and this plane is 0.01326, and a run's own `val_baseline_l1` prints 0.01326 - the number the model is
+measured against is the derive's plane, not a bilinear upsample wearing its name.
+
+Two defects came out of wiring it, both older than this change and both invisible to a colour-only refine run:
+
+- `jitter`/`history_jitter` were broadcast to the *render's* grid, so any refine run asking for jitter - whose
+  colour plane is the target's - died on a 256-vs-128 shape mismatch at the first convolution. They are
+  broadcast to the colour plane's grid now, which is a no-op for every recorded upscaling run because there the
+  two grids are the same;
+- `depth`/`motion`/`history`/`validity` are packed on the render's grid, which a target-resolution model cannot
+  consume; the combination is refused with that reason rather than silently mis-shaped, because the resampling a
+  display-grid post-filter would need is the open Phase-4 item and not something to invent here.
+
+The guards are two callable functions (`check_task_flags`, `check_refine_inputs`) so the self-test can exercise
+every refusal without launching a run, and the gate messages and quality line name the baseline by task - "the
+bilinear baseline" was naming a number a refine run never computes. Self-test green with two new checks, 0
+problems; the C++ suite is unchanged at **194/194**, 6/6 executables, exit 0.
+
+
+
+The mirror's placement was validated against two other statements of the placement rule - all three of them in
+Python. `tools/export_runtime_plane_case.py` (new) closes that gap: it generates a three-frame case (a coarse
+render per frame, the engine's jitter, and a motion field in the frame contract's unit whose left column leaves
+the frame, so the accumulation's out-of-frame emptying and the coverage fallback both run inside the comparison)
+together with the plane the derive computes from the same bytes, into `tests/generated/plane_case.h`.
+`test_input_render_resolve_matches_the_derived_plane` then uploads those bytes through the real device path with
+`NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER` and compares every displayed channel, with the *other* source rendering the
+same first frame as a control that the comparison is about the arrangement rather than about the scene.
+
+The first case found two things the Python checks could not. The derive's splat places onto a **square** grid only
+(`scatter_sum`/`upsample_rgb` take one size per axis) and the 4x8 case silently derived a wrong plane from that,
+so the mirror now refuses a non-square frame instead of mis-placing its samples; and the mirror is float64 where
+the runtime computes its taps, weights and resolve in float32, so the case's exact dyadic values sit *on* the
+write-back's rounding boundary - **12 bytes differed by one level** on the first run, ten of them outside any
+tolerance. The generator marks those bytes (197 of 2304, 8.55%) and refuses a frame where they exceed 35%; the test
+requires zero mismatches on every other byte and additionally caps the tolerated set at 5% of the frame.
+
+That the case pins the *rule* rather than this scene is measured, not asserted: with the accumulation's motion
+warp disabled in `apply` for one run, frame 2 fails with **737 of 768 bytes wrong, worst delta 220**, and the
+field went back in. Suite **194/194**, 6/6 executables, exit 0; `--check` makes the checked-in case fail loudly if
+it ever goes stale.
+
+
+
+`tools/refinement_base_dataset.py` gained `--plane phase-aligned-splat`, which materialises the plane
+`NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER` displays: the caller's own low-resolution renders splatted into the
+display grid, the coverage fallback for pixels no sample reached, the accumulation's motion warp, and the
+per-pixel emptying an out-of-frame warp source implies. Its placement is validated on every invocation against
+both statements of the rule already in the tree and agrees with each of them exactly (0.000e+00):
+`regen_aa_fixture.scatter_sum`, the fixture the C++ constants in `tests/unit/test_jitter.cpp` come from, and
+`capture_fidelity_probe.scatter_to_grid`, written for the product measurement.
+
+That derive then measured the arrangement over all 745 pairs of `godot-v6-warp`, against the same targets, and it
+reverses how the 13.9% has to be read:
+
+| plane | L1 against the target | against bilinear |
+| --- | --- | --- |
+| a bilinear upsample of the render | 0.01375 | - |
+| one frame splatted on its own | 0.01224 | **-11.0%** |
+| the accumulation, warped by the field | 0.02648 | +92.5% |
+| the accumulation as the runtime reads this field | 0.03124 | +127.2% |
+
+The 13.9% was measured on the *one-frame* configuration (`capture_fidelity_probe`'s `placed`), and the runtime
+accumulates every frame of the scene. On this capture that accumulation is **worse than not placing at all**: the
+scene moves about a pixel per frame on the input grid - five times past the 0.2 px/frame stillness gate this pass
+was measured to hold within - and a temporal mean of moving content is a smear that no placement rule recovers.
+The recorded claim that the arrangement is 13.9% closer to the display-resolution render than a bilinear upsample
+is true of one frame and false of the sequence the runtime displays.
+
+A second defect is recorded beside it, of the same species as the one above: the source packs its field in
+**viewport UV**, while the frame contract's motion texture is *pixel motion on the input grid* resampled by the
+resolution ratio (`specification/frame_contract.md`). Fed this dataset, the runtime's warp is therefore 0.015
+output pixels - a no-op. Both numbers are in the derived manifest and in the roadmap, so neither can be quoted as
+"the runtime's" by accident, which is exactly how the 13.9% came to be. The refinement base plane was re-registered
+accordingly (the one-frame splat, whose gap is detail rather than a smear). Suite **193/193**, 6/6 executables,
+exit 0.
+
+
+
+`PhaseAlignedFrame::offset_x` is stated in **output pixels**: `phase_aligned_frame_for` scales the renderer's
+jitter by the resolution ratio once, and a unit test pins that (0.25 px of jitter at a 2x pipeline is 0.5).
+`PhaseAlignedAccumulator::add_frame` takes its offset in **frame-grid** pixels and scales it into output pixels
+itself (`out_width / width`), which is the convention the fixture and `tools/capture_fidelity_probe.py` mirror.
+Each is right on its own; the two only ever *meet* in `TemporalAccumulator::apply`, and the default source
+cannot tell them apart, because there the frame is at the output grid and the scale is one. The input-render
+source is the one arrangement in which they disagree, and `apply` passed the output-pixel value straight
+through: a low-resolution render's samples went to `jitter * scale^2` instead of where the renderer took them,
+`jitter * scale`.
+
+Measured before the fix, by a new probe (`tools/offset_unit_probe.py`): splatting the ordering fixture's eight
+frames at twice the displacement is **+104.6% edge error** against the placement the capture asks for, where
+that placement is -60.1% against a bilinear upsample of the same input and the doubled one only -18.4%. So the
+arrangement recorded as worth more than a bilinear upsample was, on a 2x pipeline with a non-zero jitter, worth
+about a quarter of it. `apply` now divides back into the frame's own grid at its one call site - a no-op at
+scale 1, so every shipped path is byte-identical.
+
+The test that should have caught it did not, and that is the part worth recording: the end-to-end test compared
+the device's displayed frame against *the accumulator's own resolve of the bytes it uploaded*, and the reference
+it built had been handed the same scaled value - so it agreed with the defect. An expectation recomputed through
+the same composed units can catch a plumbing slip and never a unit one. The seam now has a test of its own,
+`test_input_render_offset_is_the_frame_grid_one_add_frame_documents`: it drives both sides - the accumulator
+through `apply`, and a second accumulator in the unit `add_frame` documents - requires the same plane, and
+asserts that the doubled placement is a *different* one. It fails with the scaling put back, the end-to-end
+reference was corrected to state the rule rather than mirror the code, and the missing unit is now written into
+`add_frame`'s own documentation. Suite **193/193**, 6/6 executables, exit 0.
+
+### The coarse-frame splat had no caller; the pass can now be told which frames to integrate
+
+The splat added above is what the accumulator does when a frame is coarser than the display grid, and nothing
+in the render path ever gave it one: `TemporalAccumulator` integrated the *displayed* frames at the display
+grid, so the arrangement measured 13.9% closer to the display-resolution render than a bilinear upsample of the
+same input had no way to be reached. `NRRPhaseAlignedSource` and
+`nrr_device_set_phase_aligned_source` are that way. The pass now integrates either
+
+- **the frames the model displayed** (`NRR_PHASE_ALIGNED_SOURCE_DISPLAYED`, 0, the default - everything every
+  backend did before the choice existed: a temporal denoise of the model's output, measured 3.0% of edge error
+  and 15.1% of plain error at 8 frames on the real capture), or
+- **the low-resolution renders the caller submitted** (`NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER`, 1), each
+  placed into the display grid at the position its samples were taken: the frames are coarser than the grid,
+  the accumulator splats, and the resolve *is* the displayed frame - the model still runs and its frame is not
+  what is shown.
+
+It is a *source* rather than a flag because the two describe the same scene on two different grids, so
+changing it discards what has been collected; `DISPLAYED` is a no-op to re-select, so a caller may set it
+every frame. An unknown value is refused rather than clamped onto the default, and a backend with no
+accumulator reports `NRR_ERROR_STATE_INVALID` rather than accepting a setting nothing honours - the contract
+the switch beside it has.
+
+Both backends hand over the bytes the renderer submitted (the CPU backend from the colour image it already
+holds, the shared accelerator kernel from the same bytes it records for the model's `history`), through the
+one election both of them share, so a sequence cannot integrate differently depending on which one rendered
+it. Reachable from both engines: `NRRDevice.SetPhaseAlignedSource`/`TryGetPhaseAlignedSource` in Unity and
+`set_phase_aligned_source`/`phase_aligned_source` on `NRR` in Godot, with the family's convention that
+"could not be read" is not reported as "displayed".
+
+Four tests, the fourth of which is what makes the rest worth having: the accumulator integrates the input
+render and reports `phase-aligned upscale` (**a constant input render resolves to that constant in every
+channel**, against a ramp displayed frame, so the arrangement cannot be confused); changing the source
+discards the accumulation while re-selecting the current one does not; the C ABI round-trips, refuses
+unknown values, and leaves the caller's variable untouched on failure; and the **end-to-end** test renders two
+jittered frames through the real render path once per source and compares every displayed channel against the
+accumulator's own resolve of the bytes the test uploaded - which caught a real defect in the first cut of
+this change: the resolve is at the *output* grid while the copy-back still used the *frame's* plane count, so
+a 2x upscale wrote only its first quarter and left the rest of the frame from the model. Suite **192/192**,
+6/6 executables, exit 0; the header's entry-point count moved 49 to 51 and the C-ABI-header cross-check
+agrees.
+
+
+### The accumulator splats a frame coarser than the grid instead of gathering it, and that is worth 13.9% on the input the product has
+
+`PhaseAlignedAccumulator::add_frame()` (runtime/nrr_jitter.cpp) accumulated `sum += place(upsample(frame))` and
+divided once: two resamplings of every frame - an interpolate, then a read back at `X + offset * scale` - averaged
+in place. When the frame is coarser than the output grid that order throws away the thing the class exists for: it
+resamples the coarse grid's *reconstruction* instead of integrating the samples. The coarse case now **splats**:
+each sample is written once, at the position it was taken at, with bilinear weights, the weights are accumulated
+beside the values, `resolve` divides the pair once, and any pixel no sample reached takes the frame's own bilinear
+upsample - the naive path - so the arrangement cannot be worse than not placing at all. A restarted pixel is
+emptied *before* the frame's samples land rather than being overwritten after them.
+
+The output-resolution case is deliberately unchanged: there the frame's samples and the grid's pixels are the same
+set, the placement is the whole question, and that order is the one measured at 3.0% of edge error and 15.1% of
+plain error at 8 frames on the real static capture. It is also the case the runtime actually calls
+(`nrr_temporal.cpp` passes the display grid for both the frame and the output), so no shipped behaviour moves; what
+moves is what the class does when a caller integrates a *coarser* frame into the display grid, which is the
+temporal-upscale arrangement the measurements below are about.
+
+Measured, in three places, all of which moved:
+
+| where | what it says |
+| --- | --- |
+| `tools/capture_fidelity_probe.py` (new section), a capture's own half-resolution raster | splat **0.00986** against bilinear **0.01146** = **-13.9%**, where applying the placement and then averaging is worth 3.4% on the same pairs |
+| `tools/regen_aa_fixture.py` step 3, the point-sampled zone plate at 8 frames (edge error) | splat **-59.4%** against -27.8% for de-jitter-then-average and **+9.8%** for the mirrored sign - better than every arrangement the class's own comment had measured, including the "leave the samples and average" bound at -33.4% |
+| `tools/regen_aa_fixture.py` step 2b, the capture's real pixels | the fixture's sign now agrees with the capture on **2/2** frames whose two placements differ at all |
+
+Two things were found in the doing, and both are recorded rather than smoothed over:
+
+- **The mirror has to keep two accumulators, not one resolved image.** Normalising each frame and then averaging
+  the frames is a different statistic - it re-normalises each frame's own coverage - and on the plate the two
+  disagree by 40% (0.376 against 0.606 at the pinned point). The first cut of the Python mirror made that mistake
+  and the C++ test caught it; `scatter_resolve()` now accumulates `Σwv` and `Σw` across frames and divides once,
+  which is what the class does.
+- **A ramp cannot pin a splat's sign.** The fixture's ramp is the one signal where bilinear interpolation is exact
+  and where the splat's half-sample centroid bias dominates (0.0039, half a sample times the ramp slope), so both
+  signs produce the same image: the frames whose offsets leave every output pixel on exactly one sample's taps
+  cannot discriminate, and `regen_aa_fixture.py` now counts those as uninformative rather than as disagreement
+  instead of refusing every constant. The one-frame/mirror constants moved to the fixture's second offset, which
+  does discriminate, and the sign is pinned where it is observable - the plate and the capture's own pixels.
+
+The pinned constants were regenerated (`aa_resolved`, `aa_plate_resolved`, and the one-frame pair), the class's
+header documents both orders with their measurements, and a new test covers the branch the equal-resolution
+fixtures cannot reach - `test_aa_accumulator_fills_pixels_no_sample_reached` recomputes the coverage itself and
+asserts that every pixel no sample reached is exactly the frame's own upsample. The suite is **188/188** with 6/6
+executables, exit 0.
+
+
+### The placement is worth 18.1%, but only on an input that is a sampling of the target - and the capture's raster is 58% something that is not a resampling relationship
+
+The plan at this point was to change the runtime: `PhaseAlignedAccumulator::add_frame()` computes each frame's
+placement and then *averages it in place*, and the scatter it was going to be changed to is worth 18.1% against
+bilinear on the pairs this work had been measuring on. It was not made the change, because reading
+`runtime/nrr_jitter.h` before editing it turned up the two caveats that number needed:
+
+- the frame builders in this repository (`regen_aa_fixture.py`'s `capture()` and everything derived from it,
+  including `subsampled_input_dataset.py`'s `capture_rgb`) are "**the mirror of the real capture, so it confirms
+  the wrong sign and looks right doing it**";
+- the arrangement being measured - leave the samples where they fell and integrate - is what the class already
+  documents and had already measured, at **3.0% of edge error and 15.1% of plain error on the real frames**,
+  "because a Godot raster filters its textures ... the plate is the bound".
+
+18.1% sits between the zone plate's 26-33% and the real capture's 3-15%, which is what a synthetic target's
+unfiltered aliasing should do. So the number is the *bound*, not the product path, and three measurements were
+taken to find out which of the two candidate mechanisms the real captures are actually limited by:
+
+| question | measurement (40-80 held-out pairs of `godot-v6-warp`) |
+| --- | --- |
+| is the raster a point sample or a filtered copy of the target? | **0.00833** from a point sample, 0.01255 from an area-filtered copy, contrast 0.05852 against a point sample's 0.05796 - it *is* a sampling and the aliasing is still in it |
+| is the recorded `jitter` the raster's real phase? | the best-fit displacement against the target correlates **+0.937 / +0.938** with the record at a mean error of 0.088 px, and the mirror does not fit it (0.486) - the metadata is right, correctly signed, and sub-pixel accurate |
+| then what is the error made of? | the raster differs from a *point sample of the target* by **0.00833 - 58% of the 0.01444 the model has to remove** - where the sub-pixel signal a sampling-of-the-target input carries is ~18% (0.0027) |
+
+The phase is right and the aliasing is there, so the failure is neither of the two things that had been assumed,
+and the *first* of those measurements rules out the explanation the class's comment implies: this capture's
+low-resolution pass has not been filtered flat. What it has been is **rendered separately**: its pixels are not
+the target's samples but a second render of the same scene, with its own texture filtering, LOD selection and
+sub-pixel coverage. `tools/capture_fidelity_probe.py` (new) reports the three questions for any packed dataset,
+and its control is the dataset that worked - the same instrument separates the two configurations completely:
+
+| the input | \|input - point sample of the target\| | against an area-filtered copy | correlation with the recorded phase | mean phase error | share of the task that is not a resampling relationship |
+| --- | --- | --- | --- | --- | --- |
+| `godot-v6-warp`, the engine's own raster | 0.00602 | 0.00990 | +0.939 / +0.944 | 0.083 px | **53%** |
+| `godot-v6-subsampled`, a sampling of the target | **0.00000** | 0.00520 | **+0.998 / +0.999** | **0.014 px** | **0%** |
+
+Refining the phase to 0.02 px closes only 16.7% of the first row's gap, so it is not phase quantisation: the
+low-resolution pass really is a different image of the scene, and the share of the task that comes from that is
+the share the network can only hallucinate - from the low-resolution shading, on the scenes it saw in training.
+That is the defect every arm above displayed, and it is not a defect of any of the features they were measured on.
+
+The consequence is that the one lever that did work works for a reason worth naming, and it is a *capture*
+change rather than a runtime one: `godot-v6-subsampled` feeds the network a point-sampling of the image it
+targets - the same targets, sampled on each frame's own displaced grid - and is the only configuration in this
+work where the arm clears the 5% bar (+9.45%), trains (29.8% against 1.8-4.0%), exports, and beats its
+history-zeroed control (13.8%, the control worse than bilinear). One full-screen point-sample pass in the engine,
+and the phase it sampled at, reproduces exactly that input; the placement worth 18.1% then composes on top of it
+rather than competing with it. The runtime change is deferred with the numbers that defer it, in `docs/roadmap.md`
+(M10.4).
+
+
+### The history a temporal model is trained on is not the history the runtime feeds it
+
+The temporal arms report a live `history` input (ablation 0.0029) that buys nothing, and a control that zeroes it
+ties its own arm. Reading the runtime explains both, and the explanation is a seam rather than a lever:
+
+- `TemporalAccumulator::record_input_frame()` stores the frame's *input render* by bytes and
+  `previous_input_frame()` hands it back unmodified - no reprojection. `BackendCPU` fills the model's `history`
+  tensor from exactly that. `warp_previous_output()` runs on the *displayed* output, for the internal blend, and
+  feeds no model.
+- The accelerator kernel takes the tensor from `input.temporal.history_input` and zero-fills when it is NULL, and
+  both shipped engine bindings leave that field NULL.
+
+So `history` has only ever existed in the datasets: every arm was trained on the previous frame reprojected onto
+this frame's grid and judged on the previous frame verbatim (CPU) or on zeros (a desktop accelerator).
+
+Measured, not inferred:
+
+- `models/nrr_history_probe.onnx` is a new fixture (generated by `tools/gen_sample_model.py`) whose output *is* the
+  `history` plane it was handed, 2x nearest-neighbour replicated so the displayed frame decimates back to the
+  tensor exactly. `tests/unit/test_history_delivery.cpp` renders two frames through the real path and reads back
+  what the model was fed: the CPU backend delivers frame 1's render (max delta **0** levels, 189/192 channels
+  lit); the device's own choice on this machine (NVIDIA) and a CPU device under `NRR_TEST_BACKEND=kernel` both
+  deliver **0/192 channels lit** - a zero-filled tensor.
+- `tools/history_delivery_probe.py` measures the same seam on the datasets, proving its premise first: every
+  compared pair (716 of godot-v6-warp, 166 of v5, 117 of v7) reproduces the packed plane exactly through the
+  packer's own warp, and a raw dataset measures a seam of exactly 0.00000. On `godot-v6-warp` the seam is
+  **0.01475** and the trained plane sits 15.1% closer to the frame being resolved than the plane the runtime
+  delivers; 35.3% on `godot-v7-warp`. Against the 0.0029 the input is worth, the plane a model is judged on
+  differs from the one it trained on by five times that input's entire value.
+
+Six tests were added (four at the accumulator, two through the real path) and one fixture; the suite was 185/185
+with ctest 6/6 at that point. The tables are in `docs/roadmap.md` (M10.4).
+
+### The seam above was then measured and closed, and it was worth 0.00003 of L1
+
+`--measure-history` (new, `tools/train_nrr.py`) judges a trained model on a history plane other than the
+dataset's own: `zeros`, or another dataset's for the *same pairs* - refused unless the two name the same val
+pairs in the same order, and unless reading the primary dataset's own planes that way reproduces the tensor the
+loader built. Because `godot-v6` and `godot-v6-warp` are the same pairs with only `history` differing, one
+trained arm can be judged on all three planes, with no retraining:
+
+| the plane the arm is judged on | val L1 | vs bilinear |
+| --- | --- | --- |
+| the packed, reprojected plane (what it trained on) | 0.0169894 | 2.995% |
+| the previous frame, unwarped (what the CPU path served) | 0.01702 | 2.84% |
+| zeros (what an accelerator served) | 0.01701 | 2.87% |
+| its own control model, retrained | 0.01701 | 2.87% |
+
+The spread across all three planes is **0.00003**, and on the plane the runtime actually delivered the arm scores
+its own control's number - while its whole edge over that control on the plane it trained on was 0.00002, smaller
+than the seam. So the seam is real and is not why history failed; the hypothesis is refuted the way the three
+before it were. It was closed anyway, because a runtime that feeds a model a plane it was not trained on is a
+defect at any size:
+
+- `warp_input_history_to_nchw()` (`runtime/nrr_temporal.{h,cpp}`) reprojects the recorded input plane by this
+  frame's motion field - backward, bilinear, source clamped into the frame - which is the packer's own rule.
+- `BackendCPU` fills the model's `history` tensor from it, and so does the accelerator kernel, which first had to
+  be given the two things it never had: `record_input_frame`/`record_depth` (it recorded nothing at all, so its
+  history was always empty) and the `validity` mask it never built - a model declaring `validity` was fed the
+  *colour image* through a three-channel tensor.
+- `include/nrr.h`'s `history_input` now states that the runtime fills the plane on every path that owns a record,
+  and that a caller supplying a texture overrides it.
+
+Measured both ways on both backends by `tests/unit/test_history_delivery.cpp`: with no field the model is handed
+the previous frame (max delta 0 levels), with a field it is handed that frame reprojected, against an expectation
+computed by hand from the patterns (max delta 0). The suite is 187/187 with ctest 6/6, and each accumulating
+backend's forced-override configuration keeps exactly the failures it had before this work.
+
+Recorded rather than fixed, and the one finding here that is bigger than the seam above: the capture's motion
+texture holds `uv * motion_scale * 0.5 + 0.5` while `specification/frame_contract.md` says `motion_vectors` is
+pixel motion and both engine bindings set `motion_vectors_scale = 1.0`. A replay of these captures therefore hands
+the runtime a field four times too small with a constant half-pixel offset, which a scale cannot express because a
+bias is not a scale: on 128-wide frames the true motion is 1.22 px/frame and the runtime warps by 0.497 px.
+Measured over 716 pairs, the history plane's distance from the frame it has to resolve is 0.02087 as the previous
+frame, 0.01809 correctly reprojected, and **0.03879** warped by the runtime's reading of the capture's field.
+
+### The plane every earlier number was measured on is not the plane the runtime feeds
+
+The packer writes `input` as the capture's render *plus* seeded noise (INPUT_NOISE_SIGMA 0.005) and keeps
+`input_clean` beside it; the model and its bilinear baseline were both trained and validated on the noisy plane.
+The runtime adds no noise - an engine hands it the render. `--input-source clean` (new in `tools/train_nrr.py`,
+recorded in every report) trains and validates on `input_clean` instead. Same arm, same seed, same 386 held-out
+pairs:
+
+| the plane `color` is read from | the arm | bilinear baseline | the arm against it |
+| --- | --- | --- | --- |
+| `input`, noisy - every number recorded before this | 0.01699 | 0.01751 | **+3.00%** |
+| `input_clean`, what the runtime is fed | 0.01686 | 0.01541 | **-9.40%** |
+
+On the noisy plane the training loss falls 23.6%: most of what the model learns is to remove the packer's noise,
+a scene-independent skill that generalises perfectly and that the runtime has no use for. On the clean plane the
+same architecture has almost nothing to learn (0.01229 to 0.01207, 1.8% - the trainer's progress gate refuses the
+run as degenerate), its loss *rises* after epoch 12, stopping there still leaves it 3.22% behind bilinear, and it
+beats bilinear only on the pairs it trained on. So the headroom the M10.4 comparisons were taken on was mostly an
+artefact, and those comparisons need re-running on this plane before the next architecture decision. Both new
+tools are in the same change: `tools/accumulated_input_probe.py` measures the capture's own planes and reports the
+runtime's resolve as *not* better upscaler input than a single frame (14% further from the ground truth at 2
+frames, 45% at 4, 92% at 8) - while the de-jitter that placing a single frame performs is worth 2.8%, and while
+what the runtime *displays* is that resolve, which is the residual-refinement arm's real headroom.
+
+### An input that is a *sampling* of the target, and the first arm that beats its own control
+
+Every dataset in the tree pairs a `target` with an `input` that is the engine's own *independent* half-resolution
+raster of the same scene - two different samplings of one signal, so detail the raster never caught is absent from
+the input rather than aliased in it, and an L1 objective cannot recover what was never sampled.
+`tools/subsampled_input_dataset.py` (new) rebuilds `input`/`input_clean` as the target sampled on the frame's own
+displaced grid (`tools/regen_aa_fixture.capture_rgb`, the convention `tests/unit/test_jitter.cpp` pins), adds no
+noise, and re-derives `history` from the previous frame's sampled view through the packer's own warp. Its own
+manifest states the case before any training: one sampled view stands 0.01316 from the target where the source's
+independent raster stands 0.01375, and the samples scattered to the positions they were taken at stand 0.01102.
+
+Two runs, same flags and seed as every arm before them, `--input-source clean`:
+
+| godot-v6-subsampled, seed 20261020 | val L1 | vs bilinear 0.01487 | progress | export |
+| --- | --- | --- | --- | --- |
+| arm (color,motion,history,jitter) | **0.01346** | **+9.45%** | **29.8%** | **exported** |
+| control (arm, history zeroed) | 0.01561 | -5.01% | 2.1%, refused | - |
+
+The arm clears the 5% bar, trains 29.8% where the engine-raster arms managed 1.8-4.0%, exports for the first time
+in this work, and beats its own history-zeroed control by 13.8% - the comparison M10.4 could never make, with the
+control landing *worse* than bilinear.
+
+And the same dataset shows that the winning operation is not the model. One held-out view combined four ways:
+
+| the view, combined (386 held-out pairs) | val L1 | against bilinear |
+| --- | --- | --- |
+| no correction | 0.01487 | - |
+| the model's own de-jitter stage, then bilinear | 0.01537 | +3.4%, worse |
+| placed, then upsampled (the accumulator's order) | 0.01437 | -3.4% |
+| **scattered to the fine pixels the samples were taken at** | **0.01218** | **-18.1%** |
+
+A two-line geometric operation beats the trained network by 9.5% and the naive path by 18%. The de-jitter is not
+mis-signed (the flipped sign is worse, 0.01527) - it is weak, because correcting the phase on the coarse grid and
+then interpolating cannot use information that is sub-pixel *of the output grid*. `docs/roadmap.md` (M10.4)
+carries the tables and the consequence.
+
+**Both of the claims above were then re-measured against the real captures and qualified** (the entry at the top
+of this file): the 18.1% is the *bound* of a synthetic target rather than the product path, because the builders
+that produced this dataset are the mirror of the real capture; and the raster's detail is not "absent rather than
+aliased" - it *is* a point sample of the scene with the aliasing intact at a correctly recorded phase
+(correlation +0.94), and what it is not is the target's samples. That is what makes this input the one that works
+and the engine's own raster the one that does not, without making it a runtime defect.
+
+### The clean-plane re-basing, and the refinement task built and measured against it
+
+The pre-registered comparison (arm vs jitter-aware reference vs the arm's own history-zeroed control) re-run on
+the plane an engine actually feeds (`--input-source clean`), one variable changed from every recorded run:
+
+| configuration, seed 20261020 | val L1 | against bilinear 0.01541 | progress |
+| --- | --- | --- | --- |
+| arm (color,motion,history,jitter) | 0.01686 | -9.40% | 1.8%, refused |
+| arm, 12 epochs | 0.01591 | -3.22% | - |
+| arm, lr 0.0005 | 0.01584 | -2.75% | 1.1%, refused |
+| arm, detail-weight 0.5 | 0.01788 | -16.03% | -29.1%, diverged |
+| reference (colour + jitter) | 0.01617 | -4.90% | 3.1%, refused |
+| control (arm, history zeroed) | 2.31164 | - | diverged |
+
+Nothing beats a bilinear upsample and no run reaches the progress gate, so the recorded tie is not a tie: the
+comparison is unmeasurable on the real input, and the four refutations before this one were four measurements
+taken above a signal the augmentation had supplied.
+
+The refinement task is then built and measured, because it is the framing with a gap that is real:
+`tools/refinement_base_dataset.py` materialises the frame the runtime displays (the recursive reprojection
+blend, `compute_state`'s alpha, the packed validity as its reject mask, deviations stated in its manifest), and
+that plane is **0.01639 against one upsampled render's 0.01541 on the held-out split** - the runtime's display is
+6.4% worse than the frame it was built from. `--refine` (new: identity skip, so an untrained model *is* the
+plane and the plane is its own baseline) trains a correction of it, and does not beat it:
+
+| refiner's base plane | its own bar | the refiner | against it | progress |
+| --- | --- | --- | --- | --- |
+| the frame the runtime displays | 0.01639 | 0.01646 | -0.41% | 4.0%, refused |
+| the same frames unaccumulated (`--alpha 0`) | 0.01541 | 0.01560 | -1.18% | 2.8%, refused |
+
+SSIM and PSNR end exactly where the plane had them, and neither refiner reaches even the unaccumulated frame's
+quality. The reason is structural: the correction that would close the gap is about 1% of the loss, and the rest
+is detail the input's samples never carried - the target is a full-resolution capture while the input is a
+separate half-resolution raster of the same scene. `docs/roadmap.md` (M10.4) carries the tables, the diagnosis,
+and the dataset change the measurements now point at.
+
+### The reprojection blend stops trusting history it cannot see, and a motion-layout bug the mask had
+
+`TemporalRenderer::blend_frame` blended the reprojected previous frame into every pixel the motion field said
+history reprojected - no disocclusion rejection, no clamp. The trust mask the runtime already builds (one plane,
+1 where the reprojected history at that pixel can be believed) was fed only to a model that declares a
+`validity` input; the accumulation itself never saw it. So the runtime ghosted history through occlusion
+boundaries and through any pixel whose colour had drifted while its depth still looked valid.
+
+The blend consumes the mask now, under a guard the accumulator turns on:
+
+- **rejection** - a pixel the mask refuses keeps the current frame; the history there is not blended at all.
+- **clamping** - a pixel the mask accepts has its reprojected history clamped, per channel, to the min/max of
+  the *current* frame over a `TEMPORAL_CLAMP_RADIUS` (3x3) neighbourhood: a thin mover or a shading change,
+  which the mask cannot reject because the depth is unchanged, is pulled back toward the frame instead of
+  ghosting.
+
+Its default is the device's own capability, not a constant: the guard is **on wherever the device reports
+temporal coherence (BASIC or better) and off where it does not** (`disocclusion_rejection_default` in
+`nrr_temporal.h`), applied once at device initialization from the capability `DeviceImpl` has just read.
+`TemporalAccumulator::set_disocclusion_rejection_enabled()` - forwarded through `Backend`, `DeviceImpl` and the
+new C entry points `nrr_device_set_disocclusion_rejection` / `nrr_device_get_disocclusion_rejection`
+(`NRR_ENTRY_POINT_COUNT` is 49) - overrides it either way. Where the guard is off, or where a frame supplies no
+mask, the accumulation is byte-for-byte what it was: a null mask leaves `blend_frame` exactly as it was. The
+mask is built only when the guard is on and only when the depth provider, the previous frame's recorded depth
+and this frame's motion are all present; a frame missing any of them keeps the un-guarded blend rather than
+rejecting or trusting on a guess.
+
+Every backend that accumulates now claims `temporal_coherence`, so the guard's default is on wherever the
+device can do temporal work: `BackendCPU` already did, and the five desktop accelerator backends that render
+through the shared `AcceleratorExecutionKernel` (NVIDIA, AMD, Intel, Vulkan, RISC-V) now do too. The claim is a
+property of the backend, not a device probe - it holds whether or not a GPU was found, because the kernel
+accumulates on the ONNX CPU EP fallback as well. The mobile backends are deliberately *not* included: they run
+on `MobileExecutionKernel`, which owns no accumulator, so there is no blend there for the guard to guard.
+
+A vendor backend's kernel comes up lazily (on its first frame or model load), and the caller-facing switch
+reports NRR_ERROR_STATE_INVALID before then - so a default derived at device initialization would be lost by
+the time the kernel exists. `Backend::apply_disocclusion_rejection_default()` therefore hands the default to the
+kernel, which remembers it and applies it from `initialize()`. That place is pinned by
+`test_disocclusion_default_is_applied_when_a_lazy_kernel_starts`: an on default set before the start is in force
+after it, an off default stays off, and the live switch still works once the kernel is up.
+
+The two fixtures that pin the *unguarded* equation against a zeroed depth leave the guard off explicitly
+(`tests/integration/test_temporal_accumulation.cpp` and `tests/integration/test_path_parity.cpp`), which is what
+keeps them measuring the equation they are about rather than the guard's default.
+
+Both shipped engine bindings wrap the switch, so it is reachable from game code rather than from C alone:
+`NRR.set_disocclusion_rejection()` / `disocclusion_rejection()` in Godot (declared in `nrr_godot.h`, called
+through the C API, bound for `ClassDB`, wrapped in `NRR.gd`, and round-tripped by `godot_verify/verify.gd`), and
+`NRRDevice.SetDisocclusionRejection` / `TryGetDisocclusionRejection` in Unity (with the raw `DllImport`s in
+`NRRNative.cs` and the verify project's copies re-synced). Both offer the query as well as the setter, because
+the guard's default is capability-derived: without the query a caller could turn the guard on but not off, and
+a flattened bool would turn "this backend cannot accumulate" into a silent no-op. The Godot pair is recorded
+as **source-level verified** rather than verified - the round-trip is in the script, but no fresh Godot run has
+been recorded for it.
+
+Two consequences worth recording. The mask a model is fed and the mask the blend consumes are now **one call to
+one function** (`compute_history_trust_mask_from_textures()`, decoding the raw attachments through the same
+`texture_to_nchw()` the model's tensors use). Hanging that on the guard surfaced the second item: the mask
+function indexed the motion field **interleaved** while every caller passed it **planar** - the layout
+`texture_to_nchw()` produces for the model's `motion` tensor - so a `validity` input computed from a nonzero
+motion field was built from a scrambled field, and no plane-level test could see it because the plane fixture was
+written in the same interleaved order the reader used. The function reads planar now, and
+`tests/unit/test_history_mask.cpp` drives the raw-attachment path so the decode and the rule cannot disagree
+about a layout again.
+
+Eight new tests, `ctest` 6/6, suite 179/179: the two blend behaviours on `blend_frame` (rejection against a
+no-mask control, and clamping to the neighbourhood edge), the mask from raw attachments (planar decode, and a
+wrong-size field refused), the whole path through the accumulator (a sky depth rejects every pixel with the
+guard on and blends every pixel with it off), the C ABI switch including its capability-derived default, the
+guard reaching the shared kernel through the `Backend` default on whichever vendor backend the host selects, the
+default-on path driven through the real render pipeline with a depth that has geometry, the later-applied
+default for a lazily-started vendor kernel, and both engine bindings exposing the pair.
 
 ### The third explanation for history, built and refuted: telling the model where the samples sit
 

@@ -24,6 +24,14 @@ extends CanvasLayer
 
 signal stats_updated(stats: Dictionary)
 
+## Where the released scale-agnostic model is looked for when `model_path` is left empty: beside the
+## addon, so installing the addon and installing the model are the same act for the one everyone uses.
+## It is the artifact `docs/parity.md` and `docs/parity-512.md` measure (`models/phase4/
+## upscale_msreal_scale.onnx` in the NRR tree), and it is *one* graph for every tier: it declares a
+## resolution token - log2(input_width / 128) - which the runtime derives from the frame itself, so a
+## caller that leaves the model path empty gets the right tier without knowing which one it is at.
+const RELEASE_MODEL_PATH := "res://addons/nrr/models/upscale_msreal_scale.onnx"
+
 @export var enabled: bool = true:
 	set(value):
 		enabled = value
@@ -31,6 +39,11 @@ signal stats_updated(stats: Dictionary)
 			_overlay.visible = value
 
 ## Model to load. res:// paths are resolved for the native filesystem layer.
+##
+## Empty means "the released model, if it has been installed": the node then looks for
+## [constant RELEASE_MODEL_PATH] and reports honestly when it is not there rather than rendering
+## nothing and saying nothing. Installing it is a copy - see the addon README's "Using it as an
+## upscaler" section for the one command.
 @export_file("*.onnx", "*.nrrmodel") var model_path: String = ""
 
 ## Cap the resolution the neural pass runs at, as a fraction of the viewport.
@@ -104,7 +117,22 @@ func _ready() -> void:
 				+ "passthrough. Build engine_plugins/godot/src for this platform "
 				+ "to enable neural rendering.")
 	else:
-		_nrr.load_model(model_path)
+		# An empty path means the released model, if it has been installed. Reported rather than assumed:
+		# a node that silently renders nothing while claiming to be an upscaler is the failure this whole
+		# addon is written against.
+		var chosen := model_path
+		if chosen == "":
+			# FileAccess rather than ResourceLoader: a .onnx has no Godot importer, so it is a raw
+			# resource and ResourceLoader.exists() reports false for a file that is sitting right there.
+			if FileAccess.file_exists(RELEASE_MODEL_PATH):
+				chosen = RELEASE_MODEL_PATH
+			else:
+				push_warning(
+					"NRRPostProcess: no model_path set and the released model is not installed at %s; "
+					% RELEASE_MODEL_PATH
+					+ "running as passthrough. See the addon README, 'Using it as an upscaler'.")
+		if chosen != "":
+			_nrr.load_model(chosen)
 		# Pay the one-time neural-stack initialization here, at the size _process()
 		# will actually render at, rather than stalling the first presented frame.
 		# Measured: 632 ms cold against 11.7 ms steady state on a CUDA host.

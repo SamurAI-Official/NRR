@@ -452,9 +452,10 @@ NRRResult BackendCPU::execute_model(
      * which is both the treatment an absent depth already gets and exactly what a model is fed when it is run
      * as its own zeroed control.
      *
-     * Both fields are converted with the same texture_to_nchw() the model's own `depth` tensor uses, so the
-     * mask is built from the numbers the model is given rather than from a second decode of the same
-     * attachment down a different path. */
+     * The fields are decoded with the same texture_to_nchw() the model's own `depth` and `motion` tensors
+     * use, through compute_history_trust_mask_from_textures() - one definition of the decode-then-rule
+     * plumbing, shared with the accumulation's own disocclusion guard, so the mask a model is fed and the
+     * mask the blend consumes cannot be assembled differently. */
     std::vector<float> trust_mask;
     bool trust_mask_built = false;
     auto history_trust_mask = [&]() -> const std::vector<float>& {
@@ -463,18 +464,13 @@ NRRResult BackendCPU::execute_model(
             std::vector<uint8_t> previous_bytes;
             uint32_t previous_w = 0, previous_h = 0;
             NRRTextureFormat previous_format = NRR_TEXTURE_FORMAT_R32F;
-            std::vector<float> current_depth, previous_depth, motion_uv;
-            const bool have_fields =
-                depth_img != nullptr && depth_img->width == in_w && depth_img->height == in_h &&
-                temporal_.previous_depth_frame(previous_bytes, previous_w, previous_h, previous_format) &&
-                previous_w == in_w && previous_h == in_h &&
-                texture_to_nchw(depth_img->pixels.data(), in_w, in_h, depth_img->format, 1, current_depth) &&
-                texture_to_nchw(previous_bytes.data(), previous_w, previous_h, previous_format, 1,
-                                previous_depth);
-            if (have_fields && motion_img != nullptr &&
-                motion_img->width == in_w && motion_img->height == in_h &&
-                texture_to_nchw(motion_img->pixels.data(), in_w, in_h, motion_img->format, 2, motion_uv)) {
-                compute_history_trust_mask(current_depth, previous_depth, motion_uv, in_w, in_h, trust_mask);
+            if (depth_img != nullptr && motion_img != nullptr &&
+                temporal_.previous_depth_frame(previous_bytes, previous_w, previous_h, previous_format)) {
+                compute_history_trust_mask_from_textures(
+                    depth_img->pixels.data(), depth_img->width, depth_img->height, depth_img->format,
+                    previous_bytes.data(), previous_w, previous_h, previous_format,
+                    motion_img->pixels.data(), motion_img->width, motion_img->height, motion_img->format,
+                    trust_mask);
             }
         }
         return trust_mask;
@@ -507,6 +503,10 @@ NRRResult BackendCPU::execute_model(
              * a two-channel offset tensor was filled with the *colour image* - a silent
              * corruption that renders and looks plausible while being nonsense. */
             case TensorRole::Jitter: channels = 2; break;
+            /* One channel: the resolution token, derived from the frame's own input width. Without this case it
+             * was three channels of *colour* aimed at a one-channel input, which the session rejected on the
+             * element count - a model that renders in the harness and could not render here at all. */
+            case TensorRole::Scale:  channels = 1; break;
             /* One channel: the trust mask the runtime computes for itself. */
             case TensorRole::Validity: channels = 1; break;
             default:                 channels = 3; break;
@@ -544,6 +544,29 @@ NRRResult BackendCPU::execute_model(
             continue;
         }
 
+        /* The resolution token is built rather than supplied, like the offset above and for the stronger version
+         * of the same reason: the frame already says how wide it is, so the engine cannot hand a scale-agnostic
+         * model the wrong tier. */
+        if (role == TensorRole::Scale) {
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(ort->get_input_shape(i), channels, in_w, in_h, shape)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("model input '") + name +
+                               "' shape conflicts with the frame resolution");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            if (!build_scale_plane(in_w, in_h, t.data)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("could not build the resolution token for input '") + name + "'");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            tensors.push_back(std::move(t));
+            continue;
+        }
+
         /* The mask is built rather than converted from an attachment: no caller supplies one, which is the
          * point of computing it here. Zero-filled when it could not be built - an absent depth, or the first
          * frame of a sequence - so a model's validity input is always satisfied and the zeroed-control case is
@@ -569,6 +592,47 @@ NRRResult BackendCPU::execute_model(
             continue;
         }
 
+        /* The plane a temporal model was trained on: the previous frame's render, reprojected by *this* frame's
+         * motion field. This is the seam docs/roadmap.md records - the runtime fed the previous frame verbatim
+         * while every temporal dataset was packed from the reprojected form - and the reprojection is the
+         * packer's own rule (tools/pack_godot_pairs.py warp_history_bilinear), so the plane a model trains on
+         * and the plane it is served are one construction rather than two that happen to agree.
+         *
+         * Without a motion field there is nothing to reproject with, and the previous frame passes through
+         * unmodified - exactly what this path did before the warp existed, which is why a caller that supplies
+         * no field sees no change. */
+        if (role == TensorRole::History && have_history) {
+            std::vector<int64_t> shape;
+            if (!concrete_input_shape(ort->get_input_shape(i), channels, in_w, in_h, shape)) {
+                std::ostringstream oss;
+                oss << "model input '" << name << "' resolution " << in_w << "x" << in_h
+                    << " conflicts with the model's static input shape";
+                set_last_error(NRR_ERROR_RENDER_FAILED, oss.str());
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            TensorInput t;
+            t.name = name;
+            t.shape = shape;
+            const bool warped = motion_img != nullptr &&
+                warp_input_history_to_nchw(history_img.pixels.data(), history_img.width, history_img.height,
+                                           history_img.format,
+                                           motion_img->pixels.data(), motion_img->width, motion_img->height,
+                                           motion_img->format, input.temporal.motion_vectors_scale,
+                                           channels, t.data);
+            if (!warped && !texture_to_nchw(history_img.pixels.data(), history_img.width, history_img.height,
+                                            history_img.format, channels, t.data)) {
+                set_last_error(NRR_ERROR_RENDER_FAILED,
+                               std::string("unsupported texture format for input '") + name + "'");
+                return NRR_ERROR_RENDER_FAILED;
+            }
+            tensors.push_back(std::move(t));
+            continue;
+        }
+
+        /* History is handled above whenever the accumulator has a record; reaching the ternary with that role
+         * means there is none (the first frame of a sequence, or the frame after a cut), and the tensor is
+         * zero-filled like any other absent optional input - which is what the caller's own zeroed control is
+         * fed, and why the two cases are the same code path. */
         const BackendCPU::CPUImage* src =
             (role == TensorRole::Depth) ? depth_img
             : (role == TensorRole::Motion) ? motion_img
@@ -661,10 +725,37 @@ NRRResult BackendCPU::execute_model(
         }
         return field;
     };
+    /* This frame's depth, at the input grid, for the accumulation's own disocclusion guard. Supplied
+     * unconditionally (it is just a pointer to a texture the call already holds); the guard reads it only
+     * when a caller turned it on, so a sequence that did not ask for it pays nothing. */
+    auto depth_source = [&]() -> TemporalAccumulator::MotionImage {
+        TemporalAccumulator::MotionImage field;
+        if (depth_img) {
+            field.pixels = depth_img->pixels.data();
+            field.width = depth_img->width;
+            field.height = depth_img->height;
+            field.format = depth_img->format;
+        }
+        return field;
+    };
+
+    /* What the pass may use, including which frames it is being given: the source is held by the accumulator
+     * the frames go through (here the backend's own; on the test route the kernel's), so the election and the
+     * accumulator cannot disagree about it. */
+    TemporalAccumulator::PhaseAlignedFrame phase_elected = phase_aligned_frame_for(
+        input, model_uses_jitter, in_w, in_h, out_w, out_h, temporal_.phase_aligned_source());
+    if (phase_elected.from_input_render) {
+        /* The renderer's own low-resolution pass, by bytes, so what gets placed is what it wrote. Left unset
+         * when the color texture was unreadable, and the pass then integrates nothing and says so rather than
+         * quietly integrating the other source. */
+        phase_elected.input_render.pixels = color_img.pixels.data();
+        phase_elected.input_render.width = in_w;
+        phase_elected.input_render.height = in_h;
+        phase_elected.input_render.format = color_img.format;
+    }
 
     const TemporalAccumulator::Result temporal = temporal_.apply(
-        input, out_bytes, out_w, out_h, motion_source,
-        phase_aligned_frame_for(input, model_uses_jitter, in_w, in_h, out_w, out_h));
+        input, out_bytes, out_w, out_h, motion_source, phase_elected, depth_source);
 
     /* Record this frame's low-resolution input so the *next* frame can bind it as the
      * model's history. Recorded after inference, when the input pixels are final, and
@@ -830,6 +921,70 @@ bool BackendCPU::is_phase_aligned_enabled() const {
         if (kernel != nullptr) return kernel->is_phase_aligned_enabled();
     }
     return temporal_.is_phase_aligned_enabled();
+}
+
+NRRResult BackendCPU::set_phase_aligned_source(NRRPhaseAlignedSource source) {
+    if (!initialized_) {
+        return NRR_ERROR_STATE_INVALID;
+    }
+    temporal_.set_phase_aligned_source(source);
+    /* Same reason as set_phase_aligned_accumulation above: on the test route this backend's own accumulator
+     * is not the one that sees the frames. The kernel's own accumulator holds the choice too, because on that
+     * route it is the one electing the frame in the first place. */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) return kernel->set_phase_aligned_source(source);
+    }
+    return NRR_SUCCESS;
+}
+
+bool BackendCPU::phase_aligned_source(NRRPhaseAlignedSource* out_source) const {
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr && kernel->is_initialized()) {
+            return kernel->phase_aligned_source(out_source);
+        }
+    }
+    if (out_source == nullptr) return false;
+    *out_source = temporal_.phase_aligned_source();
+    return true;
+}
+
+NRRResult BackendCPU::set_disocclusion_rejection(bool enabled) {
+    if (!initialized_) {
+        return NRR_ERROR_STATE_INVALID;
+    }
+    temporal_.set_disocclusion_rejection_enabled(enabled);
+    /* Same reason as set_phase_aligned_accumulation above: on the test route the kernel's accumulator is the
+     * one that sees the frames, so a success that did not reach it would be the silent-loss failure mode. */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) kernel->set_disocclusion_rejection(enabled);
+    }
+    return NRR_SUCCESS;
+}
+
+bool BackendCPU::is_disocclusion_rejection_enabled() const {
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) return kernel->is_disocclusion_rejection_enabled();
+    }
+    return temporal_.is_disocclusion_rejection_enabled();
+}
+
+NRRResult BackendCPU::apply_disocclusion_rejection_default() {
+    if (!initialized_) {
+        return NRR_ERROR_STATE_INVALID;
+    }
+    const bool enabled = disocclusion_rejection_default(capabilities_.temporal_coherence);
+    temporal_.set_disocclusion_rejection_enabled(enabled);
+    /* Same reason as the switch above: on the test route the kernel's accumulator is the one that sees the
+     * frames, so it must be told the default too. */
+    if (test_route_through_accel_kernel()) {
+        AcceleratorExecutionKernel* kernel = get_accel_kernel();
+        if (kernel != nullptr) kernel->set_disocclusion_rejection_default(enabled);
+    }
+    return NRR_SUCCESS;
 }
 
 // ============================================================================

@@ -58,6 +58,15 @@ TensorRole classify_tensor_role(const std::string& name) {
         n == "subpixel" || n == "sub_pixel" || n.find("offset") != std::string::npos) {
         return TensorRole::Jitter;
     }
+    /* The resolution token, matched narrowly - the name the exporter writes and the two spellings a model
+     * author reaches for - because "scale" is a substring of ordinary input names ("upscale_factor",
+     * "motion_scale", "scale_bias") and a false positive here feeds a one-channel token into a three-channel
+     * path, which is the corruption the jitter and validity rules above exist to prevent. It is matched before
+     * the colour synonyms for the same reason jitter is: none of them collide with these exact names, and
+     * matching colour first would swallow anything ending in "_input". */
+    if (n == "scale" || n == "scale_token" || n == "resolution_token") {
+        return TensorRole::Scale;
+    }
     /* History is matched early, and before colour, for the same reason: "history_color"
      * is a natural input name that the colour synonyms would otherwise claim. The
      * temporal guard on the last clause keeps a model input merely called
@@ -88,6 +97,21 @@ TensorRole classify_tensor_role(const std::string& name) {
         return TensorRole::Color;
     }
     return TensorRole::Other;
+}
+
+bool build_scale_plane(uint32_t width, uint32_t height, std::vector<float>& out_nchw) {
+    if (width == 0 || height == 0) return false;
+    /* One number per frame, repeated: log2(128 / 128) = 0.0 at the reference tier, log2(256 / 128) = 1.0 one
+     * octave up, 2.0 two. A tier between them is a fraction rather than a special case (192 -> 0.585), which is
+     * what makes the measure a description of the grid instead of a label - and a model trained on a fractional
+     * token has been told something meaningful rather than an unknown value.
+     *
+     * The harness derives the same number the same way (tools/compare_upscalers.py::build_feed_from_image), so a
+     * model measured there and rendered here is told the same thing about its tier. If these two ever diverge,
+     * every Python-side number is a measurement of a different input than the one the engine feeds. */
+    const float token = std::log2(static_cast<float>(width) / kScaleReferenceWidth);
+    out_nchw.assign(static_cast<size_t>(width) * static_cast<size_t>(height), token);
+    return true;
 }
 
 bool concrete_input_shape(const std::vector<int64_t>& model_shape,

@@ -190,6 +190,58 @@ func phase_aligned_accumulation() -> int:
 	return int(_native.call("get_phase_aligned_accumulation"))
 
 
+## Chooses what that integration integrates. Mirrors nrr_device_set_phase_aligned_source().
+##
+## SOURCE_DISPLAYED (0, the default) integrates the frames the model displayed, at the display grid: a
+## temporal denoise of the model's output, which is what set_phase_aligned_accumulation() has always
+## produced. SOURCE_INPUT_RENDER (1) integrates the low-resolution frames this binding submitted, each
+## placed into the display grid where its samples were taken: a temporal upscale, whose resolve *is* the
+## displayed frame, measured 13.9% closer to the display-resolution render than a bilinear upsample of the
+## same input (tools/capture_fidelity_probe.py). Selecting it means choosing the runtime's resolve as the
+## picture - the model still runs, and its frame is not what is shown.
+##
+## The source belongs to the accumulation, not to a frame, so changing it discards what has been collected:
+## samples placed from the input grid and samples of the display grid describe the same scene on two
+## different grids. Returns false for an unknown value, a missing device, or a backend with no accumulator.
+func set_phase_aligned_source(source: int) -> bool:
+	if not available or _native == null:
+		return false
+	return bool(_native.call("set_phase_aligned_source", source))
+
+
+## 0 (displayed frames) or 1 (input renders) for the accumulator this device will run frames through,
+## -1 when the source could not be read. See set_phase_aligned_source().
+func phase_aligned_source() -> int:
+	if not available or _native == null:
+		return -1
+	return int(_native.call("get_phase_aligned_source"))
+
+
+## Turns the reprojection blend's history guard on or off. Mirrors
+## nrr_device_set_disocclusion_rejection() from the public C API.
+##
+## The guard rejects the history the runtime's history trust mask refuses (a source that left the frame, a
+## surface the previous frame held something nearer than, sky) and clamps the rest to the current frame's
+## neighbourhood, so a disoccluded pixel stops smearing the old scene through. Its default is not off: it
+## follows the device's temporal-coherence capability, so a device that reports it already has the guard on,
+## and a device that does not is not handed the extra pass. The mask is built from this frame's depth and the
+## previous frame's recorded depth, which render_frame() supplies when the caller passes them; a call that
+## omits the depth attachments gets no mask and keeps the un-guarded blend.
+## Returns false when the device is missing or its backend has no accumulator (see last_error()).
+func set_disocclusion_rejection(enabled: bool) -> bool:
+	if not available or _native == null:
+		return false
+	return bool(_native.call("set_disocclusion_rejection", enabled))
+
+
+## 1 when the accumulator has the guard on, 0 when it is off, -1 when this device has no accumulator at all -
+## "off" and "cannot" are different answers (see set_disocclusion_rejection).
+func disocclusion_rejection() -> int:
+	if not available or _native == null:
+		return -1
+	return int(_native.call("get_disocclusion_rejection"))
+
+
 ## Reports the scene motion the runtime should assume for the frames submitted next, in the unit
 ## NRRFrameInput::temporal.motion_magnitude is declared in: pixels moved per frame divided by the frame
 ## width (specification/frame_contract.md 4.3). Zero means "no measurement", which makes the
@@ -238,8 +290,9 @@ func has_temporal_inputs() -> bool:
 
 
 ## What the runtime decided about the last frame, as a Dictionary: `motion_magnitude`, `temporal_alpha`,
-## `history_frames`, `jitter_enabled`, `phase_aligned_enabled`, `frame_index` and `debug_info` (the
-## runtime's own note, which distinguishes "off", "declined" and "ran"). Empty when nothing has rendered.
+## `history_frames`, `jitter_enabled`, `phase_aligned_enabled`, `phase_aligned_source`,
+## `disocclusion_rejection`, `frame_index` and `debug_info` (the runtime's own note, which distinguishes
+## "off", "declined" and "ran"). Empty when nothing has rendered.
 func temporal_state() -> Dictionary:
 	if _native == null:
 		return {}

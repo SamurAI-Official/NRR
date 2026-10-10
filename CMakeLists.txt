@@ -704,6 +704,10 @@ if(NRR_BUILD_TESTS)
     target_compile_definitions(nrr_tests PRIVATE
         NRR_SAMPLE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_upscaler_v0.1.onnx"
         NRR_PASSTHROUGH_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_passthrough_2x.onnx"
+        # The history-delivery fixture: its output is the `history` plane it was handed, so
+        # test_history_delivery.cpp can read back the tensor the runtime fed a model. Absolute like the two
+        # above, because ctest runs the suite with the build directory as its working directory.
+        NRR_HISTORY_PROBE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_history_probe.onnx"
         # Source root, so the engine-plugin drift guards can read
         # engine_plugins/**/*.cfg / *.gdextension / *.gd / src/*.cpp and check
         # them against include/nrr.h at test time.
@@ -774,6 +778,94 @@ if(NRR_BUILD_TESTS)
     # test_mobile_model vendor tests under `#ifdef NRR_ENABLE_MOBILE_VENDOR`
     # (on by default for Android/iOS, off for desktop), so on a desktop build
     # only the platform-independent mobile constraints tests run.
+endif()
+
+# ============================================================================
+# The benchmarker (benchmarks/nrr_bench.cpp)
+# ============================================================================
+#
+# A standalone binary rather than a mode of the test suite, because tests/main.cpp runs all 194 tests and has
+# no filter: a benchmark you cannot run on its own is a benchmark you will not run. It is deliberately outside
+# the NRR_BUILD_TESTS block for the same reason - measuring the runtime should not require building the suite.
+# It links nrr_static (and nrr) only, and is handed the sample model paths as absolute definitions so it
+# measures a real model from any working directory.
+add_executable(nrr_bench ${CMAKE_SOURCE_DIR}/benchmarks/nrr_bench.cpp)
+target_include_directories(nrr_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(nrr_bench PRIVATE nrr_static nrr)
+target_compile_definitions(nrr_bench PRIVATE
+    NRR_SAMPLE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_upscaler_v0.1.onnx"
+    NRR_PASSTHROUGH_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_passthrough_2x.onnx"
+)
+nrr_copy_ort_dll(nrr_bench)
+
+# ============================================================================
+# The XeSS host (benchmarks/xess_host/xess_host.cpp)
+# ============================================================================
+#
+# Runs Intel's XeSS Super Resolution over *our* captured frames, so the parity table can score it against the
+# same targets NRR is scored against instead of recording it as a capability row. It needs two optional
+# things, and is built only when both are present: Vulkan headers (tools/fetch_vulkan_headers.ps1) and the
+# XeSS SDK (tools/fetch_xess.ps1). A machine without them simply has no XeSS arm - which is what the table
+# already says, with the reason - rather than a build that fails.
+#
+# It links nrr_static for one thing: runtime/vulkan/vulkan_api.cpp is this repository's own Vulkan loader
+# table (volk without the dependency), so the host resolves vulkan-1.dll at runtime exactly as the runtime
+# does and needs no import library. libxess.dll is loaded by path at runtime for the same reason.
+file(GLOB _NRR_XESS_SDK_ROOTS "${CMAKE_SOURCE_DIR}/third_party/xess-*/inc/xess")
+file(GLOB _NRR_VK_HEADERS "${CMAKE_SOURCE_DIR}/third_party/vulkan-headers-*/include")
+if(_NRR_XESS_SDK_ROOTS AND _NRR_VK_HEADERS)
+    list(GET _NRR_XESS_SDK_ROOTS 0 _NRR_XESS_INC)
+    list(GET _NRR_VK_HEADERS 0 _NRR_VK_INCLUDE)
+    get_filename_component(_NRR_XESS_INC_PARENT "${_NRR_XESS_INC}" DIRECTORY)
+    get_filename_component(_NRR_XESS_ROOT "${_NRR_XESS_INC_PARENT}" DIRECTORY)
+
+    add_executable(xess_host ${CMAKE_SOURCE_DIR}/benchmarks/xess_host/xess_host.cpp)
+    target_include_directories(xess_host PRIVATE
+        ${CMAKE_SOURCE_DIR}/runtime
+        ${CMAKE_SOURCE_DIR}/runtime/vulkan
+        ${_NRR_VK_INCLUDE}
+        ${_NRR_XESS_INC})
+    target_link_libraries(xess_host PRIVATE nrr_static)
+    target_compile_definitions(xess_host PRIVATE
+        NRR_XESS_LIBRARY="${_NRR_XESS_ROOT}/bin/libxess.dll")
+    nrr_copy_ort_dll(xess_host)
+    message(STATUS "XeSS host: built against ${_NRR_XESS_ROOT} (libxess.dll loaded at runtime)")
+else()
+    message(STATUS "XeSS host: skipped (needs third_party/vulkan-headers-* and third_party/xess-*)")
+endif()
+
+# ============================================================================
+# The DLSS host (benchmarks/dlss_host/dlss_host.cpp)
+# ============================================================================
+#
+# Runs NVIDIA DLSS Super Resolution over our captured frames, the counterpart of the XeSS host. It takes the
+# NGX path rather than Streamline on purpose: no application on this machine ships Streamline's DLSS SR plugin
+# (`sl.dlss.dll`), while the direct NGX path needs only what is already here - the NGX headers and import lib
+# from the vendored Streamline clone's `external/ngx-sdk`, and `nvngx_dlss.dll`, which exports the NVSDK_NGX_*
+# entry points themselves.
+#
+# Gated on those two things existing, so a machine without them has no DLSS host rather than a broken build.
+# The runtime DLL is loaded by NGX itself at startup (it looks beside the executable), which is why the target
+# copies the staged `third_party/dlss-ngx/nvngx_dlss.dll` next to the binary when it is present.
+set(_NRR_NGX_INC "${CMAKE_SOURCE_DIR}/third_party/Streamline/external/ngx-sdk/include")
+set(_NRR_NGX_LIB "${CMAKE_SOURCE_DIR}/third_party/Streamline/external/ngx-sdk/lib/Windows_x86_64/nvsdk_ngx_d.lib")
+if(EXISTS "${_NRR_NGX_INC}/nvsdk_ngx.h" AND EXISTS "${_NRR_NGX_LIB}")
+    add_executable(dlss_host ${CMAKE_SOURCE_DIR}/benchmarks/dlss_host/dlss_host.cpp)
+    target_include_directories(dlss_host PRIVATE ${_NRR_NGX_INC})
+    target_link_libraries(dlss_host PRIVATE "${_NRR_NGX_LIB}" d3d12 dxgi)
+    if(NOT MSVC)
+        message(WARNING "dlss_host is a D3D12 host and is only built on MSVC")
+    endif()
+    # NGX loads nvngx_dlss.dll from beside the executable, so the staged runtime is copied there when it exists.
+    set(_NRR_NGX_RUNTIME "${CMAKE_SOURCE_DIR}/third_party/dlss-ngx/nvngx_dlss.dll")
+    if(EXISTS "${_NRR_NGX_RUNTIME}")
+        add_custom_command(TARGET dlss_host POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_NRR_NGX_RUNTIME}" "$<TARGET_FILE_DIR:dlss_host>"
+            COMMENT "Staging nvngx_dlss.dll beside dlss_host")
+    endif()
+    message(STATUS "DLSS host: built against ${_NRR_NGX_INC}")
+else()
+    message(STATUS "DLSS host: skipped (needs third_party/Streamline/external/ngx-sdk)")
 endif()
 
 # ============================================================================

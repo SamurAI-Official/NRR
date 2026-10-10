@@ -59,6 +59,10 @@ pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild
 * `set_phase_aligned_accumulation()` / `phase_aligned_accumulation()` - the switch round-trips, and
   "off" is never confused with "cannot" (the refusal path reports -1 rather than 0). A frame rendered
   with it on must still come back non-passthrough.
+* `set_disocclusion_rejection()` / `disocclusion_rejection()` - the history guard round-trips the same way.
+  Its **default is the device's temporal-coherence capability rather than off**, so the same invariant is what
+  is checked: an accepted setting is one the accumulator holds, and a refusal reports -1 ("cannot") rather than
+  0 ("off").
 * `shutdown()` leaves `available == false`.
 
 ## Recorded result
@@ -77,6 +81,10 @@ reset_temporal_history=true    available_after_shutdown=false
 phase_aligned_supported=true   state_after_off=0   state_after_on=1
 RESULT: PASS
 ```
+
+(The block above predates the disocclusion guard pair. A fresh run prints three more lines after
+`phase_aligned_supported=...` - `disocclusion_supported=...`, `disocclusion_enabled=...` and
+`disocclusion_final_state=...` - and `entry_point_count` reads 49.)
 
 Two lines need reading carefully rather than taking at face value:
 

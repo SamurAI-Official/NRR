@@ -88,6 +88,40 @@ public:
 	 *  accumulator at all (see nrr_device_get_phase_aligned_accumulation). */
 	int get_phase_aligned_accumulation();
 
+	/** nrr_device_set_phase_aligned_source(): choose what that integration integrates.
+	 *
+	 *  NRR_PHASE_ALIGNED_SOURCE_DISPLAYED (0) is the denoise of the frames the model displayed, which is
+	 *  what the switch above has always produced. NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER (1) integrates the
+	 *  low-resolution renders this binding submitted, placed into the display grid - a temporal upscale,
+	 *  whose resolve *is* the displayed frame, and which is measured 13.9% closer to the display-resolution
+	 *  render than a bilinear upsample of the same input (tools/capture_fidelity_probe.py). A caller that
+	 *  selects it is choosing the runtime's resolve as the picture.
+	 *
+	 *  Returns false, with the reason in get_last_error(), for an unknown value, a missing device, or a
+	 *  backend with no accumulator. Changing it discards what has been accumulated, because the two sources
+	 *  describe the same scene on two different grids. */
+	bool set_phase_aligned_source(int p_source);
+
+	/** 0 (displayed) or 1 (input render) for the accumulator this device will run frames through, -1 when
+	 *  the source could not be read (see nrr_device_get_phase_aligned_source). */
+	int get_phase_aligned_source();
+
+	/** nrr_device_set_disocclusion_rejection(): turn the reprojection blend's history guard on or off.
+	 *
+	 *  The guard rejects the history the runtime's history trust mask refuses (a source that left the
+	 *  frame, a surface the previous frame held something nearer than, sky) and clamps the rest to the
+	 *  current frame's neighbourhood. Its *default* is not off: it follows the device's temporal-coherence
+	 *  capability, so a device that reports it already has the guard on and a caller only needs this to
+	 *  override that either way. The guard reads this frame's depth and the previous frame's recorded depth,
+	 *  so a sequence that supplies no depth attachment gets no mask and keeps the un-guarded blend. Returns
+	 *  false, with the reason in get_last_error(), when the device is missing or its backend has no
+	 *  accumulator - a backend that cannot accumulate is not the same answer as "off". */
+	bool set_disocclusion_rejection(bool p_enabled);
+
+	/** 1 when the accumulator has the guard on, 0 when it is off, -1 when this device has no accumulator at
+	 *  all (see nrr_device_get_disocclusion_rejection). */
+	int get_disocclusion_rejection();
+
 	godot::String get_backend_name() const;
 	godot::Dictionary get_capabilities() const;
 	double get_render_time_ms() const;
@@ -118,7 +152,8 @@ public:
 	bool set_jitter(godot::Vector2 p_offset, bool p_enabled);
 
 	/** The runtime's own report for the last rendered frame: the magnitude it used, the history weight it
-	 *  computed, the history depth it saw, whether the integration is on, and the debug line. Returned
+	 *  computed, the history depth it saw, whether the integration is on, whether the history guard is on,
+	 *  and the debug line. Returned
 	 *  rather than logged because a benchmark has to compare what the runtime decided against what it was
 	 *  asked - and because "the pass is off", "the pass declined" and "the pass ran" are three different
 	 *  answers, which is what the phase note distinguishes. */
