@@ -148,8 +148,25 @@ for constant and comparison for comparison (`tools/pack_godot_pairs.py`): a mask
 inference from the one the model was trained on is a different input wearing the same name. A model declares it
 by naming an input `validity` (or `trust`, or `mask`); the runtime feeds it, and zero-fills it when it cannot be
 built - no depth attachment, or the first frame of a sequence - which is the same tensor a model sees when it is
-run as its own zeroed control. Nothing here is an ABI change for a caller: the mask is built, consumed inside
-the render path, and never crosses the C API.
+run as its own zeroed control.
+
+The mask is built from the raw attachments a binding already holds - this frame's depth, the previous frame's
+depth, this frame's motion - by `compute_history_trust_mask_from_textures()`, one definition of the
+decode-then-rule plumbing. The motion field is read **planar** (u-plane then v-plane), the layout
+`texture_to_nchw()` produces for the model's own `motion` tensor and therefore the field the caller already
+converted. An earlier revision read the field interleaved while every caller passed it planar, so a mask built
+from a motion field that was nonzero was built from a scrambled field; the layout has one meaning now, pinned by
+`tests/unit/test_history_mask.cpp`.
+
+The mask is not only a model input. The accumulation's own reprojection blend consumes it too when the
+disocclusion guard is on: at the pixels the mask refuses the blend keeps the current frame, and at the rest it
+clamps the reprojected history to the current frame's neighbourhood. The guard's default is the device's own
+temporal-coherence capability - on wherever the device reports it (BASIC or better), off where it does not - so
+it is not a fixed default; a caller overrides either way with `nrr_device_set_disocclusion_rejection`.
+The mask the model is fed and the mask the blend consumes are one call to one rule, at the two grids each
+needs (the model's input grid; the blend's output grid, reached by nearest resampling because the mask is a
+per-pixel decision, not an image). Nothing here is an ABI change for a caller: the mask is built, consumed
+inside the render path, and never crosses the C API.
 
 ---
 

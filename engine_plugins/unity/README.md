@@ -59,6 +59,17 @@ drops the accumulation rather than averaging across the move. This renderer zero
 today, so the field it offers says nothing has moved, which makes the magnitude the only thing standing
 between a moving camera and a smear.
 
+`NRRDevice.SetPhaseAlignedSource` chooses *what* that pass integrates, and the two sources are different
+features rather than a flag on one. 0 (the default) integrates the frames the model displayed, at the display
+grid: a temporal denoise of its output. 1 integrates the low-resolution frames the renderer submitted, each
+placed into the display grid where its samples were taken - a temporal upscale, whose resolve *is* the
+displayed frame, measured 13.9% closer to the display-resolution render than a bilinear upsample of the same
+input (`tools/capture_fidelity_probe.py`) and better than what the trained models produce on that input, which
+is why it is a runtime pass rather than a model. Selecting it means the model's frame is not what is shown.
+The source belongs to the accumulation rather than to a frame, so changing it discards what has been
+collected; `TryGetPhaseAlignedSource` reports which source is in use, and reports failure rather than
+"displayed" when the device has no accumulator at all.
+
 **The magnitude is measured, not asked for.** `MotionMagnitude` defaults to 0, which means "measure it from
 the camera": each frame the renderer projects one world point at `MotionReferenceDepth` through the previous
 and the current camera matrices and reports how far it moved on screen, in frame fractions - the units the
@@ -81,6 +92,23 @@ test now stays inside half a period.
 From code, `NRRDevice.SetPhaseAlignedAccumulation` and `NRRDevice.TryGetPhaseAlignedAccumulation` are the same
 switch; the query returns a result code because "off" and "this backend cannot integrate" are different
 answers.
+
+## Disocclusion rejection and clamping
+
+The reprojection blend trusts the previous frame's pixels wherever the motion field says they reproject, which
+is wrong at a disocclusion: the source left the frame, or the previous frame held something nearer, and the old
+scene smears through. `NRRDevice.SetDisocclusionRejection` turns on a guard that stops it. It builds the
+runtime's *history trust mask* from the frame's depth and the previous frame's recorded depth - so a renderer
+that submits no depth gets no mask and keeps the un-guarded blend - and then rejects the history the mask
+refuses and clamps the rest to the current frame's neighbourhood, which also catches a history whose colour
+drifted while its depth still looked valid.
+
+Unlike the phase-aligned switch, this one is **on by default where the device can afford it**: its default is
+the device's own temporal-coherence capability, so a backend that reports temporal coherence has the guard on
+without the caller asking, and one that does not is left without the extra pass.
+`NRRDevice.TryGetDisocclusionRejection` reports what the accumulator holds (and returns a result code that
+keeps "off" apart from "this backend cannot accumulate"), and `NRRDevice.IsDisocclusionRejectionSupported`
+says whether this device can hold it at all.
 
 ## Requirements
 

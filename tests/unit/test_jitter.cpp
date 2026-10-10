@@ -401,13 +401,13 @@ const float aa_plate_k = 0.040f;
 /* Pinned values at these points. The offsets equal aa_halton(1..3), asserted in the first
  * test, so the fixture cannot drift from the tool's frame set unnoticed. */
 const int aa_points[6][2] = {{0, 0}, {10, 20}, {32, 33}, {63, 62}, {100, 101}, {127, 127}};
-const double aa_resolved[6] = {0.006148727, 0.175781250, 0.320312500,
-                               0.607421875, 0.984375000, 1.234699516};
+const double aa_resolved[6] = {0.005533854, 0.175973224, 0.320401278,
+                               0.609075944, 0.984463778, 1.236746652};
 const int aa_wrong_points[2][2] = {{32, 33}, {63, 62}};
-const double aa_wrong[2] = {0.321614583, 0.608723958};
-const double aa_one_frame[2] = {0.320312500, 0.607421875};
+const double aa_wrong[2] = {0.323567708, 0.613606771};
+const double aa_one_frame[2] = {0.320638021, 0.610677083};
 const int aa_plate_points[3][2] = {{20, 30}, {64, 64}, {110, 100}};
-const double aa_plate_resolved[3] = {0.614664373, 0.997607489, 0.372503726};
+const double aa_plate_resolved[3] = {0.376075907, 0.999927178, 0.563459340};
 const double aa_plate_single[3] = {0.654102142, 0.998502148, 0.546668620};
 
 /* Halton (2,3) with index = frame + 1: the capture's own sequence, so the fixture is not a set
@@ -613,21 +613,27 @@ NRR_TEST(test_aa_accumulator_places_each_frame_where_it_was_sampled) {
                    + " against " + std::to_string(aa_resolved[i]));
     }
 
-    /* One frame placed with the capture's sign. On a ramp this equals the three-frame mean above - a
-     * linear function is its own average under a shift - so the two pin the placement without pinning
-     * the division, which the zone-plate constants in the next test do instead. */
-    const JitterOffset first = aa_halton(1);
+    /* One frame placed with the capture's sign. On a ramp a linear function is its own average under a shift,
+     * so this is close to the three-frame mean above but no longer equal to it: the splat's coverage differs
+     * frame to frame - a pixel takes one sample in one frame and two in another - so the division is visible
+     * here too, and the zone-plate constants in the next test pin it on a signal where the mean matters. */
+    const JitterOffset second = aa_halton(2);
     PhaseAlignedAccumulator one_frame, flipped;
-    NRR_ASSERT(one_frame.add_frame(aa_capture(scene, first), 1, aa_lo, aa_lo, aa_hi, aa_hi, first),
+    NRR_ASSERT(one_frame.add_frame(aa_capture(scene, second), 1, aa_lo, aa_lo, aa_hi, aa_hi, second),
                "a single frame must be accepted");
     std::vector<float> one;
     NRR_ASSERT(one_frame.resolve(one), "a single-frame resolve must succeed");
 
     /* The same frame with the mirrored sign: the check that the pinned placement is the capture's
      * direction and not its mirror. The values differ in the third decimal - the offset times the ramp
-     * slope - which is precisely the size of the misalignment being corrected. */
-    NRR_ASSERT(flipped.add_frame(aa_capture(scene, first), 1, aa_lo, aa_lo, aa_hi, aa_hi,
-                                 JitterOffset(-first.x, -first.y)),
+     * slope - which is precisely the size of the misalignment being corrected.
+     *
+     * The *second* offset, not the first: the first frame's offset puts every output pixel on exactly one
+     * sample's taps, which the normalisation cancels, so both signs produce the same image there and the
+     * comparison below would be vacuous. tools/regen_aa_fixture.py counts frames like that as unable to
+     * discriminate rather than as evidence for either direction. */
+    NRR_ASSERT(flipped.add_frame(aa_capture(scene, second), 1, aa_lo, aa_lo, aa_hi, aa_hi,
+                                 JitterOffset(-second.x, -second.y)),
                "a frame placed with the mirrored sign must still be accepted");
     std::vector<float> wrong;
     NRR_ASSERT(flipped.resolve(wrong), "the mirrored resolve must succeed");
@@ -754,6 +760,76 @@ NRR_TEST(test_aa_accumulator_integrates_distinct_subpixel_samples) {
                    + std::to_string(aa_plate_points[i][1]) + " must match the Python reference; got "
                    + std::to_string(aligned[index]) + " against " + std::to_string(aa_plate_resolved[i]));
     }
+}
+
+/* The coarse-frame splat has to cover the grid. A frame far coarser than the display leaves pixels no sample
+ * reaches - at 8 -> 64 a sample's two taps span two pixels and the gap behind them is six - and those pixels
+ * are filled with the frame's own bilinear upsample rather than left at zero or divided by a weight of zero.
+ * That is the branch the equal-resolution tests cannot reach, and the property that makes the arrangement
+ * never worse than not placing at all: where the scatter has nothing to say, the naive path is what the pixel
+ * gets. The coverage is recomputed here independently of the implementation, from the geometry the header
+ * documents, so the test says which pixels *should* have been empty rather than trusting the resolve. */
+NRR_TEST(test_aa_accumulator_fills_pixels_no_sample_reached) {
+    using namespace aa_fixture;
+    const uint32_t coarse = 8;
+    std::vector<float> frame(static_cast<size_t>(coarse) * coarse, 0.0f);
+    for (uint32_t y = 0; y < coarse; ++y) {
+        for (uint32_t x = 0; x < coarse; ++x) {
+            frame[static_cast<size_t>(y) * coarse + x] =
+                static_cast<float>(y * coarse + x) / static_cast<float>(coarse * coarse);
+        }
+    }
+    const JitterOffset offset(0.3f, -0.2f);
+    PhaseAlignedAccumulator accumulator;
+    NRR_ASSERT(accumulator.add_frame(frame, 1, coarse, coarse, aa_hi, aa_hi, offset),
+               "a frame far coarser than the grid must be accepted");
+    std::vector<float> resolved;
+    NRR_ASSERT(accumulator.resolve(resolved), "and it must resolve");
+
+    std::vector<float> upsampled;
+    NRR_ASSERT(upsample_bilinear_nchw(frame, 1, coarse, coarse, aa_hi, aa_hi, upsampled),
+               "the fallback is the frame's own upsample, so the test needs it");
+
+    std::vector<uint8_t> covered(static_cast<size_t>(aa_hi) * aa_hi, 0);
+    const float scale = static_cast<float>(aa_hi) / static_cast<float>(coarse);
+    for (uint32_t qy = 0; qy < coarse; ++qy) {
+        for (uint32_t qx = 0; qx < coarse; ++qx) {
+            /* The sample's position, and the two pixels its taps can reach on each axis. */
+            const float sx = (static_cast<float>(qx) + 0.5f) * scale - 0.5f - offset.x * scale;
+            const float sy = (static_cast<float>(qy) + 0.5f) * scale - 0.5f - offset.y * scale;
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    const long px = static_cast<long>(std::floor(sx)) + dx;
+                    const long py = static_cast<long>(std::floor(sy)) + dy;
+                    if (px < 0 || py < 0 || px >= static_cast<long>(aa_hi) || py >= static_cast<long>(aa_hi)) {
+                        continue; /* clamped onto a border pixel that is reached anyway */
+                    }
+                    covered[static_cast<size_t>(py) * aa_hi + static_cast<size_t>(px)] = 1;
+                }
+            }
+        }
+    }
+
+    size_t holes = 0;
+    size_t lit = 0;
+    double worst_hole = 0.0;
+    for (uint32_t y = 0; y < aa_hi; ++y) {
+        for (uint32_t x = 0; x < aa_hi; ++x) {
+            const size_t p = static_cast<size_t>(y) * aa_hi + x;
+            if (covered[p] != 0) {
+                ++lit;
+                continue;
+            }
+            ++holes;
+            worst_hole = std::max(worst_hole,
+                                  std::fabs(static_cast<double>(resolved[p]) - upsampled[p]));
+        }
+    }
+    NRR_ASSERT(holes > 0,
+               "this fixture must leave pixels no sample reached, or the fallback is not exercised");
+    NRR_ASSERT(lit > 0, "and it must cover some of them, or the splat did nothing");
+    NRR_EXPECT_EQ(worst_hole, 0.0,
+                  "a pixel no sample reached must be the frame's own bilinear upsample, undivided");
 }
 
 /* A sequence has one output grid and one channel count, and a frame that was rendered for a different
@@ -1019,6 +1095,285 @@ NRR_TEST(test_phase_aligned_pass_is_off_until_asked) {
     NRR_EXPECT_EQ(result.phase_aligned_frames, 1u, "the eligible frame must be accumulated");
     NRR_ASSERT(result.phase_note[0] != '\0', "a pass that ran must say so");
     NRR_ASSERT(enabled != original, "a frame placed by half a pixel must differ from the one given");
+}
+
+/* The pass can integrate the caller's low-resolution *input renders* instead of the frames the model
+ * displayed, and the two are different accumulations rather than a flag on the same one: the input render is
+ * coarser than the display grid, its samples are placed at the positions they were taken (the splat the
+ * coarse case performs), and the displayed frame is that resolve rather than the model's output.
+ *
+ * The fixture makes the difference unmistakable: a *constant* input render against a ramp displayed frame.
+ * Every output pixel of a splat resolve of a constant frame is that constant, whatever the weights that
+ * reached it - a pixel no sample reached takes the frame's own bilinear upsample, which is the same constant
+ * - so the arrangement that ran can be read off the displayed frame without a tolerance in sight. */
+NRR_TEST(test_phase_aligned_source_integrates_the_input_render_when_asked) {
+    using namespace phase_fixture;
+    const uint32_t coarse_w = pf_w / 2;
+    const uint32_t coarse_h = pf_h / 2;
+    std::vector<uint8_t> input_render(static_cast<size_t>(coarse_w) * coarse_h * 3, 200);
+
+    /* Runs one frame through the accumulator with `source` selected, electing the frame the way a backend
+     * would: the input render's own grid for the coarse source, the display grid for the other. */
+    auto run = [&](NRRPhaseAlignedSource source, std::vector<uint8_t>& displayed, bool hand_over_bytes) {
+        TemporalAccumulator accumulator;
+        accumulator.initialize();
+        accumulator.set_phase_aligned_enabled(true);
+        accumulator.set_phase_aligned_source(source);
+        const bool from_input = (source == NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+        const NRRFrameInput input = pf_input(1, 0.5f, 0.25f, true);
+        TemporalAccumulator::PhaseAlignedFrame phase = phase_aligned_frame_for(
+            input, false, from_input ? coarse_w : pf_w, from_input ? coarse_h : pf_h,
+            pf_w, pf_h, source);
+        NRR_ASSERT(phase.eligible, "the fixture must be an eligible frame, or this proves nothing");
+        if (from_input && hand_over_bytes) {
+            phase.input_render.pixels = input_render.data();
+            phase.input_render.width = coarse_w;
+            phase.input_render.height = coarse_h;
+            phase.input_render.format = NRR_TEXTURE_FORMAT_RGB8;
+        }
+        return accumulator.apply(input, displayed, pf_w, pf_h, pf_no_field, phase);
+    };
+
+    std::vector<uint8_t> upscaled = pf_ramp();
+    const TemporalAccumulator::Result from_input =
+        run(NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER, upscaled, true);
+    NRR_EXPECT_EQ(from_input.phase_aligned_frames, 1u, "the elected input render must be integrated");
+    NRR_ASSERT(std::string(from_input.phase_note) == "phase-aligned upscale",
+               "the note must say which arrangement ran; got " + std::string(from_input.phase_note));
+    size_t wrong = 0;
+    for (size_t i = 0; i < upscaled.size(); i += 3) {
+        if (upscaled[i] != 200 || upscaled[i + 1] != 200 || upscaled[i + 2] != 200) ++wrong;
+    }
+    NRR_EXPECT_EQ(wrong, 0u,
+                  "the displayed frame must be the resolve of the input render, and a constant input render "
+                  "resolves to that constant everywhere");
+
+    /* The other source, on the same frame: the displayed frame is what gets placed, so the result is the ramp
+     * and not the constant - which is what makes the check above evidence rather than a coincidence. */
+    std::vector<uint8_t> displayed_frame = pf_ramp();
+    const std::vector<uint8_t> ramp = displayed_frame;
+    const TemporalAccumulator::Result from_display =
+        run(NRR_PHASE_ALIGNED_SOURCE_DISPLAYED, displayed_frame, false);
+    NRR_EXPECT_EQ(from_display.phase_aligned_frames, 1u, "the displayed frame must still be integrable");
+    NRR_ASSERT(displayed_frame != upscaled, "the two sources must not produce the same picture");
+    NRR_ASSERT(std::strstr(from_display.phase_note, "upscale") == nullptr,
+               "and the note must not claim the upscale arrangement for the other source");
+    NRR_EXPECT_TRUE(displayed_frame != ramp,
+                    "the displayed source places the frame it was given, so a placed ramp differs from it");
+
+    /* And an elected input render that never arrived integrates nothing, rather than quietly falling back to
+     * the frame the caller did not ask to integrate. */
+    std::vector<uint8_t> untouched = pf_ramp();
+    const std::vector<uint8_t> before = untouched;
+    const TemporalAccumulator::Result missing =
+        run(NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER, untouched, false);
+    NRR_EXPECT_EQ(missing.phase_aligned_frames, 0u, "no bytes, no integration");
+    NRR_ASSERT(std::strstr(missing.phase_note, "unreadable") != nullptr,
+               "and the reason must be reported; got " + std::string(missing.phase_note));
+    NRR_ASSERT(untouched == before, "a pass that integrated nothing must leave the frame alone");
+}
+
+/* The source is a property of the accumulation, not of a frame: changing it discards what has been
+ * collected. Averaging samples placed from the input grid with samples of the display grid would be the same
+ * mistake the accumulator already refuses between two output grids, so it is refused here too - and setting
+ * the source that is already selected must not throw the accumulation away, or a caller that sets it every
+ * frame would never accumulate anything. */
+NRR_TEST(test_phase_aligned_source_change_discards_the_accumulation) {
+    using namespace phase_fixture;
+    TemporalAccumulator accumulator;
+    accumulator.initialize();
+    accumulator.set_phase_aligned_enabled(true);
+    NRR_EXPECT_EQ(accumulator.phase_aligned_source(), NRR_PHASE_ALIGNED_SOURCE_DISPLAYED,
+                  "the denoise of the displayed frames is the default");
+
+    const NRRFrameInput input = pf_input(1, 0.5f, 0.25f, true);
+    const TemporalAccumulator::PhaseAlignedFrame phase =
+        phase_aligned_frame_for(input, false, pf_w, pf_h, pf_w, pf_h);
+    std::vector<uint8_t> frame = pf_ramp();
+    NRR_EXPECT_EQ(accumulator.apply(input, frame, pf_w, pf_h, pf_no_field, phase).phase_aligned_frames, 1u,
+                  "one frame must accumulate under the default source");
+    frame = pf_ramp();
+    /* A later frame index: a frame whose index did not advance is a scene change, and the accumulator
+     * discards everything for it - which would make this check pass for the wrong reason. */
+    NRR_EXPECT_EQ(accumulator.apply(pf_input(2, 0.75f, -0.25f, true), frame, pf_w, pf_h, pf_no_field, phase)
+                      .phase_aligned_frames,
+                  2u, "and a second one must join it");
+
+    accumulator.set_phase_aligned_source(NRR_PHASE_ALIGNED_SOURCE_DISPLAYED);
+    NRR_EXPECT_EQ(accumulator.phase_aligned_frames(), 2u,
+                  "setting the source that is already selected must be a no-op");
+
+    const uint32_t coarse_w = pf_w / 2;
+    const uint32_t coarse_h = pf_h / 2;
+    std::vector<uint8_t> input_render(static_cast<size_t>(coarse_w) * coarse_h * 3, 200);
+    accumulator.set_phase_aligned_source(NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+    NRR_EXPECT_EQ(accumulator.phase_aligned_source(), NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER,
+                  "the switch must report what was set");
+    NRR_EXPECT_EQ(accumulator.phase_aligned_frames(), 0u,
+                  "a different source is a different accumulation, so what was collected for the old one "
+                  "must be discarded");
+
+    TemporalAccumulator::PhaseAlignedFrame coarse =
+        phase_aligned_frame_for(input, false, coarse_w, coarse_h, pf_w, pf_h,
+                                NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+    coarse.input_render.pixels = input_render.data();
+    coarse.input_render.width = coarse_w;
+    coarse.input_render.height = coarse_h;
+    coarse.input_render.format = NRR_TEXTURE_FORMAT_RGB8;
+    frame = pf_ramp();
+    NRR_EXPECT_EQ(accumulator.apply(pf_input(3, 0.25f, 0.5f, true), frame, pf_w, pf_h, pf_no_field, coarse)
+                      .phase_aligned_frames,
+                  1u, "and the new source must start accumulating from this frame");
+}
+
+
+/* The offset's two units, composed - the seam that had no test.
+ *
+ * `phase_aligned_frame_for` fills `PhaseAlignedFrame::offset_x` in *output* pixels (pinned above, where a 2x
+ * pipeline turns a 0.25 px jitter into 0.5), and `add_frame` takes *frame-grid* pixels and scales them into
+ * output pixels itself. At the default source the frame is at the output grid, the scale is one, and the two
+ * units coincide by construction; the input-render source is the only arrangement in which they can disagree,
+ * and `apply` handed the output-pixel value straight through - so a low-resolution render's samples landed at
+ * `jitter * scale^2` instead of where the renderer took them, at `jitter * scale`. Measured by
+ * tools/offset_unit_probe.py on the ordering fixture: +104.6% edge error against the placement the capture
+ * asks for, where that placement is -60.1% against bilinear and the doubled one only -18.4%.
+ *
+ * This drives both sides of the seam and requires the same plane: the accumulator through `apply`, against a
+ * second accumulator driven directly in the unit `add_frame` documents, against the doubled placement the
+ * composed unit produced. The fixture is the coarse case the product is in - a 2x pipeline whose frames come
+ * from the caller's own render - because that is the only place the difference exists to be caught.
+ */
+NRR_TEST(test_input_render_offset_is_the_frame_grid_one_add_frame_documents) {
+    using namespace phase_fixture;
+    const uint32_t coarse_w = pf_w / 2;
+    const uint32_t coarse_h = pf_h / 2;
+    const float jitter_x = 0.125f;
+    const float jitter_y = -0.375f;
+    const size_t coarse_plane = static_cast<size_t>(coarse_w) * coarse_h;
+
+    /* The renderer's own pass: every second pixel of the ramp, so the signal varies from sample to sample.
+     * The ramp moves 255/32 levels per output pixel, which is what makes a quarter of a pixel of misplacement
+     * visible in the bytes the pass hands back. */
+    const std::vector<uint8_t> ramp = pf_ramp();
+    std::vector<uint8_t> input_render(coarse_plane * 3, 0);
+    std::vector<float> coarse_nchw(coarse_plane * 3, 0.0f);
+    for (uint32_t y = 0; y < coarse_h; ++y) {
+        for (uint32_t x = 0; x < coarse_w; ++x) {
+            const size_t src = (static_cast<size_t>(y * 2) * pf_w + x * 2) * 3;
+            const size_t dst = static_cast<size_t>(y) * coarse_w + x;
+            for (size_t c = 0; c < 3; ++c) {
+                input_render[dst * 3 + c] = ramp[src + c];
+                coarse_nchw[c * coarse_plane + dst] = static_cast<float>(ramp[src + c]) * (1.0f / 255.0f);
+            }
+        }
+    }
+
+    const NRRFrameInput input = pf_input(1, jitter_x, jitter_y, true);
+    TemporalAccumulator accumulator;
+    accumulator.initialize();
+    accumulator.set_phase_aligned_enabled(true);
+    accumulator.set_phase_aligned_source(NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+
+    TemporalAccumulator::PhaseAlignedFrame phase = phase_aligned_frame_for(
+        input, false, coarse_w, coarse_h, pf_w, pf_h, NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+    NRR_EXPECT_EQ(phase.offset_x, jitter_x * 2.0f, "the election states the offset in output pixels");
+    NRR_EXPECT_EQ(phase.offset_y, jitter_y * 2.0f, "both axes");
+    phase.input_render.pixels = input_render.data();
+    phase.input_render.width = coarse_w;
+    phase.input_render.height = coarse_h;
+    phase.input_render.format = NRR_TEXTURE_FORMAT_RGB8;
+
+    std::vector<uint8_t> displayed = pf_ramp();
+    NRR_EXPECT_EQ(accumulator.apply(input, displayed, pf_w, pf_h, pf_no_field, phase).phase_aligned_frames,
+                  1u, "the caller's own render must be the frame that is integrated");
+    /* The expectation, from the interface `add_frame` documents: the same coarse frame placed in frame-grid
+     * pixels, resolved to the output grid and converted exactly as the runtime's own write-back converts. */
+    auto placed_bytes = [&](float offset_x, float offset_y, std::vector<uint8_t>& out) {
+        PhaseAlignedAccumulator reference;
+        NRR_ASSERT(reference.add_frame(coarse_nchw, 3, coarse_w, coarse_h, pf_w, pf_h,
+                                       JitterOffset(offset_x, offset_y)),
+                   "the coarse frame must be accepted");
+        std::vector<float> resolved;
+        NRR_ASSERT(reference.resolve(resolved), "and it must resolve");
+        const size_t plane = static_cast<size_t>(pf_w) * pf_h;
+        out.resize(plane * 3);
+        for (size_t i = 0; i < plane; ++i) {
+            const float channels[3] = {resolved[i], resolved[plane + i], resolved[plane * 2 + i]};
+            for (size_t c = 0; c < 3; ++c) {
+                const float v = std::min(1.0f, std::max(0.0f, channels[c]));
+                out[i * 3 + c] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+            }
+        }
+    };
+
+    std::vector<uint8_t> where_taken;
+    placed_bytes(jitter_x, jitter_y, where_taken);
+    NRR_ASSERT(where_taken != pf_ramp(),
+               "placing the samples must not be the identity, or the check below proves nothing");
+    NRR_ASSERT(where_taken == displayed,
+               "the input-render source must place each sample where the renderer took it: the election "
+               "reports the offset in output pixels and add_frame takes frame-grid ones");
+
+    /* And the doubled displacement is a different image, so the check above is not passing for the wrong
+     * reason - nor would it have passed before the divide-back, when this was the plane the seam produced. */
+    std::vector<uint8_t> doubled;
+    placed_bytes(jitter_x * 2.0f, jitter_y * 2.0f, doubled);
+    NRR_ASSERT(doubled != displayed,
+               "the composed unit's placement is a different plane from the one the renderer's samples "
+               "describe, which is exactly what this test exists to keep out");
+}
+
+/* The disocclusion guard, end to end through the accumulator. With a depth that says every pixel is sky, the
+ * mask the accumulator builds rejects the whole frame, so the reprojection blend mixes nothing in - and with
+ * the guard off (its default) the very same frames blend normally. That is the wiring no single-component
+ * test can see: the mask is built from a provider the accumulator is handed, resampled to the output grid,
+ * and passed to the blend that already knew how to consume a mask. */
+NRR_TEST(test_disocclusion_guard_rejects_all_sky_through_the_accumulator) {
+    using namespace phase_fixture;
+
+    std::vector<uint8_t> sky_depth(static_cast<size_t>(pf_w) * pf_h * 4, 0);  /* R32F, all zero: no geometry */
+    auto depth_source = [&]() -> TemporalAccumulator::MotionImage {
+        TemporalAccumulator::MotionImage field;
+        field.pixels = sky_depth.data();
+        field.width = pf_w;
+        field.height = pf_h;
+        field.format = NRR_TEXTURE_FORMAT_R32F;
+        return field;
+    };
+
+    const std::vector<uint8_t> original = pf_ramp();
+
+    TemporalAccumulator accumulator;
+    accumulator.initialize();
+    /* Frame 1: no history yet, but it records the frame and the depth the next frame's mask needs. */
+    std::vector<uint8_t> first = original;
+    accumulator.apply(pf_input(1, 0.0f, 0.0f, false), first, pf_w, pf_h,
+                      [] { return pf_field(0.0f, 0.0f); }, TemporalAccumulator::PhaseAlignedFrame(), depth_source);
+    accumulator.record_depth(sky_depth.data(), pf_w, pf_h, NRR_TEXTURE_FORMAT_R32F);
+
+    /* Frame 2, guard off (the default): zero motion, so the history reprojects onto itself and every pixel is
+     * blended - the behaviour every caller had before the guard existed. */
+    NRR_ASSERT(!accumulator.is_disocclusion_rejection_enabled(), "off is the default");
+    std::vector<uint8_t> unguarded = original;
+    const TemporalAccumulator::Result off = accumulator.apply(
+        pf_input(2, 0.0f, 0.0f, false), unguarded, pf_w, pf_h,
+        [] { return pf_field(0.0f, 0.0f); }, TemporalAccumulator::PhaseAlignedFrame(), depth_source);
+    NRR_EXPECT_TRUE(off.blended, "the unguarded frame blends");
+    NRR_EXPECT_EQ(off.blend_stats.rejected_pixels, 0u, "with the guard off nothing is rejected");
+    NRR_EXPECT_EQ(off.blend_stats.blended_pixels, pf_w * pf_h, "every pixel is blended");
+
+    /* Frame 3, guard on: the same frames, but the depth says sky everywhere, so the mask claims nothing and
+     * the blend is refused at every pixel. */
+    accumulator.set_disocclusion_rejection_enabled(true);
+    NRR_ASSERT(accumulator.is_disocclusion_rejection_enabled(), "the switch must report what was set");
+    std::vector<uint8_t> guarded = original;
+    const TemporalAccumulator::Result on = accumulator.apply(
+        pf_input(3, 0.0f, 0.0f, false), guarded, pf_w, pf_h,
+        [] { return pf_field(0.0f, 0.0f); }, TemporalAccumulator::PhaseAlignedFrame(), depth_source);
+    NRR_EXPECT_TRUE(on.blended, "the guarded frame still runs a blend");
+    NRR_EXPECT_EQ(on.blend_stats.rejected_pixels, pf_w * pf_h, "a sky depth rejects every pixel");
+    NRR_EXPECT_EQ(on.blend_stats.blended_pixels, 0u, "and blends none of them");
+    NRR_ASSERT(guarded == original, "with every pixel rejected the displayed frame is the one given");
 }
 
 

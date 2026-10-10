@@ -562,6 +562,14 @@ def main(argv):
         offset += int(manifest["frames"])
 
     entries = train_entries + val_entries
+    # A split the data gate emptied is a refusal, not a crash: the size lookup below assumes at least one entry,
+    # and the honest answer is that this capture carries no pair an upscaler can learn from - most often because
+    # the content is too smooth at this resolution for the bilinear baseline to leave anything to recover.
+    for name, kept, skipped in (("train", train_entries, train_skipped), ("val", val_entries, val_skipped)):
+        if not kept:
+            raise SystemExit("every %s frame was skipped by the data gate (%d of %d): this capture has no pair "
+                             "with enough recoverable detail at this resolution" % (name, len(skipped),
+                                                                                    len(skipped)))
     skipped = train_skipped + val_skipped
 
     def spread(key, pick):

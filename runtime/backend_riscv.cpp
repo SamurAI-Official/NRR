@@ -75,6 +75,10 @@ NRRResult BackendRISCV::query_rvv_capabilities() {
     capabilities_.int8 = NRR_CAPABILITY_OPTIMIZED; /* RVV 1.0 vector integer ops */
     capabilities_.neural_acceleration = rvv_intrinsic_available_
         ? NRR_CAPABILITY_BASIC : NRR_CAPABILITY_ABSENT;
+    /* This backend accumulates temporal history - it renders through the shared AcceleratorExecutionKernel,
+     * which owns the same TemporalAccumulator the CPU backend uses - so it reports temporal coherence, and with
+     * it the disocclusion guard's default. */
+    capabilities_.temporal_coherence = NRR_CAPABILITY_BASIC;
     return NRR_SUCCESS;
 }
 

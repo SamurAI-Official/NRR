@@ -16,6 +16,9 @@
 #include "test_framework.h"
 #include "nrr.h"
 #include "nrr_temporal.h"
+#include "nrr_inference.h"
+#include "generated/plane_case.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -146,6 +149,13 @@ void make_fixture(TemporalFixture& fx) {
                   "device creation");
     NRR_EXPECT_TRUE(fx.device != nullptr, "device handle");
 
+    /* This file pins the *unguarded* accumulation equation, and its depth attachment is a zeroed one - a
+     * frame the history trust mask would reject everywhere ("no geometry"), which would leave nothing to
+     * blend. The guard's default follows the device's temporal-coherence claim, and the CPU backend reports
+     * it, so it is on for this device; turned off here explicitly so these tests keep measuring the equation
+     * they are about. The guard has its own tests (test_multi_frame, test_jitter, test_api). */
+    nrr_device_set_disocclusion_rejection(fx.device, 0);
+
     make_textures(fx, kInW, kInH);
 
     NRR_EXPECT_EQ(nrr_model_load(fx.device, NRR_SAMPLE_MODEL, &fx.model),
@@ -168,12 +178,26 @@ void upload_color_columns(TemporalFixture& fx, const float* values) {
 }
 
 /* Brightness ramp across the columns plus a constant offset. */
-void upload_ramp(TemporalFixture& fx, float offset) {
-    std::vector<float> values(fx.in_w);
-    for (uint32_t x = 0; x < fx.in_w; ++x) {
-        values[x] = 0.1f * static_cast<float>(x) + offset;
+
+/* The bytes upload_ramp() submits: one quantised gray level per column, alpha 255. A test that has to know
+ * exactly what the renderer handed the runtime - rather than only re-render it - reads them here, so the
+ * expected value is derived from the same bytes rather than from a second implementation of the ramp. */
+std::vector<uint8_t> ramp_rgba(uint32_t in_w, uint32_t in_h, float offset) {
+    std::vector<uint8_t> rgba(static_cast<size_t>(in_w) * in_h * 4, 255);
+    for (uint32_t y = 0; y < in_h; ++y) {
+        for (uint32_t x = 0; x < in_w; ++x) {
+            const uint8_t value = quantize(0.1f * static_cast<float>(x) + offset);
+            const size_t i = (static_cast<size_t>(y) * in_w + x) * 4;
+            rgba[i] = rgba[i + 1] = rgba[i + 2] = value;
+        }
     }
-    upload_color_columns(fx, values.data());
+    return rgba;
+}
+
+void upload_ramp(TemporalFixture& fx, float offset) {
+    const std::vector<uint8_t> rgba = ramp_rgba(fx.in_w, fx.in_h, offset);
+    NRR_EXPECT_EQ(nrr_texture_upload(fx.device, fx.color, rgba.data(), rgba.size()),
+                  NRR_SUCCESS, "color upload");
 }
 
 /* Uniform motion field, expressed in *input* texels. */
@@ -191,7 +215,7 @@ void upload_constant_motion(TemporalFixture& fx, float dx, float dy) {
 }
 
 NRRFrameOutput render_frame(TemporalFixture& fx, uint64_t frame_index,
-                            float motion_magnitude) {
+                            float motion_magnitude, float jitter_x = 0.0f, float jitter_y = 0.0f) {
     NRRFrameInput input = {};
     input.color = fx.color;
     input.depth = fx.depth;
@@ -205,6 +229,12 @@ NRRFrameOutput render_frame(TemporalFixture& fx, uint64_t frame_index,
     input.temporal.resolution_y = fx.in_h;
     input.temporal.motion_magnitude = motion_magnitude;
     input.temporal.motion_vectors_scale = 1.0f;
+    /* The sub-pixel offset the renderer applied, which the phase-aligned pass integrates over. Zero (and so
+     * off) unless a test asks: an un-jittered sequence is reported as not integrable, which is what every
+     * other test in this file relies on. */
+    input.temporal.jitter.enabled = (jitter_x != 0.0f || jitter_y != 0.0f) ? 1 : 0;
+    input.temporal.jitter.offset_x = jitter_x;
+    input.temporal.jitter.offset_y = jitter_y;
     /* Deliberately wrong values: the pipeline must replace both with measured
      * ones, otherwise test_temporal_state_reported_from_pipeline sees them. */
     input.temporal.temporal_alpha = kIgnoredInputAlpha;
@@ -626,6 +656,245 @@ NRR_TEST(test_temporal_resolution_change_discards_history) {
               << ", delta vs raw=" << resized_delta
               << ", alpha f3=" << f3.temporal.temporal_alpha
               << " -> f4=" << f4.temporal.temporal_alpha << std::endl;
+}
+
+/* The guard's default follows the device's temporal-coherence claim, and the CPU backend reports it - so the
+ * shipped CPU path runs the guard unless a caller turns it off. With a depth that says every pixel has
+ * geometry (the real case), the accumulation must still happen: the guard rejects the history it cannot
+ * trust, not the frame. This drives that default-on path through the pipeline, so a default that quietly
+ * stopped accumulating would fail here. (The default value itself is asserted in
+ * tests/unit/test_api.cpp; make_fixture turns the guard off to keep pinning the unguarded equation, so it is
+ * turned back on here.) */
+NRR_TEST(test_disocclusion_guard_on_still_accumulates_through_the_pipeline) {
+    TemporalFixture fx;
+    make_fixture(fx);
+    NRR_EXPECT_EQ(nrr_device_set_disocclusion_rejection(fx.device, 1), NRR_SUCCESS,
+                  "the guard can be turned back on for this frame sequence");
+
+    /* A depth at one distance across the frame: nothing is sky, so the mask rejects nothing and the blend
+     * runs at every pixel. */
+    const std::vector<float> depth(static_cast<size_t>(fx.in_w) * fx.in_h, 1.0f);
+    NRR_EXPECT_EQ(nrr_texture_upload(fx.device, fx.depth, depth.data(),
+                                     depth.size() * sizeof(float)),
+                  NRR_SUCCESS, "depth upload");
+
+    upload_constant_motion(fx, 0.0f, 0.0f);
+    upload_ramp(fx, kOffsetA);
+    render_frame(fx, 1, 0.0f);
+    upload_ramp(fx, kOffsetB);
+    const NRRFrameOutput second = render_frame(fx, 2, 0.0f);
+
+    NRR_EXPECT_EQ(second.temporal.history_frames, 1u, "the previous frame is history");
+    NRR_EXPECT_TRUE(std::strstr(second.stats.debug_info, "accumulated") != nullptr,
+                    "a valid depth lets the guard pass the accumulation through; got: "
+                    + std::string(second.stats.debug_info));
+}
+
+// --- 9. The input-render source, end to end through the device ----------------
+//
+// The phase-aligned pass integrates either the frames the model displayed or the frames the renderer
+// submitted, and until this test the second had no caller at all: the choice lived on the accumulator and
+// nowhere in the render path, so the coarse-frame arrangement - the one whose placement is measured 13.9%
+// closer to the display-resolution render than a bilinear upsample of the same input
+// (tools/capture_fidelity_probe.py) - could not be reached from the runtime.
+
+/* Two jittered frames through the real render path, once per source, with the displayed image compared
+ * against the accumulator's own resolve of *the bytes this test uploaded*: at the input grid, placed into the
+ * display grid, at the offset the renderer reported. The arithmetic is pinned by tests/unit/test_jitter.cpp;
+ * what this pins is the plumbing - that the backend hands the accumulator the render it was given rather
+ * than the frame the model produced - and that connection is exactly the kind that fails into a
+ * plausible-looking picture, so it is compared channel by channel.
+ *
+ * The offset is handed to `add_frame` in *frame-grid* pixels, which is the unit that class documents and the
+ * unit the renderer's jitter is reported in. The election states it in *output* pixels instead, and the two
+ * coincide only when the frame is at the output grid; `apply` divides back by the upscale for a coarser frame.
+ * This reference passes the frame-grid value for the same reason, so the two agree by rule rather than by
+ * sharing the composed unit - which is what let the placement go to `jitter * scale^2` unnoticed
+ * (tools/offset_unit_probe.py, and the unit test that now pins the seam). */
+NRR_TEST(test_phase_aligned_input_render_source_through_the_device) {
+    const float kJitterX = 0.5f;
+    const float kJitterY = -0.25f;
+
+    struct Run {
+        std::vector<uint8_t> rgb;
+        std::string info;
+    };
+    auto run = [&](bool input_render_source) -> Run {
+        TemporalFixture fx;
+        make_fixture(fx);
+        upload_constant_motion(fx, 0.0f, 0.0f);
+        NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(fx.device, 1), NRR_SUCCESS,
+                      "the pass must be switchable on");
+        NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(
+                          fx.device, input_render_source ? NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER
+                                                         : NRR_PHASE_ALIGNED_SOURCE_DISPLAYED),
+                      NRR_SUCCESS, "both sources must be selectable");
+        upload_ramp(fx, kOffsetA);
+        render_frame(fx, 1, 0.0f, kJitterX, kJitterY);
+        upload_ramp(fx, kOffsetB);
+        const NRRFrameOutput second = render_frame(fx, 2, 0.0f, kJitterX * 0.5f, kJitterY * 0.5f);
+        Run out;
+        out.rgb = download_rgb(fx, second.color);
+        out.info = second.stats.debug_info;
+        return out;
+    };
+
+    const Run upscale = run(true);
+    const Run denoise = run(false);
+
+    NRR_ASSERT(std::strstr(upscale.info.c_str(), "phase-aligned upscale") != nullptr,
+               "the pass must report the arrangement it ran; got: " + upscale.info);
+    NRR_ASSERT(std::strstr(denoise.info.c_str(), "upscale") == nullptr,
+               "and must not report the upscale for the other source; got: " + denoise.info);
+
+    /* The frames the renderer submitted, as the test uploaded them, through the accumulator directly, in the
+     * frames' own grid: the unit `add_frame` documents and the unit the capture reports its jitter in. */
+    const std::vector<uint8_t> first_rgba = ramp_rgba(kInW, kInH, kOffsetA);
+    const std::vector<uint8_t> second_rgba = ramp_rgba(kInW, kInH, kOffsetB);
+    nrr::PhaseAlignedAccumulator expected;
+    std::vector<float> frame_nchw;
+    NRR_ASSERT(nrr::texture_to_nchw(first_rgba.data(), kInW, kInH, NRR_TEXTURE_FORMAT_RGBA8, 3,
+                                    frame_nchw),
+               "the test must be able to read back the first frame it uploaded");
+    NRR_ASSERT(expected.add_frame(frame_nchw, 3, kInW, kInH, kOutW, kOutH,
+                                  nrr::JitterOffset(kJitterX, kJitterY)),
+               "the accumulator must accept the first input render");
+    NRR_ASSERT(nrr::texture_to_nchw(second_rgba.data(), kInW, kInH, NRR_TEXTURE_FORMAT_RGBA8, 3,
+                                    frame_nchw),
+               "and the second");
+    NRR_ASSERT(expected.add_frame(frame_nchw, 3, kInW, kInH, kOutW, kOutH,
+                                  nrr::JitterOffset(kJitterX * 0.5f, kJitterY * 0.5f)),
+               "the accumulator must accept the second input render");
+    std::vector<float> resolved;
+    NRR_ASSERT(expected.resolve(resolved), "two frames must resolve");
+
+    const size_t out_plane = static_cast<size_t>(kOutW) * kOutH;
+    size_t wrong = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < out_plane; ++i) {
+        for (size_t c = 0; c < 3; ++c) {
+            const float value = resolved[c * out_plane + i];
+            const double clamped = value < 0.0f ? 0.0 : (value > 1.0f ? 1.0 : value);
+            const uint8_t wanted = static_cast<uint8_t>(clamped * 255.0 + 0.5);
+            const double delta = std::fabs(static_cast<double>(wanted)
+                                         - static_cast<double>(upscale.rgb[i * 3u + c]));
+            worst = std::max(worst, delta);
+            if (delta > 1.0) ++wrong;
+        }
+    }
+    NRR_EXPECT_EQ(wrong, 0u,
+                  "every displayed channel must be the accumulator's resolve of the input renders this test "
+                  "submitted, not of the frame the model produced (worst delta " + std::to_string(worst) + ")");
+    NRR_EXPECT_TRUE(mean_abs_delta(upscale.rgb, denoise.rgb, 0, denoise.rgb.size()) > 0.01,
+                    "the two sources must not display the same picture from the same frames, or the check "
+                    "above is about this scene rather than about which frames were integrated");
+}
+
+/* The input-render resolve, cross-checked against the derive that defines it.
+ *
+ * `tools/refinement_base_dataset.py --plane phase-aligned-splat` is what the refinement step's base plane is
+ * materialised with, and its placement is validated against two other statements of the placement rule - all
+ * three of them in Python. This is the comparison that matters: the same frames through the *real* device path,
+ * with every displayed channel compared against the plane that derive computes. The case's bytes and its expected
+ * planes come from tools/export_runtime_plane_case.py, so the expectation cannot quietly become a copy of the
+ * runtime's own arithmetic: a tool that knows only the rule generates it, and the same tool checks the checked-in
+ * file (`--check`) rather than a diff being noticed by eye.
+ *
+ * The case's field is in the frame contract's unit - pixel motion on the input grid - which is what the runtime
+ * reads out of a motion texture, and its left column leaves the frame, so both the accumulation's out-of-frame
+ * emptying and half the grid's coverage fallback run inside the comparison.
+ */
+NRR_TEST(test_input_render_resolve_matches_the_derived_plane) {
+    /* Qualified, not `using`: this file's own fixture constants are kInW/kInH/kOutW/kOutH too, and the point of
+     * the case is that its grids are *its own* statement rather than this file's. */
+    namespace pc = plane_case;
+
+    TemporalFixture fx;
+    make_fixture(fx);
+    make_textures(fx, pc::kInW, pc::kInH);
+    NRR_EXPECT_EQ(fx.in_w, pc::kInW, "the case's input grid is the one uploaded");
+    NRR_EXPECT_EQ(fx.out_w, pc::kOutW, "and the model's 2x output is the display grid it is compared on");
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(fx.device, 1), NRR_SUCCESS,
+                  "the pass must be switchable on");
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(fx.device, NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER),
+                  NRR_SUCCESS, "and must integrate the caller's own renders");
+
+    const size_t expected_size = static_cast<size_t>(pc::kOutW) * pc::kOutH * 3;
+    for (uint32_t i = 0; i < pc::kFrameCount; ++i) {
+        const pc::Case& frame = pc::kCases[i];
+        NRR_EXPECT_EQ(nrr_texture_upload(fx.device, fx.color, frame.input,
+                                         static_cast<size_t>(pc::kInW) * pc::kInH * 4),
+                      NRR_SUCCESS, "the case's render must upload");
+        NRR_EXPECT_EQ(nrr_texture_upload(fx.device, fx.motion, frame.motion,
+                                         static_cast<size_t>(pc::kInW) * pc::kInH * 4),
+                      NRR_SUCCESS, "and its motion field");
+        const NRRFrameOutput out =
+            render_frame(fx, frame.frame_index, 0.0f, frame.jitter_x, frame.jitter_y);
+        const std::vector<uint8_t> displayed = download_rgb(fx, out.color);
+        NRR_EXPECT_EQ(displayed.size(), expected_size,
+                      "the case's expected plane must be the displayed frame's size");
+
+        size_t wrong = 0;
+        size_t first_wrong = 0;
+        int worst = 0;
+        size_t tolerated = 0;
+        for (size_t byte = 0; byte < expected_size; ++byte) {
+            const bool ambiguous =
+                std::find(frame.ambiguous, frame.ambiguous + frame.ambiguous_count,
+                          static_cast<uint16_t>(byte)) != frame.ambiguous + frame.ambiguous_count;
+            const int delta = std::abs(static_cast<int>(displayed[byte]) -
+                                       static_cast<int>(frame.expected[byte]));
+            if (delta == 0) continue;
+            if (ambiguous && delta <= 1) {
+                /* The generator marked this byte as sitting on the write-back's rounding boundary, where the
+                 * mirror's float64 and the runtime's float32 decide differently and nothing about the rule does. */
+                ++tolerated;
+                continue;
+            }
+            if (wrong == 0) first_wrong = byte;
+            ++wrong;
+            worst = std::max(worst, delta);
+        }
+        NRR_EXPECT_EQ(wrong, 0u,
+                      "frame " + std::to_string(frame.frame_index) +
+                          ": every displayed channel must be the plane tools/refinement_base_dataset.py "
+                          "derives from these bytes, outside the " + std::to_string(frame.ambiguous_count) +
+                          " byte(s) the generator marks as decided by float32-vs-float64 rounding (" +
+                          std::to_string(tolerated) + " of those differed by one level; worst strict delta " +
+                          std::to_string(worst) + " at byte " + std::to_string(first_wrong) + ")");
+        /* And the tolerated set has to stay a small part of the frame, or "one level on a marked byte" would
+         * stop meaning precision and start meaning a comparison that cannot see anything. */
+        NRR_EXPECT_TRUE(tolerated * 20u <= expected_size,
+                        "frame " + std::to_string(frame.frame_index) + ": at most 5% of the frame may be "
+                        "tolerated, or the comparison is not pinning the rule (" +
+                        std::to_string(tolerated) + " of " + std::to_string(expected_size) + ")");
+    }
+
+    /* And the case is not about this scene rather than about the arrangement: the same first frame through the
+     * other source displays the model's reconstruction, not the placed samples. */
+    TemporalFixture other;
+    make_fixture(other);
+    make_textures(other, pc::kInW, pc::kInH);
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(other.device, 1), NRR_SUCCESS,
+                  "the other arrangement's pass is on too");
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(other.device, NRR_PHASE_ALIGNED_SOURCE_DISPLAYED),
+                  NRR_SUCCESS, "with the default source");
+    NRR_EXPECT_EQ(nrr_texture_upload(other.device, other.color, pc::kCases[0].input,
+                                     static_cast<size_t>(pc::kInW) * pc::kInH * 4),
+                  NRR_SUCCESS, "the same render must upload");
+    NRR_EXPECT_EQ(nrr_texture_upload(other.device, other.motion, pc::kCases[0].motion,
+                                     static_cast<size_t>(pc::kInW) * pc::kInH * 4),
+                  NRR_SUCCESS, "and the same field");
+    const std::vector<uint8_t> model_frame =
+        download_rgb(other, render_frame(other, pc::kCases[0].frame_index, 0.0f,
+                                         pc::kCases[0].jitter_x, pc::kCases[0].jitter_y).color);
+    size_t differing = 0;
+    for (size_t byte = 0; byte < expected_size; ++byte) {
+        if (model_frame[byte] != pc::kCases[0].expected[byte]) ++differing;
+    }
+    NRR_EXPECT_TRUE(differing > 0,
+                    "the two sources must not display the same picture from the same frame, or the check above "
+                    "is about this scene rather than about which frames were integrated");
 }
 
 } // namespace test

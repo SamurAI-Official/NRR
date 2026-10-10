@@ -71,6 +71,20 @@ public:
      * prevent. */
     NRRResult set_phase_aligned_accumulation(bool enabled) override;
     bool is_phase_aligned_enabled() const override;
+    /* Which frames that integration integrates (see nrr_backend.h). Overridden for the same reason as the
+     * pair above: this backend accumulates in its own TemporalAccumulator, and on the test route the frames
+     * go through the shared kernel's, so the setting has to reach both. */
+    NRRResult set_phase_aligned_source(NRRPhaseAlignedSource source) override;
+    bool phase_aligned_source(NRRPhaseAlignedSource* out_source) const override;
+
+    /* Disocclusion rejection and clamping (see nrr_backend.h). Overridden for the same reason as the
+     * phase-aligned pair above: this backend accumulates in its own TemporalAccumulator, and on the test
+     * route the frames go through the shared kernel's, so the switch has to reach both. */
+    NRRResult set_disocclusion_rejection(bool enabled) override;
+    bool is_disocclusion_rejection_enabled() const override;
+    /* Applies the guard's default from this backend's own temporal-coherence capability, to its own
+     * accumulator and - on the test route - to the kernel's. */
+    NRRResult apply_disocclusion_rejection_default() override;
 
     /* Folds the execution provider the loaded model's ONNX session ACTUALLY
      * attached into the capability block (see nrr_backend.h for the contract).

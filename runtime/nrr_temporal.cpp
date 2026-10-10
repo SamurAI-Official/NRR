@@ -256,7 +256,8 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
                                    const HistoryEntry& previous,
                                    const std::vector<float>& current_motion,
                                    float motion_vectors_scale, float alpha,
-                                   TemporalBlendStats* stats) {
+                                   TemporalBlendStats* stats,
+                                   const std::vector<float>* validity) {
     if (stats) {
         stats->mean_abs_delta = 0.0f;
         stats->blended_pixels = 0;
@@ -284,17 +285,76 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
     if (!warp_previous_output(warp_input, warp_src, warped_color, warped_depth)) return false;
     if (warped_color.size() != current.size()) return false;
 
+    /* The guarded blend. `has_validity` is the whole switch: without a mask this is the un-guarded
+     * accumulation the method always performed, element for element, so a caller that supplies no mask sees
+     * no change. With a mask, a rejected pixel is skipped (it keeps the current frame) and an accepted pixel
+     * has its reprojected history clamped to the current frame's neighbourhood before it is blended. */
+    const size_t pixel_count = static_cast<size_t>(width) * height;
+    const bool has_validity = validity != nullptr && validity->size() == pixel_count;
+    uint32_t channels = 0;
+    if (!current.empty()) channels = static_cast<uint32_t>(current.size() / pixel_count);
+    if (channels == 0) channels = 1;
+
     double accumulated_delta = 0.0;
-    for (size_t i = 0; i < current.size(); ++i) {
-        const float blended = (1.0f - alpha) * current[i] + alpha * warped_color[i];
-        accumulated_delta += std::fabs(blended - current[i]);
-        current[i] = blended;
+    uint32_t rejected = 0;
+    uint32_t clamped = 0;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t p = static_cast<size_t>(y) * width + x;
+            if (has_validity && (*validity)[p] <= 0.0f) {
+                /* History the runtime knows is wrong is not blended at all - not blended with a small
+                 * weight, not blended and then corrected. The pixel keeps the current frame. */
+                ++rejected;
+                continue;
+            }
+            /* The neighbourhood, clamped to the frame, is the same box for every channel at this pixel. */
+            uint32_t x0 = 0, y0 = 0, x1 = width - 1, y1 = height - 1;
+            if (has_validity) {
+                x0 = (x > TEMPORAL_CLAMP_RADIUS) ? x - TEMPORAL_CLAMP_RADIUS : 0u;
+                y0 = (y > TEMPORAL_CLAMP_RADIUS) ? y - TEMPORAL_CLAMP_RADIUS : 0u;
+                x1 = std::min(x + TEMPORAL_CLAMP_RADIUS, width - 1);
+                y1 = std::min(y + TEMPORAL_CLAMP_RADIUS, height - 1);
+            }
+            bool pixel_clamped = false;
+            for (uint32_t c = 0; c < channels; ++c) {
+                const size_t i = p * channels + c;
+                if (i >= current.size() || i >= warped_color.size()) continue;
+                float history = warped_color[i];
+                if (has_validity) {
+                    /* Per-channel min/max of the *current* frame over the neighbourhood: the box the
+                     * history's colour has to fall inside to be believed. */
+                    float lo = current[i];
+                    float hi = current[i];
+                    for (uint32_t ny = y0; ny <= y1; ++ny) {
+                        for (uint32_t nx = x0; nx <= x1; ++nx) {
+                            const size_t j = (static_cast<size_t>(ny) * width + nx) * channels + c;
+                            if (j >= current.size()) continue;
+                            lo = std::min(lo, current[j]);
+                            hi = std::max(hi, current[j]);
+                        }
+                    }
+                    if (history < lo) {
+                        history = lo;
+                        pixel_clamped = true;
+                    } else if (history > hi) {
+                        history = hi;
+                        pixel_clamped = true;
+                    }
+                }
+                const float blended = (1.0f - alpha) * current[i] + alpha * history;
+                accumulated_delta += std::fabs(blended - current[i]);
+                current[i] = blended;
+            }
+            if (pixel_clamped) ++clamped;
+        }
     }
 
     if (stats) {
         stats->mean_abs_delta =
             static_cast<float>(accumulated_delta / static_cast<double>(current.size()));
-        stats->blended_pixels = width * height;
+        stats->blended_pixels = width * height - rejected;
+        stats->rejected_pixels = rejected;
+        stats->clamped_pixels = clamped;
     }
     return true;
 }
@@ -522,6 +582,33 @@ static void resample_motion_field_nchw(const std::vector<float>& src_nchw,
     }
 }
 
+/* Nearest-neighbour resampling of a single plane from the frame *input* resolution to the render *output*
+ * resolution. The trust mask is a per-pixel decision on the grid its rule is defined on - the input grid the
+ * model's own `validity` tensor is built on - while the accumulation's blend runs on the output grid, so the
+ * mask is carried across the same way the motion field is: the nearest input texel, no interpolation. A
+ * binary plane interpolated would invent fractional trust at the edges of every rejected region, which is
+ * exactly where the decision matters. */
+static void resample_plane_nearest(const std::vector<float>& src,
+                                   uint32_t src_w, uint32_t src_h,
+                                   uint32_t dst_w, uint32_t dst_h,
+                                   std::vector<float>& dst) {
+    dst.assign(static_cast<size_t>(dst_w) * dst_h, 0.0f);
+    if (src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) return;
+    if (src.size() < static_cast<size_t>(src_w) * src_h) return;
+
+    const float ratio_x = static_cast<float>(dst_w) / static_cast<float>(src_w);
+    const float ratio_y = static_cast<float>(dst_h) / static_cast<float>(src_h);
+    for (uint32_t y = 0; y < dst_h; ++y) {
+        uint32_t sy = static_cast<uint32_t>(static_cast<float>(y) / ratio_y);
+        if (sy >= src_h) sy = src_h - 1;
+        for (uint32_t x = 0; x < dst_w; ++x) {
+            uint32_t sx = static_cast<uint32_t>(static_cast<float>(x) / ratio_x);
+            if (sx >= src_w) sx = src_w - 1;
+            dst[static_cast<size_t>(y) * dst_w + x] = src[static_cast<size_t>(sy) * src_w + sx];
+        }
+    }
+}
+
 /* Mean absolute per-channel difference between two equal-length images. */
 static float mean_abs_difference(const std::vector<float>& a,
                                  const std::vector<float>& b) {
@@ -563,8 +650,8 @@ bool compute_history_trust_mask(const std::vector<float>& current_depth,
              * the pixel that *contains* that position - truncation, not rounding, which is the packer's
              * astype(int). Then the same two comparisons: inside the frame, and nothing clearly nearer in
              * front of what is here now. */
-            const float prev_u = (static_cast<float>(x) + 0.5f) / fw - motion_uv[index * 2];
-            const float prev_v = (static_cast<float>(y) + 0.5f) / fh - motion_uv[index * 2 + 1];
+            const float prev_u = (static_cast<float>(x) + 0.5f) / fw - motion_uv[index];
+            const float prev_v = (static_cast<float>(y) + 0.5f) / fh - motion_uv[pixels + index];
             if (!(prev_u > 0.0f && prev_u < 1.0f && prev_v > 0.0f && prev_v < 1.0f)) continue;
             uint32_t px = static_cast<uint32_t>(prev_u * fw);
             uint32_t py = static_cast<uint32_t>(prev_v * fh);
@@ -576,6 +663,29 @@ bool compute_history_trust_mask(const std::vector<float>& current_depth,
         }
     }
     return true;
+}
+
+bool compute_history_trust_mask_from_textures(
+    const uint8_t* current_depth, uint32_t current_w, uint32_t current_h, NRRTextureFormat current_format,
+    const uint8_t* previous_depth, uint32_t previous_w, uint32_t previous_h, NRRTextureFormat previous_format,
+    const uint8_t* motion, uint32_t motion_w, uint32_t motion_h, NRRTextureFormat motion_format,
+    std::vector<float>& out_mask) {
+    out_mask.clear();
+    /* The rule is a per-pixel decision, so a field that is not even the same size as the others has no pixel
+     * to belong to: refused, and the caller treats it as no mask rather than guessing an alignment. */
+    if (!current_depth || !previous_depth || !motion) return false;
+    if (current_w == 0 || current_h == 0) return false;
+    if (previous_w != current_w || previous_h != current_h) return false;
+    if (motion_w != current_w || motion_h != current_h) return false;
+
+    /* Through the same decoder the model's own tensors use, so the mask is built from the numbers the model
+     * is given rather than from a second decode of the same attachment down a different path. The motion
+     * field comes out planar (u-plane, v-plane), which is the layout compute_history_trust_mask reads. */
+    std::vector<float> current_plane, previous_plane, motion_uv;
+    if (!texture_to_nchw(current_depth, current_w, current_h, current_format, 1, current_plane)) return false;
+    if (!texture_to_nchw(previous_depth, previous_w, previous_h, previous_format, 1, previous_plane)) return false;
+    if (!texture_to_nchw(motion, motion_w, motion_h, motion_format, 2, motion_uv)) return false;
+    return compute_history_trust_mask(current_plane, previous_plane, motion_uv, current_w, current_h, out_mask);
 }
 
 void TemporalAccumulator::record_depth(const uint8_t* depth, uint32_t width, uint32_t height,
@@ -602,6 +712,66 @@ bool TemporalAccumulator::previous_depth_frame(std::vector<uint8_t>& out_depth, 
     out_format = previous_depth_format_;
     return true;
 }
+
+/* The previous frame's render reprojected onto this frame's grid - the plane a temporal model was trained on,
+ * and so the plane it has to be fed. See the declaration in nrr_temporal.h for the rule and for why it is one
+ * function rather than one per backend. */
+bool warp_input_history_to_nchw(const uint8_t* previous, uint32_t previous_w, uint32_t previous_h,
+                                NRRTextureFormat previous_format,
+                                const uint8_t* motion, uint32_t motion_w, uint32_t motion_h,
+                                NRRTextureFormat motion_format, float motion_vectors_scale,
+                                int channels, std::vector<float>& out_nchw) {
+    if (!previous || !motion || previous_w == 0 || previous_h == 0 || channels <= 0 || channels > 4) {
+        return false;
+    }
+    std::vector<float> color_nchw;
+    std::vector<float> motion_nchw;
+    if (!texture_to_nchw(previous, previous_w, previous_h, previous_format, channels, color_nchw)) return false;
+    if (!texture_to_nchw(motion, motion_w, motion_h, motion_format, 2, motion_nchw)) return false;
+
+    /* Interleaved and carried onto the frame's own grid by the helper the blend already reprojects through: a
+     * field given at another resolution is re-expressed in the same *fraction of the image* rather than in the
+     * pixels of the grid it was measured on. When the grids already match this is the values unchanged (the
+     * ratio is 1.0), so there is one code path rather than two that could disagree. */
+    std::vector<float> field;
+    resample_motion_field_nchw(motion_nchw, motion_w, motion_h, previous_w, previous_h, field);
+    if (field.size() != static_cast<size_t>(previous_w) * previous_h * 2) return false;
+
+    const float scale = motion_vectors_scale > 0.0f ? motion_vectors_scale : 1.0f;
+    const size_t plane = static_cast<size_t>(previous_w) * previous_h;
+    const float max_x = static_cast<float>(previous_w - 1);
+    const float max_y = static_cast<float>(previous_h - 1);
+    out_nchw.assign(plane * static_cast<size_t>(channels), 0.0f);
+
+    for (uint32_t y = 0; y < previous_h; ++y) {
+        for (uint32_t x = 0; x < previous_w; ++x) {
+            const size_t p = static_cast<size_t>(y) * previous_w + x;
+            /* Backward reprojection by *this* frame's field, source clamped into the frame: a source that
+             * left the frame becomes the edge texel extended rather than black, which is the runtime's rule,
+             * the packer's rule, and the artefact the model's `validity` input exists to describe. */
+            const float sx = std::max(0.0f, std::min(static_cast<float>(x) - field[p * 2] * scale, max_x));
+            const float sy = std::max(0.0f, std::min(static_cast<float>(y) - field[p * 2 + 1] * scale, max_y));
+            const uint32_t x0 = static_cast<uint32_t>(sx);
+            const uint32_t y0 = static_cast<uint32_t>(sy);
+            const uint32_t x1 = std::min(x0 + 1, previous_w - 1);
+            const uint32_t y1 = std::min(y0 + 1, previous_h - 1);
+            const float fx = sx - static_cast<float>(x0);
+            const float fy = sy - static_cast<float>(y0);
+            const size_t row0 = static_cast<size_t>(y0) * previous_w;
+            const size_t row1 = static_cast<size_t>(y1) * previous_w;
+            for (int c = 0; c < channels; ++c) {
+                const size_t base = static_cast<size_t>(c) * plane;
+                const float top = color_nchw[base + row0 + x0] +
+                                  (color_nchw[base + row0 + x1] - color_nchw[base + row0 + x0]) * fx;
+                const float bottom = color_nchw[base + row1 + x0] +
+                                     (color_nchw[base + row1 + x1] - color_nchw[base + row1 + x0]) * fx;
+                out_nchw[base + p] = top + (bottom - top) * fy;
+            }
+        }
+    }
+    return true;
+}
+
 
 TemporalAccumulator::TemporalAccumulator()
     : seen_frame_(false), last_frame_index_(0),
@@ -695,7 +865,7 @@ void TemporalAccumulator::reset() {
 TemporalAccumulator::Result TemporalAccumulator::apply(
     const NRRFrameInput& input, std::vector<uint8_t>& rgb8,
     uint32_t width, uint32_t height, const MotionProvider& motion,
-    const PhaseAlignedFrame& phase) {
+    const PhaseAlignedFrame& phase, const DepthProvider& depth) {
 
     Result result;
 
@@ -745,10 +915,14 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
     std::vector<float> motion_out;
     bool motion_loaded = false;
     const std::vector<float> no_motion;
+    /* The field as the caller handed it, at the input grid, kept so the disocclusion guard below can build
+     * the trust mask from the same attachment the blend reprojects with. */
+    MotionImage raw_motion_field;
     auto output_motion = [&]() -> const std::vector<float>& {
         if (!motion_loaded) {
             motion_loaded = true;
-            const MotionImage field = motion ? motion() : MotionImage();
+            raw_motion_field = motion ? motion() : MotionImage();
+            const MotionImage& field = raw_motion_field;
             if (field.valid()) {
                 std::vector<float> motion_nchw;
                 if (texture_to_nchw(field.pixels, field.width, field.height, field.format,
@@ -776,10 +950,39 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         previous.width = prev_w;
         previous.height = prev_h;
 
+        /* The disocclusion guard, built only when it was asked for and only when the fields it needs are
+         * present. Everything it reads is already in hand: this frame's depth from the caller's provider,
+         * the previous frame's recorded depth, and the motion attachment the blend is about to reproject
+         * with. The mask is built at the input grid - the grid the rule is defined on, and the grid the
+         * model's own `validity` tensor uses - then carried to the output grid the blend runs on. A frame
+         * where any of the three is missing gets no mask, and the blend falls back to its un-guarded
+         * behaviour rather than rejecting or trusting on a guess. */
+        std::vector<float> mask_out;
+        const std::vector<float>* validity = nullptr;
+        if (disocclusion_rejection_enabled_ && raw_motion_field.valid()) {
+            const MotionImage depth_field = depth ? depth() : MotionImage();
+            std::vector<uint8_t> previous_depth_bytes;
+            uint32_t previous_depth_w = 0, previous_depth_h = 0;
+            NRRTextureFormat previous_depth_format = NRR_TEXTURE_FORMAT_R32F;
+            std::vector<float> mask_in;
+            if (depth_field.valid() &&
+                previous_depth_frame(previous_depth_bytes, previous_depth_w, previous_depth_h,
+                                     previous_depth_format) &&
+                compute_history_trust_mask_from_textures(
+                    depth_field.pixels, depth_field.width, depth_field.height, depth_field.format,
+                    previous_depth_bytes.data(), previous_depth_w, previous_depth_h, previous_depth_format,
+                    raw_motion_field.pixels, raw_motion_field.width, raw_motion_field.height,
+                    raw_motion_field.format, mask_in) && !mask_in.empty()) {
+                resample_plane_nearest(mask_in, depth_field.width, depth_field.height, width, height,
+                                       mask_out);
+                if (mask_out.size() == static_cast<size_t>(width) * height) validity = &mask_out;
+            }
+        }
+
         result.blended = renderer_.blend_frame(
             displayed, width, height, previous, frame_motion,
             input.temporal.motion_vectors_scale, result.state.temporal_alpha,
-            &result.blend_stats);
+            &result.blend_stats, validity);
         result.note = result.blended ? "accumulated"
                                      : "no motion field to reproject with";
     }
@@ -864,27 +1067,79 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                 phase_aligned_.reset();
                 result.phase_note = "phase-aligned reset (scene moved, no field)";
             } else {
-                const size_t plane = static_cast<size_t>(width) * height;
-                phase_frame_.assign(plane * 3u, 0.0f);
-                for (size_t i = 0; i < plane; ++i) {
-                    phase_frame_[i] = displayed[i * 3u];
-                    phase_frame_[plane + i] = displayed[i * 3u + 1u];
-                    phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
+                /* Which frames these are: what the model displayed, or the caller's own low-resolution
+                 * render. The second is the temporal-upscale arrangement - the samples are placed on the
+                 * display grid rather than the model's reconstruction of them - and it is the one measured
+                 * 13.9% closer to the display-resolution render than a bilinear upsample of the same input
+                 * (tools/capture_fidelity_probe.py). See NRRPhaseAlignedSource. */
+                const bool from_input = phase.from_input_render;
+                const uint32_t frame_w = from_input ? phase.input_render.width : width;
+                const uint32_t frame_h = from_input ? phase.input_render.height : height;
+                const size_t plane = static_cast<size_t>(frame_w) * frame_h;
+                bool frame_ready = true;
+                if (from_input) {
+                    /* The renderer's own bytes, converted by the same helper the model's colour tensor goes
+                     * through: what is placed is what was rendered rather than a reconstruction of it. */
+                    frame_ready = texture_to_nchw(phase.input_render.pixels, frame_w, frame_h,
+                                                  phase.input_render.format, 3, phase_frame_);
+                } else {
+                    phase_frame_.assign(plane * 3u, 0.0f);
+                    for (size_t i = 0; i < plane; ++i) {
+                        phase_frame_[i] = displayed[i * 3u];
+                        phase_frame_[plane + i] = displayed[i * 3u + 1u];
+                        phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
+                    }
                 }
-                /* Output grid == frame grid, so the placement's scale is 1 and the offset is already in
-                 * output pixels: this is the case the native-resolution test pins as exactly the de-jitter. */
-                if (phase_aligned_.add_frame(phase_frame_, 3, width, height, width, height,
-                                             JitterOffset(phase.offset_x, phase.offset_y),
-                                             std::vector<uint8_t>(), warp_field)) {
+                /* Two grids, and the placement knows both. At the output resolution the frame's samples and
+                 * the grid's pixels are the same set and the offset is already in grid pixels - the case the
+                 * native-resolution test pins as exactly the de-jitter. From a low-resolution render the frame
+                 * is coarser than the grid, and that is the case the accumulator splats for rather than
+                 * gathers: every output pixel takes the weighted mean of the samples that reached it.
+                 *
+                 * The offset changes units with the grid, and this is the one place the two conventions meet.
+                 * `phase.offset_x` is in *output* pixels - the renderer's jitter scaled once, see
+                 * PhaseAlignedFrame - and `add_frame` takes *frame-grid* pixels, scaling them itself by
+                 * out_width/width (the class header says so). The two units coincide when the frame is at the
+                 * output grid, which is the default source and the reason the distinction went unwritten; the
+                 * input-render source is the only arrangement in which they can disagree, and handing the
+                 * output-pixel value straight through put a low-resolution render's samples at
+                 * `jitter * scale^2` instead of where the renderer took them, `jitter * scale`
+                 * (tools/offset_unit_probe.py: +104.6% edge error against the placement the capture asks for,
+                 * where the intended one is -60.1% against bilinear and the doubled one only -18.4%). Divided
+                 * back into the frame's own grid here, once, and a no-op at scale 1. */
+                const float frame_scale_x = frame_w ? static_cast<float>(width) / static_cast<float>(frame_w)
+                                                    : 1.0f;
+                const float frame_scale_y = frame_h ? static_cast<float>(height) / static_cast<float>(frame_h)
+                                                    : 1.0f;
+                if (!frame_ready) {
+                    /* Elected, but the frame it elected cannot be read: integrate nothing and say so, rather
+                     * than quietly falling back to the other source the caller did not ask for. */
+                    phase_aligned_.reset();
+                    result.phase_note = "phase-aligned reset (frame unreadable)";
+                } else if (phase_aligned_.add_frame(phase_frame_, 3, frame_w, frame_h, width, height,
+                                                    JitterOffset(phase.offset_x / frame_scale_x,
+                                                                 phase.offset_y / frame_scale_y),
+                                                    std::vector<uint8_t>(), warp_field)) {
                     std::vector<float> resolved;
                     if (phase_aligned_.resolve(resolved)) {
-                        for (size_t i = 0; i < plane; ++i) {
+                        /* The resolve is at the *output* grid, which is the grid the displayed frame is on -
+                         * not the frame's own, and the two differ by exactly the upscale when the source is
+                         * the input render. Reading one grid and writing the other is what a temporal upscale
+                         * does; using the frame's count for the write is a half-written frame, silently, and
+                         * the constant-input-render test in tests/unit/test_jitter.cpp is what caught it. */
+                        const size_t out_plane = static_cast<size_t>(width) * height;
+                        for (size_t i = 0; i < out_plane; ++i) {
                             displayed[i * 3u] = resolved[i];
-                            displayed[i * 3u + 1u] = resolved[plane + i];
-                            displayed[i * 3u + 2u] = resolved[plane * 2u + i];
+                            displayed[i * 3u + 1u] = resolved[out_plane + i];
+                            displayed[i * 3u + 2u] = resolved[out_plane * 2u + i];
                         }
                         interleaved_float_to_rgb8(displayed, rgb8);
-                        result.phase_note = warp_field.empty() ? "phase-aligned" : "phase-aligned warped";
+                        /* The note says which arrangement ran, because the two integrate different frames and
+                         * a caller reading the state should be able to tell them apart. */
+                        result.phase_note = from_input
+                            ? (warp_field.empty() ? "phase-aligned upscale"
+                                                  : "phase-aligned upscale warped")
+                            : (warp_field.empty() ? "phase-aligned" : "phase-aligned warped");
                     }
                 }
             }

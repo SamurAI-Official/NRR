@@ -12,6 +12,7 @@
 #include "nrr_reference.h"
 #include "nrr_reference_impl.h"
 #include "nrr_backend.h"
+#include "nrr_temporal.h"
 #include "onnx_runtime.h"
 #include <cstring>
 
@@ -47,6 +48,14 @@ NRRResult DeviceImpl::initialize(const NRRDeviceOptions& options) {
         copy_string(capabilities_.active_backend, sizeof(capabilities_.active_backend), backend_name_);
     }
     copy_string(capabilities_.backend_version, sizeof(capabilities_.backend_version), "1.0");
+
+    /* The disocclusion guard's default is the device's temporal-coherence claim (see nrr_temporal.h,
+     * disocclusion_rejection_default): on for a device that reports it, off for one that does not. Applied
+     * once, here, from the capability just read - never on a later refresh, so it is the state a caller starts
+     * from and cannot override a caller's own choice. The backend decides where its accumulator is: the CPU
+     * backend's is up already, and a vendor backend's kernel starts lazily and is told the default to apply
+     * when it does, so a capability-derived default survives that start instead of being lost. */
+    backend_->apply_disocclusion_rejection_default();
 
     initialized_ = true;
     return NRR_SUCCESS;
@@ -281,6 +290,39 @@ NRRResult DeviceImpl::phase_aligned_accumulation(bool* out_enabled) {
      * backend or kernel restart the setting can be gone, and a caller reading "on" while nothing
      * integrates is the state this query exists to make visible. */
     *out_enabled = backend_->is_phase_aligned_enabled();
+    return NRR_SUCCESS;
+}
+
+NRRResult DeviceImpl::set_phase_aligned_source(NRRPhaseAlignedSource source) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    return backend_->set_phase_aligned_source(source);
+}
+
+NRRResult DeviceImpl::phase_aligned_source(NRRPhaseAlignedSource* out_source) {
+    if (out_source == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    /* The accumulator that will actually run the frames, never a copy of what was requested - the same reason
+     * as phase_aligned_accumulation(). A backend with no accumulator cannot answer, and "no accumulator" is a
+     * different answer from either source, so it is reported rather than defaulted. */
+    if (!backend_->phase_aligned_source(out_source)) return NRR_ERROR_STATE_INVALID;
+    return NRR_SUCCESS;
+}
+
+NRRResult DeviceImpl::set_disocclusion_rejection(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    return backend_->set_disocclusion_rejection(enabled);
+}
+
+NRRResult DeviceImpl::disocclusion_rejection(bool* out_enabled) {
+    if (out_enabled == nullptr) return NRR_ERROR_INVALID_ARGUMENT;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!initialized_ || !backend_) return NRR_ERROR_STATE_INVALID;
+    /* The accumulator that will actually run the frames, never a copy of what was requested - the same
+     * reason as phase_aligned_accumulation(): after a backend or kernel restart the setting can be gone. */
+    *out_enabled = backend_->is_disocclusion_rejection_enabled();
     return NRR_SUCCESS;
 }
 

@@ -363,5 +363,115 @@ NRR_TEST(test_temporal_blend_reprojects_history) {
     renderer.shutdown();
 }
 
+namespace {
+
+/* Interleaved RGB where column x holds x * step (+ offset) in every channel. A 3x3 neighbourhood of such a
+ * ramp spans +-step, so a history value placed inside that band is left alone and one placed outside it is
+ * clamped to the band's edge - the two cases the guard exists to tell apart. */
+std::vector<float> ramp_columns(float step, float offset = 0.0f) {
+    std::vector<float> v(color_size(), 0.0f);
+    for (uint32_t y = 0; y < kH; ++y) {
+        for (uint32_t x = 0; x < kW; ++x) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                v[(static_cast<size_t>(y) * kW + x) * 3 + c] = x * step + offset;
+            }
+        }
+    }
+    return v;
+}
+
+} // namespace
+
+NRR_TEST(test_temporal_blend_rejects_untrusted_history) {
+    /* A trust mask turns the blend into a per-pixel decision: the pixels it refuses keep the current frame,
+     * untouched, and the pixels it accepts are blended by the documented equation (when their history sits
+     * inside the current neighbourhood, so the clamp is a no-op and the two effects are not confounded).
+     * Without a mask the same call blends every pixel - which is why every pre-existing test is unaffected. */
+    TemporalRenderer renderer;
+    NRR_EXPECT_TRUE(renderer.initialize(nullptr), "renderer initialization");
+
+    const float step = 0.1f;
+    std::vector<float> current = ramp_columns(step);
+    HistoryEntry previous;
+    previous.width = kW;
+    previous.height = kH;
+    /* Half a step above the current column: inside the +-step neighbourhood, so it is not clamped. */
+    previous.color_data = ramp_columns(step, 0.05f);
+    const std::vector<float> motion(motion_size(), 0.0f);
+
+    /* Trust only the first pixel of every row. */
+    std::vector<float> validity(static_cast<size_t>(kW) * kH, 0.0f);
+    for (uint32_t y = 0; y < kH; ++y) validity[static_cast<size_t>(y) * kW] = 1.0f;
+
+    TemporalBlendStats stats;
+    const float alpha = 0.5f;
+    std::vector<float> blended = current;
+    NRR_EXPECT_TRUE(renderer.blend_frame(blended, kW, kH, previous, motion, 1.0f, alpha, &stats, &validity),
+                    "a masked blend runs");
+
+    const size_t rejected = (0 * kW + 3) * 3;   /* row 0, column 3: validity 0 */
+    NRR_EXPECT_NEAR(blended[rejected], current[rejected], 1e-6,
+                    "a rejected pixel keeps the current frame");
+    /* Pixel (0,0): trusted, history inside the neighbourhood, so the clamp does not fire. */
+    const float expected_trusted = (1.0f - alpha) * current[0] + alpha * previous.color_data[0];
+    NRR_EXPECT_NEAR(blended[0], expected_trusted, 1e-5,
+                    "a trusted pixel blends by (1 - alpha) * current + alpha * history");
+    NRR_EXPECT_EQ(stats.rejected_pixels, kW * kH - kH, "every untrusted pixel is reported rejected");
+    NRR_EXPECT_EQ(stats.blended_pixels, kH, "only the trusted pixels are reported blended");
+    NRR_EXPECT_EQ(stats.clamped_pixels, 0u, "a history inside the neighbourhood is not clamped");
+
+    /* The control: the same call with no mask blends every pixel, so the rejection above was the mask's
+     * doing and not a property of the frames. */
+    std::vector<float> unmasked = current;
+    TemporalBlendStats control_stats;
+    NRR_EXPECT_TRUE(renderer.blend_frame(unmasked, kW, kH, previous, motion, 1.0f, alpha, &control_stats, nullptr),
+                    "the same blend without a mask runs");
+    NRR_EXPECT_EQ(control_stats.rejected_pixels, 0u, "an unmasked blend rejects nothing");
+    NRR_EXPECT_EQ(control_stats.blended_pixels, kW * kH, "an unmasked blend touches every pixel");
+    const float control_expected = (1.0f - alpha) * current[rejected] + alpha * previous.color_data[rejected];
+    NRR_EXPECT_NEAR(unmasked[rejected], control_expected, 1e-5,
+                    "and it touches the very pixel the mask rejected");
+    NRR_EXPECT_TRUE(std::fabs(unmasked[rejected] - current[rejected]) > 1e-4,
+                    "the pixel the mask left alone is moved when there is no mask");
+
+    renderer.shutdown();
+}
+
+NRR_TEST(test_temporal_blend_clamps_drifted_history) {
+    /* The other half of the guard: a history the mask *accepts* but which has drifted in colour is pulled
+     * back to the current frame's neighbourhood before it is blended, so it cannot ghost. On the ramp the
+     * band's edge is the next column over, so a history far above the current value is clamped to that edge
+     * rather than to the value itself - the clamp bounds the history, it does not erase it. */
+    TemporalRenderer renderer;
+    NRR_EXPECT_TRUE(renderer.initialize(nullptr), "renderer initialization");
+
+    const float step = 0.1f;
+    std::vector<float> current = ramp_columns(step);
+    HistoryEntry previous;
+    previous.width = kW;
+    previous.height = kH;
+    previous.color_data = ramp_columns(step, 0.5f);   /* far above the current column */
+    const std::vector<float> motion(motion_size(), 0.0f);
+    std::vector<float> validity(static_cast<size_t>(kW) * kH, 1.0f);   /* everything trusted */
+
+    TemporalBlendStats stats;
+    const float alpha = 0.7f;
+    std::vector<float> blended = current;
+    NRR_EXPECT_TRUE(renderer.blend_frame(blended, kW, kH, previous, motion, 1.0f, alpha, &stats, &validity),
+                    "a masked blend runs");
+
+    /* Interior column 3: neighbourhood upper edge is column 4 = 4 * step, so the history is clamped there and
+     * the blend is (1 - alpha) * 3 * step + alpha * 4 * step = (3 + alpha) * step. */
+    const size_t interior = (0 * kW + 3) * 3;
+    const float expected = (1.0f - alpha) * (3.0f * step) + alpha * (4.0f * step);
+    NRR_EXPECT_NEAR(blended[interior], expected, 1e-5,
+                    "a history above the neighbourhood is clamped to its edge, not blended raw");
+    NRR_EXPECT_EQ(stats.clamped_pixels, kW * kH, "every pixel's history was clamped");
+    NRR_EXPECT_EQ(stats.rejected_pixels, 0u, "nothing was rejected");
+    NRR_EXPECT_EQ(stats.blended_pixels, kW * kH, "every pixel blended");
+
+    renderer.shutdown();
+}
+
 } // namespace test
 } // namespace nrr

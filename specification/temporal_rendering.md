@@ -137,6 +137,42 @@ genuinely wants an unplaced frame from the blend while the blend wants the displ
 Stillness gate: 0.2 frame-grid px per frame (`PHASE_ALIGNED_MOTION_GATE_PX`, measured - the integration's
 advantage is gone by 0.3). Past it the accumulation is dropped rather than continued across the move.
 
+### What the pass integrates (`NRRPhaseAlignedSource`, opt-in)
+
+The switch above turns the pass on; `nrr_device_set_phase_aligned_source` says which frames it is given, and
+the two sources are different features rather than a flag on one:
+
+- `NRR_PHASE_ALIGNED_SOURCE_DISPLAYED` (0, the default): the frames the model displayed, at the display grid.
+  The integration is a temporal denoise of the model's output - it removes what flickers between the model's
+  reconstructions of one still scene. Measured 3.0% of edge error and 15.1% of plain error over eight frames
+  on the real static capture (`tools/aa_resolve_probe.py`).
+- `NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER` (1): the low-resolution renders the caller submitted, each placed
+  into the display grid at the position its samples were taken. The frames being integrated are then *coarser
+  than the grid*, which is the case `PhaseAlignedAccumulator` splats for rather than gathers (a sample is
+  written once, with the weights it landed with, `resolve` divides the weight pair, and a pixel no sample
+  reached takes that frame's own bilinear upsample - see `runtime/nrr_jitter.h`). The resolve *is* the
+  displayed frame, so a caller that selects this is choosing the runtime's resolve as the picture: the model
+  still runs, and its frame is not what is shown. Measured 13.9% closer to the display-resolution render than
+  a bilinear upsample of the same input (`tools/capture_fidelity_probe.py`), against 2.8-9.4% *worse* than
+  bilinear for the trained models on that same input - which is why this arrangement is a runtime pass and
+  not a model.
+
+The offset changes units with the grid, and the runtime converts between them exactly once: the election
+reports it in **output pixels** (the renderer's jitter scaled by the resolution ratio) and `add_frame` takes
+**frame-grid** pixels, scaling them into output pixels itself. The two coincide at the default source, where the
+frame *is* the display grid and the scale is one; for a frame coarser than the grid `apply` divides by the
+upscale before the placement. Composing them without that step puts every sample at `jitter * scale^2` instead
+of `jitter * scale`, worth **+104.6%** edge error on the fixture `tools/offset_unit_probe.py` measures - so the
+conversion is stated here, written into `add_frame`'s own documentation, and pinned by
+`test_input_render_offset_is_the_frame_grid_one_add_frame_documents`.
+
+The source belongs to the accumulation rather than to a frame, so changing it discards what has been
+collected: samples placed from the input grid and samples of the display grid describe the same scene on two
+different grids, and averaging across the two would be the mistake the accumulator already refuses between
+two output grids. The election is one function for both backends (`phase_aligned_frame_for`), and both
+backends hand over the bytes the renderer submitted - the CPU backend and the shared accelerator kernel
+through the same path that already records them for the model's `history`.
+
 ---
 
 ## 6. Stability Metrics

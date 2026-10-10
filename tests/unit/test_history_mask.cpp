@@ -17,6 +17,7 @@
 #include "nrr_temporal.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,9 +53,12 @@ inline std::vector<float> previous_depth() {
 }
 
 inline std::vector<float> motion_uv() {
-    /* Zero everywhere except (3,0), whose source leaves the frame: prev_u = (3 + 0.5)/4 + 0.5 = 1.375. */
+    /* Planar, the layout texture_to_nchw() produces for the model's `motion` tensor: the u-plane runs for the
+     * whole frame, then the v-plane. Zero everywhere except (3,0), whose source leaves the frame:
+     * prev_u = (3 + 0.5)/4 + 0.5 = 1.375. Pixel (3,0)'s u is index 3, not 3*2 - writing it as 3*2 would only
+     * pass against an interleaved reader, which is the mismatch this fixture now guards against. */
     std::vector<float> m(kMaskW * kMaskH * 2, 0.0f);
-    m[3 * 2 + 0] = -0.5f;
+    m[3] = -0.5f;
     return m;
 }
 
@@ -92,7 +96,8 @@ void test_history_mask_matches_the_packer_on_a_moving_source() {
      * containing pixel is 1, whose previous depth is 1.0 - so this pixel is occluded too. A rounding
      * implementation would land elsewhere, which is the difference between the two rules. */
     std::vector<float> motion = motion_uv();
-    motion[2 * 2 + 0] = 0.25f;
+    /* Planar: (2,0)'s horizontal displacement is u-plane index 2. */
+    motion[2] = 0.25f;
     std::vector<float> mask;
     NRR_EXPECT_TRUE(compute_history_trust_mask(current_depth(), previous_depth(), motion, kMaskW, kMaskH, mask),
                     "the mask is built for a moved source");
@@ -161,6 +166,85 @@ void test_validity_input_name_classifies_as_its_own_role() {
     NRR_EXPECT_TRUE(classify_tensor_role("color") == TensorRole::Color, "and colour is still colour");
     NRR_EXPECT_TRUE(classify_tensor_role("history") == TensorRole::History, "history is still history");
     NRR_EXPECT_TRUE(classify_tensor_role("jitter") == TensorRole::Jitter, "and jitter is still jitter");
+}
+
+namespace {
+
+/* float -> half, enough for the exact values this file uses (-0.5, 0, 0.25). */
+uint16_t half_from_float(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+    const uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent <= 0) return static_cast<uint16_t>(sign);
+    if (exponent >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) |
+                                 (mantissa >> 13));
+}
+
+std::vector<uint8_t> depth_r32f_bytes(const std::vector<float>& values) {
+    std::vector<uint8_t> out(values.size() * sizeof(float));
+    std::memcpy(out.data(), values.data(), out.size());
+    return out;
+}
+
+/* RG16F as a render target stores it: two half floats *interleaved* per texel (u then v). The planar
+ * `uv_planar` the mask reads is what texture_to_nchw() lays that out into, so this is the transpose between
+ * the attachment and the plane. */
+std::vector<uint8_t> motion_rg16f_bytes(const std::vector<float>& uv_planar, uint32_t w, uint32_t h) {
+    const size_t pixels = static_cast<size_t>(w) * h;
+    std::vector<uint8_t> out(pixels * 4, 0);
+    for (size_t p = 0; p < pixels; ++p) {
+        const uint16_t u = half_from_float(uv_planar[p]);
+        const uint16_t v = half_from_float(uv_planar[pixels + p]);
+        std::memcpy(out.data() + p * 4, &u, 2);
+        std::memcpy(out.data() + p * 4 + 2, &v, 2);
+    }
+    return out;
+}
+
+} // namespace
+
+void test_history_mask_from_textures_matches_the_plane_builder() {
+    /* The mask a binding feeds a model is built from raw attachments, not from planes a caller already made.
+     * This is the whole path: decode each attachment through texture_to_nchw() (planar for the motion field),
+     * then the rule. If the decode and the rule disagreed about the motion layout - which they did, one
+     * planar and one interleaved - a model's `validity` input would be built from a scrambled field and no
+     * plane-level test could see it. The fixture is the same one the plane test uses, so agreement is
+     * exact. */
+    using namespace history_mask_fixture;
+    const std::vector<uint8_t> current = depth_r32f_bytes(current_depth());
+    const std::vector<uint8_t> previous = depth_r32f_bytes(previous_depth());
+    const std::vector<uint8_t> motion = motion_rg16f_bytes(motion_uv(), kMaskW, kMaskH);
+
+    std::vector<float> mask;
+    NRR_EXPECT_TRUE(compute_history_trust_mask_from_textures(
+                        current.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        previous.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        motion.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_RG16F, mask),
+                    "the mask is built from the raw attachments");
+    const std::vector<float> want = expected();
+    NRR_EXPECT_EQ(mask.size(), want.size(), "one mask value per pixel");
+
+    int mismatches = 0;
+    for (size_t i = 0; i < mask.size() && i < want.size(); ++i) {
+        if (mask[i] != want[i]) ++mismatches;
+    }
+    NRR_EXPECT_EQ(mismatches, 0,
+                  "the texture path and the plane path agree: the motion layout differs in name only");
+
+    /* A motion field that is not the depth grid's size has no pixel to belong to: refused, not stretched. */
+    NRR_EXPECT_TRUE(!compute_history_trust_mask_from_textures(
+                        current.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        previous.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        motion.data(), kMaskW + 1, kMaskH, NRR_TEXTURE_FORMAT_RG16F, mask),
+                    "a motion field of the wrong size is refused");
+    NRR_EXPECT_TRUE(!compute_history_trust_mask_from_textures(
+                        current.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        nullptr, kMaskW, kMaskH, NRR_TEXTURE_FORMAT_R32F,
+                        motion.data(), kMaskW, kMaskH, NRR_TEXTURE_FORMAT_RG16F, mask),
+                    "an absent previous depth is refused");
 }
 
 } // namespace test

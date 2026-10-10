@@ -42,6 +42,34 @@ constexpr float TEMPORAL_BASE_ALPHA = 0.7f;       /* history weight for low moti
 constexpr float TEMPORAL_ALPHA_MOTION_GATE_PX = 1.0f;
 constexpr float TEMPORAL_ALPHA_MOTION_FULL_PX = 7.0f;
 
+/* The radius of the neighbourhood the blend's colour clamp reads, in pixels. The clamps bound the
+ * reprojected history to the per-channel min/max of the *current* frame over a (2*RADIUS+1)^2 box before
+ * it is blended - the standard temporal-AA defence against a history whose colour has drifted while the
+ * reprojection still looks valid: a thin mover, a shading change, a pixel the trust mask cannot reject
+ * because its depth is unchanged. Radius 1 is a 3x3 box, the box the shipped TAA implementations use; a
+ * larger box admits more history and clamps less.
+ *
+ * The clamp is applied only when a trust mask is supplied to blend_frame. Without one the runtime cannot
+ * tell which history is usable, so it keeps the un-guarded behaviour rather than guessing. See
+ * TemporalAccumulator::set_disocclusion_rejection_enabled(). */
+constexpr uint32_t TEMPORAL_CLAMP_RADIUS = 1;
+
+/* The disocclusion guard's default, from the device's declared **temporal-coherence** capability: on wherever
+ * the device reports it (any state other than ABSENT - BASIC or better) and off where it reports ABSENT. The
+ * guard is part of the temporal path, so a device that does not claim temporal coherence is not handed the
+ * extra per-frame pass the mask costs, and a device that does gets it without its caller asking.
+ *
+ * The backend applies this once, at device initialization (DeviceImpl::initialize). A backend whose accumulator
+ * has not started yet - a vendor kernel comes up lazily, on its first frame - is told the default and applies
+ * it when it starts, so a capability-derived default survives that start instead of being lost (see
+ * Backend::apply_disocclusion_rejection_default and AcceleratorExecutionKernel::set_disocclusion_rejection_default).
+ * The switch that overrides it is TemporalAccumulator::set_disocclusion_rejection_enabled(). A backend with no
+ * accumulator at all keeps the accumulator's own default, which is off - the same answer, since such a backend
+ * is not claiming temporal coherence. */
+inline bool disocclusion_rejection_default(NRRCapabilityState temporal_coherence) {
+    return temporal_coherence != NRR_CAPABILITY_ABSENT;
+}
+
 /* The history *trust mask*: one plane over the input grid, 1 where the history a model is handed at a pixel
  * can be believed and 0 where it cannot - the reprojection's source left the frame, the previous frame held
  * something nearer (disocclusion), or there is no geometry at all (sky).
@@ -62,9 +90,16 @@ constexpr float HISTORY_TRUST_NO_GEOMETRY = 1e-6f;      /* depth at or below thi
 constexpr float HISTORY_TRUST_OCCLUSION_MARGIN = 0.05f; /* view-distance units, the packer's margin */
 
 /* Builds that mask. `current_depth` and `previous_depth` are the two frames' view distances over width x
- * height, row-major; `motion_uv` is this frame's motion field in *UV units*, two floats per pixel, +x right
- * +y down, current frame to previous - the packing convention and the unit the model's own `motion` input
- * carries, so a caller passes the field it already converted rather than a second version of it.
+ * height, row-major; `motion_uv` is this frame's motion field in *UV units*, +x right +y down, current frame
+ * to previous - the packing convention and the unit the model's own `motion` input carries.
+ *
+ * `motion_uv` is **planar**, u-plane then v-plane (`motion_uv[p]` is the horizontal displacement at pixel p,
+ * `motion_uv[pixels + p]` the vertical), which is the layout texture_to_nchw() produces for a two-channel
+ * field and therefore the one the model's own `motion` tensor is in. The runtime's mask and the mask the
+ * model is fed are computed from the same buffer, so a caller passes the field it already converted rather
+ * than a second version of it. (An earlier revision read the field interleaved while the callers passed it
+ * planar, so a mask computed from a motion field that was nonzero was built from a scrambled field. The
+ * layout is a parameter with one meaning now; tests/unit/test_history_mask.cpp pins it.)
  *
  * Returns false when the inputs disagree about their size, in which case no mask is produced and a caller
  * zero-fills its `validity` tensor - the same treatment an absent depth or motion already gets, and the same
@@ -75,6 +110,43 @@ bool compute_history_trust_mask(const std::vector<float>& current_depth,
                                 const std::vector<float>& motion_uv,
                                 uint32_t width, uint32_t height,
                                 std::vector<float>& out_mask);
+
+/* The same mask, built straight from the raw attachments a binding holds: this frame's depth, the previous
+ * frame's depth, and this frame's motion field, each with its own size and format. One definition of the
+ * decode-then-rule plumbing, so BackendCPU's `validity` tensor and the accumulator's own rejection pass
+ * cannot be assembled differently - the failure the mask's single rule exists to prevent, one level up.
+ *
+ * All three fields must agree about their size; false (and `out_mask` left empty) otherwise, which the
+ * callers treat as "no mask this frame". */
+bool compute_history_trust_mask_from_textures(
+    const uint8_t* current_depth, uint32_t current_w, uint32_t current_h, NRRTextureFormat current_format,
+    const uint8_t* previous_depth, uint32_t previous_w, uint32_t previous_h, NRRTextureFormat previous_format,
+    const uint8_t* motion, uint32_t motion_w, uint32_t motion_h, NRRTextureFormat motion_format,
+    std::vector<float>& out_mask);
+
+/* The previous frame's render, reprojected onto this frame's grid: the plane a temporal model is *trained* on,
+ * and therefore the plane it has to be fed at inference.
+ *
+ * The rule is the frame contract's (specification/frame_contract.md: `motion_vectors` carries "pixel motion
+ * since previous frame, on the input grid"), so the source position is `x - dx` with dx scaled by the caller's
+ * declared scale - the same arithmetic TemporalRenderer::warp_previous_output() performs for the internal
+ * blend, deliberately, so the plane a model is fed and the frame the blend reprojects come from one reading of
+ * the field rather than two. The source is clamped into the frame with the second tap clamped with it, so a
+ * source that left the frame becomes the edge texel extended rather than black - what the packer's warp writes
+ * and what the blend already does; the model is told where that happened by its `validity` input rather than
+ * being trained on black where the runtime shows a smear.
+ *
+ * One function because two paths build this tensor - BackendCPU from its own record, the accelerator kernel
+ * from its own accumulator - and a model fed a differently reprojected plane per backend would be the failure
+ * the mask's single rule exists to prevent, one input over.
+ *
+ * Returns false when there is nothing to reproject: no previous plane, no field, an unreadable format. The
+ * caller then passes the previous plane through unwarped, which is what every path did before this existed. */
+bool warp_input_history_to_nchw(const uint8_t* previous, uint32_t previous_w, uint32_t previous_h,
+                                NRRTextureFormat previous_format,
+                                const uint8_t* motion, uint32_t motion_w, uint32_t motion_h,
+                                NRRTextureFormat motion_format, float motion_vectors_scale,
+                                int channels, std::vector<float>& out_nchw);
 
 /* Reporting convention for NRRRenderStats::temporal_stability: the mean
  * per-channel change between consecutive displayed frames, as a fraction of the
@@ -211,7 +283,14 @@ struct TemporalFrameData {
  * real effect instead of assuming it happened. */
 struct TemporalBlendStats {
     float mean_abs_delta = 0.0f;  /* mean |blended - current| per channel, [0,1] */
+    /* Pixels the blend actually touched: all of them on an un-guarded blend, fewer when a trust mask
+     * rejected some. `rejected_pixels + blended_pixels == width * height` whenever a mask was supplied. */
     uint32_t blended_pixels = 0;
+    /* Pixels whose history the trust mask marked unusable and which therefore kept the current frame. */
+    uint32_t rejected_pixels = 0;
+    /* Pixels whose reprojected history the colour clamp pulled back into the current frame's
+     * neighbourhood (any channel). A subset of blended_pixels; 0 without a mask. */
+    uint32_t clamped_pixels = 0;
 };
 
 class TemporalHistory {
@@ -310,12 +389,29 @@ public:
      * when no reprojection is possible: no previous image at this resolution, no
      * current motion field, or a degenerate alpha. On success `stats` receives the
      * measured mean absolute change, which is the number a caller can gate on to
-     * prove the blend actually altered the image. */
+     * prove the blend actually altered the image.
+     *
+     * `validity` is the history *trust mask* for this frame - one value per pixel over the same grid as
+     * `current`, 1 where the reprojected history at that pixel can be believed and 0 where it cannot
+     * (compute_history_trust_mask builds it). It changes the equation above in the two ways the feature
+     * exists for, and only where it is supplied:
+     *
+     *   - a rejected pixel (validity 0) keeps the current frame: history the runtime knows is wrong is not
+     *     blended at all, which is what stops a disoccluded or off-screen source smearing through;
+     *   - an accepted pixel has its reprojected history clamped, per channel, to the min/max of the
+     *     *current* frame over a TEMPORAL_CLAMP_RADIUS neighbourhood before it is blended: history whose
+     *     colour has drifted while its depth still looks valid - a thin mover, a shading change - is pulled
+     *     back toward the frame instead of ghosting.
+     *
+     * A null or wrong-sized `validity` leaves the blend exactly as it was, which is why every existing
+     * caller that passes none is unaffected. `stats->rejected_pixels` and `stats->clamped_pixels` report
+     * what the guard did, so a caller can gate on its actual effect rather than assume it ran. */
     bool blend_frame(std::vector<float>& current, uint32_t width, uint32_t height,
                      const HistoryEntry& previous,
                      const std::vector<float>& current_motion,
                      float motion_vectors_scale, float alpha,
-                     TemporalBlendStats* stats = nullptr);
+                     TemporalBlendStats* stats = nullptr,
+                     const std::vector<float>* validity = nullptr);
     float calculate_temporal_stability(const NRRFrameOutput& current, const NRRFrameOutput& previous) const;
     void reset();
 
@@ -427,6 +523,13 @@ public:
     };
     using MotionProvider = std::function<MotionImage()>;
 
+    /* The caller's depth attachment for this frame, or a default-constructed instance when it has none.
+     * Same return shape as MotionProvider - MotionImage is the accumulator's one description of "a raw
+     * caller-held attachment, by bytes, with the format it is stored in"; this name says what the
+     * accumulator uses the field for. It is read only when disocclusion rejection is on, and only to build
+     * the trust mask (see set_disocclusion_rejection_enabled). */
+    using DepthProvider = std::function<MotionImage()>;
+
     /* What the frame handed to apply() knows about its own sub-pixel phase.
      *
      * The integration the accumulator performs needs two facts the accumulator cannot derive from the
@@ -456,6 +559,12 @@ public:
          * differ by a factor of two, which would make the thresholds twice as strict as the measurements
          * behind them. Zero means "whatever the caller declared as its render resolution". */
         uint32_t frame_width = 0;
+        /* True when the frames being integrated are the caller's *low-resolution input renders* rather than
+         * the frames the model displayed, and where to read them. A property of the accumulation rather than
+         * of a frame - see set_phase_aligned_source() - and the reason the frames are placed on a coarser
+         * grid than the output, which is the case the accumulator splats for (nrr_jitter.h). */
+        bool from_input_render = false;
+        MotionImage input_render;
     };
 
     /* Measured outcome of one frame's temporal pass. */
@@ -475,7 +584,9 @@ public:
          * "alpha=0 (motion above threshold)".*/
         const char* note = "no previous frame";
         /* The phase-aligned pass's own reason, empty when it did not run: "phase-aligned 4 samples",
-         * "phase-aligned reset (scene moved ...)", "phase-aligned off (not jittered)". */
+         * "phase-aligned reset (scene moved ...)", "phase-aligned off (not jittered)". The source it
+         * integrated is part of the name: "phase-aligned upscale" is the input-render arrangement, whose
+         * resolve is the displayed frame (see NRRPhaseAlignedSource). */
         const char* phase_note = "";
     };
 
@@ -507,12 +618,51 @@ public:
                  std::vector<uint8_t>& rgb8,
                  uint32_t width, uint32_t height,
                  const MotionProvider& motion,
-                 const PhaseAlignedFrame& phase = PhaseAlignedFrame());
+                 const PhaseAlignedFrame& phase = PhaseAlignedFrame(),
+                 const DepthProvider& depth = DepthProvider());
 
     /* Turns the phase-aligned integration on or off for this sequence. Off is the default and changes
      * nothing: the pass costs a placement and a mean per frame, and it rewrites the displayed frame. */
     void set_phase_aligned_enabled(bool enabled) { phase_aligned_enabled_ = enabled; }
     bool is_phase_aligned_enabled() const { return phase_aligned_enabled_; }
+
+    /* Chooses what the pass integrates: the model's displayed frames (the default, a temporal denoise of
+     * them) or the caller's low-resolution input renders placed into the display grid (a temporal upscale,
+     * whose resolve *is* the displayed frame - see NRRPhaseAlignedSource in nrr.h for both, with the
+     * measurements, and phase_aligned_frame_for below for the offset each one implies).
+     *
+     * A different source is a different accumulation, so changing it discards what has been collected:
+     * samples placed onto the display grid from the input grid and samples of the display grid itself
+     * describe the same scene on two different grids, and averaging across the two would be the mistake the
+     * accumulator already refuses between two output grids. Setting the source it already has is a no-op, so
+     * a caller may set it every frame. */
+    void set_phase_aligned_source(NRRPhaseAlignedSource source) {
+        if (source != phase_aligned_source_) {
+            phase_aligned_.reset();
+            phase_aligned_source_ = source;
+        }
+    }
+    NRRPhaseAlignedSource phase_aligned_source() const { return phase_aligned_source_; }
+
+    /* Turns disocclusion rejection and clamping on or off for this sequence. Off is the default and changes
+     * nothing - the reprojection blend behaves exactly as it did before it existed - which is deliberate:
+     * the runtime changes its accumulation only under this switch, and the callers that flip it are the ones
+     * that measured the result, the same contract set_phase_aligned_enabled() has.
+     *
+     * On, `apply` builds this frame's trust mask from the depth provider, the previous frame's recorded
+     * depth and this frame's motion (compute_history_trust_mask: geometry, source inside the frame, nothing
+     * clearly nearer before), resamples it to the output grid and hands it to the blend, which then rejects
+     * the pixels it rejects and clamps the reprojected history at the rest to the current frame's
+     * neighbourhood. The mask a model is fed and the mask the accumulation uses are one call to one
+     * function, so a model trained on the mask and the runtime that consumes it cannot disagree about which
+     * history is real.
+     *
+     * It needs a depth provider AND a previous frame's recorded depth. Without either - a caller that
+     * supplies no depth, the first frame of a sequence, a frame the accumulator forgot on a cut - no mask is
+     * built and the blend keeps its un-guarded behaviour for that frame, rather than rejecting everything or
+     * trusting everything on a guess. */
+    void set_disocclusion_rejection_enabled(bool enabled) { disocclusion_rejection_enabled_ = enabled; }
+    bool is_disocclusion_rejection_enabled() const { return disocclusion_rejection_enabled_; }
     /* Frames in the current accumulation, 0 when nothing is being integrated. */
     uint32_t phase_aligned_frames() const { return phase_aligned_.frame_count(); }
 
@@ -571,6 +721,11 @@ private:
      * different question: that one follows motion, this one requires the absence of it. */
     PhaseAlignedAccumulator phase_aligned_;
     bool phase_aligned_enabled_ = false;
+    /* Which frames the pass integrates; see set_phase_aligned_source(). */
+    NRRPhaseAlignedSource phase_aligned_source_ = NRR_PHASE_ALIGNED_SOURCE_DISPLAYED;
+    /* The reprojection blend's disocclusion guard; see set_disocclusion_rejection_enabled(). Off by
+     * default, so the accumulation is byte-for-byte what it was before the guard existed. */
+    bool disocclusion_rejection_enabled_ = false;
     /* Scratch for the RGB8 -> planar float conversion the accumulator takes, reused per frame. */
     std::vector<float> phase_frame_;
 
@@ -616,16 +771,29 @@ private:
  * `eligible` is false for an un-jittered sequence (jitter.enabled == 0): with no distinct phases there
  * is nothing to integrate, and the identity offset would quietly turn the pass into a plain mean.
  *
+ * `source` says which frames the pass is being given, and it decides the offset with the model's jitter
+ * input rather than instead of it:
+ *   - NRR_PHASE_ALIGNED_SOURCE_DISPLAYED (the default): the offset depends on `model_uses_jitter`, above.
+ *   - NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER: the frames are the renderer's own low-resolution passes, which
+ *     carry the displacement whatever the model does with it, so the offset is always the scaled jitter - and
+ *     the frames are coarser than the output grid, which is the case the accumulator splats instead of
+ *     gathering. The caller fills `frame.input_render` with the bytes it rendered.
+ *
  * Measured both ways on the static capture in tools/aa_resolve_probe.py: -27.8% edge error at 4 frames
- * for the placed arrangement, -18.0% at 8 for the unplaced one. */
+ * for the placed arrangement, -18.0% at 8 for the unplaced one. And on a capture's own half-resolution
+ * raster, placing *those* samples into the display grid is 13.9% closer to the display-resolution render
+ * than a bilinear upsample of the same input (tools/capture_fidelity_probe.py), which is the whole of what
+ * the input-render source is for. */
 inline TemporalAccumulator::PhaseAlignedFrame phase_aligned_frame_for(
     const NRRFrameInput& input, bool model_uses_jitter,
-    uint32_t in_width, uint32_t in_height, uint32_t out_width, uint32_t out_height) {
+    uint32_t in_width, uint32_t in_height, uint32_t out_width, uint32_t out_height,
+    NRRPhaseAlignedSource source = NRR_PHASE_ALIGNED_SOURCE_DISPLAYED) {
     TemporalAccumulator::PhaseAlignedFrame frame;
     if (!input.temporal.jitter.enabled) return frame;
     frame.eligible = true;
     frame.frame_width = in_width;
-    if (!model_uses_jitter && in_width > 0 && in_height > 0) {
+    frame.from_input_render = (source == NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER);
+    if (frame.from_input_render || !model_uses_jitter) {
         frame.offset_x = input.temporal.jitter.offset_x
                        * (static_cast<float>(out_width) / static_cast<float>(in_width));
         frame.offset_y = input.temporal.jitter.offset_y

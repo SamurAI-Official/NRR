@@ -42,6 +42,11 @@ NRRResult BackendNVIDIA::initialize(const NRRDeviceOptions& options) {
                 "discrete_gpu");
     capabilities_.max_texture_size = 16384;
     capabilities_.fp32 = NRR_CAPABILITY_FULL;
+    /* This backend accumulates temporal history - it renders through the shared AcceleratorExecutionKernel,
+     * which owns the same TemporalAccumulator the CPU backend uses - so it reports temporal coherence, and
+     * with it the disocclusion guard's default. True whether or not a GPU was found, because the kernel
+     * accumulates on the ONNX CPU EP fallback too. */
+    capabilities_.temporal_coherence = NRR_CAPABILITY_BASIC;
     capabilities_.model_execution_score = 0.9f;
     capabilities_.recommended_input_resolution = 512;
     capabilities_.recommended_output_resolution = 1024;

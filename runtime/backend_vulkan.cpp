@@ -373,6 +373,11 @@ NRRResult BackendVulkan::query_capabilities() {
         vk::apply_measured_capabilities(device_->info(), device_->has_dedicated_compute_family(),
                                        capabilities_);
     }
+    /* This backend accumulates temporal history - it renders through the shared AcceleratorExecutionKernel,
+     * which owns the same TemporalAccumulator the CPU backend uses - so it reports temporal coherence, and with
+     * it the disocclusion guard's default. Set here rather than by apply_measured_capabilities(), which fills
+     * the measured device facts and must not be the thing that decides this one. */
+    capabilities_.temporal_coherence = NRR_CAPABILITY_BASIC;
     std::strncpy(capabilities_.active_backend, "Vulkan",
                  sizeof(capabilities_.active_backend) - 1);
     std::strncpy(capabilities_.backend_version, "1.0",

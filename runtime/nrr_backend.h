@@ -75,6 +75,43 @@ public:
     /* True only when the accumulator that will actually run the frames has it on. */
     virtual bool is_phase_aligned_enabled() const;
 
+    /* Chooses which frames that integration integrates: the model's displayed frames, or the caller's
+     * low-resolution input renders placed into the display grid (see NRRPhaseAlignedSource in nrr.h, and
+     * TemporalAccumulator::set_phase_aligned_source). Same arrangement as the switch above, for the same
+     * reason: implemented once here and forwarded by the shared accelerator kernel, so no vendor backend can
+     * integrate a different source than the one it was asked for.
+     *
+     * Its default, DISPLAYED, is what every backend did before the choice existed, so a caller that never
+     * touches it keeps the denoise the switch above has always produced. Reports NRR_ERROR_STATE_INVALID when
+     * there is no accumulator to configure. */
+    virtual NRRResult set_phase_aligned_source(NRRPhaseAlignedSource source);
+    /* The source the accumulator that will actually run the frames is using - false when this backend has no
+     * accumulator to ask, which is a different answer from either source, and the reason this is not a plain
+     * enum return. */
+    virtual bool phase_aligned_source(NRRPhaseAlignedSource* out_source) const;
+
+    /* Turns the reprojection blend's disocclusion rejection and clamping on or off (see nrr_temporal.h,
+     * TemporalAccumulator::set_disocclusion_rejection_enabled). Its DEFAULT is the device's own
+     * temporal-coherence claim: on for a device that reports it, off for one that does not (see
+     * disocclusion_rejection_default in nrr_temporal.h), which the device applies once at initialization. On,
+     * the accumulator builds this frame's history trust mask and hands it to the blend, which rejects the
+     * history the mask refuses and clamps the rest to the current frame's neighbourhood.
+     *
+     * Same arrangement as the phase-aligned switch above, for the same reason: implemented once here and
+     * forwarded by the shared accelerator kernel, so no vendor backend can render without it. Reports
+     * NRR_ERROR_STATE_INVALID when there is no accumulator to switch. */
+    virtual NRRResult set_disocclusion_rejection(bool enabled);
+    /* True only when the accumulator that will actually run the frames has it on. */
+    virtual bool is_disocclusion_rejection_enabled() const;
+
+    /* Applies the disocclusion guard's default - the value this backend's temporal-coherence capability
+     * implies (see disocclusion_rejection_default in nrr_temporal.h) - to wherever the backend accumulates.
+     * The device calls it once at initialization. A backend whose accumulator has not started yet (a vendor
+     * kernel comes up lazily, on its first frame) remembers the default and applies it when it does, so a
+     * capability-derived default survives the lazy start instead of being lost. BackendCPU has its own
+     * accumulator and overrides it. */
+    virtual NRRResult apply_disocclusion_rejection_default();
+
     /* Re-reads state that is only knowable once work has actually run - most
      * importantly the ONNX Runtime execution provider that ended up attached to
      * a loaded model's session - and folds it into get_capabilities().

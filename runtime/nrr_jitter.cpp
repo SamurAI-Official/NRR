@@ -242,6 +242,109 @@ bool PhaseAlignedAccumulator::add_frame(const std::vector<float>& frame_nchw, in
         weight_.swap(warped_weight_);
     }
 
+    /* Two orderings, and they are not equivalent when the frame is coarser than the grid.
+     *
+     * At the output resolution the frame's samples and the grid's pixels are the same set, so the only question
+     * is where each sample belongs and the gather below answers it: one bilinear read back at X + shift per
+     * pixel, and the frames averaged. That is the order tools/aa_resolve_probe.py measured on the real capture
+     * (3.0% of edge error and 15.1% of plain error at 8 frames), and this path is left as measured.
+     *
+     * Coarser than the grid it is a different question, because four output pixels then share one sample: a
+     * gather resamples the coarse grid's reconstruction - an interpolate and then a read, two resamplings that
+     * both blur before the average even starts. The transpose of the gather writes each sample once, at the
+     * position it was sampled at, and on exactly the input the product has that is worth far more
+     * (tools/capture_fidelity_probe.py): splatting a capture's own half-resolution raster into the display grid
+     * is 13.9% better than the bilinear upsample of it, against the 3.4% the place-then-average order is worth
+     * on the same pairs. So the coarser case splats.
+     *
+     * A splat needs a weight per pixel rather than a count - a sample can land partly on one pixel and partly
+     * on its neighbour - and a pixel no sample reached has to come from somewhere: it is given this frame's own
+     * bilinear upsample, the fallback that makes the result never worse than not placing at all. */
+    const bool scattering = (width != out_width || height != out_height);
+    if (scattering) {
+        /* A restarted pixel is emptied before anything lands on it, so the samples it had collected do not get
+         * averaged into the content that replaced them - the same per-pixel restart the other path applies,
+         * taken before the frame rather than after it. */
+        for (uint32_t y = 0; y < out_height; ++y) {
+            for (uint32_t x = 0; x < out_width; ++x) {
+                const size_t p = static_cast<size_t>(y) * out_width + x;
+                if ((!restart.empty() && restart[p] != 0) || (!out_of_frame.empty() && out_of_frame[p] != 0)) {
+                    for (int c = 0; c < channels; ++c) {
+                        sum_[static_cast<size_t>(c) * out_plane + p] = 0.0;
+                    }
+                    weight_[p] = 0.0;
+                }
+            }
+        }
+
+        const float scale_x = static_cast<float>(out_width) / static_cast<float>(width);
+        const float scale_y = static_cast<float>(out_height) / static_cast<float>(height);
+        for (uint32_t qy = 0; qy < height; ++qy) {
+            /* Where the sample was taken, in output pixels: the frame's pixel centres mapped onto the grid and
+             * then moved back by the placement - the exact mirror of the gather below reading at X + shift. A
+             * sample taken at offset j belongs j * scale earlier in the grid than the upsample put it, so the
+             * splat takes the same shift off. */
+            const float v = (static_cast<float>(qy) + 0.5f) * scale_y - 0.5f - shift_y;
+            int y0 = 0, y1 = 0;
+            float ly = 0.0f;
+            bilinear_taps(v, static_cast<int>(out_height), y0, y1, ly);
+            const float wy0 = 1.0f - ly;
+            const float wy1 = ly;
+
+            for (uint32_t qx = 0; qx < width; ++qx) {
+                const float u = (static_cast<float>(qx) + 0.5f) * scale_x - 0.5f - shift_x;
+                int x0 = 0, x1 = 0;
+                float lx = 0.0f;
+                bilinear_taps(u, static_cast<int>(out_width), x0, x1, lx);
+                const float wx0 = 1.0f - lx;
+                const float wx1 = lx;
+
+                /* At the border the two taps are the same pixel, so their weights sum to one and the sample is
+                 * written once, undivided - the same clamping convention the gather uses. */
+                const size_t p00 = static_cast<size_t>(y0) * out_width + x0;
+                const size_t p01 = static_cast<size_t>(y1) * out_width + x0;
+                const size_t p10 = static_cast<size_t>(y0) * out_width + x1;
+                const size_t p11 = static_cast<size_t>(y1) * out_width + x1;
+                const float w00 = wx0 * wy0;
+                const float w01 = wx0 * wy1;
+                const float w10 = wx1 * wy0;
+                const float w11 = wx1 * wy1;
+
+                for (int c = 0; c < channels; ++c) {
+                    const double value = static_cast<double>(
+                        frame_nchw[static_cast<size_t>(c) * in_plane + static_cast<size_t>(qy) * width + qx]);
+                    double* base = &sum_[static_cast<size_t>(c) * out_plane];
+                    base[p00] += value * w00;
+                    base[p01] += value * w01;
+                    base[p10] += value * w10;
+                    base[p11] += value * w11;
+                }
+                weight_[p00] += w00;
+                weight_[p01] += w01;
+                weight_[p10] += w10;
+                weight_[p11] += w11;
+            }
+        }
+
+        /* Every pixel needs a sample or the resolve would leave it at zero, and where the scatter had nothing
+         * to say the honest value is the one the naive path gives: this frame's own bilinear upsample. A
+         * restarted pixel is emptied above and reaches this the same way, which is what makes a restart a
+         * single frame's worth of evidence rather than a hole. */
+        for (uint32_t y = 0; y < out_height; ++y) {
+            for (uint32_t x = 0; x < out_width; ++x) {
+                const size_t p = static_cast<size_t>(y) * out_width + x;
+                if (weight_[p] > 0.0) continue;
+                for (int c = 0; c < channels; ++c) {
+                    sum_[static_cast<size_t>(c) * out_plane + p] = scratch_[static_cast<size_t>(c) * out_plane + p];
+                }
+                weight_[p] = 1.0;
+            }
+        }
+
+        ++frame_count_;
+        return true;
+    }
+
     for (uint32_t y = 0; y < out_height; ++y) {
         /* Read back at Y + shift_y, which is the de-jitter's own direction: a frame recorded at
          * offset j satisfies input(p) = scene(p - j), so its pixel p holds the scene at p - j and

@@ -51,6 +51,7 @@ reinstalling anything:
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -154,14 +155,172 @@ class GpuSampler(threading.Thread):
                 "memory_used_mb": {"mean": round(sum(memory) / len(memory)), "max": max(memory)}}
 
 
-def pair_from_npz(pair):
+def read_color_source(pair, input_source):
+    """The plane the model is fed as `color`, at the pair's own resolution.
+
+    `noisy` is `input` - the capture's low-resolution render plus the seeded augmentation the packer adds - and
+    is the default because every recorded number was produced with it. `clean` is `input_clean`, the render
+    itself, which is what an engine hands the runtime: the runtime adds no noise, so a model trained and
+    validated on the noisy plane is comparing itself against a baseline that neither it nor the runtime will
+    ever see, and its reported gain is measured against that. `displayed` is a derived dataset's materialised
+    displayed frame (tools/refinement_base_dataset.py), the plane the refinement task corrects. Refuses rather
+    than falling back, because a run that silently changed which plane it trained on would be a run whose number
+    cannot be compared to any other."""
+    if input_source == "noisy":
+        return pair["input"]
+    if input_source == "clean":
+        if "input_clean" not in pair:
+            raise SystemExit("--input-source clean was asked for, but this dataset has no `input_clean`: a "
+                             "procedural dataset is generated at its final resolution and has no render to "
+                             "fall back to")
+        return pair["input_clean"]
+    if input_source == "displayed":
+        if "displayed" not in pair:
+            raise SystemExit("--input-source displayed was asked for, but this dataset has no `displayed` "
+                             "plane: derive one with tools/refinement_base_dataset.py")
+        return pair["displayed"]
+    if input_source == "phase-aligned":
+        # The input-render resolve, placed for this pair from the dataset's own render and the phase it
+        # recorded: what NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER displays for one frame, which is the base plane
+        # the refinement pre-registration names (docs/roadmap.md, M10.4). Derived here rather than read from a
+        # derived dataset, so there is no second copy of the placement to drift - the rule is
+        # `refinement_base_dataset.phase_aligned_frame`, validated against the two other statements of it in this
+        # tree and pinned against the runtime byte for byte by tools/export_runtime_plane_case.py.
+        #
+        # One frame, deliberately: the *accumulated* resolve is a different plane, and on the product's own
+        # raster it is 92.5% worse than a bilinear upsample (the scene moves about a pixel per frame, past the
+        # pass's own 0.2 px/frame stillness gate) where one frame is 11.0% better. Training against the
+        # accumulated plane would be asking a post-filter to invert a temporal mean.
+        #
+        # The import is deferred: `regen_aa_fixture` imports this module at load time to validate dejitter()
+        # against its mirror, so importing the derive at module scope would be a cycle.
+        import refinement_base_dataset as derive
+        for name in ("input_clean", "jitter", "target"):
+            if name not in pair:
+                raise SystemExit("--input-source phase-aligned was asked for, but this pair has no `%s`: the "
+                                 "resolve places the renderer's own samples by the phase it recorded, and "
+                                 "neither can be invented" % name)
+        offset = np.asarray(pair["jitter"], dtype=np.float64)
+        if not np.any(np.abs(offset) > 0.0):
+            raise SystemExit("--input-source phase-aligned was asked for, but this pair records no jitter: with "
+                             "no distinct phase the runtime does not integrate the frame at all, so the plane "
+                             "this would derive is one the runtime never displays")
+        # The field's unit cannot matter here - a single frame has no accumulation to warp - so the derive's
+        # default stands and no motion is read at all.
+        plane, _, _ = derive.phase_aligned_frame(pair, None)
+        return plane
+    raise SystemExit("unknown --input-source %r" % (input_source,))
+
+
+# The refinement task's two base planes - an accumulated frame read from a derived dataset, or the input-render
+# resolve built per pair. One name for the pair, because the guards, the loaders and the model all have to agree
+# about which sources are the refinement task's.
+# The refinement sources whose `color` is already on the nominal grid: the input-render resolve places every
+# sample at the position it was taken, which is exactly the operation the de-jitter performs - so de-jittering it
+# again moves it by the phase it was placed with. Measured on 40 held-out pairs of godot-v6-warp: the plane alone
+# 0.01462, the same plane de-jittered again 0.01589, **8.7% worse**. Every refine arm before this was trained
+# from the second number.
+PLACED_SOURCES = ("phase-aligned",)
+
+REFINE_SOURCES = ("displayed", "phase-aligned")
+
+
+def read_naive_plane(pair):
+    """The bilinear upsample of the renderer's own pass, at the target's grid: a refiner's second view.
+
+    Why it is worth an input at all is measured rather than argued. `tools/refinement_headroom_probe.py` takes
+    the best per-pixel mixture of the placed samples and this view against the ground truth, over held-out pairs
+    of `godot-v6-warp`: **0.00928 against the placed samples' 0.01462, a 36.6% oracle**, while the best *single*
+    mixture weight is the placed samples themselves (-0.0%). So the information a refiner is missing is a
+    *spatially varying choice* between the two views - exactly what a convolution can model, and exactly what a
+    refiner handed only the placed samples cannot see. The gate runs that lost 12-16% were trained that way.
+    """
+    import refinement_base_dataset as derive          # deferred: same cycle as read_color_source
+    for name in ("input_clean", "target"):
+        if name not in pair:
+            raise SystemExit("the `naive` input needs this pair's `%s`, which it does not have" % name)
+    return np.asarray(derive.upsample_rgb(np.asarray(pair["input_clean"], dtype=np.float64),
+                                          pair["target"].shape[0]), dtype=np.float32)
+
+
+def check_task_flags(input_source, refine, crop_sizes, augment_flip, refine_blend=False):
+    """The flag combinations the two tasks cannot share, refused where they are read.
+
+    A module-level function rather than inline code in run(), because the self-test has to be able to exercise
+    every refusal without launching a training run - a guard nobody can call is a guard nobody has checked. The
+    refinement plane is already at the target's resolution, so every flag that assumes the target is a fixed
+    multiple of the input has to be refused rather than quietly mis-applied.
+    """
+    refine_sources = REFINE_SOURCES
+    if refine:
+        if input_source not in refine_sources:
+            raise SystemExit("--refine corrects a plane the runtime displays, so it needs --input-source "
+                             "displayed (the accumulated frame, derived by tools/refinement_base_dataset.py) or "
+                             "phase-aligned (the input-render resolve of one frame, derived from the dataset's "
+                             "own render and jitter)")
+        # Crops and mirrors *are* allowed here, and the refusal that used to stand in this place was a
+        # consequence of the upscaling task's 2x relation rather than of the refinement one: every tensor this
+        # task sees - the plane, the renderer's reconstruction, the target - is on the same grid, so a crop is
+        # aligned by construction (the scale is 1 and the same window is taken from all of them). That matters
+        # because the task is data-starved: 359 training pairs against a 69k-parameter model is what every
+        # gate run overfitted on, and augmentation is the cheapest way to give it more.
+    elif input_source in refine_sources:
+        raise SystemExit("--input-source %s is a refinement task's plane, already at the target's resolution; "
+                         "add --refine, or the model would be asked to upscale a frame that is the target's own "
+                         "size" % input_source)
+    if refine_blend and not refine:
+        raise SystemExit("--refine-blend is the refinement task's blend architecture; add --refine")
+
+
+def check_refine_inputs(refine, requested, refine_blend=False):
+    """The inputs a refinement run cannot be given yet, refused where `--inputs` is read.
+
+    The refinement model works at the target's resolution - its `color` is a plane the runtime displays, twice
+    the render's - while `depth`, `motion`, `history` and `validity` are packed on the render's grid. Feeding one
+    to the other is a shape mismatch, and resampling them would be inventing the rule a post-filter at the
+    display grid needs at runtime, which does not exist yet (the post-filter is an open item in docs/roadmap.md,
+    M10.4). Refused rather than quietly mis-shaped: colour and the constant phase inputs are what this task can
+    be measured with today.
+
+    `--refine-blend` is the exception with the opposite shape: it *needs* `naive`, because its whole point is to
+    learn a per-pixel mixture of the placed samples with the renderer's own reconstruction, which is what the
+    oracle measured 36.6% of headroom in.
+    """
+    if not refine:
+        return
+    if refine_blend and "naive" not in requested:
+        raise SystemExit("--refine-blend mixes the base plane with the `naive` view, so it needs `naive` in "
+                         "--inputs (the per-pixel mixture of the two is where the measured headroom is: "
+                         "tools/refinement_headroom_probe.py)")
+    spatial = [name for name in requested if name in ("depth", "motion", "history", "validity")]
+    if spatial:
+        raise SystemExit("--refine cannot be given %s yet: the refinement model works at the target's "
+                         "resolution while those tensors are packed at the render's, and the runtime has no rule "
+                         "for the resampling a post-filter at the display grid would need (docs/roadmap.md, "
+                         "M10.4). Colour and jitter are the inputs this task can be measured with today"
+                         % ", ".join(spatial))
+
+
+def pair_from_npz(pair, input_source="noisy"):
     """One pair file as float32 tensors in NCHW order.
 
     Both loaders below call this, so the eager and the lazy path cannot disagree about a key's name, order or
     dtype. `--lazy` is a statement about *when* a pair is read, never about what it contains - if the two
     disagreed, switching a dataset between them would silently change which inputs a run can use."""
+    color = read_color_source(pair, input_source)
+    # The colour plane's own grid, which is the grid the *constant* inputs below are broadcast to: the render's
+    # for the upscaling task, and the *target's* for the refinement task, where the model works at the displayed
+    # resolution. Broadcasting the phase to the render's grid instead is a shape mismatch at the first
+    # convolution - and it is a mismatch only the refinement task can have, its colour plane not being the
+    # render's size, which is why it went unnoticed until a refine run asked for jitter.
+    plane_h, plane_w = color.shape[0], color.shape[1]
     item = {
-        "color": torch.from_numpy(pair["input"].transpose(2, 0, 1)[None].copy()),
+        # Which plane the model is fed as `color`. `noisy` is the packed `input` (the capture's render plus
+        # seeded noise, the augmentation every recorded number was produced with); `clean` is that render
+        # itself, which is what the *runtime* feeds - the engine has no such noise and the packer adds it, so a
+        # model trained and validated on `noisy` is measured against a baseline neither it nor the runtime will
+        # ever see. See --input-source.
+        "color": torch.from_numpy(color.transpose(2, 0, 1)[None].copy()),
         "depth": torch.from_numpy(pair["depth"][None, None].copy()),
         "motion": torch.from_numpy(pair["motion"].transpose(2, 0, 1)[None].copy()),
         "target": torch.from_numpy(pair["target"].transpose(2, 0, 1)[None].copy())}
@@ -177,9 +336,27 @@ def pair_from_npz(pair):
     # trained on jittered captures cannot know its own sampling grid, which is the information that
     # separates a jitter-aware temporal resolve from an unaware one.
     if "jitter" in pair:
-        height, width = pair["input"].shape[0], pair["input"].shape[1]
         item["jitter"] = torch.from_numpy(pair["jitter"].astype(np.float32)) \
-            .view(1, 2, 1, 1).expand(1, 2, height, width).clone()
+            .view(1, 2, 1, 1).expand(1, 2, plane_h, plane_w).clone()
+    # The resolution token: the grid this pair's input lives on, as log2(native_input_width / 128), broadcast to
+    # a one-channel plane. A fully convolutional stack can *run* at any resolution but is otherwise never told
+    # which one it is running at, and the parity table measured what that silence costs - the model this
+    # project has scores 1.10 dB *below bilinear* at 256x256->512x512 because it has only ever seen 128x128.
+    #
+    # The value is an octave measure (128 -> 0.0, 256 -> 1.0, 512 -> 2.0) centred on the tier the first models
+    # were trained at, so a token of zero means "the resolution I was trained at", and it is a plane rather
+    # than a scalar because a convolution cannot consume a scalar.
+    #
+    # A merged multi-scale dataset stores the token per pair (`scale`, written by
+    # tools/merge_scale_datasets.py, which centre-crops the larger tier to a common tensor size while keeping
+    # its native pixel scale). Reading the stored value rather than the tensor's width is what makes the token
+    # *dynamic* there: two pairs of the same dimensions carry different tokens when they came from different
+    # tiers. An unmerged dataset has no such field and the width-derived value is exact for it.
+    if "scale" in pair:
+        scale_value = float(np.asarray(pair["scale"]).reshape(-1)[0])
+    else:
+        scale_value = math.log2(max(int(plane_w), 1) / 128.0)
+    item["scale"] = torch.full((1, 1, plane_h, plane_w), scale_value, dtype=torch.float32)
     # Validity is the capture's own mask on the history it carries: 1 where this pixel's history is
     # trustworthy, 0 where the reprojection left the frame, where the previous frame held something nearer, or
     # where there is no geometry at all (sky). It is loaded as an *input* rather than as metadata because a
@@ -190,9 +367,14 @@ def pair_from_npz(pair):
     # relative placement of history's samples is the one part of a history plane that a convolution cannot read
     # off the pixel values.
     if "history_jitter" in pair:
-        height, width = pair["input"].shape[0], pair["input"].shape[1]
         item["history_jitter"] = torch.from_numpy(pair["history_jitter"].astype(np.float32)) \
-            .view(1, 2, 1, 1).expand(1, 2, height, width).clone()
+            .view(1, 2, 1, 1).expand(1, 2, plane_h, plane_w).clone()
+    # The refinement task's second view: the renderer's own reconstruction, at the target's grid. Only the
+    # refinement task has it, because only there does the model work at the target's resolution - and it is the
+    # view whose per-pixel mixture with the placed samples measured 36.6% of oracle headroom
+    # (tools/refinement_headroom_probe.py).
+    if input_source in REFINE_SOURCES:
+        item["naive"] = torch.from_numpy(read_naive_plane(pair).transpose(2, 0, 1)[None].copy())
     if "validity" in pair:
         item["validity"] = torch.from_numpy(pair["validity"][None, None].copy())
     return item
@@ -211,13 +393,16 @@ class Split:
     few hundred thousand do not - and the fix for that has to be a loader change, not a smaller dataset.
     """
 
-    def __init__(self, keys, device=None, tensors=None, paths=None):
+    def __init__(self, keys, device=None, tensors=None, paths=None, input_source="noisy"):
         self.keys = list(keys)
         self.device = device
         self.tensors = tensors                  # eager: {key: (N, C, H, W) tensor}, nothing left to read
         self.paths = paths                      # lazy: one pair file per position, read on demand
         self.count = tensors[self.keys[0]].shape[0] if tensors is not None else len(paths)
         self.zeroed = set()
+        # Which plane `color` is read from, carried on the split so the lazy and eager loaders cannot disagree
+        # about it - the same argument that makes them share pair_from_npz().
+        self.input_source = input_source
 
     def __contains__(self, key):
         return key in self.keys
@@ -259,7 +444,7 @@ class Split:
         pieces = []
         for position in self._positions(index):
             with np.load(self.paths[position]) as pair:
-                pieces.append(pair_from_npz(pair))
+                pieces.append(pair_from_npz(pair, self.input_source))
         batch = {}
         for key in self.keys:
             value = torch.cat([piece[key] for piece in pieces], dim=0)
@@ -280,11 +465,17 @@ class Split:
         split, so the augmentation arguments can be checked against it before training starts."""
         if self.tensors is not None:
             return tuple(self.tensors["color"].shape[-2:])
+        if self.input_source in REFINE_SOURCES:
+            # A refinement source's colour plane is the *target's* grid, so a crop-size check has to measure
+            # against that rather than against the render the plane was built from - the same distinction the
+            # loader's `naive` view turns on.
+            with np.load(self.paths[0]) as pair:
+                return (int(pair["target"].shape[0]), int(pair["target"].shape[1]))
         with np.load(self.paths[0]) as pair:
             return (int(pair["input"].shape[0]), int(pair["input"].shape[1]))
 
 
-def load_dataset(data_dir, lazy=False):
+def load_dataset(data_dir, lazy=False, input_source="noisy"):
     """Loads the manifest and the pairs it names.
 
     Returns (manifest, dataset) where dataset["train"] and dataset["val"] are Split objects, sizes[split] is
@@ -345,6 +536,19 @@ def load_dataset(data_dir, lazy=False):
     has_history_jitter = uniform("history_jitter")
     if has_history_jitter:
         keys.append("history_jitter")
+    # The resolution token is last, and needs no capture support: it is computed from the pair's own grid (or
+    # read from the `scale` field a merged multi-scale dataset carries), so every dataset can advertise it and
+    # any run may ask for it. It sits at the end of the key list because the model's own signature ends there -
+    # the two are read positionally by the export and the verification.
+    keys.append("scale")
+    # The refinement task's second view is *computed* rather than packed - the bilinear upsample of the same
+    # pair's render, at the target's grid - so a dataset advertises it whenever its pairs carry what it is made
+    # of, and only the refinement sources ever ask for it. Without this line a refine run asking for `naive`
+    # failed as "this dataset has no naive", which is how the first attempt at this input was found to be
+    # plumbing rather than measurement.
+    has_naive = uniform("input_clean") and uniform("target")
+    if input_source in REFINE_SOURCES and has_naive:
+        keys.append("naive")
 
     dataset = {"has_history": has_history, "has_jitter": has_jitter, "has_validity": has_validity,
                "has_history_jitter": has_history_jitter,
@@ -354,14 +558,14 @@ def load_dataset(data_dir, lazy=False):
             # Only the training split takes this path: validation is forwarded in full to produce the
             # held-out number, so laziness there would save a third of a split that is already a small
             # fraction of the data, and would complicate the metric path for nothing.
-            dataset[split] = Split(keys, paths=[path for _, path, _ in items])
+            dataset[split] = Split(keys, paths=[path for _, path, _ in items], input_source=input_source)
         else:
             loaded = []
             for _, path, _ in items:
                 with np.load(path) as pair:
-                    loaded.append(pair_from_npz(pair))
+                    loaded.append(pair_from_npz(pair, input_source))
             dataset[split] = Split(keys, tensors={key: torch.cat([item[key] for item in loaded], dim=0)
-                                                  for key in keys})
+                                                  for key in keys}, input_source=input_source)
     return manifest, dataset
 
 
@@ -414,49 +618,42 @@ def _mirror(piece, plan):
     return piece
 
 
-def augment_sample(pair, plan, scale_y, scale_x):
+def augment_sample(pair, plan):
     """Applies one plan to one pair, whose tensors are each shaped (1, C, H, W).
 
     Why a mirrored pair is still a real pair: every transform that makes one is equivariant under a mirror.
     The images carry over unchanged - history is on the same grid as the input and was warped into that grid
     before it was saved, so mirroring the input and the history together mirrors the pair - and a crop is
-    aligned by construction, since the target is the input's grid at `scale`. What does *not* carry over
-    untouched is the sign of the direction fields: motion and jitter point along +x/+y (frame_contract.md
-    4.3), so a horizontal mirror negates their x component and a vertical mirror negates their y. Training on
-    pairs whose motion points the wrong way is worse than not augmenting at all.
+    aligned by construction, because every tensor is the same scene at *some* resolution and the window is
+    taken at the same place in image terms in each. What does *not* carry over untouched is the sign of the
+    direction fields: motion and jitter point along +x/+y (frame_contract.md 4.3), so a horizontal mirror
+    negates their x component and a vertical mirror negates their y. Training on pairs whose motion points the
+    wrong way is worse than not augmenting at all.
+
+    The per-key window is the part the refinement task showed was needed: the plan is drawn against the
+    *colour plane's* grid, and a refinement run's colour plane is the target's 256-pixel grid while its depth,
+    motion, history and validity are still at the render's 128 - so a 128-pixel window ran off the end of a
+    128-pixel tensor, every sample clamped at a different place, and `torch.cat` failed on the shapes. Scaling
+    each key's window by its own grid against the colour plane's is the same rule the target always had.
     """
     out = {}
+    color_h = int(pair["color"].shape[-2])
+    color_w = int(pair["color"].shape[-1])
     for key, value in pair.items():
+        own_y = value.shape[-2] / float(color_h)
+        own_x = value.shape[-1] / float(color_w)
+        y0 = int(round(plan["offset_y"] * own_y))
+        x0 = int(round(plan["offset_x"] * own_x))
+        height = max(int(round(plan["crop_h"] * own_y)), 1)
+        width = max(int(round(plan["crop_w"] * own_x)), 1)
+        piece = _mirror(value[..., y0:y0 + height, x0:x0 + width], plan)
         if key in ("motion", "jitter"):
-            continue                      # signed direction fields, cropped and mirrored below
-        if key == "target":
-            # The target is the higher-resolution grid, so it is cropped at the same place *in image terms*:
-            # the low-resolution window multiplied by the scale. Cropping it at the same pixel offset instead
-            # would take it from a different part of the image, and the model would be trained to reproduce
-            # an offset pair.
-            piece = value[..., plan["offset_y"] * scale_y:(plan["offset_y"] + plan["crop_h"]) * scale_y,
-                          plan["offset_x"] * scale_x:(plan["offset_x"] + plan["crop_w"]) * scale_x]
-        else:
-            piece = value[..., plan["offset_y"]:plan["offset_y"] + plan["crop_h"],
-                          plan["offset_x"]:plan["offset_x"] + plan["crop_w"]]
-        out[key] = _mirror(piece, plan)
-    for key in ("motion", "jitter"):
-        if key not in pair:
-            continue
-        # Both are on the low-resolution grid and are cropped by the same window as everything else. For
-        # jitter that changes no *value* - it is one offset broadcast over the frame - but it is not optional:
-        # the model concatenates the jitter plane with the input's own features, so a full-sized jitter plane
-        # against a cropped input is a shape mismatch, which is exactly how this was found ("96 must match
-        # 128"). A broadcast input is still an input.
-        piece = pair[key][..., plan["offset_y"]:plan["offset_y"] + plan["crop_h"],
-                          plan["offset_x"]:plan["offset_x"] + plan["crop_w"]]
-        piece = _mirror(piece, plan)
-        # Channel 0 is x and channel 1 is y, both pointing +right/+down: a mirror reverses the component
-        # along the axis it mirrors and leaves the other one alone.
-        if plan["flip_h"]:
-            piece = torch.cat([-piece[:, 0:1], piece[:, 1:2]], dim=1)
-        if plan["flip_v"]:
-            piece = torch.cat([piece[:, 0:1], -piece[:, 1:2]], dim=1)
+            # Channel 0 is x and channel 1 is y, both pointing +right/+down: a mirror reverses the component
+            # along the axis it mirrors and leaves the other one alone.
+            if plan["flip_h"]:
+                piece = torch.cat([-piece[:, 0:1], piece[:, 1:2]], dim=1)
+            if plan["flip_v"]:
+                piece = torch.cat([piece[:, 0:1], -piece[:, 1:2]], dim=1)
         out[key] = piece
     return out
 
@@ -487,7 +684,7 @@ def augment_batch(batch, crop_sizes, flip, generator):
     for index in range(color.shape[0]):
         plan = augment_draw(height, width, crop_h, crop_w, flip, generator)
         pieces.append(augment_sample({key: value[index:index + 1] for key, value in batch.items()},
-                                     plan, scale_y, scale_x))
+                                     plan))
     return {key: torch.cat([piece[key] for piece in pieces], dim=0) for key in batch}
 
 
@@ -517,12 +714,12 @@ def check_gates(numbers, zeroed=None, inputs=("color", "depth", "motion")):
                numbers.get("train_progress", 0.0) * 100.0, MIN_TRAIN_PROGRESS * 100.0))
     if numbers["val_l1"] > numbers["val_baseline_l1"] * (1.0 - MIN_IMPROVEMENT):
         failures.append(
-            "does not beat the baseline: val L1 %.5f against the bilinear baseline's %.5f, which is "
+            "does not beat the baseline: val L1 %.5f against the baseline's %.5f, which is "
             "not at least %.0f%% lower" % (numbers["val_l1"], numbers["val_baseline_l1"],
                                            MIN_IMPROVEMENT * 100.0))
     if numbers["drift"] <= BASELINE_FLOOR:
         failures.append(
-            "is the baseline: its output differs from the bilinear upscale by only %.6f (needs > "
+            "is the baseline: its output differs from the plane it corrects by only %.6f (needs > "
             "%.4f), so nothing was learned" % (numbers["drift"], BASELINE_FLOOR))
     for field in ("depth_ablation", "motion_ablation", "history_ablation", "jitter_ablation",
                   "validity_ablation", "history_jitter_ablation"):
@@ -565,8 +762,14 @@ def export_onnx(model, out_path, size, inputs, opset=17):
     had completed and passed every gate. ONNX tracing needs no accelerator, and the runtime that consumes
     this graph runs it on the CPU, so the CPU is also the honest place to trace it."""
     widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2, "validity": 1,
-              "history_jitter": 2}
-    signature = ("color", "depth", "motion", "history", "jitter", "validity", "history_jitter")
+              "history_jitter": 2, "scale": 1}
+    # The order is read off the model's own signature instead of being written down here. The tuple below is
+    # passed *positionally*, so a hardcoded list silently binds each tensor to whatever slot happens to sit at
+    # its index: when `scale` was added to `forward` after `naive`, this list still ended at `scale`, the token
+    # landed in `naive`'s slot, `scale` arrived as None, and the export died in conv2d with "received NoneType".
+    # Reading the signature makes that class of bug impossible - a new parameter shifts the list with it - and
+    # the self-test pins the property by exporting a token model and checking the token moves the graph's output.
+    signature = tuple(name for name in inspect.signature(model.forward).parameters if name != "self")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     example = tuple(torch.zeros(1, widths[name], size, size) if name in inputs else None
                     for name in signature)
@@ -598,7 +801,7 @@ def _sha256(path):
 
 def run(args, log):
     manifest_path = os.path.join(args.data, "manifest.json")
-    manifest, dataset = load_dataset(args.data, lazy=args.lazy)
+    manifest, dataset = load_dataset(args.data, lazy=args.lazy, input_source=args.input_source)
     summary = manifest.get("summary", {})
     log("  dataset: %d train / %d val pairs; manifest margin min %.4f, noise %.4f, detail ratio max %.3f"
         % (dataset["sizes"]["train"], dataset["sizes"]["val"],
@@ -610,6 +813,10 @@ def run(args, log):
 
     # Augmentation is off unless asked for, and deliberately so: every number this repository has recorded
     # was produced without it, so turning a transform on by default would silently invalidate all of them.
+    # The refinement task's plane is already at the target's resolution, and the flags that assume otherwise are
+    # refused by one function the self-test calls directly.
+    check_task_flags(args.input_source, args.refine, args.crop_sizes, args.augment_flip,
+                     refine_blend=args.refine_blend)
     crop_sizes = tuple(sorted({int(value) for value in args.crop_sizes.split(",") if value.strip()}))
     frame_height, _ = dataset["train"].frame_shape()
     for size in crop_sizes:
@@ -627,9 +834,9 @@ def run(args, log):
                "/".join(str(size) for size in crop_sizes) if crop_sizes else "none"))
 
     requested = ["color"] + [name.strip() for name in args.inputs.split(",") if name.strip()]
-    available = {"color"} | {key for key in ("depth", "motion", "history", "jitter", "validity",
-                                            "history_jitter")
-                             if key in dataset["train"]}
+    available = {"color", "scale"} | {key for key in ("depth", "motion", "history", "jitter", "validity",
+                                                      "history_jitter", "naive")
+                                      if key in dataset["train"]}
     missing = [name for name in requested if name not in available]
     if missing:
         raise SystemExit(
@@ -637,10 +844,23 @@ def run(args, log):
             "contain, and inventing zeros for it would measure nothing." % (", ".join(missing),
                                                                            ", ".join(sorted(available))))
     requested = [name for name in ("color", "depth", "motion", "history", "jitter", "validity",
-                                   "history_jitter")
+                                   "history_jitter", "naive", "scale")
                  if name in requested]
+    # ... and the inputs that are packed on a different grid from the one a refinement model works at, refused
+    # here where --inputs is known.
+    check_refine_inputs(args.refine, requested, refine_blend=args.refine_blend)
     log("  inputs: %s%s" % (",".join(requested),
                             " (history available)" if dataset["has_history"] else ""))
+    if args.input_source != "noisy":
+        log("  color plane: %s - %s" % (args.input_source, {
+            "clean": "the render itself, which is what the runtime is fed, NOT the packed `input` every "
+                     "earlier run was measured on",
+            "displayed": "the accumulated frame the runtime displays, derived offline by "
+                         "tools/refinement_base_dataset.py",
+            "phase-aligned": "the input-render resolve of *one* frame, placed per pair from the dataset's own "
+                             "render and jitter (NOT the accumulated plane, which on moving content is worse "
+                             "than a bilinear upsample - see docs/roadmap.md, M10.4)",
+        }[args.input_source]))
 
     zeroed = None if args.zero_input == "none" else args.zero_input
     if zeroed:
@@ -692,8 +912,12 @@ def run(args, log):
                                                      detail_weight=args.detail_weight,
                                                       jitter_channels=args.jitter_channels,
                                                       validity_channels=args.validity_channels,
-                                                      history_jitter_channels=args.history_jitter_channels,
-                                                      augment=augment)
+                                                     history_jitter_channels=args.history_jitter_channels,
+                                                     naive_channels=args.naive_channels,
+                                                     augment=augment,
+                                                     refine=args.refine,
+                                                     refine_blend=args.refine_blend,
+                                                     de_jitter=args.input_source not in PLACED_SOURCES)
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.time() - started
@@ -707,7 +931,18 @@ def run(args, log):
     log("  training: %.1f s total, %.1f ms/epoch" % (seconds, seconds / max(args.epochs, 1) * 1000.0))
 
     val = dataset["val"].materialise()
-    full = measure(model, val, chunk=args.measure_batch)
+    # Which history plane this measurement is taken on. `None` is the dataset's own, which is what every run
+    # before this option existed measured; see substitute_history() for why it can be changed at all, and why
+    # the substitution refuses when the pair identity does not line up.
+    measured_history = substitute_history(val, args.measure_history, args.data)
+    if measured_history is not None:
+        val = dict(val)
+        val["history"] = measured_history["planes"]
+        log("  history plane: %s%s - NOT the dataset's own, so the number below is on the plane the runtime "
+            % (measured_history["mode"],
+               "" if measured_history["source"] is None else " (read from %s)" % measured_history["source"]))
+        log("  delivers rather than the one this model trained on")
+    full = measure(model, val, chunk=args.measure_batch, refine=args.refine)
     keys = list(val.keys())
 
     def ablation(name):
@@ -716,7 +951,8 @@ def run(args, log):
         does not have."""
         if name not in model.inputs:
             return 0.0
-        return float((full["output"] - measure(model, val, zero=name, chunk=args.measure_batch)["output"]).abs().mean())
+        return float((full["output"] - measure(model, val, zero=name, chunk=args.measure_batch,
+                                               refine=args.refine)["output"]).abs().mean())
 
     depth_ablation = ablation("depth")
     motion_ablation = ablation("motion")
@@ -724,6 +960,15 @@ def run(args, log):
     jitter_ablation = ablation("jitter")
     validity_ablation = ablation("validity")
     history_jitter_ablation = ablation("history_jitter")
+    # The refinement task's second view: an output that does not move when it is zeroed means the model
+    # ignored the information the oracle says is worth 36.6% - which is the failure mode this input exists to
+    # rule out, and it is measured rather than assumed.
+    naive_ablation = ablation("naive")
+    # The resolution token, measured like every other input: an output that does not move when the token is
+    # zeroed means the model ignored it. Zero is also the *reference tier's* token value, so this is the sharper
+    # question the token exists for - does the model behave as if the frame came from the 128 grid when it is
+    # told that it did?
+    scale_ablation = ablation("scale")
     # The metrics a caller checks, not only L1. Computed for the model and for the bilinear baseline on the
     # same held-out frames, so the comparison is like for like and the baseline's score is visible too.
     model_quality = quality_metrics.evaluate(full["output"], val["target"])
@@ -733,6 +978,7 @@ def run(args, log):
                "history_ablation": history_ablation, "jitter_ablation": jitter_ablation,
                "validity_ablation": validity_ablation,
                "history_jitter_ablation": history_jitter_ablation,
+               "naive_ablation": naive_ablation,
                "ssim": model_quality["ssim"], "psnr_db": model_quality["psnr_db"],
                "ms_ssim": model_quality["ms_ssim"],
                "baseline_ssim": baseline_quality["ssim"],
@@ -746,23 +992,27 @@ def run(args, log):
                "train_progress": (first_plain - last_plain) / max(first_plain, 1e-9),
                "objective_progress": (first_loss - last_loss) / max(first_loss, 1e-9),
                "improvement": 1.0 - full["l1"] / max(full["baseline_l1"], 1e-9)}
-    log("  val L1 %.5f against the bilinear baseline's %.5f -> %.2f%% better; drift from baseline %.5f"
-        % (numbers["val_l1"], numbers["val_baseline_l1"], numbers["improvement"] * 100.0,
+    # The baseline is task-dependent - the bilinear upsample for the upscaling task, the plane itself for the
+    # refinement task (base_plane) - and a report that called the second one "the bilinear baseline" would be
+    # naming a number nobody computed.
+    baseline_name = "the plane's own" if args.refine else "the bilinear baseline's"
+    log("  val L1 %.5f against %s %.5f -> %.2f%% better; drift from baseline %.5f"
+        % (numbers["val_l1"], baseline_name, numbers["val_baseline_l1"], numbers["improvement"] * 100.0,
            numbers["drift"]))
     log("  ablations (how much the output moves when the input is zeroed): depth %.5f, motion %.5f, "
-        "history %.5f, jitter %.5f, validity %.5f, history_jitter %.5f"
+        "history %.5f, jitter %.5f, validity %.5f, history_jitter %.5f, naive %.5f, scale %.5f"
         % (depth_ablation, motion_ablation, history_ablation, jitter_ablation, validity_ablation,
-           history_jitter_ablation))
-    log("  quality: ssim %.4f psnr %.2f dB against the bilinear baseline's ssim %.4f psnr %.2f dB"
-        % (numbers["ssim"], numbers["psnr_db"], numbers["baseline_ssim"],
+           history_jitter_ablation, naive_ablation, scale_ablation))
+    log("  quality: ssim %.4f psnr %.2f dB against %s ssim %.4f psnr %.2f dB"
+        % (numbers["ssim"], numbers["psnr_db"], baseline_name, numbers["baseline_ssim"],
            numbers["baseline_psnr_db"]))
     # MS-SSIM beside SSIM, because the two disagree exactly where a still-image metric is weakest: SSIM at the
     # pixel scale says nothing about whether the reconstruction is right at the scale the eye reads, and the
     # multi-scale term is what a commercial upscaler's structure claims are usually quoted in.
     scales = quality_metrics.ms_ssim_scales(val["target"].shape[-2:]
                                            if val["target"].ndim >= 3 else (0, 0))
-    log("  ms-ssim: %.4f against the bilinear baseline's %.4f (%d of 5 scales at this resolution)"
-        % (numbers["ms_ssim"], numbers["baseline_ms_ssim"], scales))
+    log("  ms-ssim: %.4f against %s %.4f (%d of 5 scales at this resolution)"
+        % (numbers["ms_ssim"], baseline_name, numbers["baseline_ms_ssim"], scales))
     log("  training progress: unweighted residual L1 %.5f -> %.5f (%.1f%% lower)"
         % (first_plain, last_plain, numbers["train_progress"] * 100.0))
     if abs(numbers["objective_progress"] - numbers["train_progress"]) > 0.02:
@@ -776,12 +1026,19 @@ def run(args, log):
     report = {"model": "nrr_upscaler_trained", "parameters": parameters, "inputs": list(model.inputs),
               "channels": args.channels,
               "depth_channels": args.depth_channels, "motion_channels": args.motion_channels,
+              "naive_channels": args.naive_channels,
               "epochs": args.epochs, "batch_size": args.batch_size,
               "learning_rate": args.learning_rate, "seed": args.seed,
               "loss": args.loss, "ssim_weight": args.ssim_weight, "lr_schedule": args.lr_schedule,
               "detail_weight": args.detail_weight,
               "deterministic": bool(args.deterministic),
               "zeroed_input": zeroed,
+              # Which plane `color` was read from: a metric is only comparable to one produced the same way,
+              # and this one changes what the held-out number *means* rather than just how it is computed.
+              "input_source": args.input_source,
+              # And which task: `refine` means the model corrected the displayed frame, so its baseline is
+              # that frame rather than a bilinear upsample, and the two tasks' numbers are not comparable.
+              "task": "refine" if args.refine else "upscale",
               # Recorded because a metric is only comparable to one produced the same way: a run with
               # augmentation and a run without are two configurations, so the report has to say which it was.
               "loading": "lazy" if args.lazy else "eager",
@@ -796,35 +1053,62 @@ def run(args, log):
               "dataset": {"dir": args.data, "manifest_sha256": _sha256(manifest_path),
                           "generator": manifest.get("generator"), "seed": manifest.get("seed"),
                           "count": manifest.get("count"), "sizes": dataset["sizes"]},
+              # Which history plane `measured` was taken on. A number whose input was substituted is not
+              # comparable to one that was not, so the report says which it was.
+              "measured_history": (None if measured_history is None
+                                   else {"plane": measured_history["mode"],
+                                         "source": measured_history["source"],
+                                         "note": "the held-out number is on a substituted history plane, not "
+                                                 "the dataset's own"}),
               "measured": numbers,
               "gates": {"min_improvement": MIN_IMPROVEMENT, "baseline_floor": BASELINE_FLOOR,
                         "conditioning_floor": CONDITIONING_FLOOR, "failures": failures}}
     report_path = os.path.splitext(args.out)[0] + ".report.json"
 
-    if failures:
-        # A model that does not qualify is not exported at all, and the refusal is written down: an
-        # exported file with a warning printed next to it gets used anyway.
+    if failures and not args.export_unqualified:
+        # A model that does not qualify is not exported, and the refusal is written down: an exported file with a
+        # warning printed next to it gets used anyway.
         log("  REFUSING to export: %d gate(s) failed, so this model does not qualify" % len(failures))
         for failure in failures:
             log("    - %s" % failure)
+        log("  pass --export-unqualified to export it anyway as a baseline or candidate (its report is then "
+            "stamped as unqualified)")
         with open(report_path, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(report, handle, indent=2)
             handle.write("\n")
         log("  report: %s (the refusal is recorded, not swallowed)" % report_path)
         return 1
+    if failures:
+        # Adopting a model that fails a gate is a decision rather than an accident, so it is recorded *in the
+        # artifact's report* and not only in a log line: the failures, the flag that permitted the export, and a
+        # sentence saying what the file therefore is.
+        log("  EXPORTING AN UNQUALIFIED MODEL at the caller's explicit request (--export-unqualified):")
+        for failure in failures:
+            log("    - %s" % failure)
+        report["unqualified"] = {
+            "failures": failures,
+            "exported_by": "--export-unqualified",
+            "note": ("this artifact does NOT pass the release gates. It is exported to serve as a baseline or a "
+                     "candidate, and every number measured with it carries that qualification.")}
 
-    export_onnx(model, args.out, args.size, model.inputs)
-    verification = verify_export(model, args.out, take(val, slice(0, 1), keys))
-    report["export"] = {"path": args.out, "opset": 17, "sha256": _sha256(args.out),
-                        "verify": verification}
+    # The export is written to a staging path and only moved into place once it has passed verification and the
+    # dynamic-size check. That order is not cosmetic: the first token run wrote its export, then failed
+    # verification, and the file sat on disk for half an hour looking like a deliverable while its report said
+    # something else. A failure must not leave an artifact behind at all.
+    staged = args.out + ".staged"
+    if os.path.exists(staged):
+        os.remove(staged)
+    export_onnx(model, staged, args.size, model.inputs)
+    verification = verify_export(model, staged, take(val, slice(0, 1), keys))
+    report["export"] = {"path": args.out, "opset": 17, "staged": staged, "verify": verification}
     # Dynamic H/W is what makes the graph usable by the runtime at sizes it was not trained at, so it is
     # checked rather than assumed.
     try:
         import onnxruntime
-        session = onnxruntime.InferenceSession(args.out, providers=["CPUExecutionProvider"])
+        session = onnxruntime.InferenceSession(staged, providers=["CPUExecutionProvider"])
         other = args.size + 32
         widths = {"color": 3, "depth": 1, "motion": 2, "history": 3, "jitter": 2, "validity": 1,
-                  "history_jitter": 2}
+                  "history_jitter": 2, "scale": 1}
         produced = list(session.run([OUTPUT_NAME], {
             name: np.zeros((1, widths[name], other, other), np.float32)
             for name in model.inputs})[0].shape)
@@ -834,10 +1118,21 @@ def run(args, log):
         if produced != expected:
             log("  FAILED: the exported graph is not dynamic in H/W (got %s, expected %s)"
                 % (produced, expected))
+            os.remove(staged)
+            log("  the staged export was removed: a graph that fails its own check is not left on disk")
             return 1
     except ImportError:
         report["export"]["dynamic_size_check"] = {"checked": False}
 
+    # Only now does the staged file become the artifact, and the hash is taken from where it will be read.
+    os.replace(staged, args.out)
+    report["export"].pop("staged", None)
+    report["export"]["sha256"] = _sha256(args.out)
+
+    # A refused run still writes its report, and that path must exist even though the export (which is what
+    # usually creates it) never ran: a refusal that raises FileNotFoundError reports nothing at all, which is
+    # exactly what happened the first time a gate stopped a run whose --out directory was new.
+    os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
     with open(report_path, "w", encoding="utf-8", newline="\n") as handle:
         json.dump(report, handle, indent=2)
         handle.write("\n")
@@ -859,7 +1154,8 @@ def verify_export(model, out_path, batch):
     import onnx
     onnx.checker.check_model(onnx.load(out_path))
     session = onnxruntime.InferenceSession(out_path, providers=["CPUExecutionProvider"])
-    signature = ("color", "depth", "motion", "history", "jitter", "validity", "history_jitter")
+    signature = ("color", "depth", "motion", "history", "jitter", "validity", "history_jitter", "naive",
+                 "scale")
     keys = [name for name in signature if name in model.inputs]
     # .cpu() because the batch lives on the model's device and numpy cannot read a CUDA tensor; onnxruntime
     # is happiest with plain host arrays.
@@ -1019,7 +1315,8 @@ def self_test():
         ("the ablation harness can zero every consumed input",
          all(float((measure(probe, probe_batch)["output"]
                     - measure(probe, probe_batch, zero=name)["output"]).abs().mean()) > 0.0
-             for name in ("depth", "motion", "history", "jitter", "validity", "history_jitter")
+             for name in ("depth", "motion", "history", "jitter", "validity", "history_jitter", "naive",
+                          "scale")
              if name in probe.inputs)),
     ]
 
@@ -1061,7 +1358,33 @@ def self_test():
                               "OK" if check_ok else "FAIL"))
         problems += 0 if check_ok else 1
 
-        # The trace must also survive the settings a real run uses. --deterministic rewrites F.interpolate
+        # The token model is the case the by-name check above cannot see. `scale` sits *after* `naive` in the
+        # forward signature, so a hardcoded example order shifted the token into `naive`'s slot, `scale` arrived
+        # as None, and the export died in conv2d with "received NoneType" - while the declared names were still
+        # exactly right, which is why this is checked by *running* the graph and moving the token rather than by
+        # reading its input list. A token that is declared but not connected also exports cleanly, and it
+        # measures as a model that ignores its own scale, so only the movement separates the two.
+        token_model = Upscaler(4, 4, 4, 4, inputs=("color", "jitter", "scale")).eval()
+        with torch.no_grad():
+            for parameter in token_model.parameters():
+                parameter.add_(torch.randn_like(parameter) * 0.05)
+        token_path = os.path.join(tempfile.mkdtemp(), "selftest_export_token.onnx")
+        export_onnx(token_model, token_path, 8, token_model.inputs)
+        declared = [entry.name for entry in onnx.load(token_path).graph.input]
+        check_ok = declared == ["color", "jitter", "scale"]
+        print("  %-44s %s" % ("the scale token survives the export's argument order",
+                              "OK (%s)" % ", ".join(declared) if check_ok else "FAIL %s" % declared))
+        problems += 0 if check_ok else 1
+        token_session = onnxruntime.InferenceSession(token_path, providers=["CPUExecutionProvider"])
+        feed = {"color": np.random.RandomState(0).rand(1, 3, 8, 8).astype(np.float32),
+                "jitter": np.full((1, 2, 8, 8), 0.25, np.float32)}
+        at_low = token_session.run([OUTPUT_NAME], dict(feed, scale=np.zeros((1, 1, 8, 8), np.float32)))[0]
+        at_high = token_session.run([OUTPUT_NAME], dict(feed, scale=np.ones((1, 1, 8, 8), np.float32)))[0]
+        movement = float(np.abs(at_high - at_low).mean())
+        check_ok = movement > 0.0
+        print("  %-44s %s" % ("the exported graph consumes the token (%.4f)" % movement,
+                              "OK" if check_ok else "FAIL - declared but not connected"))
+        problems += 0 if check_ok else 1
         # into a decomposition that mixes devices, so tracing a CUDA model with it on died in the middle of
         # exporting a model that had trained and passed every gate. The export now traces on the CPU; this
         # pins that under the same flag, on a CUDA model when one is present.
@@ -1139,6 +1462,10 @@ def self_test():
         path = os.path.join(pairs_dir, "pair_%03d.npz" % index)
         np.savez(path,
                  input=rng.rand(16, 12, 3).astype(np.float32),
+                 # The render before the packer's noise, which a capture always carries and which
+                 # --input-source clean reads. Kept distinct from `input` so a run cannot pass by reading the
+                 # same plane twice.
+                 input_clean=rng.rand(16, 12, 3).astype(np.float32),
                  depth=rng.rand(16, 12).astype(np.float32),
                  motion=rng.rand(16, 12, 2).astype(np.float32),
                  target=rng.rand(32, 24, 3).astype(np.float32),
@@ -1158,13 +1485,139 @@ def self_test():
     lazy_batch = lazily["train"].batch(positions)
     check_ok = (lazily["train"].keys == keys
                 and keys == ["color", "depth", "motion", "target", "history", "jitter", "validity",
-                             "history_jitter"]
+                             "history_jitter", "scale"]
                 and lazily["train"].count == eager["train"].count
                 and lazily["sizes"] == eager["sizes"]
                 and all(bool(torch.equal(lazy_batch[key], eager_batch[key])) for key in keys))
     print("  %-44s %s" % ("lazy loading matches eager pair for pair",
                           "OK" if check_ok else "FAIL"))
     problems += 0 if check_ok else 1
+
+    # The two planes --input-source selects between. `clean` has to be the pair's own `input_clean` and has to
+    # differ from the noisy `input`, or the flag would be a silent no-op on the datasets that carry both - and
+    # a run whose plane is not the one it was asked for is a number that cannot be compared to any other.
+    _, clean = load_dataset(pairs_dir, input_source="clean")
+    _, clean_lazy = load_dataset(pairs_dir, lazy=True, input_source="clean")
+    with np.load(files[0]) as probe:
+        want_clean = probe["input_clean"]
+    got_clean = clean["train"].tensors["color"][0].numpy().transpose(1, 2, 0)
+    plane_ok = (not torch.equal(clean["train"].tensors["color"], eager["train"].tensors["color"])
+                and bool(np.allclose(got_clean, want_clean, atol=1e-6))
+                and bool(torch.equal(clean_lazy["train"].batch(torch.tensor([0], dtype=torch.long))["color"],
+                                     clean["train"].tensors["color"][:1])))
+    print("  %-44s %s" % ("--input-source clean reads input_clean, and is not the noisy plane",
+                          "OK" if plane_ok else "FAIL"))
+    problems += 0 if plane_ok else 1
+
+    # The refinement task's second base plane: the input-render resolve of *one* frame, derived per pair rather
+    # than read from a derived dataset, so there is no second copy of the placement to drift. Four properties,
+    # each of them a way a run could silently measure something else: it is at the target's resolution; it is
+    # not the naive path (or the source would be a bilinear upsample wearing the arrangement's name); a constant
+    # render resolves to that constant in every channel, which is the property the runtime's own arrangement
+    # test uses to make the placement unmistakable; and a pair with no phase is refused rather than derived from
+    # a plane the runtime never displays.
+    def plane_pair(input_clean, target, offset):
+        return {"input_clean": np.asarray(input_clean, dtype=np.float32),
+                "target": np.asarray(target, dtype=np.float32),
+                "jitter": np.asarray(offset, dtype=np.float32)}
+
+    import refinement_base_dataset as derive          # the rule itself, not a copy of it
+    constant = read_color_source(
+        plane_pair(np.full((8, 8, 3), 0.75, np.float32), np.zeros((16, 16, 3), np.float32), (0.25, -0.5)),
+        "phase-aligned")
+    textured_input = rng.rand(8, 8, 3).astype(np.float32)
+    textured = read_color_source(
+        plane_pair(textured_input, rng.rand(16, 16, 3).astype(np.float32), (0.25, -0.5)), "phase-aligned")
+    naive = derive.upsample_rgb(np.asarray(textured_input, dtype=np.float64), 16)
+    plane_ok = (constant.shape == (16, 16, 3) and textured.shape == (16, 16, 3)
+                and bool(np.allclose(constant, 0.75, atol=1e-6))
+                and float(np.abs(textured - naive).mean()) > 1e-3)
+    print("  %-44s %s" % ("--input-source phase-aligned derives the one-frame resolve",
+                          "OK" if plane_ok else "FAIL"))
+    problems += 0 if plane_ok else 1
+
+    def refusal(call, needle):
+        try:
+            call()
+            return False
+        except SystemExit as error:
+            return needle in str(error)
+
+    guard_ok = (
+        # A pair with no phase cannot be integrated by the runtime, so deriving a plane for it would train on
+        # something the runtime never shows.
+        refusal(lambda: read_color_source(plane_pair(textured_input, np.zeros((16, 16, 3), np.float32),
+                                                     (0.0, 0.0)), "phase-aligned"), "no jitter")
+        # And a non-square render is refused rather than placed on a square grid (the mirror's limit).
+        and refusal(lambda: read_color_source(plane_pair(rng.rand(8, 6, 3).astype(np.float32),
+                                                        np.zeros((16, 12, 3), np.float32), (0.25, -0.5)),
+                                             "phase-aligned"), "square grid only")
+        # The task guards: the plane needs --refine, and --refine needs one of the two planes.
+        and refusal(lambda: check_task_flags("phase-aligned", False, "", False), "add --refine")
+        and refusal(lambda: check_task_flags("noisy", True, "", False), "needs --input-source")
+        # Crops are allowed for the refinement task now - every tensor it sees is on the target's grid, so a
+        # crop is aligned by construction - so this is the check that they are *not* refused. The upscaling
+        # task's own guards are unchanged, and the arms that lost to their plane were trained without them.
+        and not refusal(lambda: check_task_flags("phase-aligned", True, "128", False), "")
+        and not refusal(lambda: check_task_flags("phase-aligned", True, "", False), "")
+        and not refusal(lambda: check_task_flags("displayed", True, "", False), "")
+        # And the inputs packed on the render's grid, which a target-resolution model cannot consume.
+        and refusal(lambda: check_refine_inputs(True, ["color", "depth"]), "cannot be given depth")
+        and refusal(lambda: check_refine_inputs(True, ["color", "history"]), "cannot be given history")
+        and not refusal(lambda: check_refine_inputs(True, ["color", "jitter"]), "")
+        and not refusal(lambda: check_refine_inputs(True, ["color", "naive"]), "")
+        and not refusal(lambda: check_refine_inputs(False, ["color", "depth", "motion"]), ""))
+    print("  %-44s %s" % ("the plane's refusals fire, and the legal combinations do not",
+                          "OK" if guard_ok else "FAIL"))
+    problems += 0 if guard_ok else 1
+
+    # The refinement task's second view: it has to be at the target's grid, it has to be the *renderer's own*
+    # reconstruction (not the placed samples under another name - which is what a refiner given only `color`
+    # was already seeing, and what the gate runs that lost 12-16% were trained on), and the loader must only
+    # offer it to the refinement task.
+    naive = read_naive_plane(plane_pair(textured_input, np.zeros((16, 16, 3), np.float32), (0.25, -0.5)))
+    naive_ok = (naive.shape == (16, 16, 3)
+                and float(np.abs(naive - derive.upsample_rgb(np.asarray(textured_input, dtype=np.float64),
+                                                             16)).max()) < 1e-6
+                and float(np.abs(naive - textured).mean()) > 1e-3)
+    print("  %-44s %s" % ("the naive view is the renderer's reconstruction, not the plane",
+                          "OK" if naive_ok else "FAIL"))
+    problems += 0 if naive_ok else 1
+
+    # The placed-plane trap, pinned rather than remembered: for a refinement source whose frame is already on the
+    # nominal grid, an untrained model must be *exactly* that frame even when it consumes the phase, because
+    # de-jittering a placed resolve moves the whole frame by the phase it was placed with - 8.7% worse, measured
+    # on 40 held-out pairs, which is where the first three gate runs started from.
+    frame = torch.rand(1, 3, 16, 16)
+    phase = torch.full((1, 2, 16, 16), 0.375)
+    kept_model = Upscaler(channels=8, inputs=("color", "jitter"), refine=True, de_jitter=False)
+    moved_model = Upscaler(channels=8, inputs=("color", "jitter"), refine=True, de_jitter=True)
+    with torch.no_grad():
+        kept = kept_model(frame, jitter=phase)
+        moved = moved_model(frame, jitter=phase)
+    check_ok = float((kept - frame).abs().max()) == 0.0 and float((moved - frame).abs().max()) > 1e-3
+    print("  %-44s %s" % ("a placed plane is not de-jittered twice", "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # The blend architecture: the same invariant (untrained is the plane, to within a quarter of a percent of
+    # the second view's difference) and the property that makes it worth having - the output actually depends on
+    # the view it blends with, which is what the residual-only refiner failed to learn (ablation 0.00009).
+    blend_model = Upscaler(channels=8, inputs=("color", "naive"), refine=True, refine_blend=True,
+                           de_jitter=False)
+    other = torch.ones(1, 3, 16, 16)
+    with torch.no_grad():
+        blended = blend_model(frame, naive=other)
+    identity_ok = float((blended - frame).abs().max()) == 0.0
+    # And the head is *wired* to the view: the zero gate cannot show it, so it is moved by hand. The two
+    # properties are what the architecture is for - untrained it is the plane, and once trained it can leave.
+    with torch.no_grad():
+        blend_model.blend.bias.fill_(0.5)
+        moved = blend_model(frame, naive=other)
+    wiring_ok = float((moved - frame).abs().mean()) > 1e-3
+    blend_ok = identity_ok and wiring_ok
+    print("  %-44s %s" % ("the blend starts at the plane and uses the second view",
+                          "OK" if blend_ok else "FAIL"))
+    problems += 0 if blend_ok else 1
 
     # The phase plane is broadcast to the frame rather than resized: a model takes a tensor and the two numbers
     # are the entire content, so every pixel has to carry them unchanged - *per channel*, since the two channels
@@ -1197,7 +1650,7 @@ def self_test():
     # the image, the equality below fails.
     sample["target"] = sample["color"].repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
     flat = {"flip_h": False, "flip_v": False, "crop_h": 8, "crop_w": 6, "offset_y": 3, "offset_x": 2}
-    cropped = augment_sample(sample, flat, 2, 2)
+    cropped = augment_sample(sample, flat)
     check_ok = (tuple(cropped["color"].shape[-2:]) == (8, 6)
                 and tuple(cropped["target"].shape[-2:]) == (16, 12)
                 and bool(torch.allclose(cropped["target"],
@@ -1214,12 +1667,39 @@ def self_test():
                           "OK" if check_ok else "FAIL"))
     problems += 0 if check_ok else 1
 
+    # The same crop on a *refinement* pair, whose colour plane is the target's grid while its depth, motion and
+    # history are still at the render's: a window drawn against the plane ran off the end of a render-grid
+    # tensor, every sample clamped at a different place and torch.cat failed on the shapes. Every key's window
+    # is therefore its own grid's share of the plan, and this is the check that says so rather than the run that
+    # discovered it.
+    refine_sample = {
+        "color": torch.rand(1, 3, 16, 12),
+        "target": torch.rand(1, 3, 16, 12),
+        "naive": torch.rand(1, 3, 16, 12),
+        "depth": torch.rand(1, 1, 8, 6),
+        "history": torch.rand(1, 3, 8, 6),
+        "motion": torch.rand(1, 2, 8, 6),
+        "jitter": torch.full((1, 2, 16, 12), 0.25),
+    }
+    refine_plan = {"flip_h": False, "flip_v": False, "crop_h": 8, "crop_w": 6, "offset_y": 4, "offset_x": 2}
+    refine_crop = augment_sample(refine_sample, refine_plan)
+    check_ok = (tuple(refine_crop["color"].shape[-2:]) == (8, 6)
+                and tuple(refine_crop["naive"].shape[-2:]) == (8, 6)
+                and tuple(refine_crop["depth"].shape[-2:]) == (4, 3)
+                and tuple(refine_crop["motion"].shape[-2:]) == (4, 3)
+                and bool(torch.allclose(refine_crop["depth"], refine_sample["depth"][..., 2:6, 1:4]))
+                and bool(torch.allclose(refine_crop["history"], refine_sample["history"][..., 2:6, 1:4]))
+                and bool(torch.allclose(refine_crop["color"], refine_sample["color"][..., 4:12, 2:8])))
+    print("  %-44s %s" % ("a refine crop takes every key's own share of the window",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
     # The mirrors. This is the part of augmentation that is easy to get wrong and silently harmful: a mirrored
     # pair whose motion was not also mirrored has motion pointing the wrong way, which teaches the model
     # something false about its own input. Both axes are checked separately because they negate different
     # components, and each also has to leave the other one alone.
     whole = {"flip_h": True, "flip_v": False, "crop_h": 16, "crop_w": 12, "offset_y": 0, "offset_x": 0}
-    sideways = augment_sample(sample, whole, 2, 2)
+    sideways = augment_sample(sample, whole)
     check_ok = (bool(torch.equal(sideways["color"], torch.flip(sample["color"], dims=(-1,))))
                 and bool(torch.allclose(sideways["motion"][:, 0:1],
                                         -torch.flip(sample["motion"][:, 0:1], dims=(-1,))))
@@ -1232,7 +1712,7 @@ def self_test():
     problems += 0 if check_ok else 1
 
     upright = {"flip_h": False, "flip_v": True, "crop_h": 16, "crop_w": 12, "offset_y": 0, "offset_x": 0}
-    vertical = augment_sample(sample, upright, 2, 2)
+    vertical = augment_sample(sample, upright)
     check_ok = (bool(torch.equal(vertical["color"], torch.flip(sample["color"], dims=(-2,))))
                 and bool(torch.allclose(vertical["motion"][:, 1:2],
                                         -torch.flip(sample["motion"][:, 1:2], dims=(-2,))))
@@ -1273,6 +1753,17 @@ def main(argv):
     parser = argparse.ArgumentParser(description="Train the in-house NRR upscaler.")
     parser.add_argument("--data", default="models/training-data/v1")
     parser.add_argument("--out", default="models/nrr_upscaler_trained.onnx")
+    parser.add_argument("--export-unqualified", action="store_true",
+                        help="export even when a gate fails, and stamp the artifact's report as unqualified. "
+                             "This exists for baselines and candidates: a model adopted by decision rather than "
+                             "by passing the gates has to be exported deliberately, and the file says what it is")
+    parser.add_argument("--refine-blend", action="store_true",
+                        help="the refinement task's blend architecture: the model outputs a per-pixel weight "
+                             "over the base plane and the `naive` view (plus a residual), rather than a "
+                             "correction to the plane alone. The head starts at sigmoid(6) = 0.9975, so an "
+                             "untrained model is still the plane; the structure is the oracle's own family, "
+                             "measured at 36.6% of headroom between the two views "
+                             "(tools/refinement_headroom_probe.py). Requires --refine and `naive` in --inputs")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--measure-batch", type=int, default=32,
@@ -1296,6 +1787,12 @@ def main(argv):
                              "one fact a history plane cannot carry in its pixels, and the model is otherwise "
                              "told only the current frame's phase; only built when 'history_jitter' is in "
                              "--inputs")
+    parser.add_argument("--naive-channels", type=int, default=8,
+                        help="width of the branch that consumes the refinement task's second view - the "
+                             "renderer's own reconstruction of the same frame. Its per-pixel mixture with the "
+                             "placed samples measures 36.6% of oracle headroom "
+                             "(tools/refinement_headroom_probe.py); only loaded for the refinement task's base "
+                             "planes, and only built when 'naive' is in --inputs")
     parser.add_argument("--inputs", default="depth,motion",
                         help="comma-separated inputs besides color, which is always first: a subset of "
                              "depth,motion,history,jitter,validity,history_jitter. This is the comparison - a "
@@ -1334,6 +1831,33 @@ def main(argv):
                                  "history_jitter"),
                         help="ablation run: zero this input for training and validation, to measure "
                              "what it is worth")
+    parser.add_argument("--input-source", default="noisy",
+                        choices=("noisy", "clean", "displayed", "phase-aligned"),
+                        help="which plane the model is fed as `color`: 'noisy' (the packed `input`, the "
+                             "capture's render plus the packer's seeded augmentation - what every recorded "
+                             "number was produced with) or 'clean' (`input_clean`, the render itself, which is "
+                             "what an engine hands the runtime). A model judged on a plane the runtime never "
+                             "produces is judged against a baseline that neither it nor the runtime will see. "
+                             "'displayed' and 'phase-aligned' are the refinement task's two base planes: the "
+                             "accumulated frame (a derived dataset, tools/refinement_base_dataset.py) and the "
+                             "input-render resolve of one frame (derived per pair, no dataset needed)")
+    parser.add_argument("--refine", action="store_true",
+                        help="the refinement task instead of the upscaling one: `color` is a frame the runtime "
+                             "displays (--input-source displayed for the accumulated one, derived by "
+                             "tools/refinement_base_dataset.py, or phase-aligned for the input-render resolve "
+                             "of a single frame) at the target's own resolution, the model corrects that plane "
+                             "instead of upscaling a render, and the number it has to beat is the plane's own "
+                             "distance from the ground truth rather than a bilinear upsample - an untrained "
+                             "model *is* the plane, because the skip is the identity. Crops and mirrors are "
+                             "allowed here (every tensor is on the target's grid, so a crop is aligned by "
+                             "construction), which is the cheapest answer to the 359 training pairs this task "
+                             "has been overfitting on")
+    parser.add_argument("--measure-history", default="as-loaded",
+                        help="which history plane the held-out number is taken on: 'as-loaded' (the dataset's "
+                             "own, the default), 'zeros' (what a path that takes history from its caller and "
+                             "gets none feeds a model), or another dataset's directory, whose history is used "
+                             "for the same pairs - the M10.4 seam measurement. Refuses unless the two datasets "
+                             "name the same val pairs; see substitute_history()")
     parser.add_argument("--lazy", action="store_true",
                         help="read the training split's npz files per batch instead of concatenating the "
                              "whole split into memory first. Same pairs, the same order and the same numbers; "
@@ -1458,9 +1982,21 @@ class Upscaler(nn.Module):
 
     def __init__(self, channels=32, depth_channels=8, motion_channels=8, history_channels=8,
                  jitter_channels=8, inputs=("color", "depth", "motion"), validity_channels=8,
-                 history_jitter_channels=8):
+                 history_jitter_channels=8, naive_channels=8, scale_channels=8, refine=False,
+                 refine_blend=False, de_jitter=True):
         super().__init__()
         self.inputs = tuple(inputs)
+        # The refinement task: the same stack at one resolution, correcting the plane it is given rather than
+        # upscaling it. `color` is then the frame the runtime displays (256x256, see
+        # tools/refinement_base_dataset.py), so there is no PixelShuffle and no bilinear skip - the skip is the
+        # identity, which keeps the property the upscaler's zeroed head is built for: untrained, this model
+        # *is* the plane it was handed, so anything measured above that plane is something learned.
+        self.refine_task = bool(refine)
+        # Whether the frame handed to the model still carries the jitter's displacement. True for the upscaling
+        # task (an engine's low-resolution render sits on the grid it was sampled on) and for the refinement
+        # task's `displayed` plane, and **false** for a plane that is already placed (see PLACED_SOURCES):
+        # de-jittering that one would move it by the phase it was placed with, which measured 8.7% worse.
+        self.de_jitter = bool(de_jitter)
         # Leaky throughout, for the same measured reason as ResidualBlock: a feature map that is exactly
         # zero anywhere upstream of the zero-initialised output convolution cuts the only gradient path the
         # network has.
@@ -1495,36 +2031,75 @@ class Upscaler(nn.Module):
             # rather than merely present.
             self.history_jitter = conv(2, history_jitter_channels)
             fused += history_jitter_channels
-        self.fusion = conv(fused, channels * 4)
-        self.shuffle = nn.PixelShuffle(2)
+        if "naive" in self.inputs:
+            # The refinement task's second view: the renderer's own reconstruction of the same frame, three
+            # channels like `color` because it is the same picture reconstructed another way. The per-pixel
+            # choice between the two is where the oracle's 36.6% lives (tools/refinement_headroom_probe.py).
+            self.naive = conv(3, naive_channels)
+            fused += naive_channels
+        if "scale" in self.inputs:
+            # One channel: the resolution token, log2(native_input_width / 128), constant across the image like
+            # the two phases above. It is the only input that says *which tier* this pair came from, which is
+            # what a single binary serving several tiers needs in order to modulate its reconstruction rather
+            # than average over them. Convolved rather than concatenated raw, for the same reason as the others.
+            self.scale = conv(1, scale_channels)
+            fused += scale_channels
+        self.fusion = conv(fused, channels if self.refine_task else channels * 4)
+        self.shuffle = nn.Identity() if self.refine_task else nn.PixelShuffle(2)
         self.refine = nn.Sequential(conv(channels, channels), nn.LeakyReLU(0.01, inplace=True))
         self.block1 = ResidualBlock(channels)
         self.block2 = ResidualBlock(channels)
         self.output = conv(channels, 3)
-        self.skip = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        # The blend head, for the refinement task's `--refine-blend` architecture. The oracle measured on
+        # held-out pairs (tools/refinement_headroom_probe.py) is a *per-pixel mixture* of the placed samples and
+        # the renderer's own reconstruction - 0.00928 against the placed samples' 0.01462 - while the best single
+        # weight is the placed samples themselves (-0.0%), and a residual-only refiner trained on that
+        # information ignored it (its zeroed ablation came out at 0.00009). So the mixture is built into the
+        # model: a one-channel logit per pixel becomes the weight, and the network only has to learn *where* to
+        # prefer which view rather than how to reconstruct from scratch.
+        self.refine_blend = bool(refine_blend) and self.refine_task
+        if self.refine_blend:
+            self.blend = conv(channels, 1)
+            # Zero-initialised, and *linear*: `gate = 0` means no blend, so an untrained model is exactly the
+            # plane, and the gradient at that point is full-sized. A squashed gate (sigmoid or softplus) that
+            # keeps the untrained model at the plane is saturated where it starts, which freezes the head at
+            # "always the plane" - measured: the sigmoid version's `naive` ablation came out at 0.00009, and its
+            # recoverable run was refused as "is the baseline" with a drift of 0.000714 against a 0.001 floor.
+            nn.init.zeros_(self.blend.weight)
+            nn.init.zeros_(self.blend.bias)
+        self.skip = nn.Identity() if self.refine_task else nn.Upsample(scale_factor=2, mode="bilinear",
+                                                                      align_corners=False)
         # Start as the baseline: a zeroed output convolution plus the skip means the untrained model is
         # exactly the bilinear upsample, so any improvement measured later is something learned.
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
     def prepare(self, color, jitter=None):
-        """The frame every later stage sees: de-jittered when the model consumes jitter.
+        """The frame every later stage sees: de-jittered when the model consumes jitter *and* the frame still
+        carries its displacement.
 
         Called from both entry points rather than inside one of them, because training calls `residual()`
         directly (the loss is on the correction alone) while inference goes through `forward()`. Doing the
         correction in each would resample the frame twice on the inference path.
+
+        `self.de_jitter` is the part that is easy to get wrong and expensive to get wrong: `color` is an
+        engine's render on the grid it was sampled on for the upscaling task, but a *placed resolve* for
+        `--input-source phase-aligned`, whose samples are already where they were taken. De-jittering that
+        second one moves the whole frame by the phase it was placed with - 8.7% worse, measured - so `jitter`
+        stays as conditioning there and the frame is left alone.
         """
-        return dejitter(color, jitter) if "jitter" in self.inputs else color
+        return dejitter(color, jitter) if ("jitter" in self.inputs and self.de_jitter) else color
 
     def residual(self, color, depth=None, motion=None, history=None, jitter=None, validity=None,
-                 history_jitter=None):
+                 history_jitter=None, naive=None, scale=None):
         """The correction alone, from the raw inputs. This is what training optimises (the bilinear skip
         carries the low frequencies, so the loss is on what the model adds), so it prepares the frame
         itself rather than assuming someone already did."""
         return self._residual_prepared(self.prepare(color, jitter), depth, motion, history, jitter, validity,
-                                      history_jitter)
+                                      history_jitter, naive, scale)
 
-    def _residual_prepared(self, color, depth, motion, history, jitter, validity=None, history_jitter=None):
+    def _residual_prepared(self, color, depth, motion, history, jitter, validity=None, history_jitter=None,
+                           naive=None, scale=None):
         features = self.feature(color)
         parts = [features]
         if "depth" in self.inputs:
@@ -1539,20 +2114,53 @@ class Upscaler(nn.Module):
             parts.append(self.validity(validity))
         if "history_jitter" in self.inputs:
             parts.append(self.history_jitter(history_jitter))
+        if "naive" in self.inputs:
+            parts.append(self.naive(naive))
+        # The resolution token: a constant plane per sample carrying log2(native_input_width / 128). It gets a
+        # convolution like every other conditioning input rather than being appended as a raw channel, so the
+        # network can use it as a global signal rather than only as something to read off a feature map.
+        if "scale" in self.inputs:
+            parts.append(self.scale(scale))
         features = self.refine(self.shuffle(self.fusion(torch.cat(parts, dim=1))))
         features = self.block2(self.block1(features))
-        return self.output(features)
+        correction = self.output(features)
+        if self.refine_blend:
+            # The mixture, expressed as a correction so every consumer keeps its meaning: the training loss is
+            # still on `output - base_plane`, and `forward` still adds the skip.
+            #
+            # `tanh`, not a raw value and not a sigmoid: tanh(0) = 0 so an untrained model is the plane, its
+            # derivative at 0 is 1 so the head is not born saturated (a sigmoid kept at the plane has a gradient
+            # 400x smaller there, measured: its `naive` ablation came out at 0.00009), and it is *bounded* - a raw
+            # gate is not, and the augmented run on `godot-v6-subsampled` diverged with it (training residual
+            # 0.01072 -> 0.04097, val 0.09817 against the plane's 0.01218).
+            gate = torch.tanh(self.blend(features))
+            correction = correction + gate * (naive - color)
+        return correction
 
     def forward(self, color, depth=None, motion=None, history=None, jitter=None, validity=None,
-                history_jitter=None):
+                history_jitter=None, naive=None, scale=None):
         corrected = self.prepare(color, jitter)
         return self.skip(corrected) + self._residual_prepared(corrected, depth, motion, history, jitter,
-                                                              validity, history_jitter)
+                                                              validity, history_jitter, naive, scale)
 
 
 def baseline_upscale(color):
     """The thing the model has to beat, computed exactly the way the model's own skip does."""
     return torch.nn.functional.interpolate(color, scale_factor=2, mode="bilinear", align_corners=False)
+
+
+def base_plane(color, refine=False):
+    """The plane the model's correction is added to, and therefore its own baseline.
+
+    For the upscaling task that is the bilinear upsample (the skip `Upscaler` is born as). For the refinement
+    task it is the frame *itself*: `color` is already the frame the runtime displays - see
+    tools/refinement_base_dataset.py - so the model refines it, and the number it has to beat is that plane's
+    own distance from the ground truth rather than a bilinear upsample of an input render.
+
+    One function because three places have to agree about it or the comparison is meaningless: the training loss
+    (which optimises the correction against `target - plane`), the held-out measurement, and the reference the
+    report prints beside the model."""
+    return color if refine else baseline_upscale(color)
 
 
 def _gaussian_line(window_size, sigma):
@@ -1644,7 +2252,78 @@ def lr_for_epoch(epoch, epochs, base, warmup_epochs, schedule):
     return base * ramp
 
 
-def measure(model, batch, zero=None, chunk=32):
+def val_pair_files(data_dir):
+    """A dataset's val split as a list of pair file names, in the manifest's order.
+
+    This is the identity of a measurement: two datasets built from one capture name the same pairs, so a
+    history plane taken from one and applied to the other is the same frame's plane and nothing else."""
+    with open(os.path.join(data_dir, "manifest.json"), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    return [entry["file"] for entry in manifest["pairs"] if entry.get("split") == "val"]
+
+
+def history_planes(data_dir, files):
+    """The `history` key of those pairs as (N, 3, H, W), laid out exactly as the item builder builds it.
+
+    Read here rather than through load_dataset() because this needs one key of one split of a second dataset:
+    materialising a whole dataset to replace one input would double what a run needs in memory for no
+    measurement, and the layout is one line (`pair["history"].transpose(2, 0, 1)[None]`) that
+    substitute_history() checks itself against."""
+    planes = []
+    for name in files:
+        with np.load(os.path.join(data_dir, name)) as pair:
+            planes.append(torch.from_numpy(pair["history"].transpose(2, 0, 1)[None].copy()))
+    return torch.cat(planes, dim=0)
+
+
+def substitute_history(val, mode, primary_dir):
+    """The held-out `history` plane, replaced. This is the M10.4 seam measurement.
+
+    A model is trained on one history plane and the runtime feeds it another: the packer writes the previous
+    frame *reprojected* onto this frame's grid, while the CPU backend feeds the previous frame verbatim and the
+    accelerator paths feed zeros, because they take the plane from the caller and nothing supplies one
+    (docs/roadmap.md, "The seam"). "How good is this model" therefore depends on which plane the number is
+    taken on, and this makes that choice explicit instead of implicit:
+
+      as-loaded   the dataset's own plane - what every run before this option existed measured (the default);
+      zeros       what a path that takes history from its caller, and is given none, feeds a model;
+      <a path>    another dataset's plane for the *same pairs*. `--measure-history models/training-data/godot-v6`
+                  on a godot-v6-warp run measures the same model on the plane the CPU runtime delivers, because
+                  that dataset's history is the previous frame's render unwarped.
+
+    Refuses rather than substituting when the identity does not line up: the two datasets must name the same val
+    pairs in the same order, and reading the primary dataset's own planes by this rule must reproduce the tensor
+    the loader built, bit for bit. Without that second check a layout difference would measure a different image
+    in the same shape, and every number below it would be a comparison between two unknowns."""
+    if mode in (None, "as-loaded"):
+        return None
+    if "history" not in val:
+        raise SystemExit("--measure-history %s was asked for, but this dataset carries no history" % mode)
+    if mode == "zeros":
+        return {"mode": "zeros", "source": None, "planes": torch.zeros_like(val["history"])}
+    if not os.path.isdir(mode):
+        raise SystemExit("--measure-history %s is neither 'as-loaded', 'zeros', nor a dataset directory" % mode)
+
+    files = val_pair_files(mode)
+    wanted = val_pair_files(primary_dir)
+    if files != wanted:
+        raise SystemExit("--measure-history %s names %d val pairs and %s names %d, and they are not the same "
+                         "pairs in the same order - the substitution would compare two different measurements"
+                         % (mode, len(files), primary_dir, len(wanted)))
+    planes = history_planes(mode, files)
+    if tuple(planes.shape) != tuple(val["history"].shape):
+        raise SystemExit("--measure-history %s yields history of shape %s against the dataset's %s"
+                         % (mode, tuple(planes.shape), tuple(val["history"].shape)))
+    if not torch.equal(history_planes(primary_dir, wanted), val["history"].detach().cpu()):
+        raise SystemExit("the history planes read from %s do not reproduce the ones the loader built, so a "
+                         "substitution would measure a different layout rather than a different plane"
+                         % primary_dir)
+    # The split's tensors are already on the model's device (Split.batch moves them), and this one has to
+    # arrive there too or the forward pass would mix devices. The transfer is a float32 copy, so it is exact.
+    return {"mode": mode, "source": mode, "planes": planes.to(val["history"].device)}
+
+
+def measure(model, batch, zero=None, chunk=32, refine=False):
     """The numbers the gates use. `zero` names an input to replace with zeros, which is how each input's
     contribution is measured rather than assumed - including history, which is the whole point of the
     comparison this exists to settle.
@@ -1662,6 +2341,8 @@ def measure(model, batch, zero=None, chunk=32):
         jitter = batch.get("jitter")
         validity = batch.get("validity")
         history_jitter = batch.get("history_jitter")
+        naive = batch.get("naive")
+        scale = batch.get("scale")
         if zero == "depth" and depth is not None:
             depth = torch.zeros_like(depth)
         if zero == "motion" and motion is not None:
@@ -1681,6 +2362,15 @@ def measure(model, batch, zero=None, chunk=32):
         # reports the input as unused without ever having withheld it.
         if zero == "history_jitter" and history_jitter is not None:
             history_jitter = torch.zeros_like(history_jitter)
+        # And the refinement task's second view: an input the ablation harness does not zero is an input it
+        # reports as unused without ever having withheld it.
+        if zero == "naive" and naive is not None:
+            naive = torch.zeros_like(naive)
+        # And the resolution token, whose zero is not an ablation but a *different tier* - it is the token for
+        # the 128 grid - so zeroing it is exactly the experiment "does this model behave as if the input were
+        # the reference tier", which is the only way to show the token is doing anything at all.
+        if zero == "scale" and scale is not None:
+            scale = torch.zeros_like(scale)
         pieces = []
         for start in range(0, color.shape[0], chunk):
             end = start + chunk
@@ -1690,9 +2380,11 @@ def measure(model, batch, zero=None, chunk=32):
                                 history[start:end] if history is not None else None,
                                 jitter[start:end] if jitter is not None else None,
                                 validity[start:end] if validity is not None else None,
-                                history_jitter[start:end] if history_jitter is not None else None))
+                                history_jitter[start:end] if history_jitter is not None else None,
+                                naive[start:end] if naive is not None else None,
+                                scale[start:end] if scale is not None else None))
         output = torch.cat(pieces, dim=0)
-        baseline = baseline_upscale(color)
+        baseline = base_plane(color, refine)
         return {"l1": float(torch.nn.functional.l1_loss(output, batch["target"])),
                 "baseline_l1": float(torch.nn.functional.l1_loss(baseline, batch["target"])),
                 "drift": float((output - baseline).abs().mean()),
@@ -1703,11 +2395,13 @@ def measure(model, batch, zero=None, chunk=32):
 def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_channels,
           history_channels, learning_rate, warmup_epochs, seed, device, log,
           loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup", detail_weight=0.0,
-          jitter_channels=8, validity_channels=8, history_jitter_channels=8, augment=None):
+          jitter_channels=8, validity_channels=8, history_jitter_channels=8, naive_channels=8,
+          augment=None, refine=False, refine_blend=False, de_jitter=True):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      jitter_channels, inputs=inputs, validity_channels=validity_channels,
-                     history_jitter_channels=history_jitter_channels).to(device)
+                     history_jitter_channels=history_jitter_channels, naive_channels=naive_channels,
+                     refine=refine, refine_blend=refine_blend, de_jitter=de_jitter).to(device)
     parameters = sum(p.numel() for p in model.parameters())
     log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g, loss=%s, schedule=%s"
         % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate,
@@ -1744,8 +2438,8 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             # on the baseline and still report a small number.
             prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
                                         batch.get("history"), batch.get("jitter"), batch.get("validity"),
-                                        batch.get("history_jitter"))
-            skip = baseline_upscale(batch["color"])
+                                        batch.get("history_jitter"), batch.get("naive"), batch.get("scale"))
+            skip = base_plane(batch["color"], refine)
             truth = batch["target"] - skip
             weight = detail_weight_map(batch["target"], detail_weight) if detail_weight > 0.0 else None
             loss = compute_loss(loss_name, prediction, truth, ssim_weight, weight=weight,

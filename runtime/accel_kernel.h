@@ -161,6 +161,24 @@ public:
     void set_phase_aligned_accumulation(bool enabled);
     bool is_phase_aligned_enabled() const;
 
+    /* Which frames that integration integrates: the displayed ones, or the caller's low-resolution input
+     * renders placed into the display grid. Held on the same shared accumulator and reached the same way, so
+     * the election in execute_frame() and the accumulator cannot disagree about it. */
+    NRRResult set_phase_aligned_source(NRRPhaseAlignedSource source);
+    bool phase_aligned_source(NRRPhaseAlignedSource* out_source) const;
+
+    /* Disocclusion rejection and clamping, defaulted from the device's temporal-coherence capability and held
+     * on the same shared accumulator. Reached the same way:
+     * the Backend defaults forward here, so no vendor backend has to know the switch exists. */
+    void set_disocclusion_rejection(bool enabled);
+    bool is_disocclusion_rejection_enabled() const;
+
+    /* Applies the disocclusion guard's *default* - the value the device derived from this backend's
+     * temporal-coherence capability - once the accumulator exists. A vendor backend's kernel comes up lazily
+     * on its first frame (or first model load), so a default set at device initialization has to survive until
+     * then: this stores it and initialize() applies it. If the kernel is already up it is applied now. */
+    void set_disocclusion_rejection_default(bool enabled);
+
 private:
     bool apply_accel_optimizations();
     bool select_best_execution_provider();
@@ -196,8 +214,26 @@ private:
      * history at all: a camera cut was not detected, nothing was blended toward
      * previous frames, and NRRRenderStats::temporal_stability was never populated
      * - so routing frames through a vendor backend silently lost the M1.1/M1.3
-     * behaviour the CPU path is tested for. */
+     * behaviour the CPU path is tested for.
+     *
+     * One accumulator for the whole process, because this kernel is one object shared
+     * by every accelerator backend (get_accel_kernel()) and it is initialized once
+     * (initialize() returns early when it already is). BackendCPU does not have that
+     * property - each device owns its own backend and its own accumulator - so a
+     * caller that begins a *new sequence* on a device that borrows this one (a new
+     * device, or a scene cut the frame-index rule cannot see because the new sequence
+     * starts at a higher index at the same resolution) has to say so:
+     * nrr_device_reset_temporal_history() is that statement, and it is the same call a
+     * caller makes at a cut. Recording a reset here instead was tried and reverted:
+     * load_model() and unload_model() are both reached between frames of one sequence
+     * on the vendor paths, so a reset there cleared real accumulation (measured:
+     * alpha 0 on frames that had a previous frame, in
+     * test_temporal_motion_above_threshold_bypasses_history and
+     * test_temporal_resolution_change_discards_history). */
     TemporalAccumulator  temporal_;
+    /* The disocclusion guard's default, applied by initialize() once the accumulator exists (see
+     * set_disocclusion_rejection_default). */
+    bool                 disocclusion_rejection_default_;
 
     ModelImpl*           active_model_;
     const NRRReferenceSet* frame_references_;

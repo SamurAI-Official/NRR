@@ -62,6 +62,18 @@ public:
     NRRResult set_phase_aligned_accumulation(bool enabled);
     /* Whether the accumulator that will run this device's frames has it on. */
     NRRResult phase_aligned_accumulation(bool* out_enabled);
+    /* Chooses which frames that integration integrates; forwarded to the backend, with the same
+     * no-accumulator answer (see nrr_backend.h and NRRPhaseAlignedSource in include/nrr.h). */
+    NRRResult set_phase_aligned_source(NRRPhaseAlignedSource source);
+    /* Which source the accumulator that will run this device's frames is using; fails rather than answering
+     * when there is no accumulator to ask. */
+    NRRResult phase_aligned_source(NRRPhaseAlignedSource* out_source);
+    /* Turns the reprojection blend's disocclusion rejection and clamping on or off; forwarded to the backend
+     * (see nrr_backend.h). A backend with no accumulator reports NRR_ERROR_STATE_INVALID rather than
+     * accepting a setting it will not honour. */
+    NRRResult set_disocclusion_rejection(bool enabled);
+    /* Whether the accumulator that will run this device's frames has it on. */
+    NRRResult disocclusion_rejection(bool* out_enabled);
     bool is_initialized() const { return initialized_; }
 
 private:

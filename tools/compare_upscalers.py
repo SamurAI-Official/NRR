@@ -63,16 +63,32 @@ def make_upscalers(model_onnx, provider):
         inputs = em.model_inputs(session)
         out_name = session.get_outputs()[0].name
 
-        def nrr(image):
-            feed = build_feed_from_image(image, inputs)
+        def nrr(image, jitter=None):
+            feed = build_feed_from_image(image, inputs, jitter)
             return em.to_image(session.run([out_name], feed)[0])
+
+        # What the export declares, carried on the callable so a caller that reports this arm can say which
+        # inputs produced the number - a model fed color,jitter and one fed color alone are not the same arm.
+        nrr.declared_inputs = tuple(inputs)
 
         methods["nrr"] = nrr
     return methods
 
 
-def build_feed_from_image(image, inputs):
-    """The ONNX feed for a bare colour image, with zeros for any optional inputs the model still declares."""
+def build_feed_from_image(image, inputs, jitter=None):
+    """The ONNX feed for a bare colour image, with zeros for the optional inputs the model still declares -
+    except `jitter` and `scale`, which are *facts about this frame* and not something that can be defaulted.
+
+    Jitter is where this frame's low-resolution sample was taken, in low-resolution pixels, broadcast to a
+    plane: exactly the contract `train_nrr.py` feeds (see its `jitter` item). Zeros are not a neutral
+    default but a claim that the frame was sampled on the grid, so a model that declares the input and is
+    given no offset is an error here rather than a silently different measurement.
+
+    `scale` is the resolution token, derived from the image's own width as `log2(width / 128)`, which is the
+    same octave measure the trainer computes - 128 -> 0.0, 256 -> 1.0, 512 -> 2.0. It is derived rather than
+    passed because the image already says how wide it is: a caller cannot supply the wrong one by accident,
+    and a model trained with the token can therefore be scored at any tier without special-casing.
+    """
     feed = {}
     if "color" in inputs:
         feed["color"] = image.transpose(2, 0, 1)[None].astype(np.float32)
@@ -82,6 +98,16 @@ def build_feed_from_image(image, inputs):
         feed["motion"] = np.zeros((1, 2, image.shape[0], image.shape[1]), np.float32)
     if "history" in inputs:
         feed["history"] = np.zeros((1, 3, image.shape[0], image.shape[1]), np.float32)
+    if "scale" in inputs:
+        feed["scale"] = np.full((1, 1, image.shape[0], image.shape[1]),
+                                np.log2(max(image.shape[1], 1) / 128.0), np.float32)
+    if "jitter" in inputs:
+        if jitter is None:
+            raise ValueError("this model declares a jitter input; the frame's sub-pixel offset is required, "
+                             "and zeros would be a different phase rather than no phase")
+        plane = np.asarray(jitter, np.float32).reshape(2)
+        feed["jitter"] = np.repeat(plane.reshape(1, 2, 1, 1), image.shape[0], axis=2) \
+            .repeat(image.shape[1], axis=3).copy()
     return feed
 
 

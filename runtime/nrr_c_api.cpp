@@ -449,6 +449,123 @@ NRRResult nrr_device_get_phase_aligned_accumulation(NRRDevice* device, int* out_
     }
 }
 
+NRRResult nrr_device_set_phase_aligned_source(NRRDevice* device, int source) {
+    if (!device) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "device is NULL");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    if (source != NRR_PHASE_ALIGNED_SOURCE_DISPLAYED && source != NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER) {
+        /* Refused rather than clamped onto the default: the two sources integrate different frames, so a
+         * caller that passed something else has a bug, and answering it with the denoise would hide it. */
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "unknown phase-aligned source");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        const NRRResult result =
+            impl->set_phase_aligned_source(static_cast<NRRPhaseAlignedSource>(source));
+        if (result == NRR_ERROR_STATE_INVALID) {
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no phase-aligned accumulator"
+                                    : "device is not initialized");
+        }
+        return result;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during set_phase_aligned_source");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
+NRRResult nrr_device_get_phase_aligned_source(NRRDevice* device, int* out_source) {
+    if (!device || !out_source) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        NRRPhaseAlignedSource source = NRR_PHASE_ALIGNED_SOURCE_DISPLAYED;
+        const NRRResult result = impl->phase_aligned_source(&source);
+        if (result != NRR_SUCCESS) {
+            /* Nothing is written on failure, for the same reason get_phase_aligned_accumulation() does not:
+             * a caller that ignores the result must not mistake an unset 0 for "displayed". */
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no phase-aligned accumulator"
+                                    : "device is not initialized");
+            return result;
+        }
+        *out_source = static_cast<int>(source);
+        return NRR_SUCCESS;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during get_phase_aligned_source");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
+NRRResult nrr_device_set_disocclusion_rejection(NRRDevice* device, int enabled) {
+    if (!device) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "device is NULL");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        NRRResult result = impl->set_disocclusion_rejection(enabled != 0);
+        if (result == NRR_ERROR_STATE_INVALID) {
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no temporal accumulator"
+                                    : "device is not initialized");
+        }
+        return result;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during set_disocclusion_rejection");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
+NRRResult nrr_device_get_disocclusion_rejection(NRRDevice* device, int* out_enabled) {
+    if (!device || !out_enabled) {
+        nrr::set_last_error(NRR_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return NRR_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        auto impl = reinterpret_cast<nrr::DeviceImpl*>(device);
+        bool enabled = false;
+        const NRRResult result = impl->disocclusion_rejection(&enabled);
+        if (result != NRR_SUCCESS) {
+            /* Nothing is written on failure, so a caller that ignores the result cannot mistake an unset 0
+             * for "off" - the same contract as the phase-aligned getter. */
+            nrr::set_last_error(result,
+                                impl->is_initialized()
+                                    ? "this backend has no temporal accumulator"
+                                    : "device is not initialized");
+            return result;
+        }
+        *out_enabled = enabled ? 1 : 0;
+        return NRR_SUCCESS;
+    } catch (const std::exception& e) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID, e.what());
+        return NRR_ERROR_STATE_INVALID;
+    } catch (...) {
+        nrr::set_last_error(NRR_ERROR_STATE_INVALID,
+                            "unknown error during get_disocclusion_rejection");
+        return NRR_ERROR_STATE_INVALID;
+    }
+}
+
 // ============================================================================
 // Resource Management Helpers
 // ============================================================================

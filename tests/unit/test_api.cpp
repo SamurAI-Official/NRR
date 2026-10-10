@@ -177,11 +177,119 @@ NRR_TEST(test_api_phase_aligned_accumulation_switch) {
     }
 }
 
+/* The source switch through the C ABI, and on the same device as the switch above: four things have to hold
+ * for it to be worth having. The null-argument paths are refused; an unknown value is refused rather than
+ * clamped onto the default; a device whose backend has an accumulator reports the source it is using, which
+ * is the denoise until a caller changes it; and setting it does not disturb the switch, because the two are
+ * the same pass and a caller that selected one must not have silently turned the other off. */
+NRR_TEST(test_api_phase_aligned_source_switch) {
+    int source = -1;
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(nullptr, 0), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(nullptr, &source), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(nullptr, nullptr), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null output must be refused");
+
+    NRRDeviceOptions options = {};
+    /* The CPU backend, for the reason the switch test above documents: it is the one guaranteed to have an
+     * accumulator in this build. */
+    options.preferred_backend = "CPU";
+    NRRDevice* device = nullptr;
+    if (nrr_device_create(&options, &device) != NRR_SUCCESS || device == nullptr) {
+        std::cout << "  (no CPU backend available; the source switch was not exercised)" << std::endl;
+        return;
+    }
+
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(device, 9), NRR_ERROR_INVALID_ARGUMENT,
+                  "an unknown source must be refused rather than treated as the default");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(device, &source), NRR_SUCCESS,
+                  "querying an initialized device with an accumulator must succeed");
+    NRR_EXPECT_EQ(source, static_cast<int>(NRR_PHASE_ALIGNED_SOURCE_DISPLAYED),
+                  "the frames the model displayed are what the pass integrates until a caller says otherwise");
+
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_accumulation(device, 1), NRR_SUCCESS, "enable");
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(device, NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER),
+                  NRR_SUCCESS, "select the upscale");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(device, &source), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(source, static_cast<int>(NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER),
+                  "the query must report the source that was accepted");
+    int enabled = -1;
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_accumulation(device, &enabled), NRR_SUCCESS,
+                  "the switch must still answer");
+    NRR_EXPECT_EQ(enabled, 1, "and selecting a source must not have turned the pass off");
+
+    NRR_EXPECT_EQ(nrr_device_set_phase_aligned_source(device, NRR_PHASE_ALIGNED_SOURCE_DISPLAYED),
+                  NRR_SUCCESS, "and back");
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(device, &source), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(source, static_cast<int>(NRR_PHASE_ALIGNED_SOURCE_DISPLAYED), "it must go back");
+
+    /* A failed query must not be mistaken for a source, for the same reason the switch's must not be mistaken
+     * for "off": the caller's variable is left as it was. */
+    source = 5;
+    NRR_EXPECT_EQ(nrr_device_get_phase_aligned_source(nullptr, &source), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null device must be refused");
+    NRR_EXPECT_EQ(source, 5, "a failed query must not write a value the caller could read as a source");
+
+    std::cout << "  phase-aligned source: the displayed frames by default, the input renders on request"
+              << std::endl;
+    nrr_device_destroy(device);
+}
+
 NRR_TEST(test_api_reference_load_null) {
     NRRDevice* dummy_device = nullptr;
     NRRReference* ref = nullptr;
     NRRResult result = nrr_reference_load(dummy_device, "test.nrrref", &ref);
     NRR_EXPECT_EQ(result, NRR_ERROR_INVALID_ARGUMENT, "null device should fail");
+}
+
+/* The disocclusion-rejection switch through the C ABI, held to the same three properties the phase-aligned
+ * entry point is: null arguments refused; a real device can turn it on and read back that it is on; and
+ * "off" is distinguishable from "this backend cannot". */
+NRR_TEST(test_api_disocclusion_rejection_switch) {
+    int enabled = -1;
+    NRR_EXPECT_EQ(nrr_device_set_disocclusion_rejection(nullptr, 1), NRR_ERROR_INVALID_ARGUMENT,
+                  "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(nullptr, &enabled),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null device must be refused");
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(nullptr, nullptr),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null output must be refused");
+
+    NRRDeviceOptions options = {};
+    /* The CPU backend: the one guaranteed to have an accumulator in this build, and "off" has to be
+     * distinguishable from "this backend cannot", which on an accelerator backend depends on whether its
+     * shared kernel is running. */
+    options.preferred_backend = "CPU";
+    NRRDevice* device = nullptr;
+    if (nrr_device_create(&options, &device) != NRR_SUCCESS || device == nullptr) {
+        std::cout << "  (no backend available; the switch was not exercised)" << std::endl;
+        return;
+    }
+
+    /* The default is the device's temporal-coherence claim, not a blanket one: the CPU backend reports it, so
+     * the guard is on for this device without the caller asking. That is the point of the capability gate - a
+     * device that reports it can do the temporal work and gets the guard; one that does not, does not. */
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(device, &enabled), NRR_SUCCESS,
+                  "querying an initialized device must succeed");
+    NRR_EXPECT_EQ(enabled, 1,
+                  "the guard defaults to the device's temporal-coherence claim (the CPU backend reports it)");
+
+    NRR_EXPECT_EQ(nrr_device_set_disocclusion_rejection(device, 0), NRR_SUCCESS, "disable");
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(device, &enabled), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(enabled, 0, "the query must report the setting that was accepted");
+
+    NRR_EXPECT_EQ(nrr_device_set_disocclusion_rejection(device, 1), NRR_SUCCESS, "enable again");
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(device, &enabled), NRR_SUCCESS, "query");
+    NRR_EXPECT_EQ(enabled, 1, "and back on");
+
+    /* A failed query must not be mistaken for "off": the caller's variable is left as it was. */
+    enabled = 7;
+    NRR_EXPECT_EQ(nrr_device_get_disocclusion_rejection(nullptr, &enabled),
+                  NRR_ERROR_INVALID_ARGUMENT, "a null device must be refused");
+    NRR_EXPECT_EQ(enabled, 7, "a failed query must not write a value the caller could read as 'off'");
+
+    std::cout << "  disocclusion rejection: defaults to the device's temporal-coherence capability, settable and queryable" << std::endl;
+    nrr_device_destroy(device);
 }
 
 } // namespace test

@@ -181,6 +181,16 @@ public:
      * integrated on, so a change is a different accumulator, and this returns false
      * rather than silently mixing two grids (or two channel counts).
      *
+     * `offset` is the content displacement **in frame-grid pixels** - the renderer's jitter in the units it
+     * was measured in - and it is scaled into output pixels here, once, by `out_width/width`. That is *not*
+     * the unit `PhaseAlignedFrame::offset_x` carries, which is already in output pixels; the two coincide
+     * exactly when the frame is at the output grid (`out_width == width`), which is the default source and
+     * why the distinction can sit unremarked for so long. Handing an output-pixel offset to a frame coarser
+     * than the grid places every sample at `jitter * scale^2` instead of `jitter * scale`, which is worth
+     * +104.6% edge error on the fixture tools/offset_unit_probe.py measures. TemporalAccumulator::apply
+     * therefore divides back into this unit at its one call site, and the input-render test pins the two
+     * arrangements against each other.
+     *
      * `restart` (optional, `out_width * out_height` entries) marks the pixels whose
      * accumulated samples no longer describe what is on screen - the caller's motion
      * field says the content there has moved, or the history was reprojected from
@@ -197,7 +207,24 @@ public:
      * measured, that keeps a third of the edge error off the moving pixels, where restarting only
      * matches a single frame there. A zero field is the identity, and no field at all leaves the
      * accumulation untouched: a caller that cannot supply one gets exactly what this class did
-     * before. */
+     * before.
+     *
+     * **A frame coarser than the grid is integrated differently: it is splatted, not gathered.** At the
+     * output resolution the frame's samples and the grid's pixels are the same set, and the placement above
+     * answers the only question there is - where each sample belongs - so that path is left as measured. When
+     * four output pixels share one sample the gather instead resamples the coarse grid's *reconstruction*, an
+     * interpolate and then a read, two resamplings that both blur before the average starts; the transpose of
+     * the gather writes each sample once, at the position it was sampled at. Measured on a capture's own
+     * half-resolution raster (`tools/capture_fidelity_probe.py`) that is **13.9%** better than the bilinear
+     * upsample of it, against the 3.4% the place-then-average order is worth on the same pairs, and on the
+     * point-sampled zone plate the ordering fixture pins it is **-59.4%** of edge error at eight frames against
+     * -27.8% for de-jitter-then-average and +9.8% for the mirrored sign (tests/unit/test_jitter.cpp, generated
+     * by tools/regen_aa_fixture.py).
+     *
+     * A splat accumulates a weight per pixel rather than a count, because a sample can land partly on one pixel
+     * and partly on its neighbour, and `resolve` divides the pair once. A pixel no sample reached is filled with
+     * the frame's own bilinear upsample - the naive path, in other words - which is what keeps the arrangement
+     * from ever being worse than not placing at all. */
     bool add_frame(const std::vector<float>& frame_nchw, int channels,
                    uint32_t width, uint32_t height,
                    uint32_t out_width, uint32_t out_height,

@@ -55,7 +55,7 @@ typedef struct NRRBuffer NRRBuffer;
 /* Number of public C entry points exported by the library. Used by the
  * implementation-testing hook nrr_test_entry_point_count(). Keep in sync
  * with the exported function table in nrr_c_api.cpp. */
-#define NRR_ENTRY_POINT_COUNT 47
+#define NRR_ENTRY_POINT_COUNT 51
 
 /* ============================================================================
  * Result Codes
@@ -248,8 +248,13 @@ typedef struct {
     float motion_vectors_scale;
     NRRJitterState jitter;       /* zeroed by callers that do not jitter */
     /* The previous frame's low-resolution render, for a temporal model's `history`
-     * input. Optional; NULL on the first frame of a sequence, where the runtime
-     * zero-fills the tensor instead.
+     * input. Optional on every path: a backend that keeps its own input record - the CPU
+     * backend and the accelerator kernel both own a TemporalAccumulator - fills this
+     * itself from that record, reprojected by this frame's motion field, which is the
+     * plane a temporal model is trained on. A caller that supplies a texture here
+     * overrides that, and one that supplies none gets the runtime's own plane rather
+     * than zeros. NULL on the first frame of a sequence, where the tensor is
+     * zero-filled instead.
      *
      * Distinct from `previous_output` above, and the distinction matters:
      * `previous_output` is the *displayed* frame at output resolution (2x), which is
@@ -257,8 +262,7 @@ typedef struct {
      * `history` to be the previous frame's low-resolution render at *input*
      * resolution. Because the model's H/W are dynamic, handing it the 2x displayed
      * frame would not raise an error - it would produce a plausible-looking image
-     * built from the wrong pixels. Backends that keep their own input record (the CPU
-     * one does) fill this themselves and callers may leave it NULL there. */
+     * built from the wrong pixels. */
     NRRTexture* history_input;   /* may be NULL */
 } NRRTemporalState;
 
@@ -446,6 +450,82 @@ NRR_API NRRResult nrr_device_set_phase_aligned_accumulation(NRRDevice* device, i
  * *out_enabled. "Off" and "cannot" are different answers, so this returns the same
  * NRR_ERROR_STATE_INVALID the setter does for a device with no accumulator, and writes nothing. */
 NRR_API NRRResult nrr_device_get_phase_aligned_accumulation(NRRDevice* device, int* out_enabled);
+
+/* Which frames the phase-aligned integration integrates. See
+ * nrr_device_set_phase_aligned_source(). */
+typedef enum NRRPhaseAlignedSource {
+    /* The frames the model displayed, at the display grid: a temporal denoise of the model's output. The
+     * default, and what the switch above has always integrated. */
+    NRR_PHASE_ALIGNED_SOURCE_DISPLAYED = 0,
+    /* The low-resolution renders the model was fed, each placed into the display grid where its samples
+     * were taken: a temporal upscale. The displayed image is then the integration's own resolve rather than
+     * the model's frame. */
+    NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER = 1
+} NRRPhaseAlignedSource;
+
+/* Chooses what the phase-aligned integration integrates, out of the two sources in NRRPhaseAlignedSource.
+ * Both are the same pass with the same switch above; they differ in which frames it is given.
+ *
+ *   - NRR_PHASE_ALIGNED_SOURCE_DISPLAYED (0, the default): the frames the model displayed, at the display
+ *     grid. The accumulation is a temporal denoise of the model's output - it removes what flickers between
+ *     the model's reconstructions of one still scene. Measured at 3.0% of edge error and 15.1% of plain
+ *     error over eight frames on the real capture (tools/aa_resolve_probe.py).
+ *
+ *   - NRR_PHASE_ALIGNED_SOURCE_INPUT_RENDER (1): the low-resolution renders the model was fed, each placed
+ *     into the display grid at the position its samples were taken. The accumulation is a *temporal upscale*
+ *     and the displayed image is its resolve rather than the model's frame - the model still runs, and what
+ *     it produced is not displayed while this source is selected. Measured 13.9% closer to the
+ *     display-resolution render than the bilinear upsample of the same input (which is the arrangement the
+ *     class splats for: at a coarse source every output pixel is given the weighted mean of the samples that
+ *     reached it, and a pixel no sample reached takes that frame's own bilinear upsample), against 2.8-9.4%
+ *     *worse* than bilinear for the trained models on that same input (tools/capture_fidelity_probe.py).
+ *
+ * The source is a property of the accumulation rather than of a frame, so changing it discards what has been
+ * collected: samples placed for the display grid and samples placed from the input grid describe the same
+ * scene on two different grids, and averaging across them is the mistake the accumulator already refuses
+ * between two output grids. It takes effect from the next frame.
+ *
+ * `source` is 0 or 1; any other value is NRR_ERROR_INVALID_ARGUMENT. Returns NRR_ERROR_INVALID_ARGUMENT for a
+ * NULL device and NRR_ERROR_STATE_INVALID for a device that is not initialized or whose backend cannot
+ * integrate, the contract the switch above has. */
+NRR_API NRRResult nrr_device_set_phase_aligned_source(NRRDevice* device, int source);
+
+/* Reports which source the accumulator that will run this device's frames is integrating: 0 (displayed) or
+ * 1 (input render) in *out_source. "Cannot integrate" is a different answer from either, so this returns the
+ * same NRR_ERROR_STATE_INVALID the setter does and writes nothing. */
+NRR_API NRRResult nrr_device_get_phase_aligned_source(NRRDevice* device, int* out_source);
+
+/* ============================================================================
+ * Disocclusion rejection and clamping (temporal accumulation)
+ * ============================================================================
+ *
+ * The reprojection blend's history guard. Its default is the device's own temporal-coherence capability: on
+ * for a device that reports temporal coherence (BASIC or better), off for one that does not - so a device
+ * that can afford the pass gets the guard without the caller asking, and the caller can still turn it either
+ * way with the setter below.
+ *
+ * On, the runtime builds this frame's history *trust mask* itself - one value per pixel, 1 where the
+ * reprojected history can be believed and 0 where it cannot (no geometry, a source that left the frame, a
+ * surface that was occluded in the previous frame; see specification/frame_contract.md 4.7) - and gives it
+ * to the accumulation. The blend then rejects the history the mask refuses (those pixels keep the current
+ * frame) and clamps the history at the rest, per channel, to the min/max of the current frame over a small
+ * neighbourhood, so a history whose colour has drifted while its depth still looks valid is pulled back
+ * toward the frame instead of ghosting.
+ *
+ * Nothing is required of the caller to make this work beyond the depth and motion attachments it already
+ * supplies for the model: the mask is derived, consumed inside the render path, and never crosses this API.
+ * A frame without them - the first of a sequence, or a backend that supplies no depth - gets no mask and the
+ * blend keeps its un-guarded behaviour for that frame.
+ *
+ * `enabled` is 0 or 1. Returns NRR_ERROR_STATE_INVALID for a device that is not initialized or a backend
+ * with no accumulator (a backend that cannot accumulate must say so rather than accept a setting it will not
+ * honour), and NRR_ERROR_INVALID_ARGUMENT for a NULL device. */
+NRR_API NRRResult nrr_device_set_disocclusion_rejection(NRRDevice* device, int enabled);
+
+/* Reports whether the accumulator that will run this device's frames has the guard on: 1 or 0 in
+ * *out_enabled. "Off" and "cannot" are different answers, so this returns the same NRR_ERROR_STATE_INVALID
+ * the setter does for a device with no accumulator, and writes nothing. */
+NRR_API NRRResult nrr_device_get_disocclusion_rejection(NRRDevice* device, int* out_enabled);
 
 /* ============================================================================
  * Resource Management Helpers

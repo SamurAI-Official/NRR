@@ -5,11 +5,16 @@
 #  2. builds the GDExtension against a godot-cpp checkout (skippable with -NoBuild)
 #  3. copies the built library and (if the runtime was built with the ONNX
 #     Runtime SDK) onnxruntime.dll next to it, at the path nrr.gdextension lists
-#  4. prints the command that runs the verification
+#  4. installs the released upscaler into addons/nrr/models/, from models/phase4/
+#     when this tree has it and otherwise from the Hub (hf download, sha256-pinned),
+#     the same way unity_verify/setup.ps1 and unreal_verify/setup.ps1 do
+#  5. prints the command that runs the verification
 #
 # Examples:
 #   pwsh engine_plugins/godot_verify/setup.ps1 -GodotCppPath G:/tmp/godot-cpp
 #   pwsh engine_plugins/godot_verify/setup.ps1 -NoBuild          # addon copy only
+#   pwsh engine_plugins/godot_verify/setup.ps1 -SkipHub          # no Hub fetch (needs a local model)
+#   pwsh engine_plugins/godot_verify/setup.ps1 -ModelFromHub     # re-verify the published model
 #
 # Target selection: Godot's editor loads the DEBUG variant of a GDExtension and
 # exported templates load RELEASE, so -Target defaults to template_debug.
@@ -29,6 +34,12 @@ param(
 
     # Skip the ~2.3 GB CUDA runtime copy (the addon then runs on the CPU provider)
     [switch]$SkipCuda,
+
+    # The released upscaler is published on the Hub rather than committed (models/phase4/ is working state), so a
+    # fresh clone fetches it. -SkipHub refuses the fetch; -ModelFromHub forces it even when a local copy exists,
+    # which is how the published artifact gets re-verified without disturbing the local file.
+    [switch]$SkipHub,
+    [switch]$ModelFromHub,
 
     [switch]$NoBuild
 )
@@ -160,14 +171,69 @@ if (Test-Path $modelSrc) {
 # installing the addon and installing the model are the same act - and setup.ps1 rebuilds addons/nrr from the
 # source addon on every run, so the model has to be placed here rather than by hand. verify.gd's upscaler
 # section fails loudly if it is missing, and prints the path it looked for.
-$releaseSrc = Join-Path $repo 'models/phase4/upscale_msreal_scale.onnx'
-if (Test-Path $releaseSrc) {
-    $releaseDst = Join-Path $addonDst 'models'
-    New-Item -ItemType Directory -Force $releaseDst | Out-Null
-    Copy-Item $releaseSrc $releaseDst -Force
-    Write-Host "[setup] installed addons/nrr/models/upscale_msreal_scale.onnx (the released upscaler)"
+#
+# The model is published, not committed: models/phase4/ is working state and is not in git, so a fresh clone has
+# no copy of it. This step is what makes the verification reproducible on a machine that only cloned the
+# repository. It installs the local file when there is one, and otherwise fetches the published artifact from
+# https://huggingface.co/SamurAI-Official/NRR - checking it against a pinned hash first, exactly as
+# unity_verify/setup.ps1 and unreal_verify/setup.ps1 do.
+$modelName = 'upscale_msreal_scale.onnx'
+$modelRepo = 'SamurAI-Official/NRR'
+$modelSha256 = '39A4701A87D19A0B1C6A8C6231E8FEBEB3EE73905CF96BEEA772B485860F2CFF'
+$localModel = Join-Path $repo ('models/phase4/' + $modelName)
+$releaseDst = Join-Path $addonDst 'models'
+$stagedModel = Join-Path $releaseDst $modelName
+
+function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -Path $Path).Hash }
+
+New-Item -ItemType Directory -Force $releaseDst | Out-Null
+$useHub = $ModelFromHub -or (-not (Test-Path $localModel))
+
+if (-not $useHub) {
+    Copy-Item $localModel $stagedModel -Force
+    $localHash = Get-Sha256 $stagedModel
+    if ($localHash -eq $modelSha256) {
+        Write-Host "[setup] installed addons/nrr/models/$modelName (the released upscaler)"
+    } else {
+        # Not fatal - a local model is allowed to be another revision on purpose - but say so, because if the
+        # point of the run is to exercise the released model, this is the sentence that says it is not.
+        Write-Host ("[setup] note: the local models/phase4/$modelName is not the released model (expected sha256 " +
+                    "$modelSha256, got $localHash) - this run will exercise a local revision. -ModelFromHub " +
+                    "fetches the published artifact instead.") -ForegroundColor Yellow
+    }
+} elseif ($SkipHub) {
+    Write-Host ("[setup] note: models/phase4/$modelName is not in this tree and -SkipHub was passed - verify.gd's " +
+                "upscaler section will fail. Drop -SkipHub to fetch it from the Hub.") -ForegroundColor Yellow
 } else {
-    Write-Host "[setup] note: models/phase4/upscale_msreal_scale.onnx is not in this tree - verify.gd's upscaler section will fail (trace it back through tools/train_nrr.py, or copy a model in by hand)" -ForegroundColor Yellow
+    $hf = (Get-Command hf -ErrorAction SilentlyContinue).Source
+    if (-not $hf) {
+        # The installer drops hf in %USERPROFILE%\.local\bin and asks for a new terminal, so an old shell does
+        # not have it on PATH.
+        $candidate = Join-Path $env:USERPROFILE '.local\bin\hf.exe'
+        if (Test-Path $candidate) { $hf = $candidate }
+    }
+    if (-not $hf) {
+        Write-Host "[setup] note: the 'hf' CLI is not installed, so the released model cannot be fetched." -ForegroundColor Yellow
+        Write-Host "        install it:        powershell -ExecutionPolicy ByPass -c `"irm https://hf.co/cli/install.ps1 | iex`""
+        Write-Host "        or fetch by hand:  hf download $modelRepo $modelName --local-dir <tmp>, then copy it to addons/nrr/models/"
+        throw "no released model available: addons/nrr/models/$modelName is missing and the Hub fetch needs the 'hf' CLI"
+    }
+
+    Write-Host "[setup] fetching $modelName from $modelRepo (models/phase4/ is not tracked by git)..."
+    $hubTmp = Join-Path $env:TEMP 'nrr-hub-release-model'
+    if (Test-Path $hubTmp) { Remove-Item -Recurse -Force $hubTmp }
+    New-Item -ItemType Directory -Force $hubTmp | Out-Null
+    & $hf download $modelRepo $modelName --local-dir $hubTmp | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "hf download $modelRepo $modelName failed (exit $LASTEXITCODE)" }
+    $fetched = Join-Path $hubTmp $modelName
+    if (-not (Test-Path $fetched)) { throw "the Hub download reported success but produced no $modelName" }
+    $fetchedHash = Get-Sha256 $fetched
+    if ($fetchedHash -ne $modelSha256) {
+        throw ("the model downloaded from $modelRepo is not the released model: expected sha256 $modelSha256, " +
+               "got $fetchedHash. Another revision, or a download that was not the file. Nothing was installed.")
+    }
+    Copy-Item $fetched $stagedModel -Force
+    Write-Host "[setup] installed addons/nrr/models/$modelName from $modelRepo (sha256 verified)"
 }
 
 Write-Host ""

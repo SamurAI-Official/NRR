@@ -104,6 +104,20 @@ bool setup(PathFixture& fx, const char* preferred_backend) {
     options.preferred_backend = preferred_backend;
     if (nrr_device_create(&options, &fx.device) != NRR_SUCCESS || !fx.device) return false;
 
+    /* Both paths must be configured identically for the comparison to mean anything, and the guard's default
+     * is per-device (the CPU backend claims temporal coherence, so it defaults on; a vendor backend that does
+     * not claim it defaults off). Turned off on both here so the pairing measures the *frame contract* the two
+     * paths share, which is what this file is about; the guard has its own tests. */
+    nrr_device_set_disocclusion_rejection(fx.device, 0);
+    /* Path B renders through the shared kernel rather than this device's own accumulator, and the kernel may
+     * not be up yet - a device-level switch on a lazily-started vendor kernel is refused, so a default the
+     * device set at initialization would otherwise come into force the moment the kernel starts and give the
+     * two paths different guards. Disabled on the kernel too, up or not. */
+    if (AcceleratorExecutionKernel* kernel = get_accel_kernel()) {
+        kernel->set_disocclusion_rejection_default(false);
+        kernel->set_disocclusion_rejection(false);
+    }
+
     char name[64] = {};
     nrr_get_backend_name(fx.device, name, sizeof(name));
     fx.backend_name = name;

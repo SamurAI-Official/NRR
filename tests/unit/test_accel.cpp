@@ -563,6 +563,16 @@ NRR_TEST(test_accel_phase_aligned_integration_runs_through_the_kernel) {
                         "the setting must reach the accumulator the frames go through");
         NRR_EXPECT_EQ(backend->set_phase_aligned_accumulation(false), NRR_SUCCESS, "and off again");
         NRR_EXPECT_FALSE(kernel->is_phase_aligned_enabled(), "off must reach it too");
+
+        /* The disocclusion guard shares the accumulator and the same forwarding, so it is checked the same
+         * way: a vendor backend must honour it through its inherited default, and the setting must reach the
+         * accumulator the frames actually go through. */
+        NRR_EXPECT_EQ(backend->set_disocclusion_rejection(true), NRR_SUCCESS,
+                      "a vendor backend must honour the guard switch through its inherited default");
+        NRR_EXPECT_TRUE(kernel->is_disocclusion_rejection_enabled(),
+                        "the guard setting must reach the accumulator the frames go through");
+        NRR_EXPECT_EQ(backend->set_disocclusion_rejection(false), NRR_SUCCESS, "and off again");
+        NRR_EXPECT_FALSE(kernel->is_disocclusion_rejection_enabled(), "off must reach it too");
     }
 
 
@@ -622,6 +632,45 @@ NRR_TEST(test_accel_phase_aligned_integration_runs_through_the_kernel) {
     nrr_device_destroy(device);
 }
 
+/* The disocclusion guard's default reaches an accelerator backend even though its kernel starts lazily. The
+ * device derives the default from the backend's temporal-coherence claim at initialization, but a vendor
+ * kernel does not come up until its first frame or model load - and the caller-facing switch cannot be
+ * accepted before then (it reports STATE_INVALID). Without the remembered default a vendor backend that claims
+ * temporal coherence would report the guard off for its whole life, which is the silent-loss shape this
+ * suite exists to catch. */
+NRR_TEST(test_disocclusion_default_is_applied_when_a_lazy_kernel_starts) {
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    NRR_EXPECT_TRUE(kernel != nullptr, "the shared accelerator kernel handle");
+    if (!kernel) return;
+
+    /* From a known state: no accumulator yet. */
+    kernel->shutdown();
+    kernel->set_disocclusion_rejection_default(true);
+    NRR_EXPECT_FALSE(kernel->is_disocclusion_rejection_enabled(),
+                     "a default is not in force before the accumulator exists");
+
+    NRR_EXPECT_TRUE(kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, true, false, true),
+                    "the kernel initializes");
+    NRR_EXPECT_TRUE(kernel->is_disocclusion_rejection_enabled(),
+                    "the default set before the kernel started is applied when it does");
+
+    /* A default of off before the start keeps it off - the state a device that does not claim temporal
+     * coherence leaves its backend in. */
+    kernel->shutdown();
+    kernel->set_disocclusion_rejection_default(false);
+    NRR_EXPECT_TRUE(kernel->initialize(AccelEP::CUDA, 256u * 1024u * 1024u, true, false, true),
+                    "the kernel re-initializes");
+    NRR_EXPECT_FALSE(kernel->is_disocclusion_rejection_enabled(),
+                     "a backend that does not claim temporal coherence starts with the guard off");
+
+    /* And the live switch still works once the accumulator is up. */
+    kernel->set_disocclusion_rejection(true);
+    NRR_EXPECT_TRUE(kernel->is_disocclusion_rejection_enabled(), "the live switch applies once it is up");
+    kernel->set_disocclusion_rejection(false);
+
+    /* Leave the shared kernel in the neutral state the rest of the suite expects. */
+    kernel->set_disocclusion_rejection_default(false);
+}
 
 } // namespace test
 } // namespace nrr

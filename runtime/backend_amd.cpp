@@ -44,6 +44,11 @@ NRRResult BackendAMD::initialize(const NRRDeviceOptions& options) {
      * claim about hardware nobody had looked at. query_capabilities_hip() fills the
      * measured pair when a device is actually found. */
     capabilities_.neural_acceleration = NRR_CAPABILITY_FULL;
+    /* This backend accumulates temporal history - it renders through the shared AcceleratorExecutionKernel,
+     * which owns the same TemporalAccumulator the CPU backend uses - so it reports temporal coherence, and with
+     * it the disocclusion guard's default. True whether or not a GPU was found: the kernel accumulates on the
+     * ONNX CPU EP fallback too, which is what this backend runs on without a HIP device. */
+    capabilities_.temporal_coherence = NRR_CAPABILITY_BASIC;
 #ifdef NRR_ENABLE_AMD
     hip_available_ = (initialize_hip(options) == NRR_SUCCESS);
     if (hip_available_) query_capabilities_hip();
