@@ -16,7 +16,7 @@ actually printed rather than estimates.
 ### The tier rows re-derived with their configuration recorded: the M2 table was an unoptimized build
 
 M11.1 found that the M2 tier table had no recorded build configuration and could not attribute a 3.6x
-disagreement with the same fixture. This is the re-derivation, in `__M112_COMMIT__`: `nrr_bench` now states its
+disagreement with the same fixture. This is the re-derivation, in `6bca1d85`: `nrr_bench` now states its
 own configuration and can report the per-stage split (`--stages`), `tools/measure_tiers.ps1` records every run
 with the facts a row needs to be comparable, and `docs/measurements/` holds nine rows with their JSON and CSV.
 
