@@ -13,6 +13,48 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The README stops describing a repository that no longer exists, and the model exports become Hub-only
+
+The status line still said "Unity plugin code is present but has never been run in an editor; the Unreal plugin is
+headers only" and "no trained model has passed its quality gates yet", and Phase 3 said "No
+`SessionOptionsAppendExecutionProvider` call exists anywhere in the codebase" while the same file's own header
+documented the CUDA execution provider attached in M2. All of that is now false, and every number below was
+re-derived from the code rather than remembered (`2af9fd18`):
+
+* **The counts.** 204 executed tests, not 96; 51 entry points, not 47. The test accounting closes exactly instead
+  of being asserted: `tests/main.cpp` registers 210 tests and `tests/performance/test_latency.cpp` registers 17
+  wall-clock benchmarks through its own aggregator; 23 of the 227 are compiled out of a desktop build (12 under
+  `NRR_ENABLE_MOBILE_VENDOR`, 11 under `#ifndef _WIN32`), which leaves `187 + 17 = 204` - the number the suite
+  prints. The blocking AddressSanitizer job therefore runs 187 of 204 where the README said 80 of 96. The gap
+  between "207 `NRR_TEST(` matches" and "204 executed" that started this pass was a bad search, not a missing
+  test: those three files (`test_history_delivery`, `test_history_mask`, `test_scale_token`) define their tests and
+  `main.cpp` registers them with `NRR_RUN_TEST`, so the registration count is `main.cpp`'s.
+* **What the plugins do.** Phase 12 said "code present, never run in an editor" and claimed a "URP/HDRP render
+  feature" - there is no HDRP code in the package, and `URP/HDRP` was a claim nothing could check. It now records
+  the port to URP 17.5 (the work moved into `RecordRenderGraph`, because 17.5 removed `SetupRenderPasses`,
+  `ScriptableRenderPass.Execute` and `cameraColorTargetHandle`) and the 7-of-7 Unity Test Framework run on Unity
+  6000.5.8f1, together with the two things that run cannot claim: it is a CPU-provider run
+  (`NRR_REQUIRE_CUDA=0`), and those 7 tests drive the runtime rather than the render feature. Phase 10's "the
+  verification run itself" is ticked with its evidence (Editor target, `RESULT: PASS`, exit 0); Phase 7's "never
+  executed on NVIDIA hardware" now separates NRR's own CUDA/TensorRT kernels (still structural) from the CUDA
+  execution provider (attached, measured).
+* **The model.** The README says the released model is published rather than committed, names both Hub
+  repositories, and shows the SHA-256-pinned `setup.ps1` each engine verification uses to fetch it.
+* **`models/phase3/` and `models/phase4/` are no longer tracked.** `models/HUB_README.md` and
+  `unreal_verify/README.md` already said the released model is not tracked and lives on the Hub; `.gitignore` did
+  not say so, and the previous commit had added ~1.7 MB of phase exports to git as a result. The four files are
+  untracked (and still on disk), the two directories are ignored explicitly, and that makes the published
+  statements true again rather than requiring them to be rewritten. Nothing loads those paths at run time - only a
+  comment in `test_scale_token.cpp` and a drift guard requiring `setup.ps1` to mention the name - so a fresh clone
+  is no worse off, and the Hub remains the one place a model comes from.
+* `engine_plugins/README.md`: the tree was missing `unity_verify/` and `godot_fork_patch/`, the requirements never
+  mentioned that a model is needed at all, and Future Work listed three things that already exist (full C#
+  bindings, a Blueprint surface, editor tools for Unity).
+
+Verified with the suite re-run after the change: 204 passed, 0 failed, 6 test executables, exit code 0.
+The only code change is the SKIPPED banner in `tests/main.cpp`, which said "16 latency benchmarks" where the file
+registers 17.
+
 ### The Unreal plugin becomes real: a run-time-loaded library, a frame path, and a headless verification
 
 `docs/roadmap.md`'s own status row said it plainly - "**Not real**: headers plus `NRRPlugin.Build.cs` only - no
