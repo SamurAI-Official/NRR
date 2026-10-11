@@ -388,7 +388,7 @@ NRR_RUN_TEST(test_input_render_offset_is_the_frame_grid_one_add_frame_documents)
     run_all_latency_tests();
 #else
     std::cout << "\n--- Latency Tests: SKIPPED ---\n";
-    std::cout << "  16 wall-clock benchmarks in tests/performance/test_latency.cpp are not run\n";
+    std::cout << "  17 wall-clock benchmarks in tests/performance/test_latency.cpp are not run\n";
     std::cout << "  in this build (NRR_SKIP_TIMING_TESTS): timings under instrumentation are\n";
     std::cout << "  not measurements. The render path they cover is still exercised by the\n";
     std::cout << "  inference, temporal accumulation and frame pipeline tests above.\n";
@@ -414,7 +414,7 @@ void print_test_summary() {
     std::cout << "Success Rate: " << (total > 0 ? (100.0 * passed / total) : 0) << "%\n";
 #ifdef NRR_SKIP_TIMING_TESTS
     std::cout << "Timing benchmarks: SKIPPED (NRR_SKIP_TIMING_TESTS: sanitizer build,\n";
-    std::cout << "                   16 latency benchmarks not run - see CMakeLists.txt)\n";
+    std::cout << "                   17 latency benchmarks not run - see CMakeLists.txt)\n";
 #endif
     
     if (failed > 0) {

@@ -61,6 +61,12 @@ models/p3/
 models/p4/
 # P5 runs: the godot-v2 reliability verification and the jitter-aware temporal arm, same rationale.
 models/p5/
+# Phase exports: the released model is published at SamurAI-Official/NRR and the graphs around it at
+# SamurAI-Official/NRR-checkpoints, and that is their distribution channel - unreal_verify/setup.ps1
+# fetches the one a run needs and checks it against a pinned SHA-256. The probe fixtures directly
+# under models/ stay tracked, because the test suite and the plugin drift guards load them.
+models/phase3/
+models/phase4/
 
 # The Unity verification project (engine_plugins/unity_verify). Library/ is Unity's imported-asset cache
 # and measured 1.4 GB here; Unity rebuilds it on first open, so it is generated state and not source.

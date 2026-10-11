@@ -37,12 +37,19 @@ engine_plugins/
 │   ├── setup.ps1             # Copies the addon in, builds, installs the library
 │   └── README.md
 │
-└── unity/            # Unity package
+├── unity/            # Unity package
     ├── package.json         # Package descriptor
     ├── Runtime/             # Runtime scripts and natives
     │   ├── Plugins/         # Native plugins (platform-specific)
     │   └── Scripts/         # C# API
-    └── Samples~/           # Example scenes and scripts
+    ├── Samples~/           # Example scenes and scripts
+│
+├── unity_verify/    # Unity 6 project (URP 17) whose tests render through the plugin - 7 of 7
+│   ├── Assets/NRR/          # The package, synced in by setup.ps1 (.meta files are committed)
+│   ├── Assets/StreamingAssets/smoke_fixture/  # The fixture the tests score their output against
+│   └── setup.ps1            # Package + nrr.dll + ONNX Runtime + the Hub model, then the run command
+│
+└── godot_fork_patch/ # The NVIDIA Godot fork: the Streamline seam, its probe, and the findings
 ```
 
 ## Unreal Engine (M5)
@@ -175,6 +182,8 @@ public class NRRRenderer : MonoBehaviour
 ### Unity
 1. Copy `engine_plugins/unity/` to your project's `Packages/` directory (or use .gitignore)
 2. Or import the `.unitypackage` if distributed as such
+3. Install `nrr.dll` and ONNX Runtime into `Runtime/Plugins/<platform>/`, and a model somewhere the
+   project can load - `unity_verify/setup.ps1` does all of that for the verification project
 
 ## Requirements
 
@@ -182,12 +191,39 @@ public class NRRRenderer : MonoBehaviour
 - For Unreal: NRR shared library (.dll, .so, .dylib)
 - For Godot: NRR static or shared library
 - For Unity: NRR native plugin for target platform
+- A model to render with. The released one is published at `SamurAI-Official/NRR` rather than
+  committed (`models/phase4/` is gitignored), and each `*_verify/setup.ps1` fetches it and checks
+  its SHA-256.
+
+## Running the verifications
+
+Each plugin ships a project that runs it in the real engine and reports a result rather than a
+compile:
+
+| project | what it does | last result |
+| --- | --- | --- |
+| `godot_verify/` | loads the addon headless, registers `NRRNative`, renders a frame | `RESULT: PASS` (Godot 4.7.2-stable) |
+| `unreal_verify/` | builds the plugin as a UE editor plugin, renders the released model at three tiers | `RESULT: PASS`, exit 0 (UE 5.8.3) |
+| `unity_verify/` | Unity Test Framework tests that render through the native plugin and score the output | 7 of 7 (Unity 6000.5.8f1) |
+
+```powershell
+powershell -File engine_plugins/godot_verify/setup.ps1
+powershell -File engine_plugins/unreal_verify/setup.ps1
+powershell -File engine_plugins/unity_verify/setup.ps1
+```
+
+Each `setup.ps1` installs what its project needs and prints the command to run. Unreal and Unity
+run on the CPU execution provider on this host; the reason, and the transcript of every failed
+attempt it took to get there, are in each project's README.
 
 ## Future Work
 
-- Full C# bindings for Unity
-- GDNative bindings for Godot 3.x
-- Blueprint function library for Unreal
-- Editor tools for model/reference management
+- GDNative bindings for Godot 3.x (the shipped addon is Godot 4 only)
+- Unreal: an editor UI for model/reference management, and a `USceneViewExtension` render hook
+  (frames are submitted explicitly today, and depth/motion are refused with a message)
+- Unity: an HDRP variant of the render feature (the shipped one is URP-only, ported to URP 17.5)
+- Godot: depth/motion capture, which Godot exposes no portable way to reach from GDScript
+- A render feature that has actually rendered in a camera: the Unity suite drives the runtime rather
+  than the feature, which is the honest limit recorded in `unity_verify/README.md`
 
 

@@ -2,7 +2,7 @@
 
 > A portable, vendor-agnostic neural rendering platform.
 
-**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 99/99 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output), and the NVIDIA backend is now first-class - probed through the driver ABI, so it needs no CUDA toolkit - and auto-selected**. M2 follow-up also made capability reporting honest (nothing is claimed that was not measured), added `NRR.warmup()` so a cold frame is no longer published as the frame cost, and moved the temporal pass into one `TemporalAccumulator` shared by every backend. Phases 3-6 partial; Phases 7-14 structural or gated on hardware. The Godot addon runs on the GPU too. Unity plugin code is present but has never been run in an editor; the Unreal plugin is headers only. **Model training now exists and is measured, and no trained model has passed its quality gates yet.** Pairs are generated (`tools/gen_training_pairs.py`) or captured from the engine with geometry-derived motion (`tools/godot_capture/`), packed into one dataset format (`tools/pack_godot_pairs.py`) and trained on the GPU (`tools/train_nrr.py`, 11.7x the CPU rate with driver-sampled utilization), refusing to export a model that does not beat bilinear by 5%, that learned nothing, or that ignores an input it was given. Training accuracy is now characterised rather than sampled: **ten seeds** of the chosen colour-only model give σ ≈ 2.4 points, and with a five-epoch learning-rate warmup **all ten train** at a mean of **14.25%** better than bilinear (10.57–19.10%). Before the warmup, two of ten seeds failed outright — one froze with its output at the baseline, one converged to only 2.9% — which is why the warmup exists and why the earlier two-seed figure of 12.1% is superseded. The input-set question is **closed rather than pending**: identical configurations differ by up to 6.6 points between seeds, more than any difference between input sets, so the extra inputs do not earn their place and the single-frame model stands. Model latency is measured too: 5.2/20.2/41.0/166.5 ms at the four tiers against the fixture's 3.7/17.1/39.7/157.4, so an eight-times-larger model costs 1.03–1.42× and the model is not the frame-budget bottleneck. See the stage-4 and noise-floor entries in [CHANGELOG.md](CHANGELOG.md). Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
+**Status:** Phase 0-1 complete (specification, public C API, real ONNX Runtime CPU inference; 204/204 tests green), with `M1.1` temporal accumulation wired into the render path, `M1.2` wall-clock benchmarks kept out of the blocking AddressSanitizer gate, `M1.3` scene-reset and resolution-change handling, `M1.4` the upstream defects an external consumer's Android port reported, `M1.5` the Godot addon built and loaded by Godot 4.7.2, and **`M2` started: the ONNX Runtime CUDA execution provider is attached for real and measured (22x faster than the CPU provider on the test fixture, bit-identical output), and the NVIDIA backend is now first-class - probed through the driver ABI, so it needs no CUDA toolkit - and auto-selected**. M2 follow-up also made capability reporting honest (nothing is claimed that was not measured), added `NRR.warmup()` so a cold frame is no longer published as the frame cost, and moved the temporal pass into one `TemporalAccumulator` shared by every backend. Phases 3-6 partial; Phases 7-14 structural or gated on hardware, except that **the three engine plugins are now built and run in their engines**: Godot and Unreal print `RESULT: PASS` (Godot 4.7.2; UE 5.8.3) and the Unity Test Framework suite is 7 of 7 (Unity 6000.5.8f1, URP 17.5). Unreal and Unity are **CPU** runs on this host - the CUDA provider cannot attach in Unity's package and crashes inside `nrr.dll` during model load in Unreal - while the Godot transcript records `CUDAExecutionProvider` attached. **Model training exists, is measured, and one model has passed its gates: `upscale_msreal_scale.onnx` is trained, and it is published with its card at [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) - the repository deliberately does not carry it, so the engine verifications fetch it from there.** Pairs are generated (`tools/gen_training_pairs.py`) or captured from the engine with geometry-derived motion (`tools/godot_capture/`), packed into one dataset format (`tools/pack_godot_pairs.py`) and trained on the GPU (`tools/train_nrr.py`, 11.7x the CPU rate with driver-sampled utilization), refusing to export a model that does not beat bilinear by 5%, that learned nothing, or that ignores an input it was given. Training accuracy is now characterised rather than sampled: **ten seeds** of the chosen colour-only model give σ ≈ 2.4 points, and with a five-epoch learning-rate warmup **all ten train** at a mean of **14.25%** better than bilinear (10.57–19.10%). Before the warmup, two of ten seeds failed outright — one froze with its output at the baseline, one converged to only 2.9% — which is why the warmup exists and why the earlier two-seed figure of 12.1% is superseded. The input-set question is **closed rather than pending**: identical configurations differ by up to 6.6 points between seeds, more than any difference between input sets, so the extra inputs do not earn their place and the single-frame model stands. Model latency is measured too: 5.2/20.2/41.0/166.5 ms at the four tiers against the fixture's 3.7/17.1/39.7/157.4, so an eight-times-larger model costs 1.03–1.42× and the model is not the frame-budget bottleneck. See the stage-4 and noise-floor entries in [CHANGELOG.md](CHANGELOG.md). Verified status, evidence and the forward plan: [docs/roadmap.md](docs/roadmap.md); what changed recently and how it was verified: [CHANGELOG.md](CHANGELOG.md).
 **Version:** 1.0.0-dev
 
 ---
@@ -13,8 +13,8 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 
 > **The game integrates NRR once. The GPU vendor is an implementation detail.**
 
-> **Reality check (M1 complete for its scope, M2 in progress; verified by code inspection,
-> by the suite, and by running the engine).** Inference runs on the **CUDA execution
+> **Reality check (M1 and M2 complete for their scope, M10 the active frontier; verified by code
+> inspection, by the suite, and by running the engine in all three of them).** Inference runs on the **CUDA execution
 > provider by default** when the ONNX Runtime GPU package and the CUDA runtime are present
 > (measured: 22x faster than the CPU provider, bit-identical output), and falls back to the
 > CPU provider with ONNX Runtime's own reason recorded when they are not. `nrr_device_create()`
@@ -28,15 +28,19 @@ NRR (Neural Rendering Runtime) is a portable neural-rendering platform designed 
 > routing tables are requests rather than capabilities. Measure a single frame with care: the
 > first one absorbs provider setup (measured `first_frame_ms=571.712` against
 > `steady_state_ms=0.578`), so warm up with `NRR.warmup()` and compare steady states.
-> The shipped model is an untrained identity fixture and `.nrrmodel` payloads are not parsed.
-> The temporal path is wired into the render path (motion reprojection + blend, measured
-> state, scene-cut and resolution-change handling) but accumulates that untrained fixture, so
-> it reduces flicker without improving detail; the reference/conditioning path still does not
-> reach the model. The Godot GDExtension is compiled, loaded and GPU-accelerated on Windows
-> x86_64; every other platform entry in `nrr.gdextension` is unbuilt, and the Unreal plugin
-> still contains no executable code. [docs/roadmap.md](docs/roadmap.md) lists every gap
-> together with the milestone that closes it, and [CHANGELOG.md](CHANGELOG.md) records what
-> changed recently and how it was verified.
+> The *sample* model (`models/nrr_upscaler_v0.1.onnx`) is an untrained identity fixture and
+> `.nrrmodel` payloads are not parsed; the **released** `upscale_msreal_scale.onnx` is trained, is
+> published rather than committed, and is what every engine verification renders with. The
+> temporal path is wired into the render path (motion reprojection + blend, measured state,
+> scene-cut and resolution-change handling) but the fixtures it accumulates are untrained, so it
+> reduces flicker without improving detail; the reference/conditioning path still does not reach
+> the model. The three engine plugins are built and run in their engines, each with a verification
+> project that reports a result rather than a compile - but the Unreal and Unity runs are
+> CPU-provider evidence on this machine (the CUDA provider cannot attach there, and crashes inside
+> `nrr.dll` during model load in Unreal), so the GPU path in those two engines is unverified here.
+> Every other platform entry in `nrr.gdextension` is unbuilt. [docs/roadmap.md](docs/roadmap.md)
+> lists every gap together with the milestone that closes it, and [CHANGELOG.md](CHANGELOG.md)
+> records what changed recently and how it was verified.
 
 ---
 
@@ -55,7 +59,7 @@ nrr/
 │   └── reference_conditioning.md
 │
 ├── include/
-│   └── nrr.h                   # Phase 1: public C API (47 entry points)
+│   └── nrr.h                   # Phase 1: public C API (51 entry points)
 │
 ├── runtime/                    # Phase 1: C++ runtime
 │   ├── nrr_runtime.h
@@ -81,18 +85,18 @@ nrr/
 │   ├── mobile/                   # Phase 13: mobile kernel + vendor backends
 │   └── platform/                 # Phase 13: Android (NDK/JNI) + iOS (Obj-C++) bridges
 │
-├── models/                     # Phase 3: sample .onnx fixtures + architecture docs + (generated, not committed) training pairs and trained models
-├── engine_plugins/             # Phase 10-12: Unreal (plugin + verification harness, built & run), Godot (addon + GDExtension, built & run), Unity (code)
-├── tools/                      # build/fetch scripts, gen_sample_model.py, gen_training_pairs.py, train_nrr.py, pack_godot_pairs.py, check_capture.py, godot_capture/ (engine motion-vector capture)
+├── models/                     # sample .onnx fixtures + architecture.md + HUB_README.md (the card published beside the released model); trained runs under models/phase*/ are gitignored, because the Hub is their distribution channel
+├── engine_plugins/             # Phase 10-12: three plugins, each with the verification project that runs it in its engine (unreal/ + unreal_verify/ built and run, godot/ + godot_verify/ built and run, unity/ + unity_verify/ 7 of 7)
+├── tools/                      # build + fetch scripts (fetch_ort, fetch_cuda_runtime, fetch_vulkan_headers, fetch_xess), gen_sample_model.py, gen_training_pairs.py, train_nrr.py, pack_godot_pairs.py, check_capture.py, check_abi.py, push_*_to_hf.ps1, godot_capture/ (engine motion-vector capture)
 ├── benchmarks/                 # nrr_bench.cpp + xess_host/ + dlss_host/: our benchmarker and the two vendor hosts
-├── docs/                       # roadmap.md (authoritative status + plan), parity.md and parity-512.md (generated tables)
-├── tests/                      # unified suite (main.cpp) + standalone phase tests
+├── docs/                       # roadmap.md (authoritative status + plan: M0-M10), parity.md and parity-512.md (generated tables), evaluation-protocol.md (the rules the tables are held to), third-party-sdks.md, nvidia-streamline-godot.md
+├── tests/                      # unified suite (main.cpp: 210 registrations) + latency benchmarks + standalone phase tests
 │   ├── unit/                   # API, device, model, reference, backend, inference, mobile
 │   ├── integration/            # frame pipeline, multi-frame, temporal accumulation, reference/conditioning
 │   ├── performance/            # render time, latency
 │   └── mobile/                 # Phase 13 mobile tests (guarded; not run on device)
 │
-├── .github/workflows/ci.yml    # build + full suite; blocking AddressSanitizer job
+├── .github/workflows/ci.yml    # 8 jobs: build + full suite, blocking AddressSanitizer, CUDA ONNX Runtime link, Android NDK cross-build, Vulkan-without-SDK, metrics self-check, C ABI audit, trainer self-checks
 ├── CHANGELOG.md                # notable changes, with commit hashes and measured numbers
 ├── CMakeLists.txt
 ├── Makefile
@@ -148,21 +152,24 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       `std::vector<uint8_t>` today
 - [ ] Vendor GPUs (Adreno, Mali, AMD, Intel, NVIDIA) through this same path
 
-### Phase 3 - Neural Model Execution (CPU only)
+### Phase 3 - Neural Model Execution (real inference; CUDA EP attached, CPU fallback)
 - [x] ONNX Runtime wrapper (real OrtSession via the stable OrtApi C interface)
 - [x] Model loading for `.onnx` files
 - [ ] `.nrrmodel` container: the extension is recognised but the payload is never
       parsed and no capability negotiation happens (see M3 in docs/roadmap.md)
 - [x] Input/output tensor management
-- [ ] Execution provider selection: CUDA/DirectML requests only set a flag and a
-      note. No `SessionOptionsAppendExecutionProvider` call exists anywhere in the
-      codebase, so every provider setting runs on the CPU EP today (see M2)
+- [x] Execution provider selection: the ONNX Runtime **CUDA execution provider is attached and
+      measured** (`SessionOptionsAppendExecutionProvider_CUDA`, M2: 22x the CPU provider on the
+      test fixture, bit-identical output) and is what `auto` prefers; `NRR_EXECUTION_PROVIDER`
+      (`auto`/`cuda`/`cpu`) overrides it. The other vendors are still a decision function rather
+      than an attachment - no DirectML/ROCm/oneAPI/OpenVINO provider is appended anywhere - so
+      those requests run on the CPU EP, with the reason recorded (see M2/M7)
 - [x] Full compute pipeline integration (frame textures -> NCHW tensors -> inference -> RGB8 output texture)
 - [x] Sample model fixture (models/nrr_upscaler_v0.1.onnx - ~45 KB untrained
       identity 2x upscaler from tools/gen_sample_model.py; a test fixture, not the
       network described in models/architecture.md)
 - [x] Model execution test (real end-to-end inference in the unified suite)
-- [~] **Training pipeline (in progress; no trained model has passed its gates yet).** Four
+- [x] **Training pipeline (a model passed its gates and is released).** Four
       tools, each gated by measurement: `tools/gen_training_pairs.py` generates pairs
       (procedural scenes, ground-truth depth and motion, rejecting a pair with nothing to
       learn, a difference that is only noise, or constant conditioning),
@@ -233,9 +240,12 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       at a mean of **14.25%**, minimum 10.57%, maximum 19.10%. `--warmup-epochs` defaults to 5.
       PSNR/SSIM are reported too, through a Python mirror of `runtime/nrr_quality.cpp` pinned from
       both sides, and model latency is measured per tier through the exported graph.
-- [ ] Trained model with a measured quality gate (PSNR/SSIM) - see M1
+- [x] Trained model with a measured quality gate (PSNR/SSIM): `upscale_msreal_scale.onnx` is the
+      one the three engine verifications render, and it is published with its card at
+      [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) - its measured numbers
+      are in [docs/parity.md](docs/parity.md) and [docs/parity-512.md](docs/parity-512.md). See M10
 
-### Phase 4 - Temporal Neural Rendering (wired into the render path; untrained model)
+### Phase 4 - Temporal Neural Rendering (wired into the render path; the fixtures are untrained)
 - [x] Temporal history buffer (ring buffer; depth 2 - only the previous displayed frame
       is ever reprojected)
 - [x] Motion vector warping (backward mapping + bilinear, in output texels)
@@ -262,8 +272,11 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
       with a real ONNX model) and `tests/integration/test_multi_frame.cpp` (8 tests on the
       history/state/renderer classes).
 - [x] Temporal blending (alpha compositing) into the output image
-- [ ] Temporal accumulation that improves detail: today it accumulates the *untrained*
-      fixture, so it only reduces flicker. Needs M1's trained model.
+- [ ] Temporal accumulation that improves detail: the fixtures it accumulates are *untrained*, so it
+      only reduces flicker. A trained model now exists (see M10), but the temporal arms measured
+      *below* the colour-only model on the jittered dataset, so temporal detail is a data and
+      history-quality question rather than a missing-model one - M10.4 in
+      [docs/roadmap.md](docs/roadmap.md)
 - [x] Disocclusion rejection and clamping, defaulted from the device's capability. The history
       is no longer trusted wherever the motion field says it reprojects: the runtime builds this
       frame's *history trust mask*
@@ -312,11 +325,13 @@ attached (see the M2 postmortem in `docs/roadmap.md`).
 - [x] Domain enable/disable control
 - [ ] Full neural model domain integration
 
-### Phase 7 - NVIDIA Backend (structural: never executed on NVIDIA hardware)
+### Phase 7 - NVIDIA Backend (driven through the CUDA execution provider; NRR's own kernels structural)
 
-All items below are structural: the code is compiled but inert unless
-`NRR_ENABLE_NVIDIA` is set with the CUDA/TensorRT SDKs present, and no item has
-been run on an NVIDIA device. See M2/M7 in [docs/roadmap.md](docs/roadmap.md).
+The items below are structural: compiled but inert unless `NRR_ENABLE_NVIDIA` is set with the
+CUDA/TensorRT SDKs present, and none of *these* items has been run on an NVIDIA device. What has
+run is the real GPU path: M2 attaches ONNX Runtime's **CUDA execution provider** and measured it -
+**22x the CPU provider** on the fixture, bit-identical output, with FP16/Tensor-Core capability
+read from the device rather than requested. See M2 and M7 in [docs/roadmap.md](docs/roadmap.md).
 - [x] CUDA device selection and initialization
 - [x] CUDA context and stream management
 - [x] CUDA memory management (device/host)
@@ -396,9 +411,14 @@ GPU one does. See [docs/roadmap.md](docs/roadmap.md) M2.
 - [ ] Editor UI for model/reference management
 - [ ] Render pass integration (a `USceneViewExtension`; frames are submitted explicitly today, and depth/motion
       are refused with a message rather than silently dropped)
-- [ ] **The verification run itself**: the plugin compiles for UE 5.8.3, but a launcher *Installed* engine cannot
-      link a standalone Game target (it ships no import libraries) and its Editor target needs the .NET Framework
-      4.6+ SDK, which this host lacks. One Visual Studio component away - see `engine_plugins/unreal/README.md`
+- [x] **The verification run itself**: `unreal_verify/` builds the plugin for UE 5.8.3 - the
+      **Editor** target, because a launcher *Installed* engine ships no import libraries and so cannot
+      link a standalone Game target - and the `NRRVerify` commandlet rendered the released model at
+      three tiers headless, printing `RESULT: PASS` with exit code 0 (2026-10-10). The editor target
+      needed the .NET Framework 4.6+ SDK, one Visual Studio component
+      (`Microsoft.Net.Component.4.8.SDK`, installed elevated). That run is a **CPU** run: with the
+      CUDA provider attached, model load crashes inside `nrr.dll` on this host, so
+      `NRR_EXECUTION_PROVIDER=cpu` was required. See `engine_plugins/unreal_verify/README.md`
 
 ### Phase 11 - Godot Integration (addon compiled, loaded and rendering in Godot 4.7.2)
 
@@ -408,7 +428,10 @@ godot-cpp 10.0.0 (Godot 4.7 API) and loaded by Godot 4.7.2-stable, which registe
 is measurably different from its input (`engine_plugins/godot_verify/`, transcript in
 `engine_plugins/godot/README.md`). Only the Windows x86_64 **debug** variant is built;
 the other platform entries in `nrr.gdextension` are unbuilt. Nine drift guards in
-`tests/unit/test_engine_plugins.cpp` lock the wiring.
+`tests/unit/test_engine_plugins.cpp` lock the wiring, one of which reads the binding and checks
+that it references only entry points the header declares - so the binding follows
+`NRR_ENTRY_POINT_COUNT` (51 today; the recorded transcript says 44, the count at the revision it
+was run against).
 - [x] INI plugin descriptor (`engine_plugins/godot/plugin.cfg`)
 - [x] Editor plugin entry point (`nrr_plugin.gd`, `extends EditorPlugin`)
 - [x] GDScript `NRR` class - `initialize()` / `shutdown()`
@@ -423,20 +446,29 @@ the other platform entries in `nrr.gdextension` are unbuilt. Nine drift guards i
 - [ ] Editor UI beyond the status menu item
 - [ ] Build and load the addon on any platform other than Windows x86_64 debug
 
-### Phase 12 - Unity Integration (code present, never run in an editor)
+### Phase 12 - Unity Integration (built and run: 7 of 7 in Unity 6000.5.8f1)
 
-The C# surface is real (`Runtime/Scripts/NRRNative.cs` declares the `DllImport`
-bindings), but the package has never been opened in a Unity editor, and no native
-binary is committed - `Runtime/Plugins/` contains a README describing where the
-build output goes.
+`engine_plugins/unity_verify/` is a Unity 6 project (URP 17) whose Unity Test Framework suite renders
+real frames through the native plugin and scores them: **7 of 7 pass** (2026-10-10, Unity
+6000.5.8f1), including a URP camera pass and a cross-check of the C# binding against the
+repository's own Python reference. The tests measure rather than assert liveness, so the evidence is
+the results XML and Unity's exit code; `engine_plugins/unity_verify/README.md` carries the
+transcript. No native binary is committed - `Runtime/Plugins/` describes where the build output goes
+- and `unity_verify/setup.ps1` installs `nrr.dll`, ONNX Runtime and the model the tests render with.
+Two honest limits: the run is a **CPU** run (`NRR_REQUIRE_CUDA=0`, for the same host reason as
+Unreal), and these 7 tests drive the runtime rather than the render feature, so `NRRRenderFeature`
+compiling against URP 17.5 is not the same as a camera having rendered through it.
 - [x] Package.json descriptor
 - [x] Unity package structure
 - [x] Runtime/Scripts folder structure
 - [x] Native plugin structure
 - [x] Full C# API bindings
-- [x] URP/HDRP render feature
+- [x] URP `ScriptableRendererFeature` + pass, ported to URP 17.5 (work now happens in
+      `RecordRenderGraph`, because 17.5 removed `SetupRenderPasses`, `ScriptableRenderPass.Execute`
+      and `ScriptableRenderer.cameraColorTargetHandle`; HDRP is **not** implemented)
 - [x] Editor window for model management
 - [x] Sample scenes and scripts
+- [x] Verification project that runs the plugin in a real editor (`unity_verify/`, 7 of 7)
 
 ### Phase 13 - Mobile Support (structural: never executed on a mobile device)
 
@@ -491,7 +523,8 @@ and writes test logs to `<build>/test-results/`. CMake auto-detects
 **Without the SDK** the library and the tests now *compile* (they did not: `M1.4` fixed an
 undeclared `provider_note_`), but the suite does not go green on that path and CI refuses
 to pretend otherwise - `.github/workflows/ci.yml` fails the job if the SDK is missing.
-Measured on Windows x64 Release without ORT: `nrr_tests` runs 90 tests, 77 pass, 13 fail.
+Measured at `M1.4` on Windows x64 Release without ORT: `nrr_tests` ran 90 tests, 77 passed,
+13 failed - the count at that revision; the suite has grown since and the failure mode has not.
 Every failure is a rendering test, because the placeholder session declares a fabricated
 `512x512` static input and fabricated temporal stats, so it cannot honour a real frame.
 That configuration is not the product; see [docs/roadmap.md](docs/roadmap.md) M1.4.
@@ -520,58 +553,103 @@ Studio installer):
 pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests
 ```
 
+### The released model, and the three engine verifications
+
+The trained model is published rather than committed. [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR)
+carries `upscale_msreal_scale.onnx` (461,501 bytes; inputs `color`, `jitter`, `scale`) with the card
+kept here as [models/HUB_README.md](models/HUB_README.md), plus the probe fixtures and the phase
+graphs; the other 119 checkpoints are in
+[SamurAI-Official/NRR-checkpoints](https://huggingface.co/SamurAI-Official/NRR-checkpoints). That is
+why `models/phase3/` and `models/phase4/` are `.gitignore`d. Fetch one by hand with:
+
+```powershell
+hf download SamurAI-Official/NRR upscale_msreal_scale.onnx --local-dir models/phase4
+```
+
+Each verification project fetches what it needs by itself and checks the model against its pinned
+SHA-256 (`-SkipHub` refuses the fetch for an offline run, `-ModelFromHub` forces it):
+
+```powershell
+powershell -File engine_plugins/unreal_verify/setup.ps1   # plugin + nrr.dll + ONNX Runtime + model, then the two commands it prints
+powershell -File engine_plugins/unity_verify/setup.ps1    # Assets/NRR + nrr.dll + ONNX Runtime + model, then the Unity command it prints
+powershell -File engine_plugins/godot_verify/setup.ps1    # the addon + its library, then the two --headless commands it prints
+```
+
+Unreal and Unity run on the **CPU** execution provider here (`NRR_EXECUTION_PROVIDER=cpu` for the
+commandlet, `NRR_REQUIRE_CUDA=0` for the Unity suite): on this host the CUDA provider cannot attach
+in Unity's project and crashes inside `nrr.dll` during model load in Unreal. The Godot transcript
+records `CUDAExecutionProvider` attached. `tools/fetch_xess.ps1` fetches XeSS for the Intel arm of
+the benchmark harness, the way `tools/fetch_ort.ps1` and `tools/fetch_cuda_runtime.ps1` fetch the
+rest.
+
 ## Testing
 
-`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 96 tests) plus the
+`tools/build.ps1 -RunTests` runs the unified suite (`nrr_tests`, 204 executed tests) plus the
 five standalone phase tests (`test_nrr_basic`, `test_nrr_model`, `test_nrr_temporal`,
 `test_nrr_reference`, `test_nrr_conditioning`). `ctest` works where it is available:
 `ctest --test-dir build -C Release --output-on-failure`.
 
-`nrr_tests` registers 103 tests. Of those, 23 are compiled out of a desktop build and stay
+The accounting, because "204" is easy to quote and hard to check: `tests/main.cpp` registers 210
+tests and `tests/performance/test_latency.cpp` registers 17 wall-clock benchmarks through its own
+aggregator (`run_all_latency_tests()`). 23 of the 227 are compiled out of a desktop build and stay
 in the count only as an explicit gap (12 under `NRR_ENABLE_MOBILE_VENDOR`, 11 under
-`#ifndef _WIN32`), and 2 need `NRR_HAVE_ONNXRUNTIME`; the 16 latency benchmarks are run by
-their own aggregator, which is what makes the executed total `78 + 2 + 16 = 96`. The mobile
-platform and vendor tests have never run on a device or in CI - see M8 in
-[docs/roadmap.md](docs/roadmap.md). `CHANGELOG.md` derives these counts per commit.
+`#ifndef _WIN32`), 2 run only where `NRR_HAVE_ONNXRUNTIME` is defined and 1 only where
+`NRR_HAVE_CUDA_EP` is, which leaves `187 + 17 = 204` on Windows x64 Release with ONNX Runtime
+present - the number this host reports, exit code 0. The mobile platform and vendor tests have never
+run on a device or in CI - see M8 in [docs/roadmap.md](docs/roadmap.md). `CHANGELOG.md` derives
+these counts per commit.
 
-The 1 execution-provider test that needs `NRR_HAVE_CUDA_EP` (the CPU-vs-GPU comparison) runs
-only when the GPU ONNX Runtime package is selected; it **skips with a recorded reason**
-otherwise, and CI (no GPU runner) is in that group.
+The one test that needs `NRR_HAVE_CUDA_EP` (the CPU-vs-GPU execution-provider comparison) runs only
+when the GPU ONNX Runtime package is selected; it **skips with a recorded reason** otherwise, and CI
+(no GPU runner) is in that group.
 
 ## Engine integrations
 
 | Consumer | What it uses | Verified how |
 | --- | --- | --- |
-| **ShugoCore** (`G:\Program Prototype\shugocore`) | Vendors this repository as a git submodule at `platforms/android/app/src/main/cpp/nrr` (pinned `6c977e2`) and consumes the **C ABI** from an ONNX Runtime extracted out of the Maven AAR. It owns its Android CMake build (an `NRR_SOURCES` list mirroring ours); that is no longer forced by us - the Android arm of our ORT detection accepts the AAR layout and the Vulkan arm takes Vulkan from the NDK sysroot, so `add_subdirectory()` is viable for it now (recorded as optional, not required, in the re-pin checklist). Its Python `nrr/` package mirrors `specification/frame_contract.md` at the descriptor level and stays binary-free. | Its own 58 structural tests are green at the pin, and `M1.4` fixes all six defects its Android port reported plus the four power-manager hook declarations; the Godot descriptor patch it carried is upstream too, so **both** `patches/nrr/*.patch` can be retired when it re-pins. Two later findings are fixed here because its path exposed them: `MobileExecutionKernel` claimed NNAPI/Core ML from the request rather than from the session (its port doc documented the workaround), and the NVIDIA registrar was unconditional, which forced consumers that own their source list to ship `backend_nvidia.cpp` + `nrr_cuda_driver.cpp`. **Re-pinning is ShugoCore-side work and is not done here**: the checklist (three runtime sources to add, `NRR_ENTRY_POINT_COUNT` 43 -> 44, the appended `NRRCapabilities::fp16_hardware`, the new `quality_metric` semantics, patch retirement) is in `docs/roadmap.md`. The Android configuration now cross-builds here (`pwsh tools/build.ps1 -Android`, arm64-v8a, real ORT, Vulkan on, run in CI); behaviour on a device is still evidenced only by their `nrr_probe` run. |
+| **ShugoCore** (`G:\Program Prototype\shugocore`) | Vendors this repository as a git submodule at `platforms/android/app/src/main/cpp/nrr` (pinned `6c977e2`) and consumes the **C ABI** from an ONNX Runtime extracted out of the Maven AAR. It owns its Android CMake build (an `NRR_SOURCES` list mirroring ours); that is no longer forced by us - the Android arm of our ORT detection accepts the AAR layout and the Vulkan arm takes Vulkan from the NDK sysroot, so `add_subdirectory()` is viable for it now (recorded as optional, not required, in the re-pin checklist). Its Python `nrr/` package mirrors `specification/frame_contract.md` at the descriptor level and stays binary-free. | Its own 58 structural tests are green at the pin, and `M1.4` fixes all six defects its Android port reported plus the four power-manager hook declarations; the Godot descriptor patch it carried is upstream too, so **both** `patches/nrr/*.patch` can be retired when it re-pins. Two later findings are fixed here because its path exposed them: `MobileExecutionKernel` claimed NNAPI/Core ML from the request rather than from the session (its port doc documented the workaround), and the NVIDIA registrar was unconditional, which forced consumers that own their source list to ship `backend_nvidia.cpp` + `nrr_cuda_driver.cpp`. **Re-pinning is ShugoCore-side work and is not done here**: the checklist (three runtime sources to add, `NRR_ENTRY_POINT_COUNT` 43 -> 51, the appended `NRRCapabilities::fp16_hardware`, the new `quality_metric` semantics, patch retirement) is in `docs/roadmap.md`. The Android configuration now cross-builds here (`pwsh tools/build.ps1 -Android`, arm64-v8a, real ORT, Vulkan on, run in CI); behaviour on a device is still evidenced only by their `nrr_probe` run. |
 | **Godot 4.7.2** (engine) | The GDExtension binding in `engine_plugins/godot/src/` calls the C ABI directly; the GDScript layer in `engine_plugins/godot/NRR.gd` drives it. | **Run, not just compiled, and GPU-accelerated**: `engine_plugins/godot_verify/` loads the addon in the real engine headless and prints `RESULT: PASS` with `class_registered=true`, `entry_point_count=44`, a non-passthrough render, and `model_info` reporting `"provider": "CUDAExecutionProvider"`. Transcript in `engine_plugins/godot/README.md`. Windows x86_64 debug variant only. |
 | **Shogunet** | Nothing. | `G:\Program Prototype\Shogunet` is an empty directory - there is no code to integrate with. NRR's transport-agnostic contract (`NRRFrameDescriptor` / `NRRRenderResult` as structured payloads) is what a Shogunet binding would carry; it does not exist yet. |
 
 The integration surface that matters in both directions is the export table: `include/nrr.h`
-declares 47 entry points (`NRR_ENTRY_POINT_COUNT`), `test_api_entry_point_count` asserts the
-linked library exports all of them, and the Godot GDExtension binding is checked against the
-same header by `test_godot_binding_references_only_declared_c_api_entry_points`. Godot
-itself reported `entry_point_count=44`, so the cross-language count agrees with the C ABI.
+declares 51 entry points (`NRR_ENTRY_POINT_COUNT`), `test_api_entry_point_count` asserts the linked
+library exports all of them, and the Godot GDExtension binding is checked against the same header by
+`test_godot_binding_references_only_declared_c_api_entry_points`. Godot's verification run reported
+`entry_point_count=44`, which is what the header declared when that transcript was recorded; the
+binding reads `NRR_ENTRY_POINT_COUNT` from the linked runtime, so it follows the header as it grows.
+Unreal's harness goes further and resolves every one of the 51 by name at load time, naming the ones
+that fail.
 
-Exports: the two committed `models/*.onnx` files are test fixtures
-(`tools/gen_sample_model.py`), not weights. `.nrrmodel` is not parsed. Nothing in
-`engine_plugins/` ships a compiled binary - Godot's libraries are per-platform build output
-under `engine_plugins/godot/bin/`, which is `.gitignore`d.
+Exports: the `.onnx` files committed under `models/` are test fixtures (`tools/gen_sample_model.py`
+plus the probe exporters), not weights - the test suite and the plugin drift guards load them.
+`.nrrmodel` is not parsed. The trained model and the training checkpoints are published on the Hub
+instead (`models/phase3/` and `models/phase4/` are `.gitignore`d for that reason), and each
+verification project fetches the one it needs and checks its SHA-256. Nothing in `engine_plugins/`
+ships a compiled binary - Godot's libraries are per-platform build output under
+`engine_plugins/godot/bin/`, which is `.gitignore`d.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and
-runs the full suite (96 tests). A second, **blocking** job runs the same correctness tests
-under MSVC AddressSanitizer; it excludes the 16 wall-clock benchmarks
-(`NRR_SKIP_TIMING_TESTS`, see [docs/roadmap.md](docs/roadmap.md) M1.2) because timings under
-instrumentation are not measurements, so the sanitizer job runs 80 of the 96 tests. A failing
-sanitizer run publishes the unresolved DLL dependencies of the built binaries as
-annotations. Both jobs carry `timeout-minutes: 30`.
+`.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and runs the full
+suite (**204** tests); the job fails outright when the SDK is missing, rather than passing on a build
+that cannot honour a real frame. A second, **blocking** job runs the same correctness tests under
+MSVC AddressSanitizer; it excludes the 17 wall-clock benchmarks (`NRR_SKIP_TIMING_TESTS`, see
+[docs/roadmap.md](docs/roadmap.md) M1.2) because timings under instrumentation are not measurements,
+so the sanitizer job runs **187 of the 204**. A failing sanitizer run publishes the unresolved DLL
+dependencies of the built binaries as annotations. Both jobs carry `timeout-minutes: 30`.
+
+Six more jobs cover the paths that break quietly while the main suite stays green: the CUDA ONNX
+Runtime link and test, the Android cross-build (NDK r27, arm64-v8a, on every push), the Vulkan branch
+compiled with headers only and no SDK, the metrics-harness self-check, the **C ABI / managed mirror
+audit** (`tools/check_abi.py`, which proves the Unity C# mirror matches the native ABI field by
+field), and the trainer self-checks (gates, losses, ONNX export).
 
 ## Roadmap
 
-[docs/roadmap.md](docs/roadmap.md) is the authoritative status and plan (M0-M9),
-including what is blocked on hardware and SDKs, and the engineering rule that no
-capability is claimed without a test that measures it.
+[docs/roadmap.md](docs/roadmap.md) is the authoritative status and plan (M0-M10, with M10 - the
+trained model, its data and the engine seam - as the active frontier), including what is blocked on
+hardware and SDKs, and the engineering rule that no capability is claimed without a test that
+measures it.
 
 ## Changelog
 
