@@ -37,6 +37,10 @@ probe found a content bug rather than a capture one:
   1.0, refuses a non-finite or non-positive value with `RESULT: FAIL` and exit code 1, and is **byte-identical by
   default**: the same two frames at 256 produce a `color_0000.png` with the same SHA-256 across three runs, so
   every dataset captured before the flag existed stays comparable.
+* **The tier run is one recorded command.** `tools/capture_godot_temporal.ps1` takes `-Size`, `-DetailScale`,
+  `-Frames` and `-OutRoot` and opens its transcript with the configuration it used, with defaults (256, 1.0, each
+  scene's own frame count, `temporal`) that reproduce the existing captures exactly - verified end to end by
+  SHA-256 on a rendered frame (`cf89fbbc`).
 * **A dataset now says what content it carries.** The capture manifest records `detail_scale` and
   `checker_uv_scale`, and `tools/pack_godot_pairs.py` carries them into each capture entry of the dataset manifest
   as `content` - because a dataset is only comparable to one produced the same way, and at a raised tier that
