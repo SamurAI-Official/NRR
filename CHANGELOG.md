@@ -16,7 +16,7 @@ actually printed rather than estimates.
 ### M11.3, second step: the blend's loops are row-banded across threads, with the frames still byte-identical
 
 The first step removed ~16.6M per-pixel allocations and took the 1080p->4K tier from 1452.6 ms to 958.5 ms. This
-is the second, in `__M113B_COMMIT__`: the passes themselves now run on more than one thread, and the recorder
+is the second, in `be67e676`: the passes themselves now run on more than one thread, and the recorder
 proves the frames did not change.
 
 * **`runtime/nrr_parallel.{h,cpp}`**: row/element bands handed out from an atomic cursor (so a band that costs
