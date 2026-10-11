@@ -106,38 +106,45 @@ $arguments += @('--frames', "$Frames", '--warmup', "$Warmup",
 if ($Provider) { $arguments += @('--provider', $Provider) }
 if ($Stages) { $arguments += '--stages' }
 
-# Native tools write progress and warnings to stderr, and with $ErrorActionPreference = 'Stop' a
-# *captured* stderr line becomes a terminating error - so this script first failed on an ONNX Runtime
-# warning (its "Memcpy nodes are added ... for CUDAExecutionProvider" note) and on the
-# entirely-expected "the CUDA provider could not be loaded" note a CPU-flavour build prints. That is
-# the same defect tools/build.ps1 documents and fixes the same way: relax the preference around the
-# native call and judge the run by its exit code, which is what actually reports success. The stderr
-# text is kept - it is evidence about which provider was available, and it belongs in the record.
+# Native tools write progress and warnings to stderr, and PowerShell promotes a *captured* stderr line
+# to a terminating error when the preference is 'Stop' - so this script first failed on an ONNX Runtime
+# warning ("Memcpy nodes are added ... for CUDAExecutionProvider") and then on the entirely-expected
+# "the CUDA provider could not be loaded" note, which is the configuration the engine integrations
+# actually run in. Relaxing the preference inside a helper was not enough: the promotion happened on
+# the pipeline anyway. So the call does not go through a pipeline at all - Start-Process redirects the
+# streams to files, which PowerShell's error stream never sees, and the run is judged by its exit code.
+# tools/build.ps1 documents the same defect class; this avoids it rather than working around it.
 function Invoke-NativeTool {
-    param([Parameter(Mandatory)][scriptblock]$Command)
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList
+    )
+    $stdout = [System.IO.Path]::GetTempFileName()
+    $stderr = [System.IO.Path]::GetTempFileName()
     try {
-        $text = & $Command 2>&1 | Out-String
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru `
+                                 -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $process.WaitForExit()
+        $text = ((Get-Content $stdout -Raw) + (Get-Content $stderr -Raw))
+        return [pscustomobject]@{ Text = $text; ExitCode = $process.ExitCode }
     } finally {
-        $ErrorActionPreference = $previous
+        Remove-Item $stdout, $stderr -ErrorAction SilentlyContinue
     }
-    return $text
 }
 
-$measured = Invoke-NativeTool { & $binary @arguments }
-$exit = $LASTEXITCODE
-if ($exit -ne 0) {
+$run = Invoke-NativeTool -FilePath $binary -ArgumentList $arguments
+$measured = $run.Text
+if ($run.ExitCode -ne 0) {
     Write-Host $measured
-    throw "measure_tiers: $Target exited $exit"
+    throw "measure_tiers: $Target exited $($run.ExitCode)"
 }
 
 # What the frames actually reported, per tier, read out of the renders' own debug strings by the tool.
 # A requested backend is not evidence that it ran - the first version of this script recorded a row
 # labelled "cpu" that had in fact attached CUDA, because a CUDA runtime on PATH made the auto-selected
 # backend NVIDIA - so the record states both, and says so loudly when they disagree.
-$seen = [regex]::Matches($measured, '(?m)provider\s+(\w+)') |
-        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+$seen = [regex]::Matches($measured, '(?m)provider\s+([^\r\n]+)') |
+        ForEach-Object { $_.Groups[1].Value.Trim() } | Sort-Object -Unique
 $seenNote = if ($seen.Count -gt 0) { $seen -join ', ' } else { 'none reported' }
 $providerNote = ''
 if ($Provider) {

@@ -201,13 +201,25 @@ struct TierResult {
 
 /* The provider the runtime actually attached, read out of the render's own debug string rather than assumed
  * from the requested backend. The suite's budget test decides whether to enforce a budget the same way, and
- * for the same reason: "we asked for CUDA" is not evidence that CUDA ran. */
+ * for the same reason: "we asked for CUDA" is not evidence that CUDA ran.
+ *
+ * Two spellings map to one answer. The accelerator path names the execution provider
+ * ("... CPUExecutionProvider via accel ...") and the CPU backend names its own frame path ("ONNX CPU EP ..."),
+ * so a single-string match reported `unknown` for a frame that ran on the CPU - and now that both are
+ * recognised they must not become two different answers to "which provider is this row?". One canonical
+ * vocabulary, two accepted spellings: the JSON and the CSV consumers compare this column. */
 const char* detect_provider(const std::string& debug) {
-    static const char* providers[] = {"TensorrtExecutionProvider", "CUDAExecutionProvider",
-                                      "DirectMLExecutionProvider", "VulkanExecutionProvider",
-                                      "CPUExecutionProvider"};
-    for (const char* provider : providers) {
-        if (debug.find(provider) != std::string::npos) return provider;
+    struct Spelling { const char* needle; const char* canonical; };
+    static const Spelling providers[] = {
+        {"TensorrtExecutionProvider", "TensorrtExecutionProvider"},
+        {"CUDAExecutionProvider", "CUDAExecutionProvider"},
+        {"DirectMLExecutionProvider", "DirectMLExecutionProvider"},
+        {"VulkanExecutionProvider", "VulkanExecutionProvider"},
+        {"CPUExecutionProvider", "CPUExecutionProvider"},
+        {"CPU EP", "CPUExecutionProvider"}, /* the CPU backend's own name for it */
+    };
+    for (const Spelling& provider : providers) {
+        if (debug.find(provider.needle) != std::string::npos) return provider.canonical;
     }
     return "unknown";
 }
