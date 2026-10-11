@@ -12,12 +12,24 @@
 # 100% geometry and 1.94 px per frame over geometry, with the objects inset so the frame carries more than one
 # motion layer.
 #
-#   --detail-scale 15 on a 3840 capture, because detail authored in UV space does not survive the tier change:
-#   without it the same scene measures a recoverable margin of 0.0031 against the packer's 0.0100 gate and every
-#   frame is skipped. See capture.gd and docs/roadmap.md M10.7.
+# Tiers. The defaults reproduce the 256 captures exactly. A raised tier needs its content scaled with it, because
+# detail authored in UV space does not survive the change: at 3840 the same scene measures a recoverable margin of
+# 0.0031 against the packer's 0.0100 gate and every frame is skipped ("the content is too smooth at this
+# resolution"), where -DetailScale (size / 256) reproduces the 256 statistics and the gate accepts. See capture.gd,
+# and M10.7 in docs/roadmap.md for that measurement, its control, and the cost of a run at that tier:
+#
+#   powershell -File tools/capture_godot_temporal.ps1 -Size 3840 -DetailScale 15 -OutRoot temporal4k
+#   # 6 scenes x 200 frames at 92 MB/frame and ~5-6 s/frame: ~110 GB raw, ~2 h, ~32 GB once packed
+param(
+    [int]$Size = 256,
+    [double]$DetailScale = 1.0,
+    # 0 keeps each scene's own frame count from the table below.
+    [int]$Frames = 0,
+    [string]$OutRoot = "temporal"
+)
+$ErrorActionPreference = "Continue"
 # The same binary, the same flags and the same jitter convention as capture_godot_v4.ps1, so the two datasets
 # differ in content and not in how they were made.
-$ErrorActionPreference = "Continue"
 $godot = "G:\godot\Godot_v4.7.2-stable_win64_console.exe"
 # 400 frames per scene, matching the v4 training captures: the packer's data gate refuses frames whose content
 # has drifted out of its margin band, and each corridor's camera crosses its wall over the run.
@@ -30,11 +42,15 @@ $frames = @{ "temporal" = 200; "temporal3" = 200; "temporal4" = 200; "temporal5"
              "temporal2" = 200; "temporal6" = 200 }
 $order = @("temporal", "temporal3", "temporal4", "temporal5", "temporal2", "temporal6")
 $failed = @()
+# The configuration goes into the transcript, because a capture's content is part of what its pairs mean: two runs
+# of one scene at two detail scales produce datasets that must not be compared (M10.7).
+Write-Output "capture_godot_temporal: size=$Size detail_scale=$DetailScale out=user://capture/$OutRoot"
 foreach ($scene in $order) {
-    Write-Output "=== $scene ($($frames[$scene]) frames) ==="
+    $count = if ($Frames -gt 0) { $Frames } else { $frames[$scene] }
+    Write-Output "=== $scene ($count frames) ==="
     & $godot --path tools\godot_capture res://capture.tscn -- `
-        --scene $scene --frames $frames[$scene] --size 256 --jitter halton `
-        --out "user://capture/temporal/$scene"
+        --scene $scene --frames $count --size $Size --detail-scale $DetailScale --jitter halton `
+        --out "user://capture/$OutRoot/$scene"
     if ($LASTEXITCODE -ne 0) { $failed += $scene }
 }
 if ($failed.Count -gt 0) { Write-Output "FAILED: $($failed -join ', ')" }
