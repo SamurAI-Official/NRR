@@ -97,9 +97,11 @@ void StageTimings::reset() {
 void StageTimings::add(FrameStage stage, double milliseconds) {
     const std::size_t index = frame_stage_index(stage);
     if (index >= kStageCount) return;
-    /* A negative interval is a clock that went backwards, not a stage that gave time back;
-     * counting it would make the residual mean two things at once. */
-    ms[index] += (milliseconds > 0.0) ? milliseconds : 0.0;
+    /* Only a positive interval is a recording. A negative one is a clock that went backwards, not
+     * a stage that gave time back, and a zero is what a caller accumulates when the instrument is
+     * off - which must not turn a record into a "measured" one. */
+    if (!(milliseconds > 0.0)) return;
+    ms[index] += milliseconds;
     measured = true;
 }
 

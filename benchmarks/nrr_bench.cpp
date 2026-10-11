@@ -32,6 +32,9 @@
  *       p50=32.30ms  p99=36.10ms  fps=30.6
  */
 #include "nrr.h"
+/* The per-stage frame record, so this benchmark can say where a frame's time went rather than
+ * only how long it took in three buckets (docs/roadmap.md M11.1). */
+#include "nrr_frame_stages.h"
 
 #include <algorithm>
 #include <chrono>
@@ -103,6 +106,43 @@ Stats compute_stats(std::vector<double> samples) {
     return s;
 }
 
+/* The configuration every number below was taken in, as one line.
+ *
+ * This exists because a latency row without it cannot be compared against or reproduced: M11.1
+ * found that the M2 tier table had no recorded build configuration, so a 3.6x disagreement with the
+ * same fixture could not be attributed to anything. The optimization state is compiled in
+ * (`NDEBUG`) *and* the generator's configuration is printed, because those are two different facts
+ * and it is the optimization state that changes the number. */
+std::string configuration_line() {
+    std::string text = "build=";
+#ifdef NRR_BUILD_CONFIG
+    text += NRR_BUILD_CONFIG;
+#else
+    text += "unknown";
+#endif
+#ifdef NDEBUG
+    text += " (optimized: NDEBUG)";
+#else
+    text += " (unoptimized: no NDEBUG)";
+#endif
+#ifdef _MSC_VER
+    text += "  compiler=MSVC " + std::to_string(_MSC_VER);
+#elif defined(__clang__)
+    text += std::string("  compiler=clang ") + __clang_version__;
+#elif defined(__GNUC__)
+    text += "  compiler=gcc " + std::to_string(__GNUC__) + "." + std::to_string(__GNUC_MINOR__);
+#else
+    text += "  compiler=unknown";
+#endif
+#ifdef NRR_ORT_SDK
+    text += "  onnxruntime=" NRR_ORT_SDK;
+#else
+    text += "  onnxruntime=unknown";
+#endif
+    text += std::string("  stage-timing=") + (nrr::stage_timing_enabled() ? "on" : "off");
+    return text;
+}
+
 void usage() {
     std::cout <<
         "nrr_bench - NRR's benchmarker (the counterpart of the XeSS sample's --benchmark)\n"
@@ -113,6 +153,9 @@ void usage() {
         "  --frames N     measured frames per tier (default 60)\n"
         "  --warmup N     frames discarded before measuring (default 5)\n"
         "  --model PATH   the .onnx to measure\n"
+        "  --stages       also report the per-stage split of the frame (download, NCHW and RGB8\n"
+        "                 conversion, trust mask, warp, derived planes, inference, blend, upload,\n"
+        "                 quality, and the unattributed residual) rather than only prep/infer/post\n"
         "  --motion F     scene motion per frame as a fraction of the frame width (default 0). Above the\n"
         "                 runtime's own threshold the temporal blend disengages, and the render's debug\n"
         "                 string says so - it is copied into the JSON either way\n"
@@ -149,6 +192,10 @@ struct TierResult {
     std::string runtime_debug;
     std::string provider;
     std::vector<double> frame_ms;
+    /* The per-stage record *accumulated over the measured frames*, so its average is the same
+     * average the statistics above are. Zeroes unless --stages asked for it, and `measured` inside
+     * the record says which - a record of nothing is not a measurement of zero. */
+    nrr::StageTimings stages;
     bool ok = false;
 };
 
@@ -223,7 +270,7 @@ bool seed_textures(NRRDevice* device, const Tier& tier, NRRTexture* color, NRRTe
 }
 
 TierResult measure_tier(const Tier& tier, const char* model_path, const std::string& provider,
-                        int frames, int warmup, float scene_motion) {
+                        int frames, int warmup, float scene_motion, bool stages_enabled) {
     TierResult result;
     result.tier = tier;
 
@@ -339,6 +386,13 @@ TierResult measure_tier(const Tier& tier, const char* model_path, const std::str
         inference.push_back(static_cast<double>(out.stats.neural_inference_time_ms));
         overhead.push_back(static_cast<double>(out.stats.backend_overhead_ms));
         result.runtime_debug.assign(out.stats.debug_info);
+        if (stages_enabled) {
+            const nrr::StageTimings& frame_stages = nrr::last_frame_stages();
+            for (int k = 0; k < nrr::frame_stage_count(); ++k) {
+                const nrr::FrameStage stage = static_cast<nrr::FrameStage>(k);
+                result.stages.add(stage, frame_stages.get(stage));
+            }
+        }
     }
 
     result.wall = compute_stats(wall);
@@ -398,6 +452,10 @@ int main(int argc, char** argv) {
     int warmup = 5;
     float scene_motion = 0.0f;
     std::string model_arg, csv_dir, json_path, provider;
+    /* Off by default, like the instrument itself: a frame timed with per-stage timing on is not the
+     * frame a user pays for, so asking for the split is an explicit choice and the header records
+     * which way it was set. */
+    bool stages = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -425,6 +483,7 @@ int main(int argc, char** argv) {
         else if (arg == "--csv") csv_dir = value("--csv");
         else if (arg == "--json") json_path = value("--json");
         else if (arg == "--provider") provider = value("--provider");
+        else if (arg == "--stages") stages = true;
         else { std::cerr << "nrr_bench: unknown option " << arg << "\n"; usage(); return 3; }
     }
     if (frames < 1 || warmup < 0 || ratio <= 0.0) {
@@ -480,13 +539,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::cout << "NRR benchmark: model=" << model_path << "  ratio=" << ratio << "  frames=" << frames
+    /* On before the first frame of the first tier, so every row below is measured the same way. */
+    if (stages) nrr::set_stage_timing_enabled(true);
+
+    std::ifstream model_probe(model_path.c_str(), std::ios::binary | std::ios::ate);
+    const std::streamoff model_bytes = model_probe.good() ? model_probe.tellg() : 0;
+    std::cout << "NRR benchmark: model=" << model_path << " (" << model_bytes << " bytes)"
+              << "  ratio=" << ratio << "  frames=" << frames
               << "  warmup=" << warmup << "  motion=" << std::fixed << std::setprecision(4) << scene_motion
               << "  tiers=" << tiers.size() << "\n";
+    /* The configuration, with the measurement rather than in whoever ran it: a row nobody can
+     * reproduce is the defect this line exists to remove (see configuration_line()). */
+    std::cout << "  configuration: " << configuration_line() << "\n";
 
     std::vector<TierResult> results;
     for (const Tier& tier : tiers) {
-        TierResult result = measure_tier(tier, model_path.c_str(), provider, frames, warmup, scene_motion);
+        TierResult result = measure_tier(tier, model_path.c_str(), provider, frames, warmup, scene_motion,
+                                         stages);
         if (!result.ok) {
             /* No partial table: a tier that did not render is a failure to measure, not a zero. */
             std::cerr << "nrr_bench: " << tier.name() << " could not be measured\n";
@@ -505,6 +574,22 @@ int main(int argc, char** argv) {
                   << "  max " << result.wall.max_ms << "  stddev " << result.wall.stddev_ms
                   << "  inference share " << std::setprecision(1) << share << "%  provider "
                   << result.provider << "\n";
+        /* The per-stage split, when asked for: the same record the suite asserts (M11.1) in the same
+         * shape, so a tier row here and a tier row there cannot disagree about where the time went.
+         * Averages over the measured frames, like every statistic on the two lines above. */
+        if (stages && result.stages.measured && result.wall.count > 0) {
+            const double n = static_cast<double>(result.wall.count);
+            std::cout << "      stages:";
+            for (int k = 0; k < nrr::frame_stage_count(); ++k) {
+                const nrr::FrameStage stage = static_cast<nrr::FrameStage>(k);
+                const double value = result.stages.get(stage) / n;
+                std::cout << " " << nrr::frame_stage_key(stage) << "=" << std::setprecision(3) << value
+                          << "ms(" << std::setprecision(2)
+                          << (result.reported.avg_ms > 0.0 ? value / result.reported.avg_ms * 100.0 : 0.0)
+                          << "%)";
+            }
+            std::cout << "\n";
+        }
         results.push_back(std::move(result));
     }
 
@@ -537,6 +622,8 @@ int main(int argc, char** argv) {
         json << "{\n";
         json << "  \"tool\": \"nrr_bench\",\n";
         json << "  \"model\": \"" << json_escape(model_path) << "\",\n";
+        /* With the numbers, not beside them: see configuration_line(). */
+        json << "  \"configuration\": \"" << json_escape(configuration_line()) << "\",\n";
         json << "  \"ratio\": " << ratio << ",\n";
         json << "  \"frames\": " << frames << ",\n";
         json << "  \"warmup\": " << warmup << ",\n";
@@ -559,6 +646,17 @@ int main(int argc, char** argv) {
             json << "      \"max_ms\": " << r.wall.max_ms << ",\n";
             json << "      \"stddev_ms\": " << r.wall.stddev_ms << ",\n";
             json << "      \"fps\": " << (r.wall.avg_ms > 0.0 ? 1000.0 / r.wall.avg_ms : 0.0) << ",\n";
+            if (r.stages.measured && r.wall.count > 0) {
+                const double n = static_cast<double>(r.wall.count);
+                json << "      \"stages_ms\": {";
+                for (int k = 0; k < nrr::frame_stage_count(); ++k) {
+                    const nrr::FrameStage stage = static_cast<nrr::FrameStage>(k);
+                    if (k) json << ",";
+                    json << "\"" << nrr::frame_stage_key(stage) << "\": "
+                         << r.stages.get(stage) / n;
+                }
+                json << "},\n";
+            }
             json << "      \"provider\": \"" << json_escape(r.provider) << "\",\n";
             json << "      \"runtime_debug\": \"" << json_escape(r.runtime_debug) << "\"\n";
             json << "    }" << (i + 1 == results.size() ? "\n" : ",\n");

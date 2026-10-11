@@ -797,11 +797,25 @@ endif()
 # It links nrr_static (and nrr) only, and is handed the sample model paths as absolute definitions so it
 # measures a real model from any working directory.
 add_executable(nrr_bench ${CMAKE_SOURCE_DIR}/benchmarks/nrr_bench.cpp)
-target_include_directories(nrr_bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# runtime/ is here for exactly one header: nrr_frame_stages.h, so this benchmark can report the
+# per-stage split (--stages) rather than only the prep/infer/post buckets (docs/roadmap.md M11.1).
+target_include_directories(nrr_bench PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/runtime
+)
 target_link_libraries(nrr_bench PRIVATE nrr_static nrr)
+# Every number this binary prints states the configuration it was taken in. A latency row whose
+# build configuration is unknown is a row nobody can compare against or reproduce - which is
+# exactly the defect M11.1 found in the M2 tier table - so the configuration travels with the
+# measurement rather than living in whoever ran it. $<CONFIG> is the multi-config generator's
+# answer for the active configuration; the optimization state is compiled in separately and both
+# are printed (see the source), because a Debug build measures a different machine.
+get_filename_component(_NRR_ORT_SDK_NAME "${NRR_ONNXRUNTIME_ROOT}" NAME)
 target_compile_definitions(nrr_bench PRIVATE
     NRR_SAMPLE_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_upscaler_v0.1.onnx"
     NRR_PASSTHROUGH_MODEL="${CMAKE_SOURCE_DIR}/models/nrr_passthrough_2x.onnx"
+    NRR_BUILD_CONFIG="$<CONFIG>"
+    NRR_ORT_SDK="${_NRR_ORT_SDK_NAME}"
 )
 nrr_copy_ort_dll(nrr_bench)
 
