@@ -15,7 +15,7 @@ actually printed rather than estimates.
 ## [Unreleased] - 1.0.0-dev
 ### The frame split, measured: the temporal blend is the largest host stage at 1080p->4K
 
-M11's first milestone, in `__M111_COMMIT__`. M2 measured that 85-88% of a tier's frame is host-side pixel work and
+M11's first milestone, in `b3197610`. M2 measured that 85-88% of a tier's frame is host-side pixel work and
 had one number for all of it; this records the frame per stage on both execution paths, prints and asserts it at
 every tier, and the first measurement changes what M11.3 should attack first.
 
