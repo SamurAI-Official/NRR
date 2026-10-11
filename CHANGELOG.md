@@ -13,6 +13,136 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The 2.5x model is trained, qualified and published: 768x432 -> 1920x1080
+
+The head could synthesise 2.5; now an artifact that does it has cleared the trainer's own gates and is on the
+Hub under `ratio25/`, **beside** the released 2x model rather than replacing it (`upscale_msreal_scale.onnx` is
+untouched: its sha256 is pinned in `engine_plugins/unreal_verify/setup.ps1`, and the published contract is
+`color,jitter,scale` at 2x - a 2.5x result is not a thing that model can be asked for).
+
+* **`models/ratio25/upscale_25x_procedural_depth.onnx`** - 90,974 parameters, sha256
+  `86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9`, inputs `color`, `depth`, output **2.5x the
+  input** on both axes with dynamic H/W. Trained by `tools/run_ratio25.ps1` (new) on `work/pairs25-full`: 480
+  procedural pairs from `tools/gen_training_pairs.py --size 128 --ratio 2.5` (the target *rendered* at 320, not
+  resampled onto it), 360 train / 120 val, ch32, batch 8, 60 epochs, lr 0.002 with linear warmup,
+  `--deterministic`, 2330 ms/epoch on the RTX 4070 Ti.
+* **It passes the gates, and the numbers are the ratio's own.** Held-out val L1 **0.01058** against the 2.5x
+  bilinear baseline's **0.02542** - **58.37% better**, against a 5% bar - with training progress 58.9% lower
+  than the first epoch, conditioning `depth` ablation **0.02742** (bar: > 0.0001), SSIM 0.9479 vs 0.8897, PSNR
+  27.38 vs 21.55 dB, MS-SSIM 0.9739 vs 0.9427. onnxruntime agrees with PyTorch to 8.17e-06 and the dynamic-size
+  check passes at the run's own ratio (the check that refused a correct 2.5x export when it asserted 2).
+* **The first configuration refused, and what refused it is worth recording.** Declaring `depth,motion` trains a
+  *materially better* model - val L1 0.00541 against the same 0.02542 baseline, **78.73%** better, where the
+  depth-only configuration reaches 58.37% - and the trainer still refused it, because the trained artifact
+  barely consumes motion: zeroing motion moves the output by **0.000032** against the 0.0001 gate, so no
+  artifact was exported and the refusal is recorded in its report. The published graph therefore declares only
+  the inputs it uses. Motion earns its place in *training* (a 2x better model at the same epoch count) and not
+  in the *artifact*; making the model consume it, or the data make it necessary, is a recorded follow-up
+  (M11.11) rather than a re-labelled input list.
+* **The procedural generator re-draws a pair its gate refuses, instead of aborting the run.** A scene's single
+  mover can be drawn behind a nearer sphere, and a fully occluded mover leaves `motion` identically zero
+  (0.000000000, not merely small): 5 draws in 485 at `--ratio 2.5`, one of which aborted a 480-pair run before
+  this change. `_draw_gated` steps the seed by a prime co-prime with the pair stride, records the accepted
+  draw's seed and every refusal under `gate_rejections`, and gives up loudly after eight attempts. The scene
+  sampler itself is untouched, so the ratio-2 dataset reproduces **byte for byte** - all 40 pairs of
+  `models/training-data/v1` verified against a fresh generation, its manifest differing only by the `ratio` key
+  `--ratio` added - and a dataset whose every draw passed is unchanged in every byte, manifest included.
+* **The tier measured through the runtime, with the ratio in the record.**
+  `docs/measurements/ratio25-release-cuda.txt`: 768x432 -> 1920x1080, `runtime_output` 1920x1080 **confirmed**
+  by the runtime, CUDA provider, 222.4 ms reported / 224.6 ms wall / 102.1 ms inference, frame hash
+  `0x45317f2470dc61ac`. `docs/measurements/ratio25-release-cpu.txt`: CPU EP 2101.6 / 2104.3 / 2006.2, hash
+  `0x8aded9efba8d036a`. The two hashes differ **because of TF32, not nondeterminism**: an independent
+  onnxruntime comparison of the same graph on the same input measures max |CPU - CUDA| **6.341e-04** (mean
+  1.558e-05) at the CUDA execution provider's default, and **2.176e-06** (mean 5.443e-08) at `use_tf32=0`,
+  while a re-run on the same provider reproduces its hash exactly. Recorded because two rows disagreeing on a
+  bit-exact digest otherwise reads as a defect.
+* **Everything else still passes:** 205/205 CPU and 205/205 GPU.
+
+### The 2.5x ratio is the model's own: the head synthesises it, and the tier is verified with our own graph
+
+The tier was verified to be *carriable* before this step; it is now *owned*. The ratio is a property of the
+model our trainer builds and exports - nothing outside the graph resamples the frame, and no engine-side pass
+supplies the missing resolution.
+
+* **`tools/train_nrr.py --ratio` (default 2).** The head reaches the display grid by synthesising the ratio's
+  polyphase components. At 2x that is the existing `channels * 4` through `PixelShuffle(2)`, kept **verbatim** -
+  every recorded row in this repository was produced by that graph, and changing it would move its own baseline.
+  For any other p/q in lowest terms (`ratio_factors`, 2.5 -> 5/2) it is `PixelShuffle(p)` followed by a
+  **learned** q-tap convolution with stride q, narrowed to 3 channels before the shuffle so the memory term is
+  the colour width rather than `channels * p * p`. That lands on the baseline's lattice *exactly*, not near it:
+  for 5/2 the stride-2 window at output index j has its centre at `(j - 0.75)/2.5`, identical to
+  `interpolate(scale_factor=2.5, align_corners=False)`. The skip is the same ratio's bilinear upsample, so an
+  untrained model is exactly that ratio's baseline - checked, not assumed (val L1 0.03726 against the 2.5x
+  baseline's 0.03726 on the first run).
+* **Ratio 2 is byte-identical.** The same command (3 epochs, 8 channels, 32-pixel example, seed 1,
+  `--deterministic`) on the same pairs exports **11,123 parameters, sha256 `55589FAE220657A73297664A314EC5B4...`**
+  from both this trainer and the one at HEAD - so the generalisation moved nothing for the shipped ratio.
+* **Three assumptions of 2 were removed, each found by a check rather than by a run going wrong:**
+  `baseline_upscale`/`base_plane` (a baseline fixed at 2 would score every other ratio against a plane the model
+  was never asked to beat); `augment_batch`'s integer-scale guard (a 2.5x pair was refused outright); and the
+  trainer's own dynamic-size check, which asserted `output == input * 2` and **refused a correct 2.5x export**
+  ("not dynamic in H/W (got [1,3,160,160], expected [1,3,128,128])") - the staging/removal discipline meant the
+  bad-looking artifact was deleted and no wrong graph was left on disk.
+* **Fractional ratios need a crop lattice, and the crop path now draws on one.** `augment_sample` already mapped
+  each key's window by its own grid ratio, but the *values* were integers on the input grid, so at 2.5 the
+  target's window was `round(plan * 2.5)` - exact for even plans and half a target pixel out for odd ones. Half
+  the crops would have trained against a shifted target, silently, as a blur. `augment_scale`/`augment_draw`
+  now floor sizes and draw offsets on a lattice of the denominator (q = 2 for 5/2; a no-op at q = 1, so every
+  recorded augmentation run is unchanged), and the pair's own ratio is what the guard checks.
+* **The data can be generated at the ratio.** `tools/gen_training_pairs.py --ratio` renders the target at
+  `round(size * ratio)` - rendered, not resampled, so a fractional ratio is still a real render - and the
+  identity-margin gate scores against that ratio's baseline. Ratio 2 is byte-identical there too: regenerating
+  the first four pairs of `models/training-data/v1` reproduces its recorded sha256s exactly
+  (`d33431aa73e2`, `221c44911d30`, `a07024636a87`, `9db17787dc95`). A 2.5 set (`--size 64`, target 160) clears
+  the gate: margin 0.035-0.039 against the floor of 0.01, detail ratio 0.40 against the 0.90 bar.
+* **Verified end to end with a model this repository trained.** `models/nrr_upscaler_25x_procedural.onnx`
+  (11,494 parameters, 5 epochs, 8 procedural pairs, CPU - exported under `--export-unqualified` because the
+  gates *fail*: 0.7% progress, not the 5% bar, and the report says so). onnxruntime agrees with PyTorch to
+  **4.65e-06**, dynamic H/W verified at 2.5, and the graph is `Resize` -> `DepthToSpace` (the 25 synthesised
+  phases) -> `Conv` (the learned q=2 phase selection) -> the residual stack. Rendered through the engine's
+  runtime it reports `768x432->1920x1080`, `runtime_output: [1920, 1080]` **confirmed by the runtime**, frame
+  hash `0x2dcf1f0be9712f39` - a different frame from the fixture's, because it is a different model's
+  (docs/measurements/ratio25-own-procedural.txt).
+* **What this does not claim:** that the model is *good* at 2.5. It is 5 epochs on 8 procedural pairs and does
+  not beat the baseline; the quality claim needs the 2.5x capture (roadmap M11.11) and a full run. What is
+  established is that the ratio is the model's, that ours can be trained and exported at it, and that the
+  runtime renders our graph at the tier.
+
+### A 2.5x tier: the model takes 768x432 and displays 1920x1080, verified before it was built for
+
+The requirement is an upscale whose ratio is not a power of two (768 x 2.5 = 1920, 432 x 2.5 = 1080), so the
+first question was what in the pipeline actually *assumed* 2. The answer is the trainer's upscaling head
+(`PixelShuffle(2)`, an `Upsample(scale_factor=2)` skip, an `interpolate(scale_factor=2)` baseline, and a crop
+alignment that refuses a target which is not an integer multiple of its input), the capture (`lowres_size` is
+`_size / 2`), the packer's data gate (a 2x bilinear baseline), the evaluation protocol's tier list, and two
+places nobody had looked - the benchmarker and its recorder. **Not the runtime.**
+
+* **The runtime carries it unchanged.** The display grid is the model's own output tensor (`nchw_to_rgb8` ->
+  `get_or_create_output_texture`), never `input x ratio`, and the blend works at that grid while the trust mask
+  works at the input grid - both parameterised rather than halved. Proved rather than argued:
+  `models/nrr_upscaler_25x.onnx` is new and `tools/gen_sample_model.py` now takes the ratio as a parameter (a
+  `Resize`'s `scales` is a float tensor, so nothing structural ever required an integer), and a 768x432 frame of
+  it displays **1920x1080** - asserted through `nrr_texture_get_desc`, the getter `nrr.h` added *because* a
+  caller otherwise learns the output size by guessing it from its own render target.
+* **`nrr_bench` no longer takes the ratio's word for the output grid.** Every tier reads the grid back from the
+  texture the runtime returned and refuses a tier whose model disagrees with `--ratio`; the JSON carries it as
+  `runtime_output` and `runtime_output_confirmed`. The defect it closes was measured before it was fixed: the
+  2x fixture at `--ratio 2.5` printed a real `frame-hash` and a complete row of timings from a 1536x864
+  texture, because a download is clamped to what the texture holds - a hash, and therefore a budget, of an
+  image the row did not name. The four rows of `blend-pool-fixture`, re-run under the check, report their
+  hashes unchanged (`0x54908619d860b3f5`, `0x675657715c63f3f5`, `0xebb4f2f86d22cc5`, `0x9c3d3479ea20eec5`).
+* **`tools/measure_tiers.ps1` takes `-Ratio`** and records it, instead of writing the literal `ratio=2` into a
+  record whose scenario line is what makes a row comparable. A 2.5x row recorded as a 2x row would have been a
+  false record of a true measurement - this script's own defect, one field over.
+* **Two rows recorded** (`ratio25-fixture`, `ratio25-cpu-fixture`; docs/measurements/README.md): CUDA 100.0 ms
+  reported / 75.8 ms resolve, CPU EP 122.2 ms reported / 89.6 ms resolve, **both frame-hashes
+  `0x7bd190fbab0961e1`**. The resolve matches the 2x tier at the same *display* grid (79.0 ms at 540p->1080p,
+  a different input): the blend's cost follows the output grid, so the grid an engine renders at moves the
+  renderer's load and not the upscaler's.
+* **Not done, and stated as such:** the trainer cannot be handed a 2.5x pair yet, the capture cannot render the
+  2.5x low grid, the packer's gate scores against a 2x baseline, and the protocol has no 2.5x tier. Roadmap
+  M11.11 carries each, named with the code that assumes 2.
+
 ### M11.3, fourth step: a worker pool evaluated against the per-call form, and the crossover retested
 
 The threads the runtime's per-pixel loops use were created per call, which M11.3's sweep had already priced (the
