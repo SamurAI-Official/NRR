@@ -395,6 +395,14 @@ const SCENES := {
 var _scene_id := "train"
 var _frames := 24
 var _size := 512
+# Multiplies the checker's UV frequency, and it exists because detail authored in UV space does not survive a
+# change of tier: the same scenes at 3840 measure a recoverable margin of 0.0031 against the data gate's 0.0100,
+# because a tile that spans a few pixels at 256 spans fifteen times as many there and the frame is locally
+# smooth - bilinear is already within 0.31% of the target, so there is nothing for a model to learn. Passing
+# `--detail-scale <size/256>` keeps a tile's pixel footprint constant across tiers, which is the version of the
+# content the 0.0100 bar was calibrated on. Default 1.0, so a capture taken before this flag existed is
+# byte-identical and stays comparable with the datasets built from it.
+var _detail_scale := 1.0
 var _out_dir := "user://capture"
 # "halton" moves the low-resolution sample every frame; "none" holds it still, which is the ablation that
 # shows how much of the temporal gain comes from the jitter and how much from the model simply seeing a real
@@ -424,7 +432,15 @@ func _ready() -> void:
 		print("RESULT: FAIL")
 		get_tree().quit(1)
 		return
-	print("capture: scene=%s frames=%d size=%d out=%s" % [_scene_id, _frames, _size, _out_dir])
+	# A zero or negative detail scale would tile the checker without limit or invert it, and either way the
+	# capture would read as a content change rather than as a mistyped flag.
+	if not is_finite(_detail_scale) or _detail_scale <= 0.0:
+		print("FAILURE: --detail-scale must be finite and positive (got %s)" % str(_detail_scale))
+		print("RESULT: FAIL")
+		get_tree().quit(1)
+		return
+	print("capture: scene=%s frames=%d size=%d detail_scale=%.4f out=%s"
+		% [_scene_id, _frames, _size, _detail_scale, _out_dir])
 	_run()
 
 
@@ -528,7 +544,7 @@ func _run() -> void:
 	var backdrop_material := StandardMaterial3D.new()
 	backdrop_material.albedo_texture = checker
 	backdrop_material.albedo_color = Color(0.9, 0.9, 0.95)
-	backdrop_material.uv1_scale = Vector3(CHECKER_UV_SCALE, CHECKER_UV_SCALE, 1.0)
+	backdrop_material.uv1_scale = Vector3(CHECKER_UV_SCALE * _detail_scale, CHECKER_UV_SCALE * _detail_scale, 1.0)
 	backdrop.material_override = backdrop_material
 	color_view.add_child(backdrop)
 
@@ -570,7 +586,7 @@ func _run() -> void:
 		var material := StandardMaterial3D.new()
 		material.albedo_color = entry["color"]
 		material.albedo_texture = checker
-		material.uv1_scale = Vector3(CHECKER_UV_SCALE, CHECKER_UV_SCALE, 1.0)
+		material.uv1_scale = Vector3(CHECKER_UV_SCALE * _detail_scale, CHECKER_UV_SCALE * _detail_scale, 1.0)
 		node.material_override = material
 		color_view.add_child(node)
 
@@ -689,6 +705,11 @@ func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -
 		"motion_scale": MOTION_SCALE,
 		"depth_scale": DEPTH_SCALE,
 		"checker_period": checker,
+		# The UV frequency the renderer actually used, and the multiplier that produced it. Two captures of one
+		# scene at two sizes are only comparable if this is recorded, because the scene id does not say how much
+		# detail was on screen - which is exactly how the 3840 tier came out smooth.
+		"checker_uv_scale": CHECKER_UV_SCALE * _detail_scale,
+		"detail_scale": _detail_scale,
 		"camera_velocity": [camera_velocity.x, camera_velocity.y, camera_velocity.z],
 		"motion_convention": "viewport UV units, +y down, from the current frame to the previous one",
 		"motion_decode": "motion = (png_value - 0.5) * 2 / motion_scale",
@@ -930,6 +951,8 @@ func _parse_args() -> void:
 				_frames = int(args[index + 1])
 			"--size":
 				_size = int(args[index + 1])
+			"--detail-scale":
+				_detail_scale = float(args[index + 1])
 			"--out":
 				_out_dir = args[index + 1]
 			"--jitter":

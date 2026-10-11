@@ -1391,7 +1391,8 @@ Recommended pick-per-sitting sequence, with what blocks each one:
 | 5 | M10.2 RCAS post-sharpen against the detail bar | nothing | hours, no training |
 | 6 | M10.2 **publish** the model + the provenance gate | 2 and 5 | **half done** - the model is published (Hub, pinned SHA-256); the provenance *gate* is M10.6 |
 | 7 | M10.3 Blender/CC0 capture factory | nothing | 1-2 days |
-| 8 | M10.5 engine capture mirrors, then the injection benchmark | Unreal install / Unity editor | larger |
+| 8 | M10.5 engine capture mirrors, then the injection benchmark | nothing - Unreal and Unity are both verified in-engine now | larger |
+| 9 | M10.7 the 1080p->4K tier: content-scaled capture, streamed validation, train, measure | the trainer's streamed validation; ~110 GB and ~2 h of capture | days, mostly machine time |
 
 ### M10.1 - The NVIDIA Streamline seam in the Godot fork `built and probed; live arm gated on Streamline`
 
@@ -1489,9 +1490,10 @@ matter too.
       is why the mask input could not have helped anything. Both are fixed and measured: 100% geometry, a wall
       at 2.77 px/frame against objects at 10.12 px, disocclusion 1.45% of geometry (from 0.00%), with a
       `temporal` scene laid out for motion (wall at 2 units, objects inset, dolly 0.05/frame) and
-      `tools/capture_godot_temporal.ps1` to capture it. What has *not* been done is the run that uses it: a full
-      400-frame capture, packed, retrained and re-measured - which is the next step here, and the one that tests
-      whether the temporal arms' failures were the data or the input
+      `tools/capture_godot_temporal.ps1` to capture it. What this bullet called the next step - a full capture,
+      packed, retrained and re-measured - has since been *done*: six scenes, 2400 captured frames, 745 pairs, with
+      M10.4 recording the result (the temporal lever beats the phase-aware reference and fails attribution against
+      its own control). What remains is the *tier*, which is M10.7: the same content at 1920->3840 grid
 - [x] Trainer changes a dataset of that size needs: lazy npz loading, crop/flip augmentation, and
       multi-scale crops - **built and measured** (`tools/train_nrr.py`). `--lazy` reads the training split's
       files per batch instead of concatenating the split into RAM: on godot-v4 the training split goes from
@@ -2231,6 +2233,59 @@ convention:
       review
 
 ---
+
+### M10.7 - The 1080p->4K tier: what it costs, and the content bug that was blocking it `started`
+
+`models/architecture.md` describes a colour+depth+motion network at 1080p -> 4K, and
+`docs/evaluation-protocol.md` says quality is scored only where reference pairs exist - 128 -> 256 today, with
+256->512, 540p->1080p and 1080p->4K listed as *latency* tiers "because there is no reference data at these sizes to
+score quality against". This is the work that changes that clause. Probed before it was built (2026-10-10):
+
+| what | measured |
+| --- | --- |
+| a 3840 capture (1920 low = the 1080p->4K grid) | `--size 3840` works first try: `lowres: 1920px`, the jitter self-test passes at that size (a +1px translation matches to 0.00000 against 0.00179 unmoved), `RESULT: PASS` |
+| wall clock | 14.2 s for 2 frames including engine start, so ~5-6 s/frame |
+| bytes per frame | color 2.7 MB + lowres 0.8 MB + **depth+motion 88.5 MB** (3840^2 x 6 B, the pass is written at the *target* grid) = 92 MB/frame; 200 frames/scene ~ 18 GB |
+| a packed pair | **~43 MB** (fp16 planes), so a 745-pair dataset ~ 32 GB |
+| the data gate at 3840, default content | **every frame refused**: "after a bilinear 2x upscale the input is within 0.0031 of the target (needs > 0.0100)" |
+| the data gate at 3840, `--detail-scale 15` | **accepted, 0 of 4 skipped**: margin 0.0105-0.0122, noise 0.0040, detail 0.367-0.403, valid 0.0-91.3% |
+| the same scene at 256, as the control | margin 0.0108-0.0126, noise 0.0040, detail 0.374-0.403, valid 0.0-91.2% |
+
+- [x] **The tier is capturable, and the control found the blocker: the content, not the capture.** The capture path
+      needed no change for the tier; what it produced was *smooth*, because the scenes' detail is authored in UV
+      space (`CHECKER_UV_SCALE`, twelve tiles across a surface). A tile that spans a few pixels at 256 spans fifteen
+      times as many at 3840, so bilinear lands within 0.31% of the target and there is nothing left for a model to
+      learn. That is the packer's own stated cause - "the content is too smooth at this resolution for the bilinear
+      baseline to leave anything to recover" - now with a number, a control and a remedy
+- [x] `--detail-scale` in `tools/godot_capture/capture.gd`, default **1.0**: recorded in the capture manifest as
+      `detail_scale` and `checker_uv_scale`, carried into the dataset manifest per capture as `content`, refused
+      when it is not finite and positive, and **verified to be a no-op by default** - the same two frames at 256
+      produce a `color_0000.png` with the same SHA-256 before and after the change. `--detail-scale <size/256>`
+      keeps a tile's pixel footprint constant across tiers, and at 3840 it reproduces the 256 tier's statistics
+      (table above), which is what makes the tier's pairs acceptable to the same gate
+- [ ] **The capture run**: 6 scenes x 200 frames at 3840 with `--detail-scale 15` (~110 GB raw and ~2 h, ~32 GB
+      packed once the raw passes are deleted), or split 4 train + 2 held-out
+- [ ] **The trainer cannot validate at this tier yet, and this is the next code change.** `--lazy` covers the
+      *training* split only (`tools/train_nrr.py:557`) and `val = dataset["val"].materialise()` (`:933`)
+      concatenates every held-out pair - ~8.5 GB for 200 pairs, ~17 GB for 400 at 43 MB/pair. The fix is to stream
+      validation the way the training split is already streamed, with the numbers unchanged: `measure()` (`:2326`)
+      already chunks its forward pass, so what has to become chunk-cumulative is the accumulation - L1, baseline
+      L1, drift and the input ablations are means; SSIM and MS-SSIM are weighted means; PSNR is *not* a mean of
+      per-chunk PSNRs and has to come from an accumulated squared error. `--measure-history` needs the whole
+      history plane set and would refuse under a streamed split rather than half-support it
+- [ ] Train colour+depth+motion(+history+validity/jitter) at the tier and judge it against the **jitter-aware
+      reference** under the protocol's rule, on crops of the tier's frames, at the tier those crops came from
+- [ ] Two cost levers, each measured before it is adopted: the depth+motion pass is written at the target grid and
+      4x-reduced by the packer, so rendering it at the *low* grid would cut 74% of the capture's bytes - and it is
+      the more correct grid, because that is the grid the model and the runtime's warp consume; and a 16:9 capture
+      (1920x1080 -> 3840x2160, exactly the spec's tier and the harness's latency tier) is 44% smaller than the
+      square 1920x1920 -> 3840x3840 the tools take today, at the cost of rectangular sizes through
+      capture/packer/probes plus a content check that the backdrop covers the wider frame
+- [ ] **Then the two spec claims the model cannot carry by itself.** `<16 ms at 1080p -> 4K` is a data-path target,
+      not a model one (measured: 1031 ms with 85-88% of the frame in host-side pixel work - M2/M4), and "2.5M
+      parameters" is a capacity choice this roadmap has already measured to be unhelpful without data (the ch64 arm
+      lost to ch32 inside the seed noise). `models/architecture.md` is rewritten to describe what ships once the
+      tier is trained and measured - not before
 
 ## Engineering rules
 

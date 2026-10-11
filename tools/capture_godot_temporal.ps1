@@ -12,6 +12,9 @@
 # 100% geometry and 1.94 px per frame over geometry, with the objects inset so the frame carries more than one
 # motion layer.
 #
+#   --detail-scale 15 on a 3840 capture, because detail authored in UV space does not survive the tier change:
+#   without it the same scene measures a recoverable margin of 0.0031 against the packer's 0.0100 gate and every
+#   frame is skipped. See capture.gd and docs/roadmap.md M10.7.
 # The same binary, the same flags and the same jitter convention as capture_godot_v4.ps1, so the two datasets
 # differ in content and not in how they were made.
 $ErrorActionPreference = "Continue"

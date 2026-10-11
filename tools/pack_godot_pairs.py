@@ -545,6 +545,13 @@ def main(argv):
         captures.append({"split": "train", "dir": capture_dir, "scene": manifest["scene"],
                          "frames": manifest["frames"],
                          "input": "lowres" if use_lowres else "downscale",
+                         # The content parameters the capture rendered with. Recorded because a dataset is only
+                         # comparable to one produced the same way, and at a raised tier this difference is
+                         # decisive rather than cosmetic: the same scene at 3840 measures a recoverable margin of
+                         # 0.0031 at the default UV frequency (refused by the gate) against 0.0105-0.0122 at
+                         # --detail-scale 15, so a dataset has to say which of the two it is.
+                         "content": {key: manifest[key] for key in ("checker_period", "checker_uv_scale",
+                                                                    "detail_scale") if key in manifest},
                          "manifest_sha256": file_sha256(os.path.join(capture_dir, "manifest.json"))})
         offset += int(manifest["frames"])
     val_entries, val_skipped = [], []
@@ -558,6 +565,8 @@ def main(argv):
         captures.append({"split": "val", "dir": capture_dir, "scene": manifest["scene"],
                          "frames": manifest["frames"],
                          "input": "lowres" if use_lowres else "downscale",
+                         "content": {key: manifest[key] for key in ("checker_period", "checker_uv_scale",
+                                                                    "detail_scale") if key in manifest},
                          "manifest_sha256": file_sha256(os.path.join(capture_dir, "manifest.json"))})
         offset += int(manifest["frames"])
 
@@ -568,8 +577,9 @@ def main(argv):
     for name, kept, skipped in (("train", train_entries, train_skipped), ("val", val_entries, val_skipped)):
         if not kept:
             raise SystemExit("every %s frame was skipped by the data gate (%d of %d): this capture has no pair "
-                             "with enough recoverable detail at this resolution" % (name, len(skipped),
-                                                                                    len(skipped)))
+                             "with enough recoverable detail at this resolution - at a raised tier the scene's "
+                             "detail is authored in UV space, so capture with --detail-scale <capture size / 256> "
+                             "to keep a tile's pixel footprint constant" % (name, len(skipped), len(skipped)))
     skipped = train_skipped + val_skipped
 
     def spread(key, pick):
