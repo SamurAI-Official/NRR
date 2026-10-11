@@ -59,6 +59,26 @@ single before/after would not: four threads beat eight at the three smaller tier
 threads, ~35 spawns in a small frame), and the host portion of the 4K frame only fell 2.01x (886.2 -> 440.2 ms)
 rather than the ~8x the core count suggests - so the remaining host cost is not the four banded passes alone.
 
+## The worker pool against per-call threads (M11.3): same rows, two modes
+
+| tier | spawn (ms) | pool (ms) | difference | frame hash |
+| --- | --- | --- | --- | --- |
+| 128x128 -> 256x256 | 6.95 | **3.60** | **-48%** | `0xf7657931c2f427e5` (both) |
+| 256x256 -> 512x512 | 18.21 | **13.95** | **-23%** | `0x1501ab7292c2a005` (both) |
+| 512x512 -> 1024x1024 | 61.64 | 61.24 | within noise | `0xb9b2e5a12eec4705` (both) |
+| 1920x1080 -> 3840x2160 | 458.30 | 463.11 | within 1% | `0x9c3d3479ea20eec5` (both) |
+
+Reported ms, eight threads, CUDA EP, one session, `NRR_PARALLEL=spawn|pool`; the mode is in each record's
+`configuration:` line. The win is exactly where the per-call cost dominated - which the spawn-cost measurement
+predicted before the pool was written - and the frame hash is identical in every pair, so the two modes render
+the same picture.
+
+**The thread-count crossover, retested with the pool** (reported ms): 128->256: 2t 4.93, 4t 3.56, 8t 3.10;
+256->512: 2t 18.31, 4t 14.94, 8t 15.75 (single runs) - and five repeats each at that tier give **4t 14.92 mean
+over 14.59-15.16 against 8t 14.38 over 12.68-15.49**. So the four-threads-for-small-frames candidate that the
+*spawn* path justified does not survive the pool: the crossover was the spawn cost. The rule stays "one worker per
+hardware thread, capped at eight".
+
 ## Inside the blend stage (M11.3): per resolve, one thread, 1080p -> 4K
 
 | operation | ms | share |

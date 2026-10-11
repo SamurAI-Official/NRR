@@ -13,6 +13,39 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### M11.3, fourth step: a worker pool evaluated against the per-call form, and the crossover retested
+
+The threads the runtime's per-pixel loops use were created per call, which M11.3's sweep had already priced (the
+per-step times of a small frame inflate with the worker count). This step, in `__M113D_COMMIT__`, parks them
+instead - `NRR_PARALLEL=spawn|pool`. **The pool is faster and is not the default**, and both halves of that are
+measurements.
+
+* **The A/B, same host, same session, eight threads, CUDA EP: 128->256 6.95 -> 3.60 ms (-48%), 256->512
+  18.21 -> 13.95 ms (-23%), 512->1024 61.64 -> 61.24 ms (within noise), 1080p->4K 458.3 -> 463.1 ms (within 1%).**
+  The win is exactly where the per-call cost dominated, and **the frame hashes are identical between the two modes
+  at every tier** - the pool changes how the work is scheduled, not what it computes.
+* **And it is not the default, because it deadlocks in a configuration the A/B does not cover.** The
+  CUDA-flavour suite stops with every worker parked and no CPU consumed (measured 0 s of CPU over 10 s, 15
+  threads, no further test output), while the CPU-flavour suite passes 205/205 *with* the pool and both flavours
+  pass 205/205 on the spawn path. The fault is specific to the accelerator path and is not yet diagnosed, so the
+  shipped default is the scheduler that runs every suite green; `NRR_PARALLEL=pool` reproduces it. This is a
+  decision about which default is safe rather than about which is faster.
+* **A first pool defect was caught and fixed by the A/B**, and it is the reason the diagnosis above is a second
+  fault rather than the same one: `threads_(workers)` in the constructor default-constructed eight non-joinable
+  `std::thread`s and the spawn loop appended the real eight, so `threads_.size()` was sixteen while only eight
+  workers could ever increment the completion count and the wait could never be satisfied. It presented as a run
+  that stopped producing output with sixteen parked threads and 0.3 s of CPU. The constructor now starts the
+  vector empty and the wait counts *workers*, taking the count from `threads_.size()` after the spawn loop.
+* **A nested call is refused rather than hung**: the pool runs a nested job on the calling thread alone
+  (`g_nesting`), because the caller of a job waits for workers that would be inside it.
+* **The four-threads-for-small-frames candidate is retired.** It came from the spawn path, and the pool removes
+  the cost that produced it: with the pool, 8 threads beat 4 at 128->256 (3.10 vs 3.56 ms) and at 512->1024
+  (57.42 vs 64.96 ms), and at 256->512 - where a single pair of runs had suggested 4 - **five repeats each give
+  8t 14.38 ms against 4t 14.92 ms** (spread 2.8 vs 0.6), so that edge was noise. Two threads is worse everywhere.
+  The rule stays "one worker per hardware thread, capped at eight".
+* Recorded as `blend-pool-fixture`, whose configuration line states `workers=pool threads=8` - and `workers` in that
+  line is why a row cannot be mistaken for one taken on the other scheduler.
+
 ### M11.3, third step: the blend is attributed, and the residual found three copies and every buffer
 
 The blend was one number - 79% of a 1080p->4K frame - which is not something anyone can work on. This step, in

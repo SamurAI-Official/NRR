@@ -149,6 +149,8 @@ std::string configuration_line() {
      * without it, for the same reason the build configuration is not (M11.3 measured a 2.6x difference
      * between one thread and eight on this host). */
     text += "  threads=" + std::to_string(nrr::worker_threads());
+    /* And how the workers were obtained, because the two paths are not the same measurement (M11.3). */
+    text += "  workers=" + std::string(nrr::parallel_mode_name());
     return text;
 }
 

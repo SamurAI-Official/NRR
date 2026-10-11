@@ -59,8 +59,13 @@ void parallel_for_rows(std::size_t rows, std::size_t work_per_row,
  * only proves something if the eight-thread run really took the parallel path, and on a single-core host or a
  * frame below the threshold it does not. A test asserts the counter does not move with one worker and does
  * with several, alongside the byte comparison. */
+/* How many times parallel_for() has actually spread work over more than one band, ever ... */
 std::size_t parallel_call_count();
 void reset_parallel_call_count();
+
+/* Which way the workers were obtained: "spawn" (created per call) or "pool" (parked and woken). Reported in a
+ * measurement's configuration so a row states it, for the same reason it states its thread count. */
+const char* parallel_mode_name();
 
 } // namespace nrr
 

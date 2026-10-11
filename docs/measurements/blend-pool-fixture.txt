@@ -1,0 +1,35 @@
+﻿NRR tier measurement: blend-pool-fixture
+  when          : 2026-10-11 18:24:33 UTC
+  commit        : b33da48556d1e0203fc1d070cef9d3a650b09901 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (292864 bytes, built 2026-10-11 11:17:36)
+  model         : models/nrr_upscaler_v0.1.onnx  (45082 bytes)
+  model sha256  : 8f63267f6131c25fb89f48861eeb28eb07f077975442a5d06faf970a521ed5e9
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  (the frames reported CUDAExecutionProvider, as requested)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_v0.1.onnx (45082 bytes)  ratio=2  frames=5  warmup=3  motion=0.0000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=pool
+  256x256->512x512: wall=26.87ms  reported=26.44ms  (inference=7.13ms, host overhead=19.30ms)  p50=27.46ms  p99=29.04ms  fps=37.2
+      spread: min 23.71  max 29.05  stddev 2.09  inference share 27.0%  provider CUDAExecutionProvider  frame-hash 0x54908619d860b3f5
+      stages: dlc=0.158ms(0.60%) dld=0.209ms(0.79%) dlm=0.164ms(0.62%) cv=1.528ms(5.78%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=5.425ms(20.52%) rgb=1.597ms(6.04%) bl=16.077ms(60.81%) up=0.525ms(1.99%) q=0.001ms(0.00%) ot=0.752ms(2.85%)
+      blend: blend-state=0.001ms blend-convert-in=0.548ms blend-history-copy=2.178ms blend-motion-plane=1.324ms blend-warp=2.659ms blend-arithmetic=2.434ms blend-convert-out=0.451ms blend-phase-aligned=0.000ms blend-displayed-delta=1.099ms blend-record=2.282ms blend-other=2.655ms  | resolve=15.629ms  buffers=0 (0 MB) over 5 resolves
+  512x512->1024x1024: wall=92.61ms  reported=90.48ms  (inference=20.04ms, host overhead=70.44ms)  p50=98.20ms  p99=102.19ms  fps=10.8
+      spread: min 80.92  max 102.35  stddev 8.78  inference share 22.2%  provider CUDAExecutionProvider  frame-hash 0x675657715c63f3f5
+      stages: dlc=0.282ms(0.31%) dld=0.414ms(0.46%) dlm=0.214ms(0.24%) cv=5.251ms(5.80%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=15.268ms(16.87%) rgb=6.345ms(7.01%) bl=59.768ms(66.05%) up=1.087ms(1.20%) q=0.001ms(0.00%) ot=1.852ms(2.05%)
+      blend: blend-state=0.001ms blend-convert-in=1.764ms blend-history-copy=7.408ms blend-motion-plane=6.419ms blend-warp=8.506ms blend-arithmetic=9.384ms blend-convert-out=1.684ms blend-phase-aligned=0.001ms blend-displayed-delta=3.780ms blend-record=8.088ms blend-other=11.671ms  | resolve=58.704ms  buffers=0 (0 MB) over 5 resolves
+  960x540->1920x1080: wall=127.53ms  reported=124.87ms  (inference=30.11ms, host overhead=94.76ms)  p50=125.05ms  p99=154.48ms  fps=7.8
+      spread: min 114.60  max 155.71  stddev 14.69  inference share 24.1%  provider CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5
+      stages: dlc=0.290ms(0.23%) dld=0.493ms(0.39%) dlm=0.304ms(0.24%) cv=7.920ms(6.34%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=22.797ms(18.26%) rgb=9.698ms(7.77%) bl=79.968ms(64.04%) up=1.071ms(0.86%) q=0.001ms(0.00%) ot=2.325ms(1.86%)
+      blend: blend-state=0.000ms blend-convert-in=2.550ms blend-history-copy=7.655ms blend-motion-plane=7.929ms blend-warp=11.742ms blend-arithmetic=17.107ms blend-convert-out=2.399ms blend-phase-aligned=0.000ms blend-displayed-delta=5.282ms blend-record=10.235ms blend-other=14.149ms  | resolve=79.047ms  buffers=0 (0 MB) over 5 resolves
+  1920x1080->3840x2160: wall=481.66ms  reported=472.18ms  (inference=117.29ms, host overhead=354.89ms)  p50=484.64ms  p99=502.01ms  fps=2.1
+      spread: min 459.22  max 502.40  stddev 15.56  inference share 24.8%  provider CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5
+      stages: dlc=1.247ms(0.26%) dld=1.968ms(0.42%) dlm=1.119ms(0.24%) cv=31.843ms(6.74%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=87.340ms(18.50%) rgb=35.188ms(7.45%) bl=299.102ms(63.35%) up=3.428ms(0.73%) q=0.001ms(0.00%) ot=10.940ms(2.32%)
+      blend: blend-state=0.000ms blend-convert-in=11.700ms blend-history-copy=24.032ms blend-motion-plane=28.182ms blend-warp=38.010ms blend-arithmetic=61.552ms blend-convert-out=9.593ms blend-phase-aligned=0.000ms blend-displayed-delta=20.253ms blend-record=46.316ms blend-other=56.788ms  | resolve=296.428ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-pool-fixture-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-pool-fixture-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-pool-fixture-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-pool-fixture-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\blend-pool-fixture.json

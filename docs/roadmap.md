@@ -2471,11 +2471,34 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
       field" and a retained plane would be a stale field silently reprojected. **Measured: `buffers=0 (0 MB)`
       over five resolves at every tier** - the only genuinely necessary acquisitions are the first ones at a new
       size - with the frame hash unchanged (`0x9c3d3479ea20eec5`), and 205/205 in the suite.
+- [x] **A persistent pool, built and measured against the per-call form - and *not* made the default, because it
+      hangs where the A/B does not look.** `NRR_PARALLEL=spawn|pool` selects between threads created per call and
+      workers parked on a condition variable. **At eight threads, same host, same session: 128->256 6.95 -> 3.60 ms
+      (-48%), 256->512 18.21 -> 13.95 ms (-23%), 512->1024 61.64 -> 61.24 ms (within noise), 1080p->4K 458.3 ->
+      463.1 ms (within 1%)**, with **byte-identical frames at every tier** (the same frame hashes) - the win is
+      exactly where the per-call cost dominated, as the spawn measurement predicted. **But the CUDA-flavour suite
+      deadlocks with the pool as the default** (measured: all workers parked, 0 s of CPU over 10 s, 15 threads,
+      no test output) while the CPU-flavour suite passes 205/205 with it and both flavours pass 205/205 on the
+      spawn path. So the default is `spawn`, the pool stays behind the switch, and the fault - specific to the
+      accelerator path, not yet diagnosed - is reproducible with `NRR_PARALLEL=pool` on the CUDA-flavour suite.
+      This is a decision about which default is safe, not about which is faster.
+      A first defect in the pool *was* caught and fixed by the A/B: `threads_(workers)` default-constructed a
+      second set of non-joinable threads, so the completion wait counted sixteen workers while only eight could
+      finish (sixteen parked threads, 0.3 s of CPU, no output). The constructor now starts the vector empty and the
+      wait counts workers. The remaining hang is a second, distinct fault.
+- [x] **The thread-count crossover was retested with the pool, and the four-threads candidate is retired.** The
+      earlier finding - four threads beat eight at the small tiers - was the per-call spawn cost, and the pool
+      removes it. With the pool: 128->256 8t 3.10 vs 4t 3.56 ms; 512->1024 8t 57.42 vs 4t 64.96 ms; and at
+      256->512, where one pair of runs suggested 4t, **five repeats each give 8t 14.38 ms against 4t 14.92 ms**
+      (spread 2.8 vs 0.6) - so the single-run 5% edge was noise. Two threads is clearly worse everywhere (4.93 ms
+      at 128->256 against 3.10). **No width-dependent rule is justified by the evidence, so the default stays "one
+      worker per hardware thread, capped at eight"**, with the spawn path as the shipped scheduler until the pool's
+      accelerator-path fault is fixed.
 - [ ] **Priority for the rest of this milestone comes from the measurement, not from the order below.** The blend
-      is still the largest stage at the tier (680.4 ms of 878.6 ms accumulating; 118.7 of 288.0 ms in the
-      disengaged scenario the older rows use). Inside it the two per-pixel passes are 70% of the stage
-      (arithmetic 44.8%, warp 25.6%) and they are scalar; the rest is copies, conversions and a frame record that
-      are already banded but are bandwidth-bound.
+      is still the largest stage at the tier (680.4 ms of 878.6 ms at one thread accumulating; 460 ms of the
+      frame with the pool at eight). Inside it the two per-pixel passes are 70% of the stage (arithmetic 44.8%,
+      warp 25.6%) and they are scalar; the rest is copies, conversions and a frame record that are already banded
+      but are bandwidth-bound.
 - [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
       source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`
       (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-817`) and the blend.
