@@ -106,37 +106,28 @@ $arguments += @('--frames', "$Frames", '--warmup', "$Warmup",
 if ($Provider) { $arguments += @('--provider', $Provider) }
 if ($Stages) { $arguments += '--stages' }
 
-# Native tools write progress and warnings to stderr, and PowerShell promotes a *captured* stderr line
-# to a terminating error when the preference is 'Stop' - so this script first failed on an ONNX Runtime
-# warning ("Memcpy nodes are added ... for CUDAExecutionProvider") and then on the entirely-expected
-# "the CUDA provider could not be loaded" note, which is the configuration the engine integrations
-# actually run in. Relaxing the preference inside a helper was not enough: the promotion happened on
-# the pipeline anyway. So the call does not go through a pipeline at all - Start-Process redirects the
-# streams to files, which PowerShell's error stream never sees, and the run is judged by its exit code.
-# tools/build.ps1 documents the same defect class; this avoids it rather than working around it.
-function Invoke-NativeTool {
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$ArgumentList
-    )
-    $stdout = [System.IO.Path]::GetTempFileName()
-    $stderr = [System.IO.Path]::GetTempFileName()
-    try {
-        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru `
-                                 -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $process.WaitForExit()
-        $text = ((Get-Content $stdout -Raw) + (Get-Content $stderr -Raw))
-        return [pscustomobject]@{ Text = $text; ExitCode = $process.ExitCode }
-    } finally {
-        Remove-Item $stdout, $stderr -ErrorAction SilentlyContinue
-    }
+# Native tools write progress and warnings to stderr, and PowerShell promotes a *captured* stderr line to
+# a terminating error when the preference is 'Stop' - so this script first failed on an ONNX Runtime warning
+# ("Memcpy nodes are added ... for CUDAExecutionProvider") and then on the entirely-expected "the CUDA
+# provider could not be loaded" note, which is the configuration the engine integrations actually run in.
+#
+# Two things are deliberate here. The preference is relaxed at *script* scope rather than inside a helper,
+# because that is where it actually takes effect for the pipeline (measured: inside a function the promotion
+# still happened). And the call goes through the call operator rather than Start-Process: the operator quotes
+# arguments, while Start-Process joins them with spaces - which split an absolute model path under
+# "Program Prototype" into several arguments, and Start-Process's ExitCode also read empty in this shell.
+# The run is judged by $LASTEXITCODE, which is what actually reports success.
+$previous_preference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $measured = & $binary @arguments 2>&1 | Out-String
+    $exit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $previous_preference
 }
-
-$run = Invoke-NativeTool -FilePath $binary -ArgumentList $arguments
-$measured = $run.Text
-if ($run.ExitCode -ne 0) {
+if ($exit -ne 0) {
     Write-Host $measured
-    throw "measure_tiers: $Target exited $($run.ExitCode)"
+    throw "measure_tiers: $Target exited $exit"
 }
 
 # What the frames actually reported, per tier, read out of the renders' own debug strings by the tool.
