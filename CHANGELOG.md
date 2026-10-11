@@ -18,7 +18,7 @@ actually printed rather than estimates.
 M2 measured that 85-88% of a 1080p->4K frame is host-side pixel work, and M4/V2 recorded that two verified GPU
 kernels for the two largest conversions are never called by the frame path. Read together, those two facts say
 the tier's cost is what `runtime/` *does*, not what the machine has. This is the write-up of that reading, in
-`__M11_COMMIT__`; every item it adds is unchecked, because the numbers below are the ones it starts from.
+`42a69067`; every item it adds is unchecked, because the numbers below are the ones it starts from.
 
 * **A correction that had to come first: the tier table was measured with a fixture.** Those four rows used
   `models/nrr_upscaler_v0.1.onnx` (`CMakeLists.txt`'s `NRR_SAMPLE_MODEL`), a ~45 KB *untrained* identity fixture
