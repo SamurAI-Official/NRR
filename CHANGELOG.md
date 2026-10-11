@@ -13,6 +13,41 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### M11.3, second step: the blend's loops are row-banded across threads, with the frames still byte-identical
+
+The first step removed ~16.6M per-pixel allocations and took the 1080p->4K tier from 1452.6 ms to 958.5 ms. This
+is the second, in `__M113B_COMMIT__`: the passes themselves now run on more than one thread, and the recorder
+proves the frames did not change.
+
+* **`runtime/nrr_parallel.{h,cpp}`**: row/element bands handed out from an atomic cursor (so a band that costs
+  more than its neighbours does not idle a worker), the calling thread as one of the workers, one worker per
+  hardware thread capped at eight, and a **work threshold in elements** below which a loop stays on the calling
+  thread - which is what keeps the suite's small frames on exactly the pre-threading path. `NRR_THREADS`
+  overrides the count and 1 forces the serial path, which is how the parallel form is checked against its own
+  serial form rather than against a remembered number. Four passes use it: the reprojection warp, the blend
+  arithmetic, and the two RGB8<->float conversions.
+* **Measured, in one session, at 1080p->4K with the blend engaged (reported ms): 1045.6 (1 thread) / 679.6 (2) /
+  648.6 (4) / 575.8 (8)** - and **all four runs report `frame-hash 0x9c3d3479ea20eec5`**, the same hash the
+  pre-threading rows carry. The speedup is the only difference: the pixels are byte-identical, at every thread
+  count and on both execution providers. Cumulatively the tier is now **2.52x** faster than M11.1's row for that
+  scenario (1452.6 -> 575.8 ms), with the same output.
+* **The sweep changed what comes next, which is the point of recording it.** Four threads beat eight at the three
+  smaller tiers (19.1 vs 23.1 ms at 256x256; 73.9 vs 94.8 at 512x512) while eight wins at 4K - the per-call cost
+  of creating threads, ~35 spawns in a small frame - so a persistent pool or a width-dependent threshold is the
+  next lever rather than more threads. And the host portion fell only 2.01x (886.2 -> 440.2 ms) rather than the
+  ~8x the core count suggests, so the remaining 440 ms is not the four banded passes alone; measuring *within*
+  the blend is the next step, not guessing.
+* **A defect this step introduced and then caught, because the parity test counts banded passes**: the threshold
+  was compared against a *row* count while it is defined in elements, so the warp and the blend were left serial
+  - 2160 rows reads as a large number - while the flat element loops beside them were banded. The test reported 3
+  banded passes where the sequence needs 5, which is exactly the question a count answers and a timing of
+  "no change" would have hidden. Fixed by giving the row form the work per row.
+* **Guarded in the suite by a test, not by the benchmark alone**: `test_displayed_frame_is_byte_identical_across_thread_counts`
+  renders the same two-frame sequence through the production path at one worker and at the host's count, and
+  asserts the displayed frames are byte-identical - with two guards against passing vacuously: the frame is
+  rendered above the thread threshold (a smaller frame would compare the serial path against itself), and the
+  many-worker run must actually have banded. Suite: **205 passed, 0 failed** in both Release flavours.
+
 ### M11.3, first step: the blend stops allocating per pixel, and the frames are provably unchanged
 
 M11.1 measured the temporal blend as the largest single host stage of a 1080p->4K frame - 1227.9 ms, 84.5% of it

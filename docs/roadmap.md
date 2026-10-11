@@ -1,4 +1,4 @@
-# NRR Roadmap
+﻿# NRR Roadmap
 
 Single source of truth for what is built, what is verified, and what is blocked.
 The README phase checklist summarises this file - when they disagree, this file
@@ -15,14 +15,14 @@ an ONNX Runtime session, and engine plugins that contained no executable code.
 ## Verified status (re-checked after the engine-verification round; M10 and M11 active)
 
 Current numbers for this tree, because the counts inside the dated sections below are as-measured at their
-revision: **51** entry points in `include/nrr.h` (`NRR_ENTRY_POINT_COUNT`), and **204** executed tests
+revision: **51** entry points in `include/nrr.h` (`NRR_ENTRY_POINT_COUNT`), and **205** executed tests
 (`tests/main.cpp` registers 210, `tests/performance/test_latency.cpp` registers 17 through its own aggregator,
 and 23 of the 227 are compiled out of a desktop build).
 
 | Area | Prior claim | Verified reality |
 | --- | --- | --- |
 | Public C API | complete | Real: 51 entry points in `include/nrr.h`, exercised by the unified suite. Exception: `nrr_frame_begin` is a no-op returning success (`runtime/nrr_c_api.cpp`). |
-| CPU inference | real ONNX execution | Real: `runtime/backend_cpu.cpp` feeds color/depth/motion tensors through an `OrtSession` and returns an RGB8 texture. The suite passes 204/204 with the ORT SDK present (exit 0). |
+| CPU inference | real ONNX execution | Real: `runtime/backend_cpu.cpp` feeds color/depth/motion tensors through an `OrtSession` and returns an RGB8 texture. The suite passes 205/205 with the ORT SDK present (exit 0). |
 | Model quality | "2.5 M-param upscaler" (`models/architecture.md`) | **Real, with the fixture still a fixture.** `models/nrr_upscaler_v0.1.onnx` is still a ~45 KB untrained identity fixture from `tools/gen_sample_model.py` (zero-initialised final conv), and `models/architecture.md` still describes a network that is not what runs. What changed is that a *trained* model exists, passed the trainer's gates and is released: `upscale_msreal_scale.onnx` (461,501 bytes; inputs `color`, `jitter`, `scale`), published with its card at [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) and measured by `docs/parity.md` / `docs/parity-512.md`; it is what all three engine verifications render with. The gates are the trainer's (beat bilinear by 5%, not be within 1e-3 of bilinear, not ignore a declared input it was given, not freeze in training) rather than a PSNR floor - PSNR is reported, not gated, per `docs/evaluation-protocol.md`. |
 | Execution providers | "Phase 7-9 vendor backends wired", "AccelEP routing: CUDA/TensorRT/ROCm/DirectML/OpenVINO" | **Not real**: `SessionOptionsAppendExecutionProvider_*` appears nowhere in the repository. `runtime/onnx_runtime.cpp` only sets `use_cuda_ep_`/`use_directml_ep_` flags and a `provider_note_` string; the session is always created with the default CPU EP. The bundled SDK (`third_party/onnxruntime-win-x64-1.30.0`) is CPU-only - no `onnxruntime_providers_cuda.dll`, `onnxruntime_providers_tensorrt.dll` or `DirectML.dll`. **M2 fixed the CUDA half of this, and its follow-up made the reporting honest:** `SessionOptionsAppendExecutionProvider_CUDA` is called for real, the provider the session actually attached is reported, `nrr_device_create(NULL)` now yields a device whose backend name is `NVIDIA`, and every capability that is claimed is measured rather than derived from an enum (see the M2 follow-up in `CHANGELOG.md`). TensorRT, ROCm, DirectML and OpenVINO remain absent - DirectML is not published for ONNX Runtime 1.30.0 at all, and TensorRT has no Windows wheels on PyPI. |
 | Temporal rendering | Phase 4 complete | **Real but incomplete value**: the render path drives history, motion reprojection and motion-adaptive alpha, blends the reprojected previous frame into the output image, and reports measured state (`runtime/backend_cpu.cpp`, verified by `tests/integration/test_temporal_accumulation.cpp`). It also carries the opt-in **phase-aligned accumulation** (sub-pixel sample integration for jittered renderers, with per-pixel restarts instead of warping, reachable from Unity and Godot) - documented in `specification/temporal_rendering.md` and measured in `tools/aa_resolve_probe.py`. What it accumulates is the untrained fixture, so flicker drops without detail improving; the disocclusion guard (rejecting the history the trust mask refuses and clamping the rest to the current frame's neighbourhood) is built, defaults to the device's own temporal-coherence capability, and is reachable through `nrr_device_set_disocclusion_rejection` and both engine bindings, and the flicker gate is asserted per test but not against a committed baseline. |
@@ -33,7 +33,7 @@ and 23 of the 227 are compiled out of a desktop build).
 | Godot plugin | Phase 11 items checked | **Built and run.** `plugin.cfg` is the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding. Compiled against godot-cpp 10.0.0 and loaded by Godot 4.7.2-stable, which registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a non-passthrough frame (M1.5, `engine_plugins/godot_verify/`). Re-verified once the NVIDIA backend became first-class: `backend=NVIDIA`, `caps.active_backend=NVIDIA` with `neural_acceleration=0` before a model is loaded and `caps.active_backend=CUDAExecutionProvider` with `neural_acceleration=3` (FULL) after, `first_frame_ms=571.712` against `steady_state_ms=0.578`, `RESULT: PASS`. `verify.gd` now reports the cold frame and the steady state separately and asserts the steady state. Windows x86_64 **debug** variant only; the other `nrr.gdextension` entries are unbuilt. Wiring is measured by 9 drift guards in `tests/unit/test_engine_plugins.cpp`. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
 | Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. **M11.1 has since re-measured the 1080p->4K tier per stage with the same fixture and reports 289.0 ms** - 3.6x below this table's figure, and **attributed to the build configuration**: `docs/measurements/` re-derived all four rows with an unoptimized build as the control, and the rows above sit at **0.85-0.93x of Debug and 3.4-3.8x of Release**. **No budget should be derived from the four numbers in this row.** The temporal blend is the largest single host stage at the tier in every configuration measured, and the model is 10-13% of an accumulating frame. |
-| CI | none | `.github/workflows/ci.yml` added in M0 and now **eight jobs**: Windows x64 build + the full suite (**204** tests) against a real ONNX Runtime SDK, where the job fails outright when the SDK is missing rather than passing on a build that cannot honour a frame; a **blocking** AddressSanitizer job over the same suite with the 17 wall-clock benchmarks excluded, so it runs **187 of 204** (`NRR_SKIP_TIMING_TESTS`); `windows-gpu-link`, which fetches the CUDA-flavoured ONNX Runtime and builds, links and tests that configuration because the CPU-flavour job compiles none of that path; the Android cross-build (NDK r27, arm64-v8a); the Vulkan branch with headers only and no SDK; the metrics-harness self-check; the C ABI / managed mirror audit (`tools/check_abi.py`); and the trainer self-checks. |
+| CI | none | `.github/workflows/ci.yml` added in M0 and now **eight jobs**: Windows x64 build + the full suite (**205** tests) against a real ONNX Runtime SDK, where the job fails outright when the SDK is missing rather than passing on a build that cannot honour a frame; a **blocking** AddressSanitizer job over the same suite with the 17 wall-clock benchmarks excluded, so it runs **188 of 205** (`NRR_SKIP_TIMING_TESTS`); `windows-gpu-link`, which fetches the CUDA-flavoured ONNX Runtime and builds, links and tests that configuration because the CPU-flavour job compiles none of that path; the Android cross-build (NDK r27, arm64-v8a); the Vulkan branch with headers only and no SDK; the metrics-harness self-check; the C ABI / managed mirror audit (`tools/check_abi.py`); and the trainer self-checks. |
 
 ---
 
@@ -240,7 +240,7 @@ measured, and temporal/reference data actually changes that image.
       points between seeds, more than any difference between input sets. The single-frame model
       stands, the ONNX input list and the C++ feed path are unchanged, and motion's role stays where
       it already is: the runtime's `TemporalAccumulator`, measured by `TemporalBlendStats`. A ten-seed
-      noise floor later put that comparison on firmer ground still: σ ≈ 2.4 points, and the two-seed
+      noise floor later put that comparison on firmer ground still: Ïƒ â‰ˆ 2.4 points, and the two-seed
       12.12% was itself 2.2 points optimistic.
 - [x] **The model contract re-decided on data that can actually answer it, and it did not change.**
       The result above was measured on a *filtered downscale* input, which destroys sample position -
@@ -278,7 +278,7 @@ measured, and temporal/reference data actually changes that image.
       index tensors on the CPU; that killed models which had trained and passed every gate. All three
       are pinned by `tools/train_nrr.py --self-test`, which CI now runs (it did not before).
 - [x] **Training accuracy characterised, and a one-in-five run failure rate fixed.** Ten seeds of the
-      chosen configuration: mean 9.95% better than bilinear, σ ≈ 2.4 points, with two seeds failing
+      chosen configuration: mean 9.95% better than bilinear, Ïƒ â‰ˆ 2.4 points, with two seeds failing
       outright - one froze with its output at the bilinear baseline, one converged to 2.9%. Both are
       early-training pathologies on a zero-initialised output head, and a five-epoch linear warmup
       removes them: the same ten seeds then all train at a mean of **14.25%** (10.57-19.10%), about
@@ -287,18 +287,18 @@ measured, and temporal/reference data actually changes that image.
       the exported graph (5.2/20.2/41.0/166.5 ms against the fixture's 3.7/17.1/39.7/157.4), which
       shows an eight-times-larger model costing only 1.03-1.42x and the model is not the frame-budget
       bottleneck.
-- [x] **Capacity probe (P2) concluded: ch32 stands.** ch64 (372,803 params, ~4× ch32) scored 23.45%/22.98%
+- [x] **Capacity probe (P2) concluded: ch32 stands.** ch64 (372,803 params, ~4Ã— ch32) scored 23.45%/22.98%
       (mean 23.22%) against ch32's 24.13%/16.79% (mean 20.46%), a +2.75-point mean that is below the
       5-point bar pre-registered in `docs/evaluation-protocol.md`. The capacity smooths the worst case -
       ch64's two seeds span 0.47 points against ch32's 7.34 - but the rule judged *improvement*, not
       variance, so the simpler model carries forward to P3.
 - [x] **Quality levers (P3) concluded: the config is unchanged.** All five levers fall below the 5-point
-      bar against the 10-seed mean of 22.03%: depth+motion (−2.72), charbonnier (+0.92), cosine (+2.58),
-      l1ssim (+1.65) and detail-weight 0.5 (−2.38). Cosine is never worse than l1 on any seed and l1ssim is
+      bar against the 10-seed mean of 22.03%: depth+motion (âˆ’2.72), charbonnier (+0.92), cosine (+2.58),
+      l1ssim (+1.65) and detail-weight 0.5 (âˆ’2.38). Cosine is never worse than l1 on any seed and l1ssim is
       the most seed-stable, but none clears the bar, and a pre-registered threshold is not moved after the
       fact. ch32 colour-only L1 linear-warmup stands; the accuracy phase is done.
 - [x] **Final claim (10 seeds) and the full evaluation stack.** Ten seeds of the chosen config give a mean
-      held-out L1 improvement of **22.03% ± 2.60%** (range 16.79-25.39); the shipped model is the best draw,
+      held-out L1 improvement of **22.03% Â± 2.60%** (range 16.79-25.39); the shipped model is the best draw,
       seed 20261023 at 25.39%. The full stack on that model passes every pre-registered bar on both
       validation scenes: SSIM 0.922/0.940 vs 0.888/0.907, LPIPS 0.038/0.018 vs 0.144/0.101, DISTS
       0.159/0.100 vs 0.294/0.299, VMAF 76.7/81.2 vs 59.8/60.1, detail 0.63/0.55 vs 0.10/0.08, and warping
@@ -324,7 +324,7 @@ measured, and temporal/reference data actually changes that image.
       the host data path**, not the model. FSR 2/3/4 remain deferred: they are temporal upscalers, so a fair
       comparison needs NRR's trained temporal path.
 - [~] Quality harness: `tools/evaluate_model.py` reports PSNR/SSIM/MS-SSIM/LPIPS/DISTS/VMAF/detail
-      retention/temporal stability against the bilinear baseline on the held-out captures, with mean/σ and
+      retention/temporal stability against the bilinear baseline on the held-out captures, with mean/Ïƒ and
       per-scene spread, and `tools/quality_metrics.py` (sixteen self-checks) pins PSNR/SSIM to
       `runtime/nrr_quality.cpp`. The pass/fail bars, scenes, seeds and resolution tiers are pre-registered
       in `docs/evaluation-protocol.md`, and the numpy-only metric core is a CI gate (`metrics-self-check`).
@@ -546,7 +546,7 @@ so the patch series can be retired when ShugoCore re-pins.
 
 | Configuration | Command | Result |
 | --- | --- | --- |
-| Windows x64 Release, ORT SDK present | `tools/build.ps1 -Config Release -BuildDir build-ci -RunTests` | `nrr_tests` **204/204 pass**; 6/6 executables pass (92/92 at that revision - re-measured for this table) |
+| Windows x64 Release, ORT SDK present | `tools/build.ps1 -Config Release -BuildDir build-ci -RunTests` | `nrr_tests` **205/205 pass**; 6/6 executables pass (92/92 at that revision - re-measured for this table) |
 | Windows x64 Release, ORT SDK absent | `cmake -DNRR_ONNXRUNTIME_ROOT=disabled` then build | Configures, compiles and links (it did **not** before fix 1); `nrr_tests` runs 90, 77 pass, 13 fail |
 | Godot GDExtension binding | `godot --headless --path engine_plugins/godot_verify` | Compiled and loaded; `RESULT: PASS` (see M1.5) |
 
@@ -882,7 +882,7 @@ executing on the CPU provider, and every consumer that owns its own source list 
 `NRR_HAVE_CUDA_EP`, which CMake sets exactly when the CUDA provider's runtime is present - so
 ShugoCore's Android build no longer has to ship those two sources on re-pin. Verified both ways: the
 CUDA build still auto-selects `NVIDIA` (114/114, byte-identical frames against the CPU path), and a
-CPU-EP-only ORT SDK builds 113/113 (that revision; the suite is 204 today) with auto-selection on `CPU`.
+CPU-EP-only ORT SDK builds 113/113 (that revision; the suite is 205 today) with auto-selection on `CPU`.
 
 ### Re-pin checklist for ShugoCore (external consumer, pinned at `6c977e2`)
 
@@ -921,7 +921,7 @@ executes its frames through `AcceleratorExecutionKernel::execute_frame` with hos
 the kernel's resources, so the accelerator path runs on a machine with no accelerator at all. It is
 read per frame, so a process can switch routes mid-run.
 
-**Measured (113 at that revision; 204 today): `auto` 113/113, `cpu` 113/113, `kernel` 113/113.** The first `kernel` run failed
+**Measured (113 at that revision; 205 today): `auto` 113/113, `cpu` 113/113, `kernel` 113/113.** The first `kernel` run failed
 `test_temporal_reset_history_api` - `BackendCPU::reset_temporal_history()` was resetting the
 accumulator that was not accumulating, because on that route the history lives in the shared kernel.
 Same defect family as the vendor backends' forwarding, fixed the same way. CI runs the whole suite
@@ -1597,14 +1597,14 @@ warp's marginal contribution beside it, in four arms rather than two.
       part of it a model cannot see for itself - was 1.77% of geometry, and structurally absent until the
       motion pass could hold two layers at all (see M10.3). A lever worth one percent of alignment and two of
       mask, wrapped around a motion input that carries the gain, is exactly what this rule exists to catch
-- [x] **The mask needs no contract change: the runtime computes it.** §4.7 of `specification/frame_contract.md`
+- [x] **The mask needs no contract change: the runtime computes it.** Â§4.7 of `specification/frame_contract.md`
       records the rule, and `runtime/nrr_temporal.cpp::compute_history_trust_mask()` carries it out - geometry,
       source inside the frame, nothing clearly nearer before - from the current depth, the previous frame's
       depth (recorded beside the previous input render, and forgotten with it on a cut or a resolution change)
       and this frame's motion field. A model declares it by naming an input `validity` (or `trust`, or `mask`);
       the CPU backend builds it on demand and feeds it, and zero-fills it when it cannot be built, which is the
       tensor a zeroed control gets. Five tests pin it, including a hand-computed fixture with one rejection
-      reason per pixel and the narrow side of the naming rule; the suite is 171/171 (that revision; the suite is 204 today) and ctest is 6/6
+      reason per pixel and the narrow side of the naming rule; the suite is 171/171 (that revision; the suite is 205 today) and ctest is 6/6
 - [x] **The lever works on coherent data, measured against a baseline that can see what is being measured.**
       godot-v5 (175 pairs, 100% geometry, 3.44% disocclusion, a reprojection worth 15.7% where godot-v4's was
       worth 0.9%) answers the question the old dataset could not. Same seeds, same config:
@@ -1977,8 +1977,8 @@ warp's marginal contribution beside it, in four arms rather than two.
       channel against the accumulator's resolve of the bytes the test uploaded. **That last test caught a real
       defect in this change**: the resolve is at the output grid while the copy-back used the frame's plane
       count, so a 2x upscale wrote its first quarter and left the rest of the frame from the model. Suite
-      192/192, 6/6 executables, exit 0 (that revision; the suite is 204 today); the Godot and Unity bindings and the Godot verify script carry the
-      source, and the spec (§5a), both engine READMEs and the CHANGELOG record it.
+      192/192, 6/6 executables, exit 0 (that revision; the suite is 205 today); the Godot and Unity bindings and the Godot verify script carry the
+      source, and the spec (Â§5a), both engine READMEs and the CHANGELOG record it.
 - [x] **And the placement itself was scaled twice, which the recorded 13.9% would not have survived.** The
       election states its offset in *output* pixels (`phase_aligned_frame_for` scales the jitter once, and a
       unit test pins it) while `add_frame` takes *frame-grid* pixels and scales them itself. Both are right on
@@ -1999,7 +1999,7 @@ warp's marginal contribution beside it, in four arms rather than two.
       accumulator through `apply`, and a second accumulator in the unit `add_frame` documents - requires the
       same plane, and asserts the doubled placement is a different one; it fails with the scaling put back), the
       end-to-end reference was corrected to state the rule rather than mirror the code, the missing unit is
-      written into `add_frame`'s own documentation, and the spec (§5a) states the conversion. Suite **193/193**,
+      written into `add_frame`'s own documentation, and the spec (Â§5a) states the conversion. Suite **193/193**,
       6/6 executables, exit 0.
 - [x] **And the arrangement's own number is a *one frame* number, which the runtime never displays.** With the
       placement fixed, the derive for the input-render resolve was written
@@ -2417,7 +2417,7 @@ per tier after three warm-ups (the fixture above):**
 - **Gate (met):** the extended breakdown passes at all four tiers on both paths; the stages plus the residual
   equal the published total within 5% (residual 0.5-3.3%); the conversions are non-zero; the session run never
   exceeds the published inference figure; the disabled instrument reads zero clocks and the enabled one reads
-  twenty-two. Suite: **204 passed, 0 failed** in both the CPU-flavour and CUDA-flavour Release builds.
+  twenty-two. Suite: **205 passed, 0 failed** in both the CPU-flavour and CUDA-flavour Release builds.
 
 **Follow-up in the same milestone, because the table above has a hole in it:** those rows come from the latency
 test's frames, which carry motion above the runtime's threshold - so the temporal blend is *disengaged* in every
@@ -2461,9 +2461,28 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
 - [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
       source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`
       (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-817`) and the blend.
-- [ ] The independent stages row-banded across threads (a small pool, created once), because the runtime
-      currently has none - and the five passes above are pure per-pixel maps, which is the case where row banding
-      is exact rather than approximate.
+- [x] **The passes are row-banded across threads** (`runtime/nrr_parallel.{h,cpp}`): the warp, the blend and the
+      two RGB8<->float conversions run over disjoint bands of rows or elements, on the calling thread plus
+      workers (one per hardware thread, capped at eight), with a work threshold below which a loop stays on the
+      calling thread alone - which is what keeps the suite's small frames on the serial path rather than relying
+      on bands to agree. **Measured in one session at 1080p->4K accumulating (reported ms): 1045.6 (1 thread) /
+      679.6 (2) / 648.6 (4) / 575.8 (8)**, and **every one of those runs reports frame hash
+      `0x9c3d3479ea20eec5`** - the same hash the pre-threading rows carry, so the frames are byte-identical and
+      the speedup is the only difference. The parity test
+      (`test_displayed_frame_is_byte_identical_across_thread_counts`) guards it in CI: one worker must take the
+      serial path, the many-worker run must really band (the test asserts the banded-pass count, which is what
+      caught the threshold defect below), and the two displayed frames must match byte for byte.
+- [ ] **The sweep found two things that change what comes next**, both measured rather than inferred. **Four
+      threads beat eight at the three smaller tiers** (19.1 vs 23.1 ms at 256x256, 73.9 vs 94.8 at 512x512) while
+      eight wins at 4K - the cost of creating threads per call, roughly 35 spawns in a small frame - so a
+      **persistent pool** (or a higher threshold at small widths) is the next lever rather than more threads. And
+      **the host share only fell 2.01x** (886.2 -> 440.2 ms) rather than the ~8x the core count suggests, so the
+      remaining 440 ms is not the four banded passes alone: the next step is to measure *within* the blend (the
+      history copy, the conversions and resamples that are still serial, the phase-aligned pass) rather than
+      guess - which is how the allocation was found. A defect this step also fixed, because the counter made it
+      visible: the threshold was compared against a *row* count while it is defined in elements, so the warp and
+      the blend were left serial (2160 rows reads as a large number) while the flat element loops beside them were
+      banded; the test reported 3 banded passes where 5 were expected.
 - [ ] AVX2 as a **dispatched fast path**, with the baseline stated: SSE2 required, AVX2 optional, selected by
       CPUID, so no build drops the floor without saying so.
 - **Gate:** a scalar-vs-vector parity test - **byte-exact** for the integer conversions, and the one inexact
@@ -2633,7 +2652,7 @@ required. CMake auto-detects `third_party/onnxruntime-*` (or accepts
 `-DNRR_ONNXRUNTIME_ROOT=<path>`). Without the SDK the build now compiles (M1.4), but its
 suite does not pass - 90 run, 77 pass, 13 fail - because the placeholder session declares a
 fabricated `512x512` input and fabricated temporal stats. CI refuses to run in that
-configuration. With the SDK the suite is 204/204 (92 at that revision).
+configuration. With the SDK the suite is 205/205 (92 at that revision).
 
 The engine plugins are built separately and are not part of the test suite; each has a verification project that
 runs it in the real engine and reports a result rather than a compile:

@@ -1,0 +1,31 @@
+﻿NRR tier measurement: blend-threads4-fixture
+  when          : 2026-10-11 17:02:58 UTC
+  commit        : 54fbce37dbcfbc8105213544f3d2f6bacc79bafa (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (283648 bytes, built 2026-10-11 10:02:08)
+  model         : models/nrr_upscaler_v0.1.onnx  (45082 bytes)
+  model sha256  : 8f63267f6131c25fb89f48861eeb28eb07f077975442a5d06faf970a521ed5e9
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  frame-hash 0x54908619d860b3f5, CUDAExecutionProvider  frame-hash 0x675657715c63f3f5, CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5, CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5  (MISMATCH: requested nvidia and the frames reported 'CUDAExecutionProvider  frame-hash 0x54908619d860b3f5, CUDAExecutionProvider  frame-hash 0x675657715c63f3f5, CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5, CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5' - the runtime fell back to the CPU execution provider)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_v0.1.onnx (45082 bytes)  ratio=2  frames=5  warmup=3  motion=0.0000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=4
+  256x256->512x512: wall=19.32ms  reported=19.13ms  (inference=3.54ms, host overhead=15.59ms)  p50=19.30ms  p99=20.15ms  fps=51.8
+      spread: min 18.59  max 20.18  stddev 0.51  inference share 18.5%  provider CUDAExecutionProvider  frame-hash 0x54908619d860b3f5
+      stages: dlc=0.016ms(0.09%) dld=0.037ms(0.19%) dlm=0.018ms(0.09%) cv=0.861ms(4.50%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=2.887ms(15.09%) rgb=1.057ms(5.53%) bl=14.007ms(73.24%) up=0.196ms(1.02%) q=0.001ms(0.01%) ot=0.047ms(0.25%)
+  512x512->1024x1024: wall=75.23ms  reported=73.89ms  (inference=13.17ms, host overhead=60.72ms)  p50=74.80ms  p99=77.79ms  fps=13.3
+      spread: min 72.94  max 77.84  stddev 1.78  inference share 17.8%  provider CUDAExecutionProvider  frame-hash 0x675657715c63f3f5
+      stages: dlc=0.082ms(0.11%) dld=0.171ms(0.23%) dlm=0.067ms(0.09%) cv=3.652ms(4.94%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=9.984ms(13.51%) rgb=4.711ms(6.38%) bl=53.809ms(72.82%) up=0.531ms(0.72%) q=0.001ms(0.00%) ot=0.883ms(1.19%)
+  960x540->1920x1080: wall=149.52ms  reported=146.91ms  (inference=26.07ms, host overhead=120.85ms)  p50=145.64ms  p99=157.69ms  fps=6.7
+      spread: min 145.44  max 157.88  stddev 5.13  inference share 17.7%  provider CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5
+      stages: dlc=0.278ms(0.19%) dld=0.407ms(0.28%) dlm=0.219ms(0.15%) cv=7.562ms(5.15%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=19.525ms(13.29%) rgb=8.310ms(5.66%) bl=107.470ms(73.15%) up=1.277ms(0.87%) q=0.001ms(0.00%) ot=1.865ms(1.27%)
+  1920x1080->3840x2160: wall=659.22ms  reported=648.58ms  (inference=115.72ms, host overhead=532.87ms)  p50=661.09ms  p99=773.20ms  fps=1.5
+      spread: min 578.13  max 777.78  stddev 67.13  inference share 17.8%  provider CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5
+      stages: dlc=1.133ms(0.17%) dld=2.132ms(0.33%) dlm=1.005ms(0.15%) cv=33.027ms(5.09%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=86.438ms(13.33%) rgb=38.514ms(5.94%) bl=472.080ms(72.79%) up=4.402ms(0.68%) q=0.001ms(0.00%) ot=9.849ms(1.52%)
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-threads4-fixture-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-threads4-fixture-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-threads4-fixture-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-threads4-fixture-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\blend-threads4-fixture.json

@@ -274,6 +274,8 @@ void run_all_tests() {
     NRR_RUN_TEST(test_temporal_scene_change_discards_history);
     NRR_RUN_TEST(test_temporal_reset_history_api);
     NRR_RUN_TEST(test_temporal_resolution_change_discards_history);
+    /* M11.3: the frame must not depend on how many threads computed it. */
+    NRR_RUN_TEST(test_displayed_frame_is_byte_identical_across_thread_counts);
     NRR_RUN_TEST(test_phase_aligned_input_render_source_through_the_device);
 NRR_RUN_TEST(test_input_render_resolve_matches_the_derived_plane);
     NRR_RUN_TEST(test_disocclusion_guard_on_still_accumulates_through_the_pipeline);

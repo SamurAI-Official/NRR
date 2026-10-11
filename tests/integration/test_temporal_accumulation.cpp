@@ -16,6 +16,7 @@
 #include "test_framework.h"
 #include "nrr.h"
 #include "nrr_temporal.h"
+#include "nrr_parallel.h"
 #include "nrr_inference.h"
 #include "generated/plane_case.h"
 #include <algorithm>
@@ -895,6 +896,89 @@ NRR_TEST(test_input_render_resolve_matches_the_derived_plane) {
     NRR_EXPECT_TRUE(differing > 0,
                     "the two sources must not display the same picture from the same frame, or the check above "
                     "is about this scene rather than about which frames were integrated");
+}
+
+// --- 10. Thread parity: the frame does not depend on how many threads computed it ---
+//
+// M11.3 row-bands the per-pixel loops the runtime owns - the reprojection warp, the blend, and the two
+// RGB8<->float conversions. Every output element keeps the identical scalar expression, so the displayed frame
+// must be byte-identical whether one thread or eight computed it. This asserts that through the production
+// render path (nrr_render -> BackendCPU) rather than on a component, and two things keep it from passing
+// vacuously: the frame is rendered above the thread minimum (a smaller frame takes the serial path on both
+// sides and would compare the serial code against itself), and the parallel path's use is counted, so "eight
+// threads gives the same bytes" cannot pass by the eight-thread run never threading at all.
+NRR_TEST(test_displayed_frame_is_byte_identical_across_thread_counts) {
+    const uint32_t in_w = 320;
+    const uint32_t in_h = 180;
+    const std::size_t out_pixels =
+        static_cast<std::size_t>(in_w) * 2 * static_cast<std::size_t>(in_h) * 2;
+    const uint32_t default_threads = worker_threads();
+
+    NRR_EXPECT_TRUE(out_pixels > parallel_thread_minimum() * 2,
+                    "the frame under test is large enough for the runtime to band it at all");
+
+    auto render_and_read = [&](uint32_t threads, std::size_t& banded_passes,
+                               std::string& debug) -> std::vector<uint8_t> {
+        TemporalFixture fx;
+        make_fixture(fx);
+        make_textures(fx, in_w, in_h);
+        upload_constant_motion(fx, 0.0f, 0.0f);
+        set_worker_threads(threads);
+        reset_parallel_call_count();
+        upload_ramp(fx, kOffsetA);
+        render_frame(fx, 1, 0.0f); /* the frame the second one accumulates against */
+        upload_ramp(fx, kOffsetB);
+        const NRRFrameOutput second = render_frame(fx, 2, 0.0f);
+        std::vector<uint8_t> displayed = download_rgb(fx, second.color);
+        banded_passes = parallel_call_count();
+        debug.assign(second.stats.debug_info);
+        set_worker_threads(1); /* leave the process on the serial path */
+        return displayed;
+    };
+
+    std::size_t serial_passes = 0;
+    std::size_t threaded_passes = 0;
+    std::string serial_debug;
+    std::string threaded_debug;
+    const std::vector<uint8_t> serial = render_and_read(1, serial_passes, serial_debug);
+    const std::vector<uint8_t> threaded =
+        render_and_read(default_threads, threaded_passes, threaded_debug);
+
+    NRR_EXPECT_EQ(serial_passes, static_cast<std::size_t>(0),
+                  "one worker takes the serial path, so this compares against the pre-threading code");
+    if (default_threads > 1) {
+        NRR_EXPECT_TRUE(threaded_passes > 0,
+                        "the many-thread run really banded its passes - otherwise the byte comparison "
+                        "below is vacuous");
+    } else {
+        std::cout << "  (this host reports one hardware thread: the parallel path is unreachable, so the "
+                     "comparison is the serial path against itself)" << std::endl;
+    }
+
+    NRR_EXPECT_EQ(serial.size(), threaded.size(), "both runs produced a displayed frame");
+    size_t first_difference = serial.size();
+    for (size_t i = 0; i < serial.size() && i < threaded.size(); ++i) {
+        if (serial[i] != threaded[i]) {
+            first_difference = i;
+            break;
+        }
+    }
+    NRR_EXPECT_TRUE(first_difference == serial.size(),
+                    "the displayed frame is byte-identical whether one thread or " +
+                        std::to_string(default_threads) + " computed it (first differing byte: " +
+                        (first_difference == serial.size() ? std::string("none")
+                                                           : std::to_string(first_difference)) +
+                        ")");
+    /* The blend is what the banding is for, so both runs have to have taken it - a sequence that fell through
+     * to "no previous frame" would compare two unwarped frames and prove nothing about the warp or the
+     * blend. The debug strings are not compared byte for byte: the reported blend delta is a sum whose order
+     * differs between the two runs, and its printed precision is four decimals. */
+    NRR_EXPECT_TRUE(serial_debug.find("accumulated") != std::string::npos &&
+                        threaded_debug.find("accumulated") != std::string::npos,
+                    "both runs accumulated (so the blend under test ran); threaded: " + threaded_debug);
+    std::cout << "  thread parity: " << in_w << "x" << in_h << " -> " << (in_w * 2) << "x" << (in_h * 2)
+              << ", " << default_threads << " worker(s), " << threaded_passes
+              << " banded pass(es) in the sequence" << std::endl;
 }
 
 } // namespace test

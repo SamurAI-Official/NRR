@@ -10,9 +10,11 @@
 
 #include "nrr_temporal.h"
 #include "nrr_inference.h"
+#include "nrr_parallel.h"
 #include "accel_texture.h"
 #include <cmath>
 #include <algorithm>
+#include <mutex>
 
 namespace nrr {
 
@@ -242,33 +244,39 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
                       ? input.temporal.motion_vectors_scale
                       : 1.0f;
 
-    for (uint32_t y = 0; y < h; ++y) {
-        for (uint32_t x = 0; x < w; ++x) {
-            const size_t pixel = static_cast<size_t>(y) * w + x;
-            const size_t mv_idx = pixel * 2;
-            if (!motion_covers_frame && mv_idx + 1 >= previous.motion_data.size()) continue;
-            float dx = previous.motion_data[mv_idx] * scale;
-            float dy = previous.motion_data[mv_idx + 1] * scale;
-            float sx = static_cast<float>(x) - dx;
-            float sy = static_cast<float>(y) - dy;
+    /* Row-banded (M11.3): rows are independent - a pixel reads its own motion and its neighbours' colour and
+     * writes only its own outputs - so the bands are disjoint by construction and every pixel keeps the
+     * identical expression. A frame below the threshold runs this on the calling thread alone. */
+    parallel_for_rows(h, static_cast<std::size_t>(w) * color_channels,
+                      [&](std::size_t band_begin, std::size_t band_end) {
+        for (std::size_t y = band_begin; y < band_end; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const size_t pixel = y * w + x;
+                const size_t mv_idx = pixel * 2;
+                if (!motion_covers_frame && mv_idx + 1 >= previous.motion_data.size()) continue;
+                float dx = previous.motion_data[mv_idx] * scale;
+                float dy = previous.motion_data[mv_idx + 1] * scale;
+                float sx = static_cast<float>(x) - dx;
+                float sy = static_cast<float>(y) - dy;
 
-            /* A value, not a vector. These two lines used to construct and destroy a std::vector<float>
-             * per pixel each - ~16.6M allocations for a 1080p->4K frame, which is the cost this change
-             * removes; the arithmetic inside bilinear_sample is untouched. */
-            const BilinearSample sample =
-                bilinear_sample(previous.color_data, w, h, color_channels, sx, sy);
-            const size_t dst = pixel * color_channels;
-            for (uint32_t c = 0; c < color_channels; ++c) {
-                if (dst + c < warped_color.size()) warped_color[dst + c] = sample[c];
-            }
+                /* A value, not a vector. These two lines used to construct and destroy a std::vector<float>
+                 * per pixel each - ~16.6M allocations for a 1080p->4K frame, which is the cost that change
+                 * removed; the arithmetic inside bilinear_sample is untouched. */
+                const BilinearSample sample =
+                    bilinear_sample(previous.color_data, w, h, color_channels, sx, sy);
+                const size_t dst = pixel * color_channels;
+                for (uint32_t c = 0; c < color_channels; ++c) {
+                    if (dst + c < warped_color.size()) warped_color[dst + c] = sample[c];
+                }
 
-            if (have_prev_depth) {
-                const float ds =
-                    bilinear_sample(previous.depth_data, w, h, depth_channels, sx, sy)[0];
-                if (pixel < warped_depth.size()) warped_depth[pixel] = ds;
+                if (have_prev_depth) {
+                    const float ds =
+                        bilinear_sample(previous.depth_data, w, h, depth_channels, sx, sy)[0];
+                    if (pixel < warped_depth.size()) warped_depth[pixel] = ds;
+                }
             }
         }
-    }
+    });
     return true;
 }
 
@@ -318,22 +326,34 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
     double accumulated_delta = 0.0;
     uint32_t rejected = 0;
     uint32_t clamped = 0;
-    for (uint32_t y = 0; y < height; ++y) {
-        for (uint32_t x = 0; x < width; ++x) {
+    /* Row-banded (M11.3). Each band writes disjoint rows of `current` and reads only shared inputs, so the
+     * bands are race-free; the counters are exact, and the delta is summed per band and combined afterwards -
+     * so the only quantity that differs from the serial run is the order those deltas are added in, a
+     * published statistic printed to four decimals. Every pixel keeps the identical expression, which is why
+     * the frame bytes are unchanged rather than merely close. */
+    std::mutex reduce_mutex;
+    parallel_for_rows(height, static_cast<std::size_t>(width) * channels,
+                      [&](std::size_t band_begin, std::size_t band_end) {
+        double band_delta = 0.0;
+        uint32_t band_rejected = 0;
+        uint32_t band_clamped = 0;
+        for (std::size_t y = band_begin; y < band_end; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
             const size_t p = static_cast<size_t>(y) * width + x;
             if (has_validity && (*validity)[p] <= 0.0f) {
                 /* History the runtime knows is wrong is not blended at all - not blended with a small
                  * weight, not blended and then corrected. The pixel keeps the current frame. */
-                ++rejected;
+                ++band_rejected;
                 continue;
             }
             /* The neighbourhood, clamped to the frame, is the same box for every channel at this pixel. */
-            uint32_t x0 = 0, y0 = 0, x1 = width - 1, y1 = height - 1;
+            uint32_t x0 = 0, x1 = width - 1;
+            std::size_t y0 = 0, y1 = height - 1;
             if (has_validity) {
                 x0 = (x > TEMPORAL_CLAMP_RADIUS) ? x - TEMPORAL_CLAMP_RADIUS : 0u;
                 y0 = (y > TEMPORAL_CLAMP_RADIUS) ? y - TEMPORAL_CLAMP_RADIUS : 0u;
                 x1 = std::min(x + TEMPORAL_CLAMP_RADIUS, width - 1);
-                y1 = std::min(y + TEMPORAL_CLAMP_RADIUS, height - 1);
+                y1 = std::min<std::size_t>(y + TEMPORAL_CLAMP_RADIUS, height - 1);
             }
             bool pixel_clamped = false;
             for (uint32_t c = 0; c < channels; ++c) {
@@ -345,9 +365,9 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
                      * history's colour has to fall inside to be believed. */
                     float lo = current[i];
                     float hi = current[i];
-                    for (uint32_t ny = y0; ny <= y1; ++ny) {
+                    for (std::size_t ny = y0; ny <= y1; ++ny) {
                         for (uint32_t nx = x0; nx <= x1; ++nx) {
-                            const size_t j = (static_cast<size_t>(ny) * width + nx) * channels + c;
+                            const size_t j = (ny * width + nx) * channels + c;
                             if (j >= current.size()) continue;
                             lo = std::min(lo, current[j]);
                             hi = std::max(hi, current[j]);
@@ -362,12 +382,17 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
                     }
                 }
                 const float blended = (1.0f - alpha) * current[i] + alpha * history;
-                accumulated_delta += std::fabs(blended - current[i]);
+                band_delta += std::fabs(blended - current[i]);
                 current[i] = blended;
             }
-            if (pixel_clamped) ++clamped;
+            if (pixel_clamped) ++band_clamped;
+            }
         }
-    }
+        std::lock_guard<std::mutex> lock(reduce_mutex);
+        accumulated_delta += band_delta;
+        rejected += band_rejected;
+        clamped += band_clamped;
+    });
 
     if (stats) {
         stats->mean_abs_delta =
@@ -551,20 +576,26 @@ void TemporalStateManager::reset() {
 static void rgb8_to_interleaved_float(const std::vector<uint8_t>& rgb8,
                                       std::vector<float>& out) {
     out.resize(rgb8.size());
-    for (size_t i = 0; i < rgb8.size(); ++i) {
-        out[i] = static_cast<float>(rgb8[i]) * (1.0f / 255.0f);
-    }
+    /* Row-banded (M11.3): a flat element loop, so the bands are element ranges and every element keeps the
+     * identical expression. Below the thread threshold it runs on the calling thread alone. */
+    parallel_for_elements(rgb8.size(), [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            out[i] = static_cast<float>(rgb8[i]) * (1.0f / 255.0f);
+        }
+    });
 }
 
 /* Inverse of rgb8_to_interleaved_float(), clamping to the representable range. */
 static void interleaved_float_to_rgb8(const std::vector<float>& in,
                                       std::vector<uint8_t>& out) {
     out.resize(in.size());
-    for (size_t i = 0; i < in.size(); ++i) {
-        float v = in[i];
-        v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-        out[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
-    }
+    parallel_for_elements(in.size(), [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            float v = in[i];
+            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            out[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+        }
+    });
 }
 
 /* Nearest-neighbour resampling of a motion field from the frame *input*

@@ -42,6 +42,23 @@ them:
 | `blend-allocating-fixture` (accumulating) | CUDA | 1348.4 | 1358.1 | 180.2 | 1168.2 | 153.3 | 1115.3 (82.7%) |
 | `blend-allocfree-fixture` (accumulating) | CUDA | **958.5** | 967.8 | 145.6 | 813.0 | 117.2 | **756.3 (78.9%)** |
 
+## The thread sweep (M11.3): one configuration, four thread counts, one hash
+
+| threads | 256x256 | 512x512 | 960x540 | 1920x1080 | frame hash |
+| --- | --- | --- | --- | --- | --- |
+| 1 (`cuda`/`cpu`-threads1 rows) | 27.75 | 129.03 | 253.14 | 1045.62 | `0x9c3d3479ea20eec5` |
+| 2 | 23.78 | 90.91 | 181.22 | 679.59 | `0x9c3d3479ea20eec5` |
+| 4 | **19.13** | **73.89** | **146.91** | 648.58 | `0x9c3d3479ea20eec5` |
+| 8 | 23.11 | 94.82 | 185.55 | **575.76** | `0x9c3d3479ea20eec5` |
+| 8 on the CPU provider | - | - | - | 1847.10 | `0x9c3d3479ea20eec5` |
+
+Reported ms, accumulating scenario, CUDA EP unless stated, Release, this host (`NRR_THREADS` set per run, and
+every row's `configuration:` line states the count it ran with). **The frame hash is identical in every row**,
+which is the point of reporting one: the threading is a speedup and not a change. Two things the sweep says that a
+single before/after would not: four threads beat eight at the three smaller tiers (the per-call cost of creating
+threads, ~35 spawns in a small frame), and the host portion of the 4K frame only fell 2.01x (886.2 -> 440.2 ms)
+rather than the ~8x the core count suggests - so the remaining host cost is not the four banded passes alone.
+
 ## Every row also carries a frame hash
 
 `nrr_bench` reports `frame-hash` per tier: FNV-1a over the displayed RGB8 plane, chained across the measured

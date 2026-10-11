@@ -350,6 +350,7 @@ set(NRR_RUNTIME_SOURCES
     ${CMAKE_SOURCE_DIR}/runtime/nrr_test_backend.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_temporal.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_frame_stages.cpp
+    ${CMAKE_SOURCE_DIR}/runtime/nrr_parallel.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_cuda_driver.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_conditioning.cpp
     ${CMAKE_SOURCE_DIR}/runtime/nrr_inference.cpp

@@ -35,6 +35,8 @@
 /* The per-stage frame record, so this benchmark can say where a frame's time went rather than
  * only how long it took in three buckets (docs/roadmap.md M11.1). */
 #include "nrr_frame_stages.h"
+/* The runtime's own thread count, so a row states how many threads it ran with (M11.3). */
+#include "nrr_parallel.h"
 
 #include <algorithm>
 #include <chrono>
@@ -140,6 +142,10 @@ std::string configuration_line() {
     text += "  onnxruntime=unknown";
 #endif
     text += std::string("  stage-timing=") + (nrr::stage_timing_enabled() ? "on" : "off");
+    /* How many threads the runtime's own loops ran with. A latency row is not comparable to another row
+     * without it, for the same reason the build configuration is not (M11.3 measured a 2.6x difference
+     * between one thread and eight on this host). */
+    text += "  threads=" + std::to_string(nrr::worker_threads());
     return text;
 }
 
