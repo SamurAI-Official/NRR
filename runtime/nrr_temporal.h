@@ -325,6 +325,16 @@ public:
                             std::vector<float>& motion,
                             uint32_t& width, uint32_t& height) const;
 
+    /* The previous frame's colour, and nothing else.
+     *
+     * The three-vector form copies colour, depth and motion out of the ring, and at 1080p->4K that is ~200 MB
+     * per frame - of which the reprojection blend uses one of the three (M11.3's blend profile measured it as
+     * `history_copy_ms`). This is the same retrieval rule with the same width/height, for a caller that does not
+     * use the other two. */
+    bool get_previous_frame_color_only(uint64_t current_frame_index,
+                                       std::vector<float>& color,
+                                       uint32_t& width, uint32_t& height) const;
+
     /* Also reports the offset the retrieved frame was sampled at. The retrieved
      * history has to be de-jittered with *its own* offset, not the present frame's:
      * it was captured on a different sub-pixel grid, and correcting it with the
@@ -369,6 +379,68 @@ private:
     mutable std::mutex mutex_;
 };
 
+/* Where the time inside one temporal resolve went, and how many buffers it acquired (M11.3).
+ *
+ * The frame-level record (runtime/nrr_frame_stages.h) carries one `Blend` figure, which is 78.9% of a
+ * 1080p->4K frame and says nothing about *which* of its operations owns the time. This is the same instrument
+ * one level down, and it is what the allocation and threading work is aimed with rather than a guess about
+ * where the milliseconds are.
+ *
+ * Recorded only while stage timing is on (NRR_STAGE_TIMING=1 / set_stage_timing_enabled), and it accumulates
+ * over frames: the `ms` fields are sums and `frames` says how many resolves they cover, so a consumer reads an
+ * average from the two. `other_ms` is the residual - the stage total minus these steps - so the split cannot be
+ * made to add up by construction, and a large residual is the finding that an operation is missing from the
+ * list. */
+struct BlendProfile {
+    double state_ms = 0.0;              /* the history weight and the scene-change check, before the buffers */
+    double displayed_to_float_ms = 0.0; /* the frame being blended, RGB8 -> interleaved float */
+    double history_copy_ms = 0.0;       /* the previous frame out of the history ring */
+    double motion_plane_ms = 0.0;       /* the motion field decoded and resampled to the output grid */
+    double warp_ms = 0.0;               /* the reprojection: buffer acquisition + the bilinear gather */
+    double arithmetic_ms = 0.0;         /* the per-pixel blend itself */
+    double to_rgb8_ms = 0.0;            /* interleaved float -> RGB8, after the blend */
+    double phase_aligned_ms = 0.0;      /* the opt-in phase-aligned integration, when it is on */
+    /* The two operations that follow the blend and were, until they were named here, most of the residual: the
+     * frame-to-frame difference of what is displayed (a pass over the whole frame) and the recording of that
+     * frame as the next frame's history (at 1080p->4K a 100 MB copy into the ring). */
+    double displayed_delta_ms = 0.0;
+    double record_ms = 0.0;
+    double other_ms = 0.0;              /* the residual */
+    double total_ms = 0.0;              /* this function, i.e. the resolve without the backend's history
+                                         * recording, which happens after apply() returns and is inside the
+                                         * frame-level `Blend` stage but outside this profile - so the two
+                                         * totals are not the same number, deliberately and visibly */
+    /* Buffers the stage acquired, and the bytes they asked for. Counted at the sites that (re)size the
+     * runtime's own buffers rather than by intercepting the allocator, because those are the ones a caller can
+     * reuse - and after the reuse work the number is expected to be zero on frames after the first at a given
+     * size, which is what makes "genuinely necessary" a measurement rather than an opinion. */
+    unsigned allocations = 0;
+    unsigned long long allocated_bytes = 0;
+    unsigned frames = 0;
+    bool measured = false;
+};
+
+/* The steps a profile records, so a consumer can iterate the split without knowing the struct's layout.
+ * `blend_step_count()` is how many there are, and both accessors are safe for an index outside it. */
+int blend_step_count();
+const char* blend_step_name(int step);
+double blend_step_ms(const BlendProfile& profile, int step);
+/* The write side of the same list. It exists so the delta below - and anything else that has to copy a profile
+ * field by field - cannot silently miss a step that was added later: the getter, the setter and the delta live
+ * together, and the benchmark calls the delta rather than duplicating the field list. (That duplication was a
+ * real defect while the profile was being built: two steps were measured correctly and reported as zero.) */
+void set_blend_step_ms(BlendProfile& profile, int step, double value);
+/* `after` minus `before`, over every step, the total, the counters and the frame count - the form a benchmark
+ * needs, because the profile is a process-wide running record and a per-tier figure is a difference. */
+BlendProfile blend_profile_delta(const BlendProfile& before, const BlendProfile& after);
+
+/* The blend profile of the most recent resolve in this process, whichever path performed it, so a benchmark can
+ * read the split without reaching through a backend - the same pattern and the same limitation as
+ * last_frame_stages() (diagnostic state describing the latest frame, not synchronised). It is the caller's
+ * *accumulated* record, so `frames` says how many resolves it covers and the milliseconds are sums. */
+void publish_blend_profile(const BlendProfile& profile);
+const BlendProfile& last_blend_profile();
+
 class TemporalRenderer {
 public:
     TemporalRenderer();
@@ -377,7 +449,12 @@ public:
     void shutdown();
     bool process_frame(const NRRFrameInput& input, NRRFrameOutput& output, const TemporalHistory& history);
     bool warp_previous_output(const NRRFrameInput& input, const HistoryEntry& previous,
-                              std::vector<float>& warped_color, std::vector<float>& warped_depth);
+                              std::vector<float>& warped_color, std::vector<float>& warped_depth,
+                              /* The field to reproject with when it is not the entry's own: the resolve passes
+                               * the current frame's, which is what backward reprojection requires. A parameter
+                               * rather than a copy of the entry - the copy cost ~166 MB per 1080p->4K frame and
+                               * was the blend profile's whole residual until it was measured (M11.3). */
+                              const std::vector<float>* motion_override = nullptr);
 
     /* Reprojects `previous` through the *current* frame's motion field and blends
      * the result into `current` in place (interleaved RGB, values in [0,1]):
@@ -411,7 +488,12 @@ public:
                      const std::vector<float>& current_motion,
                      float motion_vectors_scale, float alpha,
                      TemporalBlendStats* stats = nullptr,
-                     const std::vector<float>* validity = nullptr);
+                     const std::vector<float>* validity = nullptr,
+                     /* Where to record the reprojection and the per-pixel blend separately. Optional, because
+                      * the two are one stage at frame level (nrr_frame_stages.h) and only the M11.3 work needs
+                      * them apart - and they happen inside this function, which is why it takes the record
+                      * rather than the caller wrapping the call. */
+                     BlendProfile* profile = nullptr);
     float calculate_temporal_stability(const NRRFrameOutput& current, const NRRFrameOutput& previous) const;
     void reset();
 
@@ -422,6 +504,11 @@ private:
     float last_timestamp_;
     float temporal_alpha_;
     float motion_threshold_;
+    /* The reprojection's two outputs, owned here so a frame does not acquire them (M11.3): they are
+     * `assign()`ed in full before every read, so holding the capacity across frames cannot change a value -
+     * it only removes the allocation and the zero-fill. */
+    std::vector<float> warped_color_;
+    std::vector<float> warped_depth_;
     /* The four taps of one bilinear sample, as a fixed-size value rather than a std::vector.
      *
      * Form follows cost here: this is called twice per output pixel (the colour reprojection and the depth
@@ -515,6 +602,9 @@ class TemporalAccumulator {
 public:
     TemporalAccumulator();
     ~TemporalAccumulator();
+
+    const BlendProfile& blend_profile() const { return blend_profile_; }
+    void reset_blend_profile() { blend_profile_ = BlendProfile(); }
 
     /* History depth 2: only the immediately previous displayed frame is ever
      * reprojected, so a deeper ring would only cost memory. */
@@ -728,6 +818,26 @@ private:
     TemporalHistory history_;
     TemporalStateManager state_;
     TemporalRenderer renderer_;
+
+    /* The resolve's working buffers, owned here rather than declared per frame (M11.3). Each is fully written
+     * before it is read, so surviving between frames changes no value; what it changes is how many buffers a
+     * frame acquires, which `BlendProfile::allocations` measures.
+     *
+     * `motion_out_` is the one that needs a rule rather than a comment: a frame whose motion field is absent or
+     * unconvertible must leave it *empty*, because the code that follows reads emptiness as "no field" - a
+     * retained buffer from an earlier frame would be a stale field silently reprojected as this frame's. It is
+     * cleared on that path, which is what keeps the reuse exact. */
+    std::vector<float> displayed_;
+    std::vector<float> prev_color_;
+    std::vector<float> motion_out_;
+    /* The decoded motion plane before it is resampled to the output grid: the same reuse rule, and the same
+     * clear-on-no-field discipline as motion_out_ (it is only ever read on the frame that filled it). */
+    std::vector<float> motion_nchw_;
+    /* The blend's description of the previous frame. A member for the same reason: as a local it started empty
+     * every frame, so assigning the history colour into it allocated ~100 MB per frame at 1080p->4K. */
+    HistoryEntry previous_entry_;
+    /* The profile above, accumulated over the frames this object has resolved. */
+    BlendProfile blend_profile_;
 
     /* The integration of distinct sub-pixel samples, opt-in and gated by the scene's stillness
      * (PHASE_ALIGNED_MOTION_GATE_PX). Separate from the reprojection history above because it answers a

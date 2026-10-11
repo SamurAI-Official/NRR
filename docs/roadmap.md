@@ -2451,13 +2451,31 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
       **1348.4 / 1115.3** - the frame **-28.9%**, the blend **-32.2%** - and **both runs report frame hash
       `0x9c3d3479ea20eec5`**, so the speedup is real and the pixels did not move (M11.1's row for that scenario
       was 1452.6 ms, so the tier is under a second for the first time).
+- [x] **The blend's operations are attributed, and the residual kept shrinking because of it.** One stage name
+      (`bl`) covering 79% of the frame is not something anyone can work on, so the resolve now records its own
+      split: state check, RGB8->float, the history copy, the motion plane, the reprojection warp, the per-pixel
+      blend arithmetic, float->RGB8, the opt-in phase-aligned pass, the displayed-frame difference, the frame
+      record, and the residual. **Measured, 1 thread, 1080p->4K, per resolve (680.4 ms total): arithmetic 304.9
+      (44.8%), warp 174.3 (25.6%), record 37.8, motion plane 27.8, history copy 25.0, RGB8 out 23.0,
+      displayed difference 20.4, RGB8 in 12.7, residual 54.5 (8.0%).** The state check and the phase-aligned pass
+      read 0 because the first is genuinely a handful of comparisons and the second is off by default.
+- [x] **The residual paid for itself three times.** Each time it was large, its cause was a copy nobody had
+      named: (1) `history_copy` was pulling colour, depth *and* motion out of the ring when only the colour is
+      used (-100 MB/frame at the tier, via `get_previous_frame_color_only`); (2) `blend_frame` built a
+      `HistoryEntry warp_src = previous` copy just to attach a different motion field, and copied the field into
+      it as well - **~166 MB of copying per frame**, which was the entire 12% residual; the callee now takes the
+      field as a parameter; (3) the resolve's working buffers (`displayed_`, `prev_color_`, `motion_out_`,
+      `motion_nchw_`, `warped_color_`, `warped_depth_`, the blend's `HistoryEntry`) were locals, so a frame
+      acquired every one of them. They are members now, with an explicit rule where reuse needs one:
+      `motion_out_` is **cleared** on a frame with no usable field, because the callers read emptiness as "no
+      field" and a retained plane would be a stale field silently reprojected. **Measured: `buffers=0 (0 MB)`
+      over five resolves at every tier** - the only genuinely necessary acquisitions are the first ones at a new
+      size - with the frame hash unchanged (`0x9c3d3479ea20eec5`), and 205/205 in the suite.
 - [ ] **Priority for the rest of this milestone comes from the measurement, not from the order below.** The blend
-      is still the largest stage at the tier (756.3 ms of 958.5 ms accumulating; 118.7 of 288.0 ms in the
-      disengaged scenario the older rows use), and it is now five scalar single-threaded passes over 25M elements
-      each: RGB8->float, the reprojection gather, the blend arithmetic, float->RGB8, and a 300 MB history copy.
-      The conversions matter next (RGB8 35.3 ms, NCHW 33.5 ms disengaged), and they come first *if* M11.5's
-      verified Vulkan kernels can be wired cheaply, because that is a 2-of-4 win on any Vulkan device with no new
-      code to write.
+      is still the largest stage at the tier (680.4 ms of 878.6 ms accumulating; 118.7 of 288.0 ms in the
+      disengaged scenario the older rows use). Inside it the two per-pixel passes are 70% of the stage
+      (arithmetic 44.8%, warp 25.6%) and they are scalar; the rest is copies, conversions and a frame record that
+      are already banded but are bandwidth-bound.
 - [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
       source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`
       (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-817`) and the blend.

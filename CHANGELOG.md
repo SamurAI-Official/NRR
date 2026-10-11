@@ -13,6 +13,39 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### M11.3, third step: the blend is attributed, and the residual found three copies and every buffer
+
+The blend was one number - 79% of a 1080p->4K frame - which is not something anyone can work on. This step, in
+`__M113C_COMMIT__`, makes the resolve say what it is doing, and then acts on what it said.
+
+* **`BlendProfile`**: the resolve now records its own split - the state check, RGB8->float, the history copy, the
+  motion plane, the reprojection warp, the per-pixel blend arithmetic, float->RGB8, the opt-in phase-aligned pass,
+  the displayed-frame difference, the frame record, and a **residual** (the stage minus the named steps).
+  Recorded under the same switch as the frame instrument and free while it is off. **Measured, one thread,
+  1080p->4K, per resolve (680.4 ms): arithmetic 304.9 (44.8%), warp 174.3 (25.6%), record 37.8, motion plane
+  27.8, history copy 25.0, RGB8 out 23.0, displayed difference 20.4, RGB8 in 12.7, residual 54.5 (8.0%).**
+* **The residual found three unnamed copies, and each was worth removing.** (1) `get_previous_frame` copied
+  colour, depth *and* motion out of the ring while the resolve reads only the colour: **-100 MB per frame** at
+  the tier, through a new colour-only fetch. (2) `blend_frame` built `HistoryEntry warp_src = previous` - a copy
+  of the history colour plane - only to attach a different motion field, and copied the field into it too:
+  **~166 MB of copying per frame**, which was the *entire* 12% residual. The callee now takes the field as a
+  parameter and no copy is made. (3) Every working buffer was a local, so a frame acquired all of them;
+  `displayed_`, `prev_color_`, `motion_out_`, `motion_nchw_`, `warped_color_`, `warped_depth_` and the blend's
+  `HistoryEntry` are members now - **measured `buffers=0 (0 MB)` over five resolves at every tier**, so the only
+  genuinely necessary acquisitions are the first ones at a new size. That reuse needed one explicit rule:
+  `motion_out_` is *cleared* on a frame whose field is absent or unconvertible, because the callers read
+  emptiness as "no field" and a retained plane would be a stale field silently reprojected as this frame's.
+* **Unchanged frames, at every step.** The tier's frame hash is `0x9c3d3479ea20eec5` before and after all of it,
+  and the suite is **205 passed, 0 failed**. Same-session, one thread: **866.9 -> 791.1 ms** reported at the
+  tier from the copies and the buffer reuse together, on top of the allocation removal and the banding that came
+  before it.
+* **Two instrumentation defects this step made, and the residual caught one of them.** The phase-aligned and
+  state scopes were first written at *function* scope, so they measured everything to the end of `apply()` -
+  including the frame record - and reported it under names that did not own it; the residual is what made that
+  visible, and both are now braced. Separately, the benchmark's hand-written profile delta dropped two newly
+  added fields, twice, silently reporting measured steps as zero - so the delta moved into the runtime
+  (`blend_profile_delta`), where the step list lives, and cannot drift again.
+
 ### M11.3, second step: the blend's loops are row-banded across threads, with the frames still byte-identical
 
 The first step removed ~16.6M per-pixel allocations and took the 1080p->4K tier from 1452.6 ms to 958.5 ms. This

@@ -11,12 +11,64 @@
 #include "nrr_temporal.h"
 #include "nrr_inference.h"
 #include "nrr_parallel.h"
+#include "nrr_frame_stages.h"
 #include "accel_texture.h"
+#include <chrono>
 #include <cmath>
 #include <algorithm>
 #include <mutex>
 
 namespace nrr {
+
+namespace {
+
+/* The same property as the frame-level instrument (runtime/nrr_frame_stages.h): with the switch off this reads
+ * no clock at all, so a build with it compiled in measures what it measured before. The slot is a pointer so a
+ * caller that has no profile to fill (or a code path that is not being attributed) passes null. */
+class BlendScope {
+public:
+    explicit BlendScope(double* slot) : slot_(slot), on_(slot != nullptr && stage_timing_enabled()) {
+        if (on_) start_ = std::chrono::steady_clock::now();
+    }
+    ~BlendScope() {
+        if (!on_) return;
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if (now > start_) {
+            *slot_ += std::chrono::duration<double, std::milli>(now - start_).count();
+        }
+    }
+    BlendScope(const BlendScope&) = delete;
+    BlendScope& operator=(const BlendScope&) = delete;
+
+private:
+    double* slot_;
+    bool on_;
+    std::chrono::steady_clock::time_point start_{};
+};
+
+/* Records that a working buffer had to be acquired, and for how many bytes. Predicted from the capacity
+ * rather than observed from the allocator, because what the work is about is the runtime's *own* buffers: a
+ * vector that already has the capacity does not allocate when it is resized, so this reads zero on a frame that
+ * reuses its buffers - which is the measurement that decides whether a buffer was necessary. */
+void count_buffer_acquire(BlendProfile& profile, std::size_t elements) {
+    if (!stage_timing_enabled()) return;
+    ++profile.allocations;
+    profile.allocated_bytes += static_cast<unsigned long long>(elements) * sizeof(float);
+}
+
+/* Whether resizing this buffer to `elements` would allocate, counted when it would. */
+bool acquire(std::vector<float>& buffer, std::size_t elements, BlendProfile& profile) {
+    if (elements <= buffer.capacity()) return false;
+    count_buffer_acquire(profile, elements);
+    return true;
+}
+
+} // namespace
+
+/* The process's record of the last resolve's split, for the same reason the frame-level record exists: a
+ * benchmark reads what the frame it just rendered did, and reaching through a backend to find the accumulator
+ * would make the instrument a property of one code path. */
+static BlendProfile g_last_blend_profile;
 
 static const float BASE_TEMPORAL_ALPHA = TEMPORAL_BASE_ALPHA;
 
@@ -102,6 +154,24 @@ bool TemporalHistory::get_previous_frame(uint64_t current_frame_index,
     /* Reported from the stored entry rather than from the caller's frame, so it
      * cannot be confused with the offset currently being rendered. */
     jitter = history_[static_cast<size_t>(index)].jitter;
+    return true;
+}
+
+bool TemporalHistory::get_previous_frame_color_only(uint64_t current_frame_index,
+                                                    std::vector<float>& color,
+                                                    uint32_t& width, uint32_t& height) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int index = find_previous_index_locked(current_frame_index);
+    if (index < 0) {
+        return false;
+    }
+    /* The same copy-assignment as the three-vector form, and the same reason it is a copy rather than a handle
+     * into the ring: the ring can be written while a caller holds the result. What this form does not do is copy
+     * two buffers nobody asked for - at 1080p->4K that was ~100 MB per frame of depth and motion planes that
+     * the resolve never read (measured as `history_copy_ms` in the blend profile). */
+    color = history_[static_cast<size_t>(index)].color_data;
+    width = history_[static_cast<size_t>(index)].width;
+    height = history_[static_cast<size_t>(index)].height;
     return true;
 }
 
@@ -219,9 +289,18 @@ TemporalRenderer::BilinearSample TemporalRenderer::bilinear_sample(
 bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
                                             const HistoryEntry& previous,
                                             std::vector<float>& warped_color,
-                                            std::vector<float>& warped_depth) {
+                                            std::vector<float>& warped_depth,
+                                            /* The motion field to reproject with, when it is not the one the
+                                             * entry was recorded with. The resolve passes the current frame's
+                                             * field, which is what backward reprojection requires; passing it
+                                             * here rather than copying it into a HistoryEntry is what removed
+                                             * ~166 MB of copying per 1080p->4K frame (M11.3). */
+                                            const std::vector<float>* motion_override) {
     if (previous.width == 0 || previous.height == 0) return false;
-    if (previous.color_data.empty() || previous.motion_data.empty()) return false;
+    if (previous.color_data.empty()) return false;
+    const std::vector<float>& motion_field =
+        motion_override != nullptr ? *motion_override : previous.motion_data;
+    if (motion_field.empty()) return false;
 
     uint32_t w = previous.width;
     uint32_t h = previous.height;
@@ -235,7 +314,7 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
     const bool have_prev_depth = !previous.depth_data.empty();
     const size_t pixel_count = static_cast<size_t>(w) * static_cast<size_t>(h);
     /* Whether the field covers the frame, so the per-pixel bounds check is only paid when it can fail. */
-    const bool motion_covers_frame = previous.motion_data.size() >= pixel_count * 2;
+    const bool motion_covers_frame = motion_field.size() >= pixel_count * 2;
 
     warped_color.assign(previous.color_data.size(), 0.0f);
     warped_depth.assign(previous.depth_data.size(), 0.0f);
@@ -253,9 +332,9 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
             for (uint32_t x = 0; x < w; ++x) {
                 const size_t pixel = y * w + x;
                 const size_t mv_idx = pixel * 2;
-                if (!motion_covers_frame && mv_idx + 1 >= previous.motion_data.size()) continue;
-                float dx = previous.motion_data[mv_idx] * scale;
-                float dy = previous.motion_data[mv_idx + 1] * scale;
+                if (!motion_covers_frame && mv_idx + 1 >= motion_field.size()) continue;
+                float dx = motion_field[mv_idx] * scale;
+                float dy = motion_field[mv_idx + 1] * scale;
                 float sx = static_cast<float>(x) - dx;
                 float sy = static_cast<float>(y) - dy;
 
@@ -285,7 +364,8 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
                                    const std::vector<float>& current_motion,
                                    float motion_vectors_scale, float alpha,
                                    TemporalBlendStats* stats,
-                                   const std::vector<float>* validity) {
+                                   const std::vector<float>* validity,
+                                   BlendProfile* profile) {
     if (stats) {
         stats->mean_abs_delta = 0.0f;
         stats->blended_pixels = 0;
@@ -300,17 +380,22 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
     if (current_motion.size() < static_cast<size_t>(width) * height * 2) return false;
     if (!(alpha > 0.0f && alpha < 1.0f)) return false;
 
-    /* warp_previous_output() reads the motion field from the history entry it is
-     * handed. Backward reprojection must use the *current* frame's motion, so the
-     * previous entry's color/depth are combined with this frame's motion. */
-    HistoryEntry warp_src = previous;
-    warp_src.motion_data = current_motion;
-
+    /* Backward warping needs the motion field of the frame being rendered, not the one the history entry was
+     * recorded with. Handing it to the callee directly (motion_override) rather than attaching it to a copy of
+     * the entry is not a micro-optimisation: the copy form copied the entry's colour plane and the motion field
+     * on every frame - ~166 MB per frame at 1080p->4K - and that was the whole of the blend profile's residual
+     * (12% of the stage) until it was measured. */
     NRRFrameInput warp_input = {};
     warp_input.temporal.motion_vectors_scale = motion_vectors_scale;
 
-    std::vector<float> warped_color, warped_depth;
-    if (!warp_previous_output(warp_input, warp_src, warped_color, warped_depth)) return false;
+    /* The reprojection, and the renderer's own output buffers (see the member comment): both are assigned in
+     * full by warp_previous_output before anything reads them, so surviving between frames changes no value. */
+    {
+        BlendScope warp_scope(profile ? &profile->warp_ms : nullptr);
+        if (!warp_previous_output(warp_input, previous, warped_color_, warped_depth_,
+                                  &current_motion)) return false;
+    }
+    const std::vector<float>& warped_color = warped_color_;
     if (warped_color.size() != current.size()) return false;
 
     /* The guarded blend. `has_validity` is the whole switch: without a mask this is the un-guarded
@@ -326,6 +411,8 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
     double accumulated_delta = 0.0;
     uint32_t rejected = 0;
     uint32_t clamped = 0;
+    {
+    BlendScope arithmetic_scope(profile ? &profile->arithmetic_ms : nullptr);
     /* Row-banded (M11.3). Each band writes disjoint rows of `current` and reads only shared inputs, so the
      * bands are race-free; the counters are exact, and the delta is summed per band and combined afterwards -
      * so the only quantity that differs from the serial run is the order those deltas are added in, a
@@ -393,6 +480,7 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
         rejected += band_rejected;
         clamped += band_clamped;
     });
+    }
 
     if (stats) {
         stats->mean_abs_delta =
@@ -913,12 +1001,88 @@ void TemporalAccumulator::reset() {
     forget_previous_frame();
 }
 
+void publish_blend_profile(const BlendProfile& profile) { g_last_blend_profile = profile; }
+const BlendProfile& last_blend_profile() { return g_last_blend_profile; }
+
+void set_blend_step_ms(BlendProfile& profile, int step, double value) {
+    switch (step) {
+        case 0: profile.state_ms = value; return;
+        case 1: profile.displayed_to_float_ms = value; return;
+        case 2: profile.history_copy_ms = value; return;
+        case 3: profile.motion_plane_ms = value; return;
+        case 4: profile.warp_ms = value; return;
+        case 5: profile.arithmetic_ms = value; return;
+        case 6: profile.to_rgb8_ms = value; return;
+        case 7: profile.phase_aligned_ms = value; return;
+        case 8: profile.displayed_delta_ms = value; return;
+        case 9: profile.record_ms = value; return;
+        case 10: profile.other_ms = value; return;
+        default: return;
+    }
+}
+
+BlendProfile blend_profile_delta(const BlendProfile& before, const BlendProfile& after) {
+    BlendProfile delta;
+    for (int step = 0; step < blend_step_count(); ++step) {
+        set_blend_step_ms(delta, step, blend_step_ms(after, step) - blend_step_ms(before, step));
+    }
+    delta.total_ms = after.total_ms - before.total_ms;
+    delta.allocations = after.allocations - before.allocations;
+    delta.allocated_bytes = after.allocated_bytes - before.allocated_bytes;
+    delta.frames = after.frames - before.frames;
+    delta.measured = after.measured && delta.frames > 0;
+    return delta;
+}
+
+int blend_step_count() { return 11; }
+const char* blend_step_name(int step) {
+    switch (step) {
+        case 0: return "blend-state";
+        case 1: return "blend-convert-in";
+        case 2: return "blend-history-copy";
+        case 3: return "blend-motion-plane";
+        case 4: return "blend-warp";
+        case 5: return "blend-arithmetic";
+        case 6: return "blend-convert-out";
+        case 7: return "blend-phase-aligned";
+        case 8: return "blend-displayed-delta";
+        case 9: return "blend-record";
+        case 10: return "blend-other";
+        default: return "";
+    }
+}
+
+double blend_step_ms(const BlendProfile& profile, int step) {
+    switch (step) {
+        case 0: return profile.state_ms;
+        case 1: return profile.displayed_to_float_ms;
+        case 2: return profile.history_copy_ms;
+        case 3: return profile.motion_plane_ms;
+        case 4: return profile.warp_ms;
+        case 5: return profile.arithmetic_ms;
+        case 6: return profile.to_rgb8_ms;
+        case 7: return profile.phase_aligned_ms;
+        case 8: return profile.displayed_delta_ms;
+        case 9: return profile.record_ms;
+        case 10: return profile.other_ms;
+        default: return 0.0;
+    }
+}
+
 TemporalAccumulator::Result TemporalAccumulator::apply(
     const NRRFrameInput& input, std::vector<uint8_t>& rgb8,
     uint32_t width, uint32_t height, const MotionProvider& motion,
     const PhaseAlignedFrame& phase, const DepthProvider& depth) {
 
     Result result;
+
+    /* This function's own attribution (M11.3): the same switch as the frame-level instrument, so a build with it
+     * compiled in costs nothing while it is off, and a residual at the end keeps the split honest. Declared
+     * first, because the total must be this function's and the first step begins immediately. */
+    BlendProfile& profile = blend_profile_;
+    const bool profiling = stage_timing_enabled();
+    const std::chrono::steady_clock::time_point profile_start =
+        profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     /* A sequence that restarts (the frame index does not advance past the last one
      * rendered) or a change of render resolution means the accumulated history
@@ -941,29 +1105,57 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         forget_previous_frame();
     }
 
-    /* One conversion for both consumers: the history weight (compute_state) and the phase-aligned gate below
-     * read the same number, so they cannot disagree about what the caller's declared motion means. The grid
-     * is the frame's own render width - what the thresholds were measured on - which on an upscaling pipeline
-     * is not the output width. */
-    const uint32_t motion_frame_grid = motion_grid(input, phase.frame_width, width);
-    result.motion_px = motion_magnitude_px(input, phase.frame_width, width);
-    result.state = state_.compute_state(input, history_, result.motion_px);
+    /* The first step. The scene-change check above is not in it (it is a handful of comparisons against the
+     * previous frame's index and size); this is the motion conversion and the history weight, which together
+     * were most of the residual while they were unnamed. */
+    uint32_t motion_frame_grid = 0;
+    {
+        BlendScope scope(profiling ? &profile.state_ms : nullptr);
+        /* One conversion for both consumers: the history weight (compute_state) and the phase-aligned gate below
+         * read the same number, so they cannot disagree about what the caller's declared motion means. The grid
+         * is the frame's own render width - what the thresholds were measured on - which on an upscaling pipeline
+         * is not the output width. */
+        motion_frame_grid = motion_grid(input, phase.frame_width, width);
+        result.motion_px = motion_magnitude_px(input, phase.frame_width, width);
+        result.state = state_.compute_state(input, history_, result.motion_px);
+    }
 
-    std::vector<float> displayed;
-    rgb8_to_interleaved_float(rgb8, displayed);
+    /* The steps as they stood when this frame began, so the residual is this frame's and not the sum of every
+     * frame this object has resolved. */
+    double steps_at_start = 0.0;
+    if (profiling) {
+        for (int step = 0; step < blend_step_count() - 1; ++step) {
+            steps_at_start += blend_step_ms(profile, step);
+        }
+    }
 
-    std::vector<float> prev_color, prev_depth, prev_motion;
+    /* `displayed_` is a member so a frame does not acquire it (see its comment); the conversion writes every
+     * element, so reuse cannot change a value. */
+    acquire(displayed_, rgb8.size(), profile);
+    {
+        BlendScope scope(profiling ? &profile.displayed_to_float_ms : nullptr);
+        rgb8_to_interleaved_float(rgb8, displayed_);
+    }
+
     uint32_t prev_w = 0, prev_h = 0;
-    const bool have_previous =
-        history_.get_previous_frame(input.temporal.frame_index, prev_color,
-                                    prev_depth, prev_motion, prev_w, prev_h) &&
-        prev_w == width && prev_h == height &&
-        prev_color.size() == displayed.size();
+    bool have_previous = false;
+    {
+        BlendScope scope(profiling ? &profile.history_copy_ms : nullptr);
+        const std::size_t color_capacity_before = prev_color_.capacity();
+        have_previous = history_.get_previous_frame_color_only(
+            input.temporal.frame_index, prev_color_, prev_w, prev_h);
+        /* Counted from the capacity rather than assumed: the fetch copy-assigns, so it acquires a buffer only
+         * when the reused one is too small - the first frame at a new size, and nothing else. */
+        if (prev_color_.capacity() != color_capacity_before) {
+            count_buffer_acquire(profile, prev_color_.size());
+        }
+    }
+    have_previous = have_previous && prev_w == width && prev_h == height &&
+                    prev_color_.size() == displayed_.size();
 
     /* The frame's motion field at the output grid, fetched at most once and only when a pass can use it:
      * the reprojection blend asks for it when it can blend, and the phase-aligned pass asks for it when it
      * has accumulated samples to judge per pixel. */
-    std::vector<float> motion_out;
     bool motion_loaded = false;
     const std::vector<float> no_motion;
     /* The field as the caller handed it, at the input grid, kept so the disocclusion guard below can build
@@ -974,16 +1166,23 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
             motion_loaded = true;
             raw_motion_field = motion ? motion() : MotionImage();
             const MotionImage& field = raw_motion_field;
+            /* A frame with no usable field must leave the reused buffer *empty*: the callers read emptiness as
+             * "no field", so a plane retained from an earlier frame would be a stale field silently reprojected
+             * as this frame's. This is the one place reuse needs a rule rather than a comment. */
+            motion_out_.clear();
             if (field.valid()) {
-                std::vector<float> motion_nchw;
+                BlendScope scope(profiling ? &profile.motion_plane_ms : nullptr);
+                acquire(motion_nchw_,
+                        static_cast<std::size_t>(field.width) * field.height * 2, profile);
                 if (texture_to_nchw(field.pixels, field.width, field.height, field.format,
-                                    2, motion_nchw)) {
-                    resample_motion_field_nchw(motion_nchw, field.width, field.height,
-                                               width, height, motion_out);
+                                    2, motion_nchw_)) {
+                    acquire(motion_out_, static_cast<std::size_t>(width) * height * 2, profile);
+                    resample_motion_field_nchw(motion_nchw_, field.width, field.height,
+                                               width, height, motion_out_);
                 }
             }
         }
-        return motion_out.empty() ? no_motion : motion_out;
+        return motion_out_.empty() ? no_motion : motion_out_;
     };
 
     if (!have_previous) {
@@ -995,11 +1194,30 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
          * for converting one. */
         const std::vector<float>& frame_motion = output_motion();
 
-        HistoryEntry previous;
+        /* The blend's description of the previous frame, owned by this object so its colour buffer survives
+         * between frames (see the member's comment). The assignment still copies - the history is a copy rather
+         * than a handle into the ring, which can be written while a caller holds the result - but it no longer
+         * acquires ~100 MB every frame, which is what the count below makes visible. */
+        HistoryEntry& previous = previous_entry_;
         previous.frame_index = input.temporal.frame_index;
-        previous.color_data = prev_color;
+        const std::size_t color_capacity_before = previous.color_data.capacity();
+        /* Attributed to `history_copy_ms` as well as the fetch above: it is the second half of the same
+         * operation - the previous frame leaving the ring - and it was ~20-40 ms of the residual at the tier
+         * before it was named. Two scopes may write one slot; they cannot overlap, so the sum is the operation. */
+        {
+            BlendScope scope(profiling ? &profile.history_copy_ms : nullptr);
+            previous.color_data = prev_color_;
+        }
+        if (previous.color_data.capacity() != color_capacity_before) {
+            count_buffer_acquire(profile, previous.color_data.size());
+        }
         previous.width = prev_w;
         previous.height = prev_h;
+        /* Not this path's inputs, and cleared rather than left from an earlier frame: the blend reprojects with
+         * the *current* frame's motion, and a stale depth plane here would be warped as if it were this frame's
+         * history if a caller ever asked for the depth output. */
+        previous.depth_data.clear();
+        previous.motion_data.clear();
 
         /* The disocclusion guard, built only when it was asked for and only when the fields it needs are
          * present. Everything it reads is already in hand: this frame's depth from the caller's provider,
@@ -1031,15 +1249,16 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         }
 
         result.blended = renderer_.blend_frame(
-            displayed, width, height, previous, frame_motion,
+            displayed_, width, height, previous, frame_motion,
             input.temporal.motion_vectors_scale, result.state.temporal_alpha,
-            &result.blend_stats, validity);
+            &result.blend_stats, validity, profiling ? &profile : nullptr);
         result.note = result.blended ? "accumulated"
                                      : "no motion field to reproject with";
     }
 
     if (result.blended) {
-        interleaved_float_to_rgb8(displayed, rgb8);
+        BlendScope scope(profiling ? &profile.to_rgb8_ms : nullptr);
+        interleaved_float_to_rgb8(displayed_, rgb8);
     }
 
     /* ---- Phase-aligned integration (opt-in) -------------------------------- *
@@ -1057,7 +1276,16 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
      * too, because it was not obvious: composition_check runs five arrangements on the same frames, and the
      * blend in front of the integration costs 4% of the integration's gain for the placed arrangement (1.040
      * of AA-only) and 11% for the unplaced one (1.106) - the two accumulators compose, in this order. */
-    if (phase_aligned_enabled_) {
+    /* The opt-in integration, attributed as one step: it is a second accumulator over the same frame, and it is
+     * off unless a caller asked for it. Its own convert-out is included here rather than in step 5 - it is the
+     * same operation, attributed where it happens, and it is therefore counted once either way.
+     *
+     * The braces are load-bearing: this was first written with the scope at function scope, which made it
+     * measure everything to the end of apply() - including the frame record - and report it under a name that
+     * did not own it. The residual is what made that visible. */
+    {
+        BlendScope phase_scope(profiling ? &profile.phase_aligned_ms : nullptr);
+        if (phase_aligned_enabled_) {
         /* The declared magnitude is a fraction of the frame and every threshold below is in frame-grid
          * pixels; the conversion happened once, above, and its result is what the blend's history weight
          * was computed from too (Result::motion_px). */
@@ -1136,9 +1364,9 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                 } else {
                     phase_frame_.assign(plane * 3u, 0.0f);
                     for (size_t i = 0; i < plane; ++i) {
-                        phase_frame_[i] = displayed[i * 3u];
-                        phase_frame_[plane + i] = displayed[i * 3u + 1u];
-                        phase_frame_[plane * 2u + i] = displayed[i * 3u + 2u];
+                        phase_frame_[i] = displayed_[i * 3u];
+                        phase_frame_[plane + i] = displayed_[i * 3u + 1u];
+                        phase_frame_[plane * 2u + i] = displayed_[i * 3u + 2u];
                     }
                 }
                 /* Two grids, and the placement knows both. At the output resolution the frame's samples and
@@ -1180,11 +1408,11 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
                          * the constant-input-render test in tests/unit/test_jitter.cpp is what caught it. */
                         const size_t out_plane = static_cast<size_t>(width) * height;
                         for (size_t i = 0; i < out_plane; ++i) {
-                            displayed[i * 3u] = resolved[i];
-                            displayed[i * 3u + 1u] = resolved[out_plane + i];
-                            displayed[i * 3u + 2u] = resolved[out_plane * 2u + i];
+                            displayed_[i * 3u] = resolved[i];
+                            displayed_[i * 3u + 1u] = resolved[out_plane + i];
+                            displayed_[i * 3u + 2u] = resolved[out_plane * 2u + i];
                         }
-                        interleaved_float_to_rgb8(displayed, rgb8);
+                        interleaved_float_to_rgb8(displayed_, rgb8);
                         /* The note says which arrangement ran, because the two integrate different frames and
                          * a caller reading the state should be able to tell them apart. */
                         result.phase_note = from_input
@@ -1196,22 +1424,27 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
             }
         }
         result.phase_aligned_frames = phase_aligned_.frame_count();
+        }
     }
 
     /* Frame-to-frame change of what is actually displayed, measured against the
      * previous displayed frame (after any blending). */
-    result.displayed_delta = have_previous
-        ? mean_abs_difference(displayed, prev_color) : 0.0f;
+    {
+        BlendScope scope(profiling ? &profile.displayed_delta_ms : nullptr);
+        result.displayed_delta = have_previous
+            ? mean_abs_difference(displayed_, prev_color_) : 0.0f;
+    }
 
     /* Record the frame that was displayed so the next frame can reproject it. Only
      * the image is kept: backward reprojection consumes the *next* frame's motion
      * field, so storing motion (or depth, unused until disocclusion rejection
      * exists) would cost memory without ever being read. */
     {
+        BlendScope scope(profiling ? &profile.record_ms : nullptr);
         TemporalFrameData frame;
         frame.width = width;
         frame.height = height;
-        frame.color = displayed;
+        frame.color = displayed_;
         frame.color_format = NRR_TEXTURE_FORMAT_RGB8;
         state_.record_frame(input, frame, history_);
     }
@@ -1220,6 +1453,24 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
     last_frame_index_ = input.temporal.frame_index;
     last_width_ = width;
     last_height_ = height;
+
+    /* The residual and the publication, the same discipline as the frame-level instrument: this frame's steps are
+     * subtracted from this frame's total, so a large residual is the finding that an operation is missing from
+     * the list rather than an accounting trick. */
+    if (profiling) {
+        const std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+        const double frame_total = end > profile_start
+            ? std::chrono::duration<double, std::milli>(end - profile_start).count() : 0.0;
+        double steps_now = 0.0;
+        for (int step = 0; step < blend_step_count() - 1; ++step) {
+            steps_now += blend_step_ms(profile, step);
+        }
+        profile.total_ms += frame_total;
+        profile.other_ms += std::max(0.0, frame_total - (steps_now - steps_at_start));
+        ++profile.frames;
+        profile.measured = true;
+        publish_blend_profile(profile);
+    }
 
     return result;
 }

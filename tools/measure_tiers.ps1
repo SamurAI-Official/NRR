@@ -134,8 +134,8 @@ if ($exit -ne 0) {
 # A requested backend is not evidence that it ran - the first version of this script recorded a row
 # labelled "cpu" that had in fact attached CUDA, because a CUDA runtime on PATH made the auto-selected
 # backend NVIDIA - so the record states both, and says so loudly when they disagree.
-$seen = [regex]::Matches($measured, '(?m)provider\s+([^\r\n]+)') |
-        ForEach-Object { $_.Groups[1].Value.Trim() } | Sort-Object -Unique
+$seen = [regex]::Matches($measured, '(?m)provider\s+(\w+)') |
+        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 $seenNote = if ($seen.Count -gt 0) { $seen -join ', ' } else { 'none reported' }
 $providerNote = ''
 if ($Provider) {

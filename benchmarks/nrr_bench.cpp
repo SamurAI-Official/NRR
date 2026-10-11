@@ -37,6 +37,9 @@
 #include "nrr_frame_stages.h"
 /* The runtime's own thread count, so a row states how many threads it ran with (M11.3). */
 #include "nrr_parallel.h"
+/* The resolve's internal split (M11.3): the frame record has one `Blend` figure, and this is what says which
+ * operation inside it owns the time. */
+#include "nrr_temporal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -210,6 +213,11 @@ uint64_t hash_frame(NRRDevice* device, NRRTexture* texture, uint32_t width, uint
     return hash;
 }
 
+/* The blend profile is a process-wide running record, so a per-tier figure is the difference between two
+ * snapshots rather than the record itself - otherwise the second tier's "average" would include the first
+ * tier's frames. The difference is computed by the runtime (blend_profile_delta), so this file cannot miss a step
+ * that is added later - which it did twice while the profile was being built. */
+
 struct TierResult {
     Tier tier;
     Stats wall, reported, inference, overhead;
@@ -223,6 +231,8 @@ struct TierResult {
     /* The hash of every measured frame chained together (see hash_frame). Two runs of one
      * configuration must agree, and a change to the pipeline that alters a frame must not. */
     uint64_t frame_hash = 0;
+    /* The resolve's internal split over this tier's measured frames (M11.3), and the buffers it acquired. */
+    nrr::BlendProfile blend;
     bool ok = false;
 };
 
@@ -405,6 +415,10 @@ TierResult measure_tier(const Tier& tier, const char* model_path, const std::str
         nrr_render(device, model, nullptr, &in, &out);
     }
 
+    /* The split is read as a difference (see blend_delta): the warm-up frames are excluded, so what is reported
+     * is the measured frames only. */
+    const nrr::BlendProfile blend_before = nrr::last_blend_profile();
+
     std::vector<double> wall, reported, inference, overhead;
     wall.reserve(static_cast<size_t>(frames));
     for (int i = 0; i < frames; ++i) {
@@ -439,6 +453,7 @@ TierResult measure_tier(const Tier& tier, const char* model_path, const std::str
     result.reported = compute_stats(reported);
     result.inference = compute_stats(inference);
     result.overhead = compute_stats(overhead);
+    result.blend = nrr::blend_profile_delta(blend_before, nrr::last_blend_profile());
     result.frame_ms = wall;
     result.provider = detect_provider(result.runtime_debug);
     result.ok = true;
@@ -630,6 +645,24 @@ int main(int argc, char** argv) {
                           << "%)";
             }
             std::cout << "\n";
+        }
+        /* The resolve's internal split, when asked for: the frame record's `bl` figure is one number, and the
+         * work of making it smaller needs to know which of its operations owns the time. The buffer count is
+         * here for the same reason - it is what decides whether a buffer is necessary or merely convenient. */
+        if (stages && result.blend.measured) {
+            const double resolves = static_cast<double>(result.blend.frames);
+            std::cout << "      blend:";
+            for (int step = 0; step < nrr::blend_step_count() - 1; ++step) {
+                std::cout << " " << nrr::blend_step_name(step) << "=" << std::setprecision(3)
+                          << nrr::blend_step_ms(result.blend, step) / resolves << "ms";
+            }
+            std::cout << " " << nrr::blend_step_name(nrr::blend_step_count() - 1) << "="
+                      << std::setprecision(3)
+                      << nrr::blend_step_ms(result.blend, nrr::blend_step_count() - 1) / resolves << "ms";
+            std::cout << "  | resolve=" << (result.blend.total_ms / resolves)
+                      << "ms  buffers=" << result.blend.allocations << " ("
+                      << (result.blend.allocated_bytes / 1024u / 1024u) << " MB) over "
+                      << result.blend.frames << " resolves\n";
         }
         results.push_back(std::move(result));
     }

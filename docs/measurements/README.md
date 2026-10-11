@@ -59,6 +59,28 @@ single before/after would not: four threads beat eight at the three smaller tier
 threads, ~35 spawns in a small frame), and the host portion of the 4K frame only fell 2.01x (886.2 -> 440.2 ms)
 rather than the ~8x the core count suggests - so the remaining host cost is not the four banded passes alone.
 
+## Inside the blend stage (M11.3): per resolve, one thread, 1080p -> 4K
+
+| operation | ms | share |
+| --- | --- | --- |
+| blend-arithmetic (the per-pixel blend) | 304.9 | 44.8% |
+| blend-warp (the bilinear reprojection) | 174.3 | 25.6% |
+| blend-record (the frame into the ring) | 37.8 | 5.5% |
+| blend-motion-plane (decode + resample) | 27.8 | 4.1% |
+| blend-history-copy (out of the ring, twice) | 25.0 | 3.7% |
+| blend-convert-out (float -> RGB8) | 23.0 | 3.4% |
+| blend-displayed-delta (frame-to-frame change) | 20.4 | 3.0% |
+| blend-convert-in (RGB8 -> float) | 12.7 | 1.9% |
+| blend-state (history weight, scene check) | 0.0 | 0% |
+| blend-phase-aligned (opt-in, off here) | 0.0 | 0% |
+| **blend-other (the residual)** | **54.5** | **8.0%** |
+| **resolve total** | **680.4** | |
+
+`blend` is one figure at frame level (79% of the frame); this is the same instrument one level down, and it is
+what made the three copies below findable. `buffers=0 (0 MB) over 5 resolves` in every tier of the row above:
+after the reuse work a frame acquires nothing, so the only genuinely *necessary* buffer is the first one at a new
+size. Recorded as `blend-attributed-fixture`, with the frame hash unchanged at `0x9c3d3479ea20eec5`.
+
 ## Every row also carries a frame hash
 
 `nrr_bench` reports `frame-hash` per tier: FNV-1a over the displayed RGB8 plane, chained across the measured
