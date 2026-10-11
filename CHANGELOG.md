@@ -16,7 +16,7 @@ actually printed rather than estimates.
 ### M11.3, third step: the blend is attributed, and the residual found three copies and every buffer
 
 The blend was one number - 79% of a 1080p->4K frame - which is not something anyone can work on. This step, in
-`__M113C_COMMIT__`, makes the resolve say what it is doing, and then acts on what it said.
+`9ca8a005`, makes the resolve say what it is doing, and then acts on what it said.
 
 * **`BlendProfile`**: the resolve now records its own split - the state check, RGB8->float, the history copy, the
   motion plane, the reprojection warp, the per-pixel blend arithmetic, float->RGB8, the opt-in phase-aligned pass,
