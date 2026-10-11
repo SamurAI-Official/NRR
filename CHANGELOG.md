@@ -13,6 +13,47 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The 1080p->4K tier: capturable and costed, and it was the *content* that had to change
+
+`models/architecture.md` promises a colour+depth+motion network at 1080p -> 4K, and `docs/evaluation-protocol.md`
+scores quality only where reference pairs exist (128 -> 256), listing 1080p->4K as a *latency-only* tier because
+"there is no reference data at these sizes". This is the first step at that tier, measured in `2292515e`, and the
+probe found a content bug rather than a capture one:
+
+* **The tier is capturable as-is.** `--size 3840` gives a 1920-low grid - the 1080p->4K grid - and works first try:
+  `RESULT: PASS`, `lowres: 1920px`, the jitter self-test passing at that size (a +1px translation matching to
+  0.00000 against 0.00179 unmoved). Cost: **14.2 s for 2 frames** (~5-6 s/frame) and **92 MB/frame** - 2.7 MB
+  colour + 0.8 MB lowres + **88.5 MB depth+motion** (3840^2 x 6 B, written at the target grid). A packed pair is
+  **~43 MB**, so a 745-pair dataset is ~32 GB and a six-scene 200-frame capture is ~110 GB over ~2 h.
+* **The data gate refused every frame at that tier, and the control says why.** At 3840: "after a bilinear 2x
+  upscale the input is within 0.0031 of the target (needs > 0.0100)" - every frame skipped. The same scene, jitter
+  mode and frame count at 256: 0.0108-0.0126, all frames packed. The scenes' detail is authored in UV space
+  (`CHECKER_UV_SCALE`, twelve tiles across a surface), so a tile that spans a few pixels at 256 spans fifteen times
+  as many at 3840, the frame is locally smooth, and bilinear is already within 0.31% of the target. That is the
+  cause `tools/pack_godot_pairs.py` names in its own refusal message - now with a number and a control.
+* **`--detail-scale` in `tools/godot_capture/capture.gd`** multiplies that UV frequency, and `--detail-scale 15`
+  (= size / 256) reproduces the 256 tier's statistics at 3840 - margin 0.0105-0.0122, noise 0.0040, detail
+  0.367-0.403, valid 0.0-91.3% - with 4 of 4 frames accepted by the gate that rejected all of them. It defaults to
+  1.0, refuses a non-finite or non-positive value with `RESULT: FAIL` and exit code 1, and is **byte-identical by
+  default**: the same two frames at 256 produce a `color_0000.png` with the same SHA-256 across three runs, so
+  every dataset captured before the flag existed stays comparable.
+* **A dataset now says what content it carries.** The capture manifest records `detail_scale` and
+  `checker_uv_scale`, and `tools/pack_godot_pairs.py` carries them into each capture entry of the dataset manifest
+  as `content` - because a dataset is only comparable to one produced the same way, and at a raised tier that
+  difference is decisive rather than cosmetic. Its every-frame-skipped refusal now names the remedy.
+* **What is not done, and the next code change**: the trainer cannot validate at this tier. `--lazy` covers the
+  training split only (`tools/train_nrr.py:557`) and `val = dataset["val"].materialise()` (`:933`) concatenates
+  every held-out pair - ~8.5 GB for 200 pairs, ~17 GB for 400 at 43 MB/pair. Validation has to stream the way the
+  training split already does, with the numbers unchanged: chunk-cumulative L1/baseline/drift and ablations,
+  weighted-mean SSIM and MS-SSIM, and PSNR from an accumulated squared error rather than a mean of per-chunk PSNRs.
+* `docs/roadmap.md` gains **M10.7** with the measurements above, the two cost levers (depth+motion rendered at the
+  *low* grid: -74% of the capture's bytes, and the grid the model and the runtime's warp actually consume; a 16:9
+  capture: -44% of the data and exactly the spec's tier, at the cost of rectangular sizes through
+  capture/packer/probes), and the two spec claims the model cannot carry alone (`<16 ms` is a data-path target -
+  1031 ms measured, 85-88% of it host-side pixel work; and 2.5M parameters is a capacity choice this roadmap
+  already measured to be unhelpful without data). M10.3's "the run that uses it has not been done" is corrected:
+  M10.4's 745-pair run is that run.
+
 ### The roadmap stops describing a repository three milestones old, and the quality table stops overstating
 
 `docs/roadmap.md` opens by claiming to be the single source of truth for what is built, and its status table still
