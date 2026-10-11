@@ -13,6 +13,50 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The frame split, measured: the temporal blend is the largest host stage at 1080p->4K
+
+M11's first milestone, in `__M111_COMMIT__`. M2 measured that 85-88% of a tier's frame is host-side pixel work and
+had one number for all of it; this records the frame per stage on both execution paths, prints and asserts it at
+every tier, and the first measurement changes what M11.3 should attack first.
+
+* **The instrument** (`runtime/nrr_frame_stages.{h,cpp}`): download (colour/depth/motion), NCHW conversion, trust
+  mask, history warp, derived planes, inference, RGB8 conversion, blend, upload, quality - recorded by the shared
+  accelerator kernel **and** by `BackendCPU`, published as a readable record plus a bounded clause in `debug_info`
+  (bounded because the buffer is a fixed 256 bytes and the notes already in it - the temporal state, the measured
+  quality - must not be truncated by an optional clause). `FrameStage::Other` is the **residual**: the frame's
+  window minus every named stage, so the parts cannot be made to add up by construction and a stage missing from
+  the list shows up as time nobody can name. The residual measured 0.5-3.3% of the frame.
+* **Free while it is off, as a measurement rather than a claim.** A disabled instrument reads no clock at all: the
+  test renders one frame with it off and asserts the clock-read counter does not move (**0**), then one with it on
+  and asserts it does (**22 per frame**), so the first assertion cannot be vacuous. Counting clock reads rather
+  than comparing wall-clock milliseconds is deliberate - a millisecond comparison would be one more load-sensitive
+  timing test and would say nothing about the absence of a per-stage cost. The instrument is off by default and
+  the test restores it, so no other timing test measures a frame with it on.
+* **What it found, 1920x1080 -> 3840x2160, Release, CUDA EP attached, five steady-state samples, the sample
+  fixture**: the tier reports **289.0 ms** and **the temporal blend is its largest single stage at 105.6 ms
+  (36.3%)** - more than the RGB8 (33.6 ms) and NCHW (29.3 ms) conversions *together*, and about the same as the
+  entire session run (104.6 ms, 36.0%). **Two thirds of the frame (186.3 ms) is work the host does for the
+  model.** M11.3's first target is therefore the blend - an output-resolution scalar loop over 8.3M pixels - not
+  the two conversions its introduction named; the verified GPU kernels for those remain the cheaper win per unit
+  of risk, but not the largest one. The same measurement on the CPU execution provider is **1647.4 ms with the
+  model at 87.7%**, which is the configuration the Unreal and Unity verifications actually run in.
+* **A finding that corrects the record rather than adding to it**: the M2 table records **1031.3 ms** for this
+  same tier with the same fixture - 3.6x above what the instrument now measures, and **not attributed** (the
+  build configuration behind those rows is not recorded in the roadmap; host load is the other candidate). M11's
+  framing, the tier budgets and the "85-88% host" headline all descend from that table, so M11.1, the M2
+  postmortem and the status table now say so and flag the four rows for re-derivation with a recorded
+  configuration. What survives is the shape, which the split makes sharper: two thirds host work, concentrated in
+  three named loops.
+* **The gate the milestone set itself is met**, in both Release flavours: stages plus residual equal the published
+  total within 5% (the existing prep/infer/post assertions are untouched and still pass), the conversions are
+  non-zero, the session run never exceeds the published inference figure, and the residual stays inside its 25%
+  budget. **204 passed, 0 failed** in the CPU-flavour build and in the CUDA-flavour build.
+* **Two items are deliberately left open and marked as such**, rather than implied: the stage **byte** counters
+  (the record is time-only, so a stage's cost is attributed but its traffic is not - that belongs with M11.2), and
+  the breakdown with the **released model** (the suite loads the sample fixture, which declares colour+depth+motion
+  only, so the trust mask, history warp and derived-plane stages read zero at every tier because no model input
+  asks for them).
+
 ### The hardware floor: the measurements say it is the code, not the hardware
 
 M2 measured that 85-88% of a 1080p->4K frame is host-side pixel work, and M4/V2 recorded that two verified GPU

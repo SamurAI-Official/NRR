@@ -6,6 +6,10 @@
 // render-stats checks are only performed on successful renders.
 #include "test_framework.h"
 #include "nrr.h"
+/* The per-stage frame record M11.1 adds (docs/roadmap.md): tests include runtime headers
+ * elsewhere in the suite (test_accel.cpp, test_inference.cpp), and this one needs the
+ * structured numbers rather than a parse of the reported string. */
+#include "nrr_frame_stages.h"
 #include <chrono>
 #include <vector>
 #include <algorithm>
@@ -676,7 +680,17 @@ NRR_TEST(latency_frame_budget_breakdown) {
      * host memory, so the texture download, the NCHW conversion, the RGB8 conversion
      * and the temporal blend are all CPU work. ONNX Runtime's own host<->device
      * transfers happen inside the inference figure, which is why the split is
-     * published rather than a single number. */
+     * published rather than a single number.
+     *
+     * M11.1 adds the half of that sentence this test could not previously answer: *which*
+     * host work. The runtime now records the frame per stage - download, NCHW conversion,
+     * trust mask, history warp, derived planes, inference, RGB8 conversion, blend, upload,
+     * quality - and publishes a residual for whatever is left, so a stage that is missing
+     * from the list shows up as unattributed time instead of being absorbed into "prep".
+     * Asserted below on whichever path rendered the frame: BackendCPU publishes the same
+     * record as the accelerator kernel (with its download stages at zero, because the pixels
+     * are already host memory), which is what lets a CPU-only runner check the structure even
+     * where it cannot check the budgets. */
     struct Tier { const char* name; uint32_t w; uint32_t h; double budget_ms; };
     /* Budgets come from measurement, not invention. With the CUDA EP attached this
      * host measures 32.7 / 136.6 / 257.6 / 989.6 ms for the four tiers (see the
@@ -687,6 +701,13 @@ NRR_TEST(latency_frame_budget_breakdown) {
         {"960x540",   960,  540,  900.0},
         {"1920x1080", 1920, 1080, 3500.0},
     };
+
+    /* The instrument is off by default and free while it is off; this test turns it on for
+     * the tiers below and off again on the way out, so no other timing test measures a frame
+     * with it on. */
+    set_stage_timing_enabled(true);
+    NRR_EXPECT_TRUE(stage_timing_enabled(),
+                    "stage timing is enabled for the breakdown");
 
     for (const Tier& tier : tiers) {
         latency_teardown();
@@ -711,6 +732,10 @@ NRR_TEST(latency_frame_budget_breakdown) {
         double infer_total = 0.0;
         double overhead_total = 0.0;
         std::string last_debug;
+        /* The same frames, per stage (M11.1). Accumulated over the samples so the stage
+         * numbers are the average the split above is, rather than one frame compared against
+         * an average of five. */
+        StageTimings stage_totals;
         for (int i = 0; i < samples; ++i) {
             NRRFrameOutput out = {};
             const double wall = render_one(static_cast<uint64_t>(i + 100), out);
@@ -719,6 +744,11 @@ NRR_TEST(latency_frame_budget_breakdown) {
             infer_total += static_cast<double>(out.stats.neural_inference_time_ms);
             overhead_total += static_cast<double>(out.stats.backend_overhead_ms);
             last_debug.assign(out.stats.debug_info);
+            const StageTimings& frame_stages = last_frame_stages();
+            for (int k = 0; k < frame_stage_count(); ++k) {
+                const FrameStage stage = static_cast<FrameStage>(k);
+                stage_totals.add(stage, frame_stages.get(stage));
+            }
             if (i == 0) {
                 std::cout << "    " << tier.name << " path: "
                           << out.stats.debug_info << std::endl;
@@ -734,6 +764,91 @@ NRR_TEST(latency_frame_budget_breakdown) {
                   << "ms  reported=" << reported_avg
                   << "ms  (inference=" << infer_avg
                   << "ms, host overhead=" << overhead_avg << "ms)" << std::endl;
+
+        /* ---- M11.1: the same frame, per stage --------------------------------- */
+        /* Milliseconds and share, because the share is the number the tier work is about: M2
+         * measured that 85-88% of a 1080p->4K frame is host-side pixel work, and this says
+         * which work. On the CPU path the download stages read 0.0 by construction - the
+         * pixels are already host memory - which is the contrast the field exists to show. */
+        double named_total = 0.0;
+        std::cout << "    stages:";
+        for (int s = 0; s < frame_stage_count(); ++s) {
+            const FrameStage stage = static_cast<FrameStage>(s);
+            const double value = stage_totals.get(stage) / n;
+            if (stage != FrameStage::Other) named_total += value;
+            std::cout << " " << frame_stage_key(stage) << "=" << value << "ms("
+                      << (reported_avg > 0.0 ? (value / reported_avg * 100.0) : 0.0)
+                      << "%)";
+        }
+        std::cout << std::endl;
+
+        /* "Off by default and free while it is off" is asserted as the mechanism it is: a
+         * frame rendered with the instrument off must not read the clock for it at all.
+         * Counting clock reads rather than comparing wall-clock milliseconds is deliberate -
+         * the millisecond comparison would be a load-sensitive timing test, which is exactly
+         * what the risk register says this suite does not need more of, and it would say
+         * nothing about the absence of a per-stage cost. The pair is asserted together so
+         * neither half can be vacuous: a counter that never moves would also pass the first
+         * assertion on its own. */
+        set_stage_timing_enabled(false);
+        const std::size_t reads_before_off = stage_clock_reads();
+        NRRFrameOutput off_out = {};
+        const double off_wall = render_one(static_cast<uint64_t>(900), off_out);
+        const std::size_t reads_off = stage_clock_reads() - reads_before_off;
+        set_stage_timing_enabled(true);
+        const std::size_t reads_before_on = stage_clock_reads();
+        NRRFrameOutput on_out = {};
+        const double on_wall = render_one(static_cast<uint64_t>(901), on_out);
+        const std::size_t reads_on = stage_clock_reads() - reads_before_on;
+        std::cout << "    instrument: " << reads_off << " clock reads disabled ("
+                  << off_wall << "ms frame), " << reads_on << " enabled ("
+                  << on_wall << "ms frame)" << std::endl;
+        NRR_EXPECT_EQ(reads_off, static_cast<std::size_t>(0),
+                      "the disabled instrument reads no clock at all");
+        NRR_EXPECT_TRUE(reads_on > 0,
+                        "the enabled instrument does read the clock (so the check above "
+                        "is not vacuous)");
+
+        if (last_debug.find("Placeholder") != std::string::npos) {
+            /* No ONNX Runtime session in this configuration (the placeholder build), so no
+             * stage ever ran and there is nothing to attribute. Recorded rather than passed:
+             * the suite already reports this configuration as failing, but a stage assertion
+             * that cannot run is not evidence either way. */
+            std::cout << "    (no per-stage record: this build has no ONNX Runtime session, "
+                         "so no stage ran)" << std::endl;
+        } else {
+            NRR_EXPECT_TRUE(stage_totals.measured,
+                            "the frame published a per-stage record");
+            /* The record has to explain the frame. `other` is the residual, so this is the
+             * check that it is anchored to the published total rather than to a different
+             * clock - and at a quarter, that no stage is quietly missing from the list, which
+             * is the failure the residual exists to make visible (see nrr_frame_stages.h). */
+            const double residual = stage_totals.get(FrameStage::Other) / n;
+            NRR_EXPECT_NEAR(named_total + residual, reported_avg,
+                            std::max(0.05, reported_avg * 0.05),
+                            "the named stages plus the residual are the published total");
+            NRR_EXPECT_TRUE(residual <= reported_avg * 0.25 + 0.05,
+                            "at most a quarter of the frame is unattributed");
+            /* The host conversions are measured rather than reported as zero: a zero here
+             * would mean the mark sites stopped recording, not that the work became free. Both
+             * run for every model, whichever path executes the frame. */
+            NRR_EXPECT_TRUE(stage_totals.get(FrameStage::ConvertToNCHW) > 0.0,
+                            "the NCHW conversion was measured");
+            NRR_EXPECT_TRUE(stage_totals.get(FrameStage::ConvertToRGB8) > 0.0,
+                            "the RGB8 conversion was measured");
+            /* The session run sits inside the published inference window (which also contains
+             * the input assembly), so it can be smaller than that figure but never larger. */
+            NRR_EXPECT_TRUE(stage_totals.get(FrameStage::Inference) / n <= infer_avg * 1.05 + 0.05,
+                            "the session run is inside the published inference figure");
+            const double host_share = reported_avg > 0.0
+                ? 1.0 - (stage_totals.get(FrameStage::Inference) / n) / reported_avg : 0.0;
+            std::cout << "    host share (frame minus the session run) = "
+                      << (host_share * 100.0) << "%" << std::endl;
+            if (last_debug.find("stages[") == std::string::npos) {
+                std::cout << "    (note: the stage clause did not fit in debug_info at this "
+                             "tier; the record above is still the frame's own)" << std::endl;
+            }
+        }
 
         /* The split must add up to the total the render claims. */
         NRR_EXPECT_NEAR(infer_avg + overhead_avg, reported_avg,
@@ -764,6 +879,9 @@ NRR_TEST(latency_frame_budget_breakdown) {
         }
     }
     latency_teardown();
+    /* Leave the instrument as it was found, so the tests that follow (and any later run in
+     * the same process) measure what they measured before M11.1. */
+    set_stage_timing_enabled(false);
 }
 
 

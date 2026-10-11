@@ -1,5 +1,6 @@
 #include "backend_cpu.h"
 #include "nrr_device.h"
+#include "nrr_frame_stages.h"
 #include "onnx_runtime.h"
 #include "nrr_inference.h"
 #include "nrr_jitter.h"
@@ -392,6 +393,13 @@ NRRResult BackendCPU::execute_model(
     }
 
     const auto t_start = std::chrono::steady_clock::now();
+    /* Per-stage attribution for this frame (docs/roadmap.md M11.1), published through the same
+     * record the accelerator kernel writes, so a tier table is attributable whichever path
+     * rendered it - including the CPU-only hosts CI runs on. Off by default and free while
+     * off: tick() reads no clock and mark() returns at once. There are no *download* stages
+     * here, because the pixels are already host memory, so `dl` reads 0.0 on this path: that
+     * contrast is the reason the field is reported rather than assumed. */
+    StageTimings stages;
 
     // ---- Resolve frame textures --------------------------------------------
     if (!input.color) {
@@ -466,11 +474,13 @@ NRRResult BackendCPU::execute_model(
             NRRTextureFormat previous_format = NRR_TEXTURE_FORMAT_R32F;
             if (depth_img != nullptr && motion_img != nullptr &&
                 temporal_.previous_depth_frame(previous_bytes, previous_w, previous_h, previous_format)) {
+                const auto t = stages.tick();
                 compute_history_trust_mask_from_textures(
                     depth_img->pixels.data(), depth_img->width, depth_img->height, depth_img->format,
                     previous_bytes.data(), previous_w, previous_h, previous_format,
                     motion_img->pixels.data(), motion_img->width, motion_img->height, motion_img->format,
                     trust_mask);
+                stages.mark(FrameStage::TrustMask, t);
             }
         }
         return trust_mask;
@@ -537,7 +547,10 @@ NRRResult BackendCPU::execute_model(
              * de-jitter stage treats as "sampled on its nominal grid" - the same
              * thing it would have been told had it been fed nothing at all, but now
              * explicitly, so the model's input set is satisfied either way. */
-            if (!build_jitter_plane(offset, in_w, in_h, t.data)) {
+            const auto t_jitter = stages.tick();
+            const bool built = build_jitter_plane(offset, in_w, in_h, t.data);
+            stages.mark(FrameStage::DerivedPlanes, t_jitter);
+            if (!built) {
                 set_last_error(NRR_ERROR_RENDER_FAILED,
                                std::string("could not build the offset plane for input '") +
                                name + "'");
@@ -561,7 +574,10 @@ NRRResult BackendCPU::execute_model(
             TensorInput t;
             t.name = name;
             t.shape = shape;
-            if (!build_scale_plane(in_w, in_h, t.data)) {
+            const auto t_plane = stages.tick();
+            const bool built = build_scale_plane(in_w, in_h, t.data);
+            stages.mark(FrameStage::DerivedPlanes, t_plane);
+            if (!built) {
                 set_last_error(NRR_ERROR_RENDER_FAILED,
                                std::string("could not build the resolution token for input '") + name + "'");
                 return NRR_ERROR_RENDER_FAILED;
@@ -616,17 +632,27 @@ NRRResult BackendCPU::execute_model(
             TensorInput t;
             t.name = name;
             t.shape = shape;
+            const auto t_warp = stages.tick();
             const bool warped = motion_img != nullptr &&
                 warp_input_history_to_nchw(history_img.pixels.data(), history_img.width, history_img.height,
                                            history_img.format,
                                            motion_img->pixels.data(), motion_img->width, motion_img->height,
                                            motion_img->format, input.temporal.motion_vectors_scale,
                                            channels, t.data);
-            if (!warped && !texture_to_nchw(history_img.pixels.data(), history_img.width, history_img.height,
-                                            history_img.format, channels, t.data)) {
-                set_last_error(NRR_ERROR_RENDER_FAILED,
-                               std::string("unsupported texture format for input '") + name + "'");
-                return NRR_ERROR_RENDER_FAILED;
+            stages.mark(FrameStage::HistoryWarp, t_warp);
+            if (!warped) {
+                /* No field to reproject with: the previous frame is converted unwarped, which
+                 * is a conversion rather than a warp that did not happen. */
+                const auto t_cv = stages.tick();
+                const bool converted = texture_to_nchw(history_img.pixels.data(), history_img.width,
+                                                       history_img.height, history_img.format,
+                                                       channels, t.data);
+                stages.mark(FrameStage::ConvertToNCHW, t_cv);
+                if (!converted) {
+                    set_last_error(NRR_ERROR_RENDER_FAILED,
+                                   std::string("unsupported texture format for input '") + name + "'");
+                    return NRR_ERROR_RENDER_FAILED;
+                }
             }
             tensors.push_back(std::move(t));
             continue;
@@ -677,8 +703,11 @@ NRRResult BackendCPU::execute_model(
         TensorInput t;
         t.name = name;
         t.shape = shape;
-        if (!texture_to_nchw(src->pixels.data(), src->width, src->height,
-                             src->format, channels, t.data)) {
+        const auto t_cv = stages.tick();
+        const bool converted = texture_to_nchw(src->pixels.data(), src->width, src->height,
+                                               src->format, channels, t.data);
+        stages.mark(FrameStage::ConvertToNCHW, t_cv);
+        if (!converted) {
             set_last_error(NRR_ERROR_RENDER_FAILED,
                            std::string("unsupported texture format for input '") +
                            name + "'");
@@ -692,7 +721,10 @@ NRRResult BackendCPU::execute_model(
     // ---- Inference ----------------------------------------------------------
     std::vector<float> out_data;
     std::vector<int64_t> out_shape;
-    if (!ort->run_inference_multi(tensors, out_data, out_shape)) {
+    const auto t_infer = stages.tick();
+    const bool ran = ort->run_inference_multi(tensors, out_data, out_shape);
+    stages.mark(FrameStage::Inference, t_infer);
+    if (!ran) {
         return NRR_ERROR_RENDER_FAILED;
     }
 
@@ -701,7 +733,10 @@ NRRResult BackendCPU::execute_model(
     // ---- Output tensor -> RGB8 texture --------------------------------------
     uint32_t out_w = 0, out_h = 0;
     std::vector<uint8_t> out_bytes;
-    if (!nchw_to_rgb8(out_data, out_shape, out_bytes, out_w, out_h)) {
+    const auto t_rgb8 = stages.tick();
+    const bool rgb8_ok = nchw_to_rgb8(out_data, out_shape, out_bytes, out_w, out_h);
+    stages.mark(FrameStage::ConvertToRGB8, t_rgb8);
+    if (!rgb8_ok) {
         set_last_error(NRR_ERROR_RENDER_FAILED,
                        "model output tensor is not a 3+ channel NCHW image");
         return NRR_ERROR_RENDER_FAILED;
@@ -757,13 +792,15 @@ NRRResult BackendCPU::execute_model(
         phase_elected.input_render.format = color_img.format;
     }
 
+    const auto t_blend = stages.tick();
     const TemporalAccumulator::Result temporal = temporal_.apply(
         input, out_bytes, out_w, out_h, motion_source, phase_elected, depth_source);
 
     /* Record this frame's low-resolution input so the *next* frame can bind it as the
      * model's history. Recorded after inference, when the input pixels are final, and
      * from the same bytes the model was fed - the history has to be the low-res render
-     * itself, not a reconstruction of it. */
+     * itself, not a reconstruction of it. Part of the blend's stage rather than a separate
+     * one: it is what the next frame's history and mask are built from. */
     temporal_.record_input_frame(color_img.pixels.data(), in_w, in_h, color_img.format);
     /* And this frame's depth, so the next frame's trust mask has two consecutive fields to compare. Recorded
      * unconditionally and by bytes (see record_depth): a caller that supplies no depth gets no mask next
@@ -772,6 +809,7 @@ NRRResult BackendCPU::execute_model(
         temporal_.record_depth(depth_img->pixels.data(), depth_img->width, depth_img->height,
                                depth_img->format);
     }
+    stages.mark(FrameStage::Blend, t_blend);
     const NRRTemporalState tstate = temporal.state;
     const bool blended = temporal.blended;
     const TemporalBlendStats blend_stats = temporal.blend_stats;
@@ -786,15 +824,27 @@ NRRResult BackendCPU::execute_model(
                        "failed to acquire the render output texture");
         return tex_result != NRR_SUCCESS ? tex_result : NRR_ERROR_OUT_OF_MEMORY;
     }
+    const auto t_up = stages.tick();
     NRRResult upload_result = upload_texture(out_tex->backend_texture,
                                              out_bytes.data(),
                                              out_bytes.size());
+    stages.mark(FrameStage::Upload, t_up);
     if (upload_result != NRR_SUCCESS) {
         set_last_error(NRR_ERROR_RENDER_FAILED,
                        "failed to upload the inference output texture");
         return NRR_ERROR_RENDER_FAILED;
     }
 
+    /* The frame's end now follows the quality measurement, which is real work on the displayed
+     * frame - an SSIM and a PSNR pass at output resolution whenever the reference set carries a
+     * ground truth - and previously fell outside the reported split entirely, so the report
+     * claimed the frame was over before work it had done had been counted. With no reference
+     * set (every tier in the latency tests, and the common case) the measurement returns
+     * immediately and this changes nothing. */
+    const auto t_quality = stages.tick();
+    const QualityMeasurement quality =
+        measure_frame_quality(out_bytes.data(), out_w, out_h, references);
+    stages.mark(FrameStage::Quality, t_quality);
     const auto t_done = std::chrono::steady_clock::now();
 
     // ---- Stats ---------------------------------------------------------------
@@ -810,6 +860,13 @@ NRRResult BackendCPU::execute_model(
     /* Measured state (history weight, history depth), not an echo of the input. */
     output.temporal = tstate;
 
+    /* The residual (see nrr_frame_stages.h): the frame's window minus every named stage, so a
+     * stage missing from the record shows up as time nobody can name rather than being
+     * absorbed into the prep/post buckets. Published through the same record the accelerator
+     * kernel writes, so M11.1's gate holds on both execution paths. */
+    stages.add(FrameStage::Other, std::max(0.0, total_ms - stages.total_ms()));
+    publish_frame_stages(stages);
+
     output.stats.render_time_ms = static_cast<float>(total_ms);
     output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
     output.stats.backend_overhead_ms = static_cast<float>(prep_ms + post_ms);
@@ -818,9 +875,7 @@ NRRResult BackendCPU::execute_model(
     /* Measured, not assumed: the *displayed* frame - out_bytes, blended in place above -
      * against the ground-truth image the caller's reference set carries, if it carries one at
      * this resolution. An unmeasured metric is published as 0.0 with the reason in debug_info;
-     * see nrr_quality.h. */
-    const QualityMeasurement quality =
-        measure_frame_quality(out_bytes.data(), out_w, out_h, references);
+     * see nrr_quality.h. Measured above, with the frame's end taken after it. */
     output.stats.quality_metric = published_quality_metric(quality);
     /* temporal_stability is derived from the measured frame-to-frame change of the
      * displayed image, via the convention shared with every other backend (see
@@ -855,6 +910,9 @@ NRRResult BackendCPU::execute_model(
         info += quality_debug_note(quality);
         copy_string(output.stats.debug_info,
                     sizeof(output.stats.debug_info), info);
+        /* Optional, and it yields to the notes already in the buffer rather than truncating
+         * them - see append_stage_summary. M11.1's test asserts it fits on every tier. */
+        append_stage_summary(output.stats.debug_info, sizeof(output.stats.debug_info), stages);
     }
 
     return NRR_SUCCESS;

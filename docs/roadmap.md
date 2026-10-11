@@ -32,7 +32,7 @@ and 23 of the 227 are compiled out of a desktop build).
 | Unreal plugin | Phase 10 items checked | **Built and verified in-engine.** Two modules that did not exist before - `NRRRuntime` loads `nrr.dll` at run time and resolves all 51 entry points of `include/nrr.h` from the header, and `NRRPlugin` provides `UNRRComponent` and the `NRRVerify` commandlet - and `engine_plugins/unreal_verify/` builds them into UE 5.8.3's **Editor** target (a Launcher *Installed* engine cannot link a standalone Game target) and renders the released model at three tiers headless: `RESULT: PASS`, exit code 0 (2026-10-10, **CPU** execution provider, because the CUDA provider crashes inside `nrr.dll` during model load on this host). What the plugin deliberately does not do is listed in M5. |
 | Godot plugin | Phase 11 items checked | **Built and run.** `plugin.cfg` is the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding. Compiled against godot-cpp 10.0.0 and loaded by Godot 4.7.2-stable, which registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a non-passthrough frame (M1.5, `engine_plugins/godot_verify/`). Re-verified once the NVIDIA backend became first-class: `backend=NVIDIA`, `caps.active_backend=NVIDIA` with `neural_acceleration=0` before a model is loaded and `caps.active_backend=CUDAExecutionProvider` with `neural_acceleration=3` (FULL) after, `first_frame_ms=571.712` against `steady_state_ms=0.578`, `RESULT: PASS`. `verify.gd` now reports the cold frame and the steady state separately and asserts the steady state. Windows x86_64 **debug** variant only; the other `nrr.gdextension` entries are unbuilt. Wiring is measured by 9 drift guards in `tests/unit/test_engine_plugins.cpp`. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
-| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. |
+| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. **M11.1 has since re-measured the 1080p->4K tier per stage with the same fixture and reports 289.0 ms** - 3.6x below this table's figure, unattributed (the build configuration behind it is not recorded here) - with the **temporal blend (105.6 ms, 36.3%) the largest single stage** and 64% of the frame host-side work. |
 | CI | none | `.github/workflows/ci.yml` added in M0 and now **eight jobs**: Windows x64 build + the full suite (**204** tests) against a real ONNX Runtime SDK, where the job fails outright when the SDK is missing rather than passing on a build that cannot honour a frame; a **blocking** AddressSanitizer job over the same suite with the 17 wall-clock benchmarks excluded, so it runs **187 of 204** (`NRR_SKIP_TIMING_TESTS`); `windows-gpu-link`, which fetches the CUDA-flavoured ONNX Runtime and builds, links and tests that configuration because the CPU-flavour job compiles none of that path; the Android cross-build (NDK r27, arm64-v8a); the Vulkan branch with headers only and no SDK; the metrics-harness self-check; the C ABI / managed mirror audit (`tools/check_abi.py`); and the trainer self-checks. |
 
 ---
@@ -738,8 +738,16 @@ model that does almost no work, and the inference column is a floor rather than 
 tier most of the 157.4 ms is ONNX Runtime's own host-to-device transfer, arena and graph bookkeeping at 4K tensor
 sizes, and a real colour+depth+motion upscaler would move milliseconds into that column and out of the host
 column without changing the conclusion. The honest reading is therefore **the host overhead is measured and the
-inference share is not yet**, which is why M11.1 re-measures this row with the released model rather than
-reinterpreting it.
+inference share is not yet**, which is why M11.1 re-measures this row rather than reinterpreting it.
+
+**That re-measurement has now happened, and it disagrees with the table above by 3.6x:** M11.1 measures the same
+tier, with the same fixture, at **289.0 ms** (Release, CUDA EP attached, five samples; the stages sum to it within
+3.3%). The gap is not attributed - the build configuration behind the figures above is not recorded in this
+roadmap, and host load is the other candidate - so the four rows are quoted here as the historical measurement they
+are, and **deriving a budget from them again requires re-deriving them with a recorded configuration**. What
+survives is the shape the table was used to argue: two thirds of the 1080p->4K frame is still host-side work
+(186.3 ms of 289.0 ms), now with names rather than a bucket - the blend 105.6 ms, the RGB8 conversion 33.6 ms, the
+NCHW conversion 29.3 ms. The released model is still not measured on this path (M11.1 records that as open).
 
 **Three defects this reachability exposed, all fixed.** The accelerator frame path was passing
 only input 0, so `Run()` failed for every three-input model in the project and the path silently
@@ -2316,6 +2324,12 @@ motion buffer every frame: `runtime/accel_kernel.cpp:200-228,436,475,488`; `runt
 `runtime/nrr_temporal.cpp:727-744`). A larger GPU would not move any of it, which is why this is its own frontier
 rather than more M2.
 
+**One correction this section has since made to its own premise:** M11.1 re-measured the 1080p->4K tier at
+**289.0 ms**, not the 1031.3 ms above, with the same fixture and an unattributed 3.6x gap (see M11.1's second
+finding and the correction in M2's postmortem). The absolute figures here are therefore the historical ones; the
+ratio is what this section is built on, and the ratio got *stronger* - 64% of the frame is host work, and the
+temporal blend alone is its largest single stage.
+
 The target this section is trying to make arithmetically possible is `< 16 ms at 1080p -> 4K`
 (`models/architecture.md` section 7.3) - a data-path claim, which is why M11.9 (the model's own floor) cannot be
 skipped even if M11.1-M11.8 all land perfectly.
@@ -2323,21 +2337,66 @@ skipped even if M11.1-M11.8 all land perfectly.
 The order below is deliberate: **nothing is judged until M11.1 can attribute the 866.8 ms**, and every lever that
 needs no toolchain and no retrain is measured before the ones that do.
 
-### M11.1 - The stage split: the instrument every other milestone is judged by
+### M11.1 - The stage split: the instrument every other milestone is judged by `done, measured`
 
-- [ ] Per-stage timing and byte counters in the frame path - download (colour/depth/motion), NCHW conversion,
-      trust mask, history warp, jitter plane, inference, RGB8 conversion, blend, upload, quality - published in
-      the stats record and `debug_info`, at **zero cost when disabled** so the instrument does not perturb the
-      number it publishes.
-- [ ] `latency_frame_budget_breakdown` extended in its existing style (`tests/performance/test_latency.cpp`):
-      each stage printed with its unit and a budget derived from measurement, and the stage sum asserted against
-      the reported total - the prep+infer+post assertion at `test_latency.cpp:739` generalised, so a stage that
-      stops being measured cannot silently vanish from the sum.
-- [ ] The breakdown measured with **three models**: the passthrough fixture, `models/nrr_upscaler_v0.1.onnx`
-      (continuity with the M2 table) and the released trained model - because the M2 table's inference column
-      describes a 45 KB fixture, so the inference *share* at the tier is not yet known for a real network.
-- **Gate:** the extended breakdown passes on all four tiers, the stages sum to the reported total within 5%, and
-  the disabled instrumentation costs under 1% of the frame over five steady-state samples.
+- [x] `runtime/nrr_frame_stages.{h,cpp}`: the frame split by stage - download (colour/depth/motion), NCHW
+      conversion, trust mask, history warp, derived planes (the jitter offset and the resolution token),
+      inference, RGB8 conversion, blend, upload, quality - recorded on **both** execution paths (the shared
+      accelerator kernel and `BackendCPU`), published as a readable record and as a bounded clause in
+      `debug_info` when it fits. `FrameStage::Other` is the **residual** (the frame's window minus every named
+      stage), so the parts cannot add up by construction and a missing stage shows as unattributed time.
+- [x] `latency_frame_budget_breakdown` extended: every stage printed in ms and as a share, the stage sum
+      asserted against the published total, the residual budgeted at 25% of the frame, the two conversions
+      asserted non-zero, and the session run asserted inside the published inference figure. The existing
+      prep/infer/post assertions are unchanged and still pass - the published split did not move.
+- [x] **"Off by default and free while off" is measured, not argued.** A disabled instrument reads **no clock at
+      all**: the test renders one frame with it off and asserts the clock-read counter does not move (**0**), then
+      one with it on and asserts it does (**22 per frame**) so the first assertion cannot be vacuous. Counting
+      clock reads rather than comparing wall-clock milliseconds is deliberate - a millisecond comparison would be
+      one more load-sensitive timing test, and would say nothing about the absence of a per-stage cost.
+- [ ] **Byte counters per stage** (the second half of the original item) are not implemented: the record is
+      time-only, so a stage's cost is attributed but its traffic is not. That belongs with M11.2, which is where
+      per-frame allocation is measured.
+- [ ] The breakdown is **not yet measured with the released model**, only with the sample fixture the suite
+      loads (`models/nrr_upscaler_v0.1.onnx`): it declares colour+depth+motion, so `mk`, `wp` and `jt` read 0 at
+      every tier because nothing declares `validity`, `history` or `jitter`. Measuring the released model is what
+      exercises those stages, and it stays open here rather than being implied.
+
+**Measured the same day the instrument landed, Release, CUDA EP attached, this host, five steady-state samples
+per tier after three warm-ups (the fixture above):**
+
+| tier | reported | session run (stage) | published inference | host share | largest stages |
+| --- | --- | --- | --- | --- | --- |
+| 256x256 -> 512x512 | 10.8 ms | 5.09 ms | 6.94 ms | 53.0% | blend 3.51 ms (32.4%), rgb 1.03 ms, cv 0.89 ms |
+| 512x512 -> 1024x1024 | 41.7 ms | 18.61 ms | 22.32 ms | 55.4% | blend 13.31 ms (31.9%), rgb 4.24 ms, cv 3.81 ms |
+| 960x540 -> 1920x1080 | 81.5 ms | 35.31 ms | 41.66 ms | 56.7% | blend 27.29 ms (33.5%), rgb 8.16 ms, cv 7.08 ms |
+| 1920x1080 -> 3840x2160 | **289.0 ms** | 104.59 ms | 129.63 ms | **64.0%** | **blend 105.56 ms (36.3%)**, rgb 33.59 ms (11.6%), cv 29.34 ms (10.1%), downloads 2.93 ms, upload 4.88 ms, residual 9.66 ms (3.3%) |
+
+**Three findings, in the order they change the plan.**
+
+1. **The blend is the biggest single stage of the 1080p->4K frame, not the conversions.** 105.6 ms of 289.0 ms
+   (36.3%) is temporal accumulation - more than the RGB8 and NCHW conversions *together* (62.9 ms, 21.7%) and
+   about the same as the whole session run (104.6 ms, 36.0%). It runs at output resolution (8.3M pixels) over a
+   scalar single-threaded loop, which is precisely what M11.3 exists to fix, and it means M11.3's first target is
+   the blend rather than the two conversions the section's introduction named. The M4/V2 kernels for the
+   conversions are still the cheaper win per unit risk (they are verified), but they are not the largest one.
+2. **The re-measured tier is 289.0 ms, against the 1031.3 ms the M2 table records for the same tier, with the
+   same fixture.** The difference is 3.6x and is **not attributed**: the candidates are the build configuration
+   (this is a Release build; the configuration behind the M2 figure is not recorded in this roadmap) and host
+   load. It matters because M11's framing, the tier budgets and the "85-88% host" headline all come from that
+   table, so the honest position is that the M2 figure needs re-deriving with a recorded configuration before
+   any budget is derived from it again. What survives - and is now much sharper than a bucket - is the *shape*:
+   two thirds of the frame is work the host does for the model (186.3 ms of 289.0 ms here) and it is
+   concentrated in three loops.
+3. **On the CPU execution provider the same tier is 1647.4 ms, and there the model dominates** (session run
+   1445.2 ms, 87.7%; host share 12.3%). That is the same instrumentation on the other path - the read-out that
+   matters for the engine integrations on this host, which run on the CPU provider, and the reason every
+   assertion above is structural rather than budget-based on that configuration.
+
+- **Gate (met):** the extended breakdown passes at all four tiers on both paths; the stages plus the residual
+  equal the published total within 5% (residual 0.5-3.3%); the conversions are non-zero; the session run never
+  exceeds the published inference figure; the disabled instrument reads zero clocks and the enabled one reads
+  twenty-two. Suite: **204 passed, 0 failed** in both the CPU-flavour and CUDA-flavour Release builds.
 
 ### M11.2 - An arena: zero allocation after warm-up
 
@@ -2349,6 +2408,12 @@ needs no toolchain and no retrain is measured before the ones that do.
   a named host.
 
 ### M11.3 - Vectorize and thread the host loops, and state the floor
+
+- [ ] **Priority inside this milestone comes from M11.1's measurement, not from the order below**: the temporal
+      blend is the largest single host stage at the tier (105.6 ms, 36.3%) - more than the two conversions
+      together - so it is the first loop to fix. The conversions still come first *if* M11.5's verified kernels can
+      be wired cheaply, because that is a 2-of-4 win on any Vulkan device with no new code to write; the blend
+      needs M11.6's shader regardless of what is done to it on the host.
 
 - [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
       source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`

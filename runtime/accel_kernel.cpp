@@ -15,6 +15,7 @@
 #include "accel_texture.h"
 #include "onnx_runtime.h"
 #include "nrr_model.h"
+#include "nrr_frame_stages.h"
 #include "nrr_inference.h"
 #include "nrr_jitter.h"
 #include "nrr_quality.h"
@@ -209,6 +210,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     ModelONNX* monx = dynamic_cast<ModelONNX*>(model);
 
     const auto t_start = std::chrono::steady_clock::now();
+    /* Per-stage attribution for this frame (docs/roadmap.md M11.1). Off by default: while it
+     * is off, tick() reads no clock and mark() returns immediately, so this costs nothing a
+     * build would otherwise have measured. The residual reported at the end is what keeps the
+     * record falsifiable - see runtime/nrr_frame_stages.h. */
+    StageTimings stages;
 
     /* ---- 0. Per-frame scratch the input builder and the record below share ---- */
     /* The thresholds, caches and byte-level downloads this frame needs. Declared here, before the colour
@@ -231,7 +237,16 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         const size_t bytes = accel_texture_bytes(tex->width, tex->height, tex->format);
         if (bytes == 0) return false;
         out.assign(bytes, 0);
-        return download(tex->backend_texture, out.data(), bytes) == NRR_SUCCESS;
+        /* Which texture this is decides which stage pays for it: depth and motion are
+         * downloaded on first demand, and an attachment the engine did not supply is not a
+         * download at all (the zero-filled note says so separately). */
+        const FrameStage stage = (tex == depth_tex)  ? FrameStage::DownloadDepth
+                               : (tex == motion_tex) ? FrameStage::DownloadMotion
+                                                     : FrameStage::DownloadColor;
+        const auto t = stages.tick();
+        const bool ok = download(tex->backend_texture, out.data(), bytes) == NRR_SUCCESS;
+        stages.mark(stage, t);
+        return ok;
     };
     auto frame_motion = [&]() -> const std::vector<uint8_t>* {
         if (!motion_frame_loaded) {
@@ -251,11 +266,16 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                                  std::vector<float>& data) -> bool {
             if (!tex || !tex->backend_texture || !download) return false;
             scratch.assign(accel_texture_bytes(tex->width, tex->height, tex->format), 0);
-            if (download(tex->backend_texture, scratch.data(), scratch.size())
-                    != NRR_SUCCESS)
-                return false;
-            return texture_to_nchw(scratch.data(), tex->width, tex->height,
-                                   tex->format, channels, data);
+            const auto t_dl = stages.tick();
+            const bool read = download(tex->backend_texture, scratch.data(), scratch.size())
+                                  == NRR_SUCCESS;
+            stages.mark(FrameStage::DownloadColor, t_dl);
+            if (!read) return false;
+            const auto t_cv = stages.tick();
+            const bool converted = texture_to_nchw(scratch.data(), tex->width, tex->height,
+                                                   tex->format, channels, data);
+            stages.mark(FrameStage::ConvertToNCHW, t_cv);
+            return converted;
         };
         if (download_nchw(in_tex, 3, color_nchw)) {
             /* The bytes the colour tensor was just built from, kept for record_input_frame() below: the history
@@ -342,14 +362,20 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                 const JitterOffset offset = input.temporal.jitter.enabled
                     ? JitterOffset(input.temporal.jitter.offset_x, input.temporal.jitter.offset_y)
                     : JitterOffset();
-                if (!build_jitter_plane(offset, w, h, data)) return false;
+                const auto t = stages.tick();
+                const bool built = build_jitter_plane(offset, w, h, data);
+                stages.mark(FrameStage::DerivedPlanes, t);
+                if (!built) return false;
             } else if (role == TensorRole::Color) {
                 /* Already converted above; its shape is the texture's own size. */
                 data = color_nchw;
             } else if (role == TensorRole::Scale) {
                 /* Derived from this frame's input width, exactly as the CPU path and the harness derive it: one
                  * channel, constant. It is not downloaded from any texture, because no engine supplies it. */
-                if (!build_scale_plane(w, h, data)) return false;
+                const auto t = stages.tick();
+                const bool built = build_scale_plane(w, h, data);
+                stages.mark(FrameStage::DerivedPlanes, t);
+                if (!built) return false;
             } else if (role == TensorRole::Validity) {
                 /* The mask was not built on this path at all, so a model declaring `validity` was fed the
                  * colour image through a three-channel tensor. Built here from this frame's depth and motion
@@ -371,11 +397,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                     if (depth_frame_loaded && field != nullptr &&
                         temporal_.previous_depth_frame(previous_depth_bytes, previous_w, previous_h,
                                                        previous_format)) {
+                        const auto t = stages.tick();
                         compute_history_trust_mask_from_textures(
                             depth_frame_bytes.data(), depth_tex->width, depth_tex->height, depth_tex->format,
                             previous_depth_bytes.data(), previous_w, previous_h, previous_format,
                             field->data(), motion_tex->width, motion_tex->height, motion_tex->format,
                             trust_mask);
+                        stages.mark(FrameStage::TrustMask, t);
                     }
                 }
                 if (trust_mask.size() == elements) data = trust_mask;
@@ -391,15 +419,23 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                                 0.0f);
                 } else {
                     const std::vector<uint8_t>* field = frame_motion();
+                    const auto t_warp = stages.tick();
                     const bool warped = field != nullptr &&
                         warp_input_history_to_nchw(previous_frame_bytes.data(), previous_frame_w,
                                                    previous_frame_h, previous_frame_format,
                                                    field->data(), motion_tex->width, motion_tex->height,
                                                    motion_tex->format, input.temporal.motion_vectors_scale,
                                                    channels, data);
-                    if (!warped && !texture_to_nchw(previous_frame_bytes.data(), previous_frame_w,
-                                                    previous_frame_h, previous_frame_format, channels, data)) {
-                        return false;
+                    stages.mark(FrameStage::HistoryWarp, t_warp);
+                    if (!warped) {
+                        /* No field to reproject with, so the previous frame is converted
+                         * unwarped - the same fallback the CPU path takes and a conversion,
+                         * so it is counted as one rather than as a warp that did not happen. */
+                        const auto t_cv = stages.tick();
+                        const bool converted = texture_to_nchw(previous_frame_bytes.data(), previous_frame_w,
+                                                              previous_frame_h, previous_frame_format, channels, data);
+                        stages.mark(FrameStage::ConvertToNCHW, t_cv);
+                        if (!converted) return false;
                     }
                 }
             } else {
@@ -407,11 +443,20 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
                 if (src && src->backend_texture && download) {
                     scratch.assign(accel_texture_bytes(src->width, src->height,
                                                        src->format), 0);
-                    if (download(src->backend_texture, scratch.data(),
-                                 scratch.size()) == NRR_SUCCESS) {
+                    const FrameStage download_stage =
+                        (src == depth_tex)  ? FrameStage::DownloadDepth
+                      : (src == motion_tex) ? FrameStage::DownloadMotion
+                                            : FrameStage::DownloadColor;
+                    const auto t_dl = stages.tick();
+                    const bool downloaded = download(src->backend_texture, scratch.data(),
+                                                     scratch.size()) == NRR_SUCCESS;
+                    stages.mark(download_stage, t_dl);
+                    if (downloaded) {
+                        const auto t_cv = stages.tick();
                         loaded = texture_to_nchw(scratch.data(), src->width,
                                                  src->height, src->format, channels,
                                                  data);
+                        stages.mark(FrameStage::ConvertToNCHW, t_cv);
                     }
                 }
                 if (!loaded) {
@@ -443,7 +488,15 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         if (!build_inputs(rt, tins)) return false;
         std::vector<float> o;
         std::vector<int64_t> os;
-        if (!rt->run_inference_multi(tins, o, os)) return false;
+        /* The model, and only the model: build_inputs() above has already recorded what its
+         * own conversions cost, so this is the session run rather than the input assembly
+         * around it. The published inference figure includes both (it is measured from
+         * t_prepared to t_inferred), which is why the two numbers are compared rather than
+         * assumed equal. */
+        const auto t_infer = stages.tick();
+        const bool ran = rt->run_inference_multi(tins, o, os);
+        stages.mark(FrameStage::Inference, t_infer);
+        if (!ran) return false;
         used_rt = rt;
         out = std::move(o);
         out_shape = std::move(os);
@@ -474,7 +527,10 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     /* ---- 4. Convert back to RGB8 ---------------------------------------- */
     std::vector<uint8_t> rgb8;
     uint32_t out_w = 0, out_h = 0;
-    if (!nchw_to_rgb8(out, out_shape, rgb8, out_w, out_h))
+    const auto t_rgb8 = stages.tick();
+    const bool rgb8_ok = nchw_to_rgb8(out, out_shape, rgb8, out_w, out_h);
+    stages.mark(FrameStage::ConvertToRGB8, t_rgb8);
+    if (!rgb8_ok)
         return NRR_ERROR_RENDER_FAILED;
 
     /* ---- 5. Temporal accumulation --------------------------------------- */
@@ -534,6 +590,7 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         phase_elected.input_render.format = in_tex->format;
     }
 
+    const auto t_blend = stages.tick();
     const TemporalAccumulator::Result temporal = temporal_.apply(
         input, rgb8, out_w, out_h, motion_source, phase_elected, depth_source);
 
@@ -550,6 +607,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         temporal_.record_depth(depth_frame_bytes.data(), depth_tex->width, depth_tex->height,
                                depth_tex->format);
     }
+    /* The blend's window closes here rather than at apply(): the recording above is what the
+     * *next* frame's history and mask are built from, so it is part of this stage, and a
+     * motion/depth field fetched inside apply() (through motion_source/depth_source) lands in
+     * this window too, deliberately - it exists because the blend asked for it. */
+    stages.mark(FrameStage::Blend, t_blend);
 
     /* ---- 6. Publish the output texture ---------------------------------- */
     TextureImpl* out_tex = nullptr;
@@ -561,8 +623,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     } else {
         out_tex = in_tex; /* defensive: no owned allocation without ModelONNX */
     }
-    if (out_tex->backend_texture && upload)
+    if (out_tex->backend_texture && upload) {
+        const auto t_up = stages.tick();
         upload(out_tex->backend_texture, rgb8.data(), rgb8.size());
+        stages.mark(FrameStage::Upload, t_up);
+    }
     output.color = reinterpret_cast<NRRTexture*>(out_tex);
 
     /* ---- 7. Report measured state --------------------------------------- */
@@ -571,6 +636,17 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
      * last_render_time_ms() read 0 for every accelerator frame - so a tool that
      * measures the frame budget would see a suspiciously free render. Report what
      * was actually measured, split the same way BackendCPU splits it. */
+    /* The frame's end is taken *after* the quality measurement, which is real work on the
+     * displayed frame - an SSIM and a PSNR pass at output resolution whenever the frame's
+     * reference set carries one - and used to fall outside the reported split entirely, so
+     * the report claimed the frame was over before work it had done had been counted. With
+     * no reference set (the common case, and every tier in the latency tests) the measurement
+     * returns immediately and this changes nothing. The field is still published as 0.0 with
+     * its reason when there is nothing to measure against - see nrr_quality.h. */
+    const auto t_quality = stages.tick();
+    const QualityMeasurement quality =
+        measure_frame_quality(rgb8.data(), out_w, out_h, frame_references_);
+    stages.mark(FrameStage::Quality, t_quality);
     const auto t_done = std::chrono::steady_clock::now();
     const double prep_ms = std::chrono::duration<double, std::milli>(
         t_prepared - t_start).count();
@@ -578,6 +654,13 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         t_inferred - t_prepared).count();
     const double post_ms = std::chrono::duration<double, std::milli>(
         t_done - t_inferred).count();
+
+    /* The residual: the frame's window minus every named stage, so a stage missing from the
+     * record shows up here as time nobody can name instead of being quietly absorbed - and
+     * the numbers below can never be made to add up by construction. See nrr_frame_stages.h. */
+    stages.add(FrameStage::Other,
+               std::max(0.0, (prep_ms + infer_ms + post_ms) - stages.total_ms()));
+    publish_frame_stages(stages);
 
     output.stats.render_time_ms = static_cast<float>(prep_ms + infer_ms + post_ms);
     output.stats.neural_inference_time_ms = static_cast<float>(infer_ms);
@@ -591,9 +674,7 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
     /* Measured through the same definition BackendCPU uses, so quality_metric means the same
      * thing wherever the frame ran: the displayed frame - rgb8, blended in place above -
      * against the ground-truth image the frame's reference set carries, if it carries one at
-     * this resolution. */
-    const QualityMeasurement quality =
-        measure_frame_quality(rgb8.data(), out_w, out_h, frame_references_);
+     * this resolution. Measured above, with the frame's end taken after it. */
     output.stats.quality_metric = published_quality_metric(quality);
     {
         char debug[256];
@@ -616,6 +697,11 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
         }
         info += quality_debug_note(quality);
         copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), info);
+        /* The stage clause is optional and yields to what is already in the buffer: a record
+         * that truncated the measured quality note would be worse than no record, so this
+         * reports whether it fitted rather than truncating anything. M11.1's test asserts it
+         * fits on every tier the suite runs. */
+        append_stage_summary(output.stats.debug_info, sizeof(output.stats.debug_info), stages);
     }
     return NRR_SUCCESS;
 }
