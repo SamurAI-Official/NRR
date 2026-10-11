@@ -16,7 +16,7 @@ actually printed rather than estimates.
 ### M11.3, fourth step: a worker pool evaluated against the per-call form, and the crossover retested
 
 The threads the runtime's per-pixel loops use were created per call, which M11.3's sweep had already priced (the
-per-step times of a small frame inflate with the worker count). This step, in `__M113D_COMMIT__`, parks them
+per-step times of a small frame inflate with the worker count). This step, in `b4f0a0d8`, parks them
 instead - `NRR_PARALLEL=spawn|pool`. **The pool is faster and is not the default**, and both halves of that are
 measurements.
 
