@@ -13,6 +13,46 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The tier rows re-derived with their configuration recorded: the M2 table was an unoptimized build
+
+M11.1 found that the M2 tier table had no recorded build configuration and could not attribute a 3.6x
+disagreement with the same fixture. This is the re-derivation, in `__M112_COMMIT__`: `nrr_bench` now states its
+own configuration and can report the per-stage split (`--stages`), `tools/measure_tiers.ps1` records every run
+with the facts a row needs to be comparable, and `docs/measurements/` holds nine rows with their JSON and CSV.
+
+* **The M2 rows are attributed, and it is the build configuration.** In the scenario those rows were measured in
+  (motion above the runtime's threshold, so the blend disengages), with the same fixture, path and provider:
+  M2 recorded 1031.3 ms at 1080p->4K; **Release measures 288.0 ms and an unoptimized Debug build 1218.8 ms**.
+  M2's row is **3.6x the Release figure and 0.85x the Debug figure**, and the same relationship holds at all four
+  tiers (3.4x/3.8x/3.4x versus Release, 0.87x/0.88x/0.93x versus Debug). The configuration behind M2 was never
+  recorded, so this cannot be proven - but the magnitude matches Debug and not Release, and **no budget should be
+  derived from those four rows**, which is what the roadmap now says in both places they appear.
+* **And the penalty is in the host loops, not the model.** Disengaged at the tier, Debug versus Release: blend
+  618.7 vs 118.7 ms, RGB8 conversion 269.6 vs 35.3 ms, NCHW conversion 171.2 vs 33.5 ms, while the session run is
+  unchanged to within 2% on the CPU provider (1442.3 vs 1434.2 ms). A 4x measurement of what M11.3's loops are
+  worth, taken without touching them.
+* **The hole in M11.1's own table is filled: the blend engaged.** Those rows came from the latency test's frames,
+  which carry in-range motion, so the temporal blend was *disengaged* in every one of them - the largest stage of
+  a real frame was never measured. With a jittered still scene at the tier, **1452.6 ms** is reported and the
+  blend is **1227.9 ms (84.5%)** against a session run of 144.8 ms (10.0%); the shape holds at thirty frames
+  (84.1%) and with the released model (83.0%). The released model also closes M11.1's open item: it is measured
+  now, and its derived-plane stage appears (`jt` = 4.6 ms) where the fixture declares no such input.
+* **The engine-integration configuration is measured too, and one suspicion is retired.** On the CPU execution
+  provider the model dominates (88.8% of a disengaged frame at the tier, 1434.2 ms). The accelerator path with the
+  CUDA provider unavailable matches the CPU backend to within 1.3% (1636.3 vs 1615.1 ms), which retires an
+  apparent ~20x pathology: that came from comparing two rows whose *sessions* had attached different providers,
+  because a stale `PATH` let the CPU backend's session attach CUDA in one run and not the other.
+* **The recorder is built so that class of mistake cannot recur**, and getting there fixed four defects in this
+  change itself, each caught by running it: untracked output was reported as a dirty tree; a requested backend was
+  assumed to be the one that ran (a row labelled `cpu` had attached CUDA); a provider *warning* on stderr became a
+  terminating error twice, once inside a helper, which is why the call is now made at script scope with the
+  preference relaxed; and `Start-Process` split an absolute model path containing a space into several arguments,
+  which is why the call operator is used instead. The provider is now pinned **and** read back from the render's
+  own debug string, with a MISMATCH recorded when they disagree.
+* Dependency-free consequences recorded rather than acted on: the tier budgets in the latency test are still 3.5x
+  the *old* rows, so the re-derived cost passes them with a ~12x margin - no longer tight enough to catch a 4x
+  regression, and re-deriving them belongs with the M11 work.
+
 ### The frame split, measured: the temporal blend is the largest host stage at 1080p->4K
 
 M11's first milestone, in `b3197610`. M2 measured that 85-88% of a tier's frame is host-side pixel work and

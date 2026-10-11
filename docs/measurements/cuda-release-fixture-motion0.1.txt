@@ -1,0 +1,31 @@
+﻿NRR tier measurement: cuda-release-fixture-motion0.1
+  when          : 2026-10-11 05:45:30 UTC
+  commit        : b5f275e1fd0ab70c3a58a830ac6dc272e351d015
+  tool          : build-gpu/Release/nrr_bench.exe  (275456 bytes, built 2026-10-10 22:36:38)
+  model         : models/nrr_upscaler_v0.1.onnx  (45082 bytes)
+  model sha256  : 8f63267f6131c25fb89f48861eeb28eb07f077975442a5d06faf970a521ed5e9
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0.1  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  (the frames reported CUDAExecutionProvider, as requested)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_v0.1.onnx (45082 bytes)  ratio=2  frames=5  warmup=3  motion=0.1000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on
+  256x256->512x512: wall=9.46ms  reported=9.28ms  (inference=3.85ms, host overhead=5.42ms)  p50=8.98ms  p99=11.53ms  fps=105.7
+      spread: min 7.94  max 11.59  stddev 1.30  inference share 41.5%  provider CUDAExecutionProvider
+      stages: dlc=0.021ms(0.23%) dld=0.021ms(0.23%) dlm=0.019ms(0.21%) cv=1.114ms(12.01%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=3.023ms(32.58%) rgb=1.107ms(11.93%) bl=3.788ms(40.82%) up=0.096ms(1.04%) q=0.000ms(0.00%) ot=0.088ms(0.95%)
+  512x512->1024x1024: wall=34.86ms  reported=33.91ms  (inference=13.71ms, host overhead=20.20ms)  p50=34.70ms  p99=35.98ms  fps=28.7
+      spread: min 34.23  max 36.02  stddev 0.63  inference share 40.4%  provider CUDAExecutionProvider
+      stages: dlc=0.059ms(0.17%) dld=0.075ms(0.22%) dlm=0.064ms(0.19%) cv=4.121ms(12.15%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=10.066ms(29.68%) rgb=4.824ms(14.23%) bl=13.420ms(39.57%) up=0.288ms(0.85%) q=0.001ms(0.00%) ot=0.994ms(2.93%)
+  960x540->1920x1080: wall=78.78ms  reported=75.93ms  (inference=28.10ms, host overhead=47.83ms)  p50=79.33ms  p99=80.28ms  fps=12.7
+      spread: min 76.70  max 80.29  stddev 1.37  inference share 37.0%  provider CUDAExecutionProvider
+      stages: dlc=0.337ms(0.44%) dld=0.240ms(0.32%) dlm=0.265ms(0.35%) cv=9.410ms(12.39%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=20.638ms(27.18%) rgb=9.277ms(12.22%) bl=32.121ms(42.31%) up=1.307ms(1.72%) q=0.001ms(0.00%) ot=2.332ms(3.07%)
+  1920x1080->3840x2160: wall=298.10ms  reported=288.02ms  (inference=109.47ms, host overhead=178.55ms)  p50=287.37ms  p99=338.23ms  fps=3.4
+      spread: min 270.97  max 338.92  stddev 27.45  inference share 38.0%  provider CUDAExecutionProvider
+      stages: dlc=1.509ms(0.52%) dld=0.959ms(0.33%) dlm=0.855ms(0.30%) cv=33.522ms(11.64%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=80.284ms(27.87%) rgb=35.334ms(12.27%) bl=118.668ms(41.20%) up=5.078ms(1.76%) q=0.001ms(0.00%) ot=11.809ms(4.10%)
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-fixture-motion0.1-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-fixture-motion0.1-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-fixture-motion0.1-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-fixture-motion0.1-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\cuda-release-fixture-motion0.1.json

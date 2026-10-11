@@ -1,0 +1,53 @@
+﻿NRR tier measurement: cpu-release-fixture-motion0.1
+  when          : 2026-10-11 05:48:37 UTC
+  commit        : b5f275e1fd0ab70c3a58a830ac6dc272e351d015
+  tool          : build/Release/nrr_bench.exe  (275456 bytes, built 2026-10-10 22:36:32)
+  model         : models/nrr_upscaler_v0.1.onnx  (45082 bytes)
+  model sha256  : 8f63267f6131c25fb89f48861eeb28eb07f077975442a5d06faf970a521ed5e9
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0.1  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested cpu  attached=CPUExecutionProvider  (the frames reported CPUExecutionProvider, as requested)
+
+nrr_bench.exe : [1;31m2026-10-10 22:48:13.9378021 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be found.")
+At G:\Program Prototype\NRR\tools\measure_tiers.ps1:123 char:17
++     $measured = & $binary @arguments 2>&1 | Out-String
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1;31m2026-10-...not be found."):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[m
+[1;31m2026-10-10 22:48:14.4688206 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be found.")
+[m
+[1;31m2026-10-10 22:48:16.4955608 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be found.")
+[m
+[1;31m2026-10-10 22:48:20.3660596 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be found.")
+[m
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_v0.1.onnx (45082 bytes)  ratio=2  frames=5  warmup=3  motion=0.1000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on
+  256x256->512x512: wall=55.55ms  reported=55.20ms  (inference=48.55ms, host overhead=6.65ms)  p50=55.70ms  p99=56.63ms  fps=18.0
+      spread: min 54.28  max 56.64  stddev 0.97  inference share 88.0%  provider CPUExecutionProvider
+      stages: dlc=0.000ms(0.00%) dld=0.000ms(0.00%) dlm=0.000ms(0.00%) cv=1.366ms(2.47%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=48.551ms(87.96%) rgb=1.416ms(2.57%) bl=3.740ms(6.78%) up=0.092ms(0.17%) q=0.000ms(0.00%) ot=0.032ms(0.06%)
+  512x512->1024x1024: wall=211.35ms  reported=210.18ms  (inference=187.59ms, host overhead=22.59ms)  p50=207.43ms  p99=229.28ms  fps=4.7
+      spread: min 204.11  max 230.14  stddev 9.51  inference share 89.3%  provider CPUExecutionProvider
+      stages: dlc=0.000ms(0.00%) dld=0.000ms(0.00%) dlm=0.000ms(0.00%) cv=3.927ms(1.87%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=187.588ms(89.25%) rgb=4.155ms(1.98%) bl=14.028ms(6.67%) up=0.332ms(0.16%) q=0.000ms(0.00%) ot=0.152ms(0.07%)
+  960x540->1920x1080: wall=421.68ms  reported=419.99ms  (inference=374.17ms, host overhead=45.82ms)  p50=423.52ms  p99=427.11ms  fps=2.4
+      spread: min 413.76  max 427.20  stddev 4.75  inference share 89.1%  provider CPUExecutionProvider
+      stages: dlc=0.000ms(0.00%) dld=0.000ms(0.00%) dlm=0.000ms(0.00%) cv=7.844ms(1.87%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=374.174ms(89.09%) rgb=8.678ms(2.07%) bl=28.312ms(6.74%) up=0.632ms(0.15%) q=0.000ms(0.00%) ot=0.351ms(0.08%)
+  1920x1080->3840x2160: wall=1622.43ms  reported=1615.06ms  (inference=1434.23ms, host overhead=180.83ms)  p50=1631.57ms  p99=1641.98ms  fps=0.6
+      spread: min 1598.04  max 1642.31  stddev 17.15  inference share 88.8%  provider CPUExecutionProvider
+      stages: dlc=0.000ms(0.00%) dld=0.000ms(0.00%) dlm=0.000ms(0.00%) cv=32.653ms(2.02%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=1434.226ms(88.80%) rgb=33.138ms(2.05%) bl=107.826ms(6.68%) up=4.707ms(0.29%) q=0.001ms(0.00%) ot=2.506ms(0.16%)
+  csv: G:\Program Prototype\NRR\docs\measurements\cpu-release-fixture-motion0.1-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cpu-release-fixture-motion0.1-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cpu-release-fixture-motion0.1-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cpu-release-fixture-motion0.1-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\cpu-release-fixture-motion0.1.json

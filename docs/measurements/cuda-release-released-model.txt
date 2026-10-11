@@ -1,0 +1,65 @@
+﻿NRR tier measurement: cuda-release-released-model
+  when          : 2026-10-11 05:45:50 UTC
+  commit        : b5f275e1fd0ab70c3a58a830ac6dc272e351d015
+  tool          : build-gpu/Release/nrr_bench.exe  (275456 bytes, built 2026-10-10 22:36:38)
+  model         : models/phase4/upscale_msreal_scale.onnx  (461501 bytes)
+  model sha256  : 39a4701a87d19a0b1c6a8c6231e8febeb3ee73905cf96beea772b485860f2cff  (matches the sha256 in upscale_msreal_scale.report.json)
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  (the frames reported CUDAExecutionProvider, as requested)
+
+nrr_bench.exe : [0;93m2026-10-10 22:45:31.2089047 [W:onnxruntime:, transformer_memcpy.cc:111 onnxruntime::MemcpyTransformer::ApplyImpl] 2 Memcpy nodes are added to the graph 
+main_graph for CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail 
+logs before this message.[m
+At G:\Program Prototype\NRR\tools\measure_tiers.ps1:123 char:17
++     $measured = & $binary @arguments 2>&1 | Out-String
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([0;93m2026-10-...his message.[m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[0;93m2026-10-10 22:45:31.2099776 [W:onnxruntime:, session_state.cc:1397 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Some nodes were not assigned to the preferred execution 
+providers which may or may not have an negative impact on performance. e.g. ORT explicitly assigns shape related ops to CPU to improve perf.[m
+[0;93m2026-10-10 22:45:31.2107478 [W:onnxruntime:, session_state.cc:1399 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Rerunning with verbose output on a non-minimal build will show 
+node assignments.[m
+[0;93m2026-10-10 22:45:31.9141822 [W:onnxruntime:, transformer_memcpy.cc:111 onnxruntime::MemcpyTransformer::ApplyImpl] 2 Memcpy nodes are added to the graph main_graph for 
+CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail logs before this 
+message.[m
+[0;93m2026-10-10 22:45:31.9152817 [W:onnxruntime:, session_state.cc:1397 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Some nodes were not assigned to the preferred execution 
+providers which may or may not have an negative impact on performance. e.g. ORT explicitly assigns shape related ops to CPU to improve perf.[m
+[0;93m2026-10-10 22:45:31.9156539 [W:onnxruntime:, session_state.cc:1399 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Rerunning with verbose output on a non-minimal build will show 
+node assignments.[m
+[0;93m2026-10-10 22:45:33.5560112 [W:onnxruntime:, transformer_memcpy.cc:111 onnxruntime::MemcpyTransformer::ApplyImpl] 2 Memcpy nodes are added to the graph main_graph for 
+CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail logs before this 
+message.[m
+[0;93m2026-10-10 22:45:33.5569442 [W:onnxruntime:, session_state.cc:1397 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Some nodes were not assigned to the preferred execution 
+providers which may or may not have an negative impact on performance. e.g. ORT explicitly assigns shape related ops to CPU to improve perf.[m
+[0;93m2026-10-10 22:45:33.5572644 [W:onnxruntime:, session_state.cc:1399 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Rerunning with verbose output on a non-minimal build will show 
+node assignments.[m
+[0;93m2026-10-10 22:45:36.6936684 [W:onnxruntime:, transformer_memcpy.cc:111 onnxruntime::MemcpyTransformer::ApplyImpl] 2 Memcpy nodes are added to the graph main_graph for 
+CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set session_options.log_severity_level=1 to see the detail logs before this 
+message.[m
+[0;93m2026-10-10 22:45:36.6946018 [W:onnxruntime:, session_state.cc:1397 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Some nodes were not assigned to the preferred execution 
+providers which may or may not have an negative impact on performance. e.g. ORT explicitly assigns shape related ops to CPU to improve perf.[m
+[0;93m2026-10-10 22:45:36.6949463 [W:onnxruntime:, session_state.cc:1399 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Rerunning with verbose output on a non-minimal build will show 
+node assignments.[m
+NRR benchmark: model=G:\Program Prototype\NRR\models\phase4\upscale_msreal_scale.onnx (461501 bytes)  ratio=2  frames=5  warmup=3  motion=0.0000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on
+  256x256->512x512: wall=47.96ms  reported=47.80ms  (inference=6.48ms, host overhead=41.32ms)  p50=47.10ms  p99=52.33ms  fps=20.9
+      spread: min 46.41  max 52.55  stddev 2.31  inference share 13.6%  provider CUDAExecutionProvider
+      stages: dlc=0.017ms(0.04%) dld=0.021ms(0.04%) dlm=0.000ms(0.00%) cv=0.292ms(0.61%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.076ms(0.16%) in=6.369ms(13.33%) rgb=0.960ms(2.01%) bl=39.950ms(83.58%) up=0.078ms(0.16%) q=0.000ms(0.00%) ot=0.036ms(0.08%)
+  512x512->1024x1024: wall=190.97ms  reported=189.60ms  (inference=24.86ms, host overhead=164.74ms)  p50=191.38ms  p99=191.98ms  fps=5.2
+      spread: min 189.59  max 192.00  stddev 0.88  inference share 13.1%  provider CUDAExecutionProvider
+      stages: dlc=0.114ms(0.06%) dld=0.086ms(0.05%) dlm=0.000ms(0.00%) cv=1.285ms(0.68%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.550ms(0.29%) in=23.702ms(12.50%) rgb=4.121ms(2.17%) bl=158.402ms(83.55%) up=0.511ms(0.27%) q=0.001ms(0.00%) ot=0.828ms(0.44%)
+  960x540->1920x1080: wall=374.30ms  reported=371.56ms  (inference=48.84ms, host overhead=322.72ms)  p50=374.11ms  p99=380.24ms  fps=2.7
+      spread: min 371.15  max 380.49  stddev 3.35  inference share 13.1%  provider CUDAExecutionProvider
+      stages: dlc=0.379ms(0.10%) dld=0.210ms(0.06%) dlm=0.000ms(0.00%) cv=2.668ms(0.72%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=1.019ms(0.27%) in=46.589ms(12.54%) rgb=8.478ms(2.28%) bl=309.221ms(83.22%) up=1.262ms(0.34%) q=0.001ms(0.00%) ot=1.733ms(0.47%)
+  1920x1080->3840x2160: wall=1491.85ms  reported=1481.35ms  (inference=196.04ms, host overhead=1285.31ms)  p50=1494.60ms  p99=1502.02ms  fps=0.7
+      spread: min 1474.65  max 1502.18  stddev 9.53  inference share 13.2%  provider CUDAExecutionProvider
+      stages: dlc=1.601ms(0.11%) dld=0.838ms(0.06%) dlm=0.000ms(0.00%) cv=12.158ms(0.82%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=4.571ms(0.31%) in=185.409ms(12.52%) rgb=33.607ms(2.27%) bl=1229.705ms(83.01%) up=4.764ms(0.32%) q=0.001ms(0.00%) ot=8.697ms(0.59%)
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-released-model-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-released-model-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-released-model-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\cuda-release-released-model-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\cuda-release-released-model.json

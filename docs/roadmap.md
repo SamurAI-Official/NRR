@@ -32,7 +32,7 @@ and 23 of the 227 are compiled out of a desktop build).
 | Unreal plugin | Phase 10 items checked | **Built and verified in-engine.** Two modules that did not exist before - `NRRRuntime` loads `nrr.dll` at run time and resolves all 51 entry points of `include/nrr.h` from the header, and `NRRPlugin` provides `UNRRComponent` and the `NRRVerify` commandlet - and `engine_plugins/unreal_verify/` builds them into UE 5.8.3's **Editor** target (a Launcher *Installed* engine cannot link a standalone Game target) and renders the released model at three tiers headless: `RESULT: PASS`, exit code 0 (2026-10-10, **CPU** execution provider, because the CUDA provider crashes inside `nrr.dll` during model load on this host). What the plugin deliberately does not do is listed in M5. |
 | Godot plugin | Phase 11 items checked | **Built and run.** `plugin.cfg` is the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding. Compiled against godot-cpp 10.0.0 and loaded by Godot 4.7.2-stable, which registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a non-passthrough frame (M1.5, `engine_plugins/godot_verify/`). Re-verified once the NVIDIA backend became first-class: `backend=NVIDIA`, `caps.active_backend=NVIDIA` with `neural_acceleration=0` before a model is loaded and `caps.active_backend=CUDAExecutionProvider` with `neural_acceleration=3` (FULL) after, `first_frame_ms=571.712` against `steady_state_ms=0.578`, `RESULT: PASS`. `verify.gd` now reports the cold frame and the steady state separately and asserts the steady state. Windows x86_64 **debug** variant only; the other `nrr.gdextension` entries are unbuilt. Wiring is measured by 9 drift guards in `tests/unit/test_engine_plugins.cpp`. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
-| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. **M11.1 has since re-measured the 1080p->4K tier per stage with the same fixture and reports 289.0 ms** - 3.6x below this table's figure, unattributed (the build configuration behind it is not recorded here) - with the **temporal blend (105.6 ms, 36.3%) the largest single stage** and 64% of the frame host-side work. |
+| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. **M11.1 has since re-measured the 1080p->4K tier per stage with the same fixture and reports 289.0 ms** - 3.6x below this table's figure, and **attributed to the build configuration**: `docs/measurements/` re-derived all four rows with an unoptimized build as the control, and the rows above sit at **0.85-0.93x of Debug and 3.4-3.8x of Release**. **No budget should be derived from the four numbers in this row.** The temporal blend is the largest single host stage at the tier in every configuration measured, and the model is 10-13% of an accumulating frame. |
 | CI | none | `.github/workflows/ci.yml` added in M0 and now **eight jobs**: Windows x64 build + the full suite (**204** tests) against a real ONNX Runtime SDK, where the job fails outright when the SDK is missing rather than passing on a build that cannot honour a frame; a **blocking** AddressSanitizer job over the same suite with the 17 wall-clock benchmarks excluded, so it runs **187 of 204** (`NRR_SKIP_TIMING_TESTS`); `windows-gpu-link`, which fetches the CUDA-flavoured ONNX Runtime and builds, links and tests that configuration because the CPU-flavour job compiles none of that path; the Android cross-build (NDK r27, arm64-v8a); the Vulkan branch with headers only and no SDK; the metrics-harness self-check; the C ABI / managed mirror audit (`tools/check_abi.py`); and the trainer self-checks. |
 
 ---
@@ -740,14 +740,32 @@ sizes, and a real colour+depth+motion upscaler would move milliseconds into that
 column without changing the conclusion. The honest reading is therefore **the host overhead is measured and the
 inference share is not yet**, which is why M11.1 re-measures this row rather than reinterpreting it.
 
-**That re-measurement has now happened, and it disagrees with the table above by 3.6x:** M11.1 measures the same
-tier, with the same fixture, at **289.0 ms** (Release, CUDA EP attached, five samples; the stages sum to it within
-3.3%). The gap is not attributed - the build configuration behind the figures above is not recorded in this
-roadmap, and host load is the other candidate - so the four rows are quoted here as the historical measurement they
-are, and **deriving a budget from them again requires re-deriving them with a recorded configuration**. What
-survives is the shape the table was used to argue: two thirds of the 1080p->4K frame is still host-side work
-(186.3 ms of 289.0 ms), now with names rather than a bucket - the blend 105.6 ms, the RGB8 conversion 33.6 ms, the
-NCHW conversion 29.3 ms. The released model is still not measured on this path (M11.1 records that as open).
+**That re-measurement has happened, and the gap is now attributed - to the build configuration.** M11.1 measured
+the same tier with the same fixture at **289.0 ms** (Release, CUDA EP), and `docs/measurements/` re-derived all
+four rows through `nrr_bench` with the configuration recorded and **an unoptimized build measured as a control**
+(`tools/measure_tiers.ps1`, commit `b5f275e1`, this host, five samples after three warm-ups):
+
+| tier | M2 table (configuration unrecorded) | re-derived, Release | re-derived, Debug | M2 / Release | M2 / Debug |
+| --- | --- | --- | --- | --- | --- |
+| 256x256 -> 512x512 | 31.7 ms | **9.28 ms** | 36.56 ms | 3.4x | 0.87x |
+| 512x512 -> 1024x1024 | 128.6 ms | **33.91 ms** | 146.57 ms | 3.8x | 0.88x |
+| 960x540 -> 1920x1080 | 260.6 ms | **75.93 ms** | 280.82 ms | 3.4x | 0.93x |
+| 1920x1080 -> 3840x2160 | 1031.3 ms | **288.02 ms** | 1218.76 ms | 3.6x | **0.85x** |
+
+Both re-derived columns are the scenario these rows were measured in (the latency test's frames: motion above
+the runtime's threshold, so the temporal blend is disengaged) and the provider that actually attached is recorded
+per row - CUDA in both. **The four rows above are therefore consistent with an unoptimized build and not with the
+Release build measured now**, at every tier, within a 15% spread. That is the strongest statement the evidence
+supports: the configuration behind them was never recorded, so it cannot be proven, but the magnitude matches
+Debug and not Release, and **no budget should be derived from these rows** - which is what M11 said when it could
+only call them "not attributed". The Debug/Release ratio also locates the penalty: at the tier, Debug costs 4.2x
+the Release frame with the *host* stages exploding (blend 618.7 vs 118.7 ms, RGB8 269.6 vs 35.3 ms, NCHW 171.2 vs
+33.5 ms) while the session run is unchanged to within 2% on the CPU provider - the unoptimized build is slow in
+exactly the loops M11.3 targets.
+
+What survives from the table, and is now sharper than a bucket: two thirds of the Release frame at that tier is
+still host-side work (178.6 ms of 288.0 ms in the disengaged scenario; 1282.1 ms of 1452.6 ms when the blend is
+accumulating), and the largest single stage is the temporal blend rather than any conversion.
 
 **Three defects this reachability exposed, all fixed.** The accelerator frame path was passing
 only input 0, so `Run()` failed for every three-input model in the project and the path silently
@@ -2357,10 +2375,11 @@ needs no toolchain and no retrain is measured before the ones that do.
 - [ ] **Byte counters per stage** (the second half of the original item) are not implemented: the record is
       time-only, so a stage's cost is attributed but its traffic is not. That belongs with M11.2, which is where
       per-frame allocation is measured.
-- [ ] The breakdown is **not yet measured with the released model**, only with the sample fixture the suite
-      loads (`models/nrr_upscaler_v0.1.onnx`): it declares colour+depth+motion, so `mk`, `wp` and `jt` read 0 at
-      every tier because nothing declares `validity`, `history` or `jitter`. Measuring the released model is what
-      exercises those stages, and it stays open here rather than being implied.
+- [x] The breakdown **is** measured with the released model now, through `nrr_bench --stages` (see below and
+      `docs/measurements/`): accumulating at the tier it reports 1481.4 ms with the session run at 185.4 ms
+      (12.5%) and the blend at 1229.7 ms (83.0%), and its derived-plane stage appears as `jt` = 4.6 ms - the
+      stage the fixture cannot exercise. `mk` and `wp` still read 0 because the released model declares neither a
+      `validity` nor a `history` input; nothing in the tree measures those two stages yet, which stays open.
 
 **Measured the same day the instrument landed, Release, CUDA EP attached, this host, five steady-state samples
 per tier after three warm-ups (the fixture above):**
@@ -2381,13 +2400,15 @@ per tier after three warm-ups (the fixture above):**
    the blend rather than the two conversions the section's introduction named. The M4/V2 kernels for the
    conversions are still the cheaper win per unit risk (they are verified), but they are not the largest one.
 2. **The re-measured tier is 289.0 ms, against the 1031.3 ms the M2 table records for the same tier, with the
-   same fixture.** The difference is 3.6x and is **not attributed**: the candidates are the build configuration
-   (this is a Release build; the configuration behind the M2 figure is not recorded in this roadmap) and host
-   load. It matters because M11's framing, the tier budgets and the "85-88% host" headline all come from that
-   table, so the honest position is that the M2 figure needs re-deriving with a recorded configuration before
-   any budget is derived from it again. What survives - and is now much sharper than a bucket - is the *shape*:
-   two thirds of the frame is work the host does for the model (186.3 ms of 289.0 ms here) and it is
-   concentrated in three loops.
+   same fixture - and the difference is now attributed.** The recorded re-derivation in `docs/measurements/`
+   measured an unoptimized build as a control in the same scenario, path, provider and fixture: **1218.8 ms**.
+   M2's row is therefore 0.85x a Debug build and 3.6x the Release build, at every tier within a 15% spread (the
+   M2 postmortem carries all four rows). It matters because M11's framing, the tier budgets and the "85-88%
+   host" headline all descend from that table, so **the four rows are quoted as the historical measurement they
+   are and no budget is derived from them**; the budgets in `tests/performance/test_latency.cpp` are still 3.5x
+   the old rows, which the re-derived cost now passes with a ~12x margin - tighter than no gate, but no longer
+   tight enough to catch a 4x regression, and re-deriving them belongs with the M11 work. What survives is the
+   shape, now with names: two thirds of the Release frame is host work at that tier, concentrated in the blend.
 3. **On the CPU execution provider the same tier is 1647.4 ms, and there the model dominates** (session run
    1445.2 ms, 87.7%; host share 12.3%). That is the same instrumentation on the other path - the read-out that
    matters for the engine integrations on this host, which run on the CPU provider, and the reason every
@@ -2397,6 +2418,17 @@ per tier after three warm-ups (the fixture above):**
   equal the published total within 5% (residual 0.5-3.3%); the conversions are non-zero; the session run never
   exceeds the published inference figure; the disabled instrument reads zero clocks and the enabled one reads
   twenty-two. Suite: **204 passed, 0 failed** in both the CPU-flavour and CUDA-flavour Release builds.
+
+**Follow-up in the same milestone, because the table above has a hole in it:** those rows come from the latency
+test's frames, which carry motion above the runtime's threshold - so the temporal blend is *disengaged* in every
+one of them, and the largest stage of a real frame is not measured there at all. `docs/measurements/` re-derives
+the four rows through `nrr_bench --stages` with the configuration recorded, and adds the scenario the suite cannot
+reach: the blend **engaged** (a jittered still scene). At the tier that scenario costs **1452.6 ms**, of which the
+blend is **1227.9 ms (84.5%)** and the session run 144.8 ms (10.0%) - the same shape with the 45 KB fixture, at
+thirty frames (84.1%), and with the released model (83.0%, and `jt` = 4.6 ms, the derived-plane stage the fixture
+cannot exercise). The same directory carries the unoptimized control that attributed the M2 rows, an A/B showing
+the accelerator path on the CPU provider matches the CPU backend to within 1.3%, and the recorder
+(`tools/measure_tiers.ps1`) that wrote each row.
 
 ### M11.2 - An arena: zero allocation after warm-up
 
@@ -2554,6 +2586,8 @@ along with the M10.7 capture run. One commit per milestone, each with a CHANGELO
 | A vectorized or threaded conversion that stops being bit-identical (the two GPU kernels are already verified against a CPU reference: pack 5.96e-08 worst error, unpack zero differing bytes) | M11.3 asserts scalar-vs-vector parity: byte-exact for the integer conversions, and the one inexact operation (`half -> float`) documented with its bound rather than assumed away |
 | A new hardware floor adopted by accident (AVX2 reached for as if universal) | M11.3 states the baseline - SSE2 required, AVX2 dispatched - and proves the SSE2-only path by forcing the dispatch off and running the suite |
 | Instrumentation that changes the number it publishes | M11.1 asserts the disabled path costs under 1% of the frame; the flag is off by default and the timing tests run with it off |
+| A latency row whose configuration is not recorded (the defect that produced the M2 table) | `tools/measure_tiers.ps1` writes the commit, binary, model hash, scenario, host and the provider that actually attached into a record under `docs/measurements/`, and `nrr_bench` prints its own build configuration; a row without those cannot be cited |
+| A row labelled by the backend it *requested* while a different one ran (`-Provider cpu` selects the frame path, and the session inside it can still attach CUDA when the runtime is on `PATH`) | The recorder pins the backend **and** reads the provider out of the render's own debug string, recording a MISMATCH when they disagree - which is what caught an earlier pair of rows that had attached different providers and appeared to show a 20x pathology |
 
 ## Running the project
 
@@ -2563,6 +2597,17 @@ pwsh tools/build.ps1 -Config Release -RunTests             # configure + build +
 pwsh tools/build.ps1 -Sanitize -BuildDir build-asan -RunTests   # memory-safety build
 pwsh tools/build.ps1 -NoBuild -RunTests                    # re-run tests only
 ```
+
+A tier row is measured and recorded in one command, and the record states the configuration it was taken in
+(build, optimization state, ONNX Runtime flavour, model with its SHA-256, host, and the execution provider that
+actually attached) - because a latency row without that cannot be compared against or reproduced:
+
+```powershell
+powershell -File tools/measure_tiers.ps1 -Target build-gpu/Release/nrr_bench.exe `
+    -Label cuda-release-fixture -Model models/nrr_upscaler_v0.1.onnx -Provider nvidia -CudaRuntime -Stages
+```
+
+The collected rows live in `docs/measurements/`, with a README that says what each one establishes.
 
 On Windows PowerShell 5.1 (no `pwsh` installed), use
 `powershell -NoProfile -ExecutionPolicy Bypass -File tools/build.ps1 ...`.
