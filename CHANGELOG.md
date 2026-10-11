@@ -13,6 +13,32 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### M11.3, first step: the blend stops allocating per pixel, and the frames are provably unchanged
+
+M11.1 measured the temporal blend as the largest single host stage of a 1080p->4K frame - 1227.9 ms, 84.5% of it
+with the blend engaged. This is the first change against it, in `__M113_COMMIT__`, and the finding was an
+allocation rather than an algorithm.
+
+* **~16.6M heap allocations per frame, inside the 84.5%.** `TemporalRenderer::warp_previous_output` reprojects
+  the history at output resolution and called `bilinear_sample` twice per output pixel (the colour reprojection
+  and the depth one); that function returned a `std::vector<float>` of three floats, so every pixel was a malloc
+  and a free. It returns a fixed-size value now and the per-call channel division - `data.size() / (width *
+  height)`, once per call - is a per-frame constant. The arithmetic inside is untouched.
+* **Measured against a control built from the pre-change code, with the frames compared rather than assumed.**
+  `nrr_bench` now reports a **frame hash** (FNV-1a over the displayed RGB8, chained across the measured frames),
+  which is what a timing-only before/after cannot give: proof that the arithmetic did not move. Same session,
+  same configuration, accumulating scenario at 1080p->4K: **958.5 ms reported / 756.3 ms blend** against the
+  control's **1348.4 / 1115.3** - the frame **-28.9%**, the blend **-32.2%** - and **both runs report frame hash
+  `0x9c3d3479ea20eec5`**. The tier is under a second for the first time (M11.1's row for that scenario: 1452.6
+  ms). Recording it also showed the two runs differ by ~8% in the *inference* figure, which is exactly the kind
+  of variation a hash-silent comparison would have let be mistaken for the change.
+* **What is deliberately left**: the blend is still five scalar single-threaded passes over 25M elements each
+  (RGB8->float, the reprojection gather, the blend arithmetic, float->RGB8, and a 300 MB history copy). Row
+  banding them across threads and dispatching an AVX2 path over an SSE2 baseline are the next levers, and they
+  are now measurable against a recorded row and a frame hash rather than against nothing.
+* Suite: **204 passed, 0 failed** in both Release flavours - which is the byte-exactness check across every tier
+  the tests span, since the temporal and jitter tests pin the blend counters and the blended frame content.
+
 ### The tier rows re-derived with their configuration recorded: the M2 table was an unoptimized build
 
 M11.1 found that the M2 tier table had no recorded build configuration and could not attribute a 3.6x

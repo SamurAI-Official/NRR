@@ -186,6 +186,24 @@ float jitter_offset(uint64_t frame_index, int axis) {
     return phase[frame_index % 4][axis];
 }
 
+/* A hash of the displayed frame, so a change to the pipeline can be shown to have rendered the *same*
+ * frames rather than merely similar timings. FNV-1a over the RGB8 bytes, chained across the measured
+ * frames (each frame's hash mixed into the running value), so one number covers the whole sequence and a
+ * second run of the same configuration must reproduce it. This is what a timing-only before/after cannot
+ * say: that the arithmetic did not move. */
+uint64_t hash_frame(NRRDevice* device, NRRTexture* texture, uint32_t width, uint32_t height,
+                    uint64_t seed) {
+    if (!device || !texture || width == 0 || height == 0) return seed;
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 3, 0);
+    if (nrr_texture_download(device, texture, pixels.data(), pixels.size()) != NRR_SUCCESS) return seed;
+    uint64_t hash = seed ? seed : 14695981039346656037ull; /* FNV-1a offset basis */
+    for (uint8_t byte : pixels) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 struct TierResult {
     Tier tier;
     Stats wall, reported, inference, overhead;
@@ -196,6 +214,9 @@ struct TierResult {
      * average the statistics above are. Zeroes unless --stages asked for it, and `measured` inside
      * the record says which - a record of nothing is not a measurement of zero. */
     nrr::StageTimings stages;
+    /* The hash of every measured frame chained together (see hash_frame). Two runs of one
+     * configuration must agree, and a change to the pipeline that alters a frame must not. */
+    uint64_t frame_hash = 0;
     bool ok = false;
 };
 
@@ -398,6 +419,7 @@ TierResult measure_tier(const Tier& tier, const char* model_path, const std::str
         inference.push_back(static_cast<double>(out.stats.neural_inference_time_ms));
         overhead.push_back(static_cast<double>(out.stats.backend_overhead_ms));
         result.runtime_debug.assign(out.stats.debug_info);
+        result.frame_hash = hash_frame(device, out.color, tier.out_w, tier.out_h, result.frame_hash);
         if (stages_enabled) {
             const nrr::StageTimings& frame_stages = nrr::last_frame_stages();
             for (int k = 0; k < nrr::frame_stage_count(); ++k) {
@@ -585,7 +607,8 @@ int main(int argc, char** argv) {
         std::cout << "      spread: min " << std::setprecision(2) << result.wall.min_ms
                   << "  max " << result.wall.max_ms << "  stddev " << result.wall.stddev_ms
                   << "  inference share " << std::setprecision(1) << share << "%  provider "
-                  << result.provider << "\n";
+                  << result.provider << "  frame-hash 0x" << std::hex << result.frame_hash
+                  << std::dec << "\n";
         /* The per-stage split, when asked for: the same record the suite asserts (M11.1) in the same
          * shape, so a tier row here and a tier row there cannot disagree about where the time went.
          * Averages over the measured frames, like every statistic on the two lines above. */
@@ -668,6 +691,12 @@ int main(int argc, char** argv) {
                          << r.stages.get(stage) / n;
                 }
                 json << "},\n";
+            }
+            {
+                char hash_text[32];
+                std::snprintf(hash_text, sizeof(hash_text), "0x%llx",
+                              static_cast<unsigned long long>(r.frame_hash));
+                json << "      \"frame_hash\": \"" << hash_text << "\",\n";
             }
             json << "      \"provider\": \"" << json_escape(r.provider) << "\",\n";
             json << "      \"runtime_debug\": \"" << json_escape(r.runtime_debug) << "\"\n";

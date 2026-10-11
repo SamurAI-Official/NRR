@@ -422,7 +422,20 @@ private:
     float last_timestamp_;
     float temporal_alpha_;
     float motion_threshold_;
-    std::vector<float> bilinear_sample(const std::vector<float>& data, uint32_t width, uint32_t height, float x, float y) const;
+    /* The four taps of one bilinear sample, as a fixed-size value rather than a std::vector.
+     *
+     * Form follows cost here: this is called twice per output pixel (the colour reprojection and the depth
+     * reprojection), so at 1080p->4K the allocating form constructed ~16.6M heap vectors per frame - a malloc
+     * and a free for three floats, each - inside the temporal blend, which M11.1 measured as 84.5% of that
+     * tier's frame. The channel count moved into the parameter list for the same reason: it was derived by a
+     * division per call (`data.size() / (width * height)`) and cannot change within a frame. The arithmetic is
+     * untouched, which is why the values are identical to the version that allocated. */
+    struct BilinearSample {
+        float v[4];
+        float operator[](std::size_t index) const { return index < 4 ? v[index] : 0.0f; }
+    };
+    BilinearSample bilinear_sample(const std::vector<float>& data, uint32_t width, uint32_t height,
+                                   uint32_t channels, float x, float y) const;
 };
 
 class TemporalStateManager {

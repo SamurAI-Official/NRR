@@ -39,6 +39,18 @@ them:
 | `cpu-release-fixture-motion0.1` (disengaged) | CPU EP | 1615.1 | 1622.4 | 1434.2 | 180.8 | 1434.2 (88.8%) | 107.8 (6.7%) |
 | `cpu-debug-fixture-motion0.1` (disengaged, unoptimized) | CPU EP | 2455.8 | 2474.2 | 1442.3 | 1013.5 | 1442.3 (58.7%) | 586.4 (23.9%) |
 | `cuda-path-cpu-ep-fixture-motion0.1` (disengaged) | CPU EP *(fell back)* | 1636.3 | 1645.8 | 1470.9 | 165.4 | 1443.0 (88.2%) | 109.1 (6.7%) |
+| `blend-allocating-fixture` (accumulating) | CUDA | 1348.4 | 1358.1 | 180.2 | 1168.2 | 153.3 | 1115.3 (82.7%) |
+| `blend-allocfree-fixture` (accumulating) | CUDA | **958.5** | 967.8 | 145.6 | 813.0 | 117.2 | **756.3 (78.9%)** |
+
+## Every row also carries a frame hash
+
+`nrr_bench` reports `frame-hash` per tier: FNV-1a over the displayed RGB8 plane, chained across the measured
+frames. It exists for the question a timing comparison cannot answer - **did the change alter the frames?** - and
+it is what made the M11.3 allocation removal checkable: `blend-allocating-fixture` and `blend-allocfree-fixture`
+above are the same run with and without per-pixel allocations in the reprojection (the control is the pre-change
+code), they differ by **-28.9%** on the frame and **-32.2%** on the blend, and **both report
+`frame-hash 0x9c3d3479ea20eec5`**. Two runs of one configuration must also agree, so the hash doubles as a
+determinism check.
 
 ## What these rows establish
 

@@ -2441,22 +2441,36 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
 
 ### M11.3 - Vectorize and thread the host loops, and state the floor
 
-- [ ] **Priority inside this milestone comes from M11.1's measurement, not from the order below**: the temporal
-      blend is the largest single host stage at the tier (105.6 ms, 36.3%) - more than the two conversions
-      together - so it is the first loop to fix. The conversions still come first *if* M11.5's verified kernels can
-      be wired cheaply, because that is a 2-of-4 win on any Vulkan device with no new code to write; the blend
-      needs M11.6's shader regardless of what is done to it on the host.
-
+- [x] **The blend's per-pixel allocations are gone, and the frames are unchanged.** This came first because the
+      cost turned out to be an allocation rather than an algorithm: `TemporalRenderer::warp_previous_output`
+      reprojects the history at output resolution and called `bilinear_sample` twice per pixel (colour and
+      depth), each call returning a `std::vector<float>` for three floats - **~16.6M heap allocations per
+      1080p->4K frame**, inside the 84.5%. The sample is a fixed-size value now and the per-call channel
+      division is a per-frame constant; the arithmetic is untouched. Measured in one session against a control
+      built from the pre-change code, accumulating at the tier: **958.5 ms reported / 756.3 ms blend** against
+      **1348.4 / 1115.3** - the frame **-28.9%**, the blend **-32.2%** - and **both runs report frame hash
+      `0x9c3d3479ea20eec5`**, so the speedup is real and the pixels did not move (M11.1's row for that scenario
+      was 1452.6 ms, so the tier is under a second for the first time).
+- [ ] **Priority for the rest of this milestone comes from the measurement, not from the order below.** The blend
+      is still the largest stage at the tier (756.3 ms of 958.5 ms accumulating; 118.7 of 288.0 ms in the
+      disengaged scenario the older rows use), and it is now five scalar single-threaded passes over 25M elements
+      each: RGB8->float, the reprojection gather, the blend arithmetic, float->RGB8, and a 300 MB history copy.
+      The conversions matter next (RGB8 35.3 ms, NCHW 33.5 ms disengaged), and they come first *if* M11.5's
+      verified Vulkan kernels can be wired cheaply, because that is a 2-of-4 win on any Vulkan device with no new
+      code to write.
 - [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
       source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`
-      (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-771`) and the blend.
+      (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-817`) and the blend.
 - [ ] The independent stages row-banded across threads (a small pool, created once), because the runtime
-      currently has none.
+      currently has none - and the five passes above are pure per-pixel maps, which is the case where row banding
+      is exact rather than approximate.
 - [ ] AVX2 as a **dispatched fast path**, with the baseline stated: SSE2 required, AVX2 optional, selected by
       CPUID, so no build drops the floor without saying so.
 - **Gate:** a scalar-vs-vector parity test - **byte-exact** for the integer conversions, and the one inexact
   operation (`half -> float`) documented with its bound; a thread sweep (1/2/4/max) with speedup and parity
-  recorded; and the SSE2-only path **proved** by forcing the dispatch off and running the suite.
+  recorded; and the SSE2-only path **proved** by forcing the dispatch off and running the suite. Every step here
+  is judged against a recorded row and `nrr_bench`'s frame hash, which is what makes "faster and unchanged"
+  checkable rather than asserted.
 
 ### M11.4 - Provider thread policy
 

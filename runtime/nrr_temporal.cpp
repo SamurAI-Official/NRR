@@ -170,11 +170,23 @@ void TemporalRenderer::shutdown() {
     initialized_ = false;
 }
 
-std::vector<float> TemporalRenderer::bilinear_sample(const std::vector<float>& data,
-                                                     uint32_t width, uint32_t height,
-                                                     float x, float y) const {
-    std::vector<float> out(3, 0.0f);
+/* The channel count the interpolation uses. Hoisted out of the per-pixel loop it used to be computed in
+ * (a division per call, twice per pixel). Same rule as that computation: data.size() / (width * height)
+ * when it lands in [1,4], and three otherwise. */
+static uint32_t interleaved_channels(const std::vector<float>& data, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return 3;
+    const size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (pixels == 0 || data.size() < pixels) return 3;
+    const size_t ccount = data.size() / pixels;
+    return (ccount >= 1 && ccount <= 4) ? static_cast<uint32_t>(ccount) : 3u;
+}
+
+TemporalRenderer::BilinearSample TemporalRenderer::bilinear_sample(
+    const std::vector<float>& data, uint32_t width, uint32_t height, uint32_t channels,
+    float x, float y) const {
+    BilinearSample out = {{0.0f, 0.0f, 0.0f, 0.0f}};
     if (data.empty() || width == 0 || height == 0) return out;
+    if (channels == 0 || channels > 4) return out;
 
     x = std::max(0.0f, std::min(x, static_cast<float>(width - 1)));
     y = std::max(0.0f, std::min(y, static_cast<float>(height - 1)));
@@ -185,10 +197,6 @@ std::vector<float> TemporalRenderer::bilinear_sample(const std::vector<float>& d
     uint32_t y1 = std::min(y0 + 1, height - 1);
     float fx = x - x0;
     float fy = y - y0;
-
-    uint32_t channels = 3;
-    size_t ccount = data.size() / (width * height);
-    if (ccount >= 1 && ccount <= 4) channels = static_cast<uint32_t>(ccount);
 
     for (uint32_t c = 0; c < channels; ++c) {
         auto get = [&](uint32_t px, uint32_t py) {
@@ -201,7 +209,7 @@ std::vector<float> TemporalRenderer::bilinear_sample(const std::vector<float>& d
         float v11 = get(x1, y1);
         float top = v00 + (v10 - v00) * fx;
         float bot = v01 + (v11 - v01) * fx;
-        out[c] = top + (bot - top) * fy;
+        out.v[c] = top + (bot - top) * fy;
     }
     return out;
 }
@@ -215,11 +223,17 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
 
     uint32_t w = previous.width;
     uint32_t h = previous.height;
-    uint32_t color_channels = 3;
-    if (!previous.color_data.empty()) {
-        size_t ccount = previous.color_data.size() / (w * h);
-        if (ccount >= 1 && ccount <= 4) color_channels = static_cast<uint32_t>(ccount);
-    }
+
+    /* The channel counts and the "is there a depth plane" question are constants of the frame; they were
+     * recomputed inside the per-pixel loop, including a division per call. Same values, derived once. */
+    const uint32_t color_channels = previous.color_data.empty()
+                                        ? 3u
+                                        : interleaved_channels(previous.color_data, w, h);
+    const uint32_t depth_channels = interleaved_channels(previous.depth_data, w, h);
+    const bool have_prev_depth = !previous.depth_data.empty();
+    const size_t pixel_count = static_cast<size_t>(w) * static_cast<size_t>(h);
+    /* Whether the field covers the frame, so the per-pixel bounds check is only paid when it can fail. */
+    const bool motion_covers_frame = previous.motion_data.size() >= pixel_count * 2;
 
     warped_color.assign(previous.color_data.size(), 0.0f);
     warped_depth.assign(previous.depth_data.size(), 0.0f);
@@ -230,22 +244,28 @@ bool TemporalRenderer::warp_previous_output(const NRRFrameInput& input,
 
     for (uint32_t y = 0; y < h; ++y) {
         for (uint32_t x = 0; x < w; ++x) {
-            size_t mv_idx = (static_cast<size_t>(y) * w + x) * 2;
-            if (mv_idx + 1 >= previous.motion_data.size()) continue;
+            const size_t pixel = static_cast<size_t>(y) * w + x;
+            const size_t mv_idx = pixel * 2;
+            if (!motion_covers_frame && mv_idx + 1 >= previous.motion_data.size()) continue;
             float dx = previous.motion_data[mv_idx] * scale;
             float dy = previous.motion_data[mv_idx + 1] * scale;
             float sx = static_cast<float>(x) - dx;
             float sy = static_cast<float>(y) - dy;
 
-            std::vector<float> sample = bilinear_sample(previous.color_data, w, h, sx, sy);
-            size_t dst = (static_cast<size_t>(y) * w + x) * color_channels;
+            /* A value, not a vector. These two lines used to construct and destroy a std::vector<float>
+             * per pixel each - ~16.6M allocations for a 1080p->4K frame, which is the cost this change
+             * removes; the arithmetic inside bilinear_sample is untouched. */
+            const BilinearSample sample =
+                bilinear_sample(previous.color_data, w, h, color_channels, sx, sy);
+            const size_t dst = pixel * color_channels;
             for (uint32_t c = 0; c < color_channels; ++c) {
                 if (dst + c < warped_color.size()) warped_color[dst + c] = sample[c];
             }
 
-            if (!previous.depth_data.empty()) {
-                float ds = bilinear_sample(previous.depth_data, w, h, sx, sy)[0];
-                if (y * w + x < warped_depth.size()) warped_depth[y * w + x] = ds;
+            if (have_prev_depth) {
+                const float ds =
+                    bilinear_sample(previous.depth_data, w, h, depth_channels, sx, sy)[0];
+                if (pixel < warped_depth.size()) warped_depth[pixel] = ds;
             }
         }
     }

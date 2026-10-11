@@ -1,0 +1,31 @@
+﻿NRR tier measurement: blend-allocating-fixture
+  when          : 2026-10-11 16:33:21 UTC
+  commit        : d69f77ff0923df5e3c8e2ca0027a9a641eae72f5 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (276480 bytes, built 2026-10-11 09:33:04)
+  model         : models/nrr_upscaler_v0.1.onnx  (45082 bytes)
+  model sha256  : 8f63267f6131c25fb89f48861eeb28eb07f077975442a5d06faf970a521ed5e9
+  scenario      : tiers=256x256,512x512,960x540,1920x1080  ratio=2  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  frame-hash 0x54908619d860b3f5, CUDAExecutionProvider  frame-hash 0x675657715c63f3f5, CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5, CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5  (MISMATCH: requested nvidia and the frames reported 'CUDAExecutionProvider  frame-hash 0x54908619d860b3f5, CUDAExecutionProvider  frame-hash 0x675657715c63f3f5, CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5, CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5' - the runtime fell back to the CPU execution provider)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_v0.1.onnx (45082 bytes)  ratio=2  frames=5  warmup=3  motion=0.0000  tiers=4
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on
+  256x256->512x512: wall=44.33ms  reported=44.14ms  (inference=3.33ms, host overhead=40.81ms)  p50=41.32ms  p99=53.06ms  fps=22.6
+      spread: min 39.17  max 53.29  stddev 5.35  inference share 7.6%  provider CUDAExecutionProvider  frame-hash 0x54908619d860b3f5
+      stages: dlc=0.016ms(0.04%) dld=0.033ms(0.07%) dlm=0.015ms(0.03%) cv=0.897ms(2.03%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=2.676ms(6.06%) rgb=0.969ms(2.20%) bl=39.336ms(89.11%) up=0.162ms(0.37%) q=0.000ms(0.00%) ot=0.040ms(0.09%)
+  512x512->1024x1024: wall=161.64ms  reported=160.17ms  (inference=13.00ms, host overhead=147.17ms)  p50=162.61ms  p99=163.34ms  fps=6.2
+      spread: min 159.05  max 163.36  stddev 1.64  inference share 8.1%  provider CUDAExecutionProvider  frame-hash 0x675657715c63f3f5
+      stages: dlc=0.077ms(0.05%) dld=0.172ms(0.11%) dlm=0.062ms(0.04%) cv=3.997ms(2.50%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=9.604ms(6.00%) rgb=4.438ms(2.77%) bl=140.320ms(87.61%) up=0.573ms(0.36%) q=0.001ms(0.00%) ot=0.926ms(0.58%)
+  960x540->1920x1080: wall=319.00ms  reported=316.36ms  (inference=26.05ms, host overhead=290.32ms)  p50=318.59ms  p99=322.35ms  fps=3.1
+      spread: min 316.86  max 322.49  stddev 1.88  inference share 8.2%  provider CUDAExecutionProvider  frame-hash 0xebb4f2f86d22cc5
+      stages: dlc=0.242ms(0.08%) dld=0.380ms(0.12%) dlm=0.256ms(0.08%) cv=7.865ms(2.49%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=19.224ms(6.08%) rgb=8.200ms(2.59%) bl=277.420ms(87.69%) up=1.130ms(0.36%) q=0.001ms(0.00%) ot=1.647ms(0.52%)
+  1920x1080->3840x2160: wall=1358.06ms  reported=1348.42ms  (inference=180.19ms, host overhead=1168.24ms)  p50=1316.37ms  p99=1529.73ms  fps=0.7
+      spread: min 1265.71  max 1536.72  stddev 94.39  inference share 13.4%  provider CUDAExecutionProvider  frame-hash 0x9c3d3479ea20eec5
+      stages: dlc=0.955ms(0.07%) dld=1.715ms(0.13%) dlm=0.815ms(0.06%) cv=29.912ms(2.22%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=153.326ms(11.37%) rgb=32.874ms(2.44%) bl=1115.282ms(82.71%) up=5.092ms(0.38%) q=0.001ms(0.00%) ot=8.452ms(0.63%)
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-allocating-fixture-csv/frames-256x256--512x512.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-allocating-fixture-csv/frames-512x512--1024x1024.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-allocating-fixture-csv/frames-960x540--1920x1080.csv
+  csv: G:\Program Prototype\NRR\docs\measurements\blend-allocating-fixture-csv/frames-1920x1080--3840x2160.csv
+  json: G:\Program Prototype\NRR\docs\measurements\blend-allocating-fixture.json
