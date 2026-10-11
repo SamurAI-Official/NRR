@@ -647,9 +647,10 @@ field), and the trainer self-checks (gates, losses, ONNX export).
 ## Roadmap
 
 [docs/roadmap.md](docs/roadmap.md) is the authoritative status and plan (M0-M10, with M10 - the
-trained model, its data and the engine seam - as the active frontier), including what is blocked on
-hardware and SDKs, and the engineering rule that no capability is claimed without a test that
-measures it.
+trained model, its data and the engine seam - as the active frontier; M6.5 covers the Unity
+verification, which had no milestone until it had a result, and M9's model distribution landed with
+the Hub publication), including what is blocked on hardware and SDKs, and the engineering rule that
+no capability is claimed without a test that measures it.
 
 ## Changelog
 
