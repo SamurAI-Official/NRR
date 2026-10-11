@@ -13,6 +13,41 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The roadmap stops describing a repository three milestones old, and the quality table stops overstating
+
+`docs/roadmap.md` opens by claiming to be the single source of truth for what is built, and its status table still
+called the Unreal plugin "**Not real**: headers plus `NRRPlugin.Build.cs` only", the Unity plugin "never opened in a
+Unity editor" and the model "No PSNR/SSIM gate exists" - while M5's heading still said its verification run was
+gated on the .NET Framework SDK *after* that run had passed. Corrected in `60672d0f`, with the README's roadmap
+pointer following:
+
+* **The status table now says what happened.** Unreal: two modules, an Editor-target build and `RESULT: PASS` at
+  three tiers (CPU provider, with the reason). Unity: 7 of 7 (Unity 6000.5.8f1), with the two limits of that run
+  stated. Model quality: the fixture is still a fixture, and a trained released model is what the engine
+  verifications render. CI: eight jobs, 204 tests, 187 of 204 under AddressSanitizer. C API: 51 entry points. CPU
+  inference: 204/204.
+* **M6.5 exists because Unity had no milestone at all** while Unreal and Godot had M5 and M6 - which is how a
+  verified engine integration sat in this file described as "code present, never run".
+* **M9 gained the item that actually happened**: model distribution, done (Hub, 119 checkpoints, pinned SHA-256),
+  with what it deliberately is not (no tag, no archive, no ABI check at load); its licence item is `[~]` because
+  the weights *have* shipped. **M10.2 is retitled "released"** rather than "committed", and M1's trained-model item
+  is `[x]`.
+* **The quality claims were re-derived from the generated tables and corrected downward.** That section quoted an
+  earlier export of the model: LPIPS 0.0546/0.0503, DISTS 0.1921/0.2106, detail 0.5713/0.3793, PSNR 26.6128/29.2989,
+  and "first on all seven, +1.02 dB over bilinear". `docs/parity.md` and `docs/parity-512.md` now carry LPIPS
+  0.0570/0.0421, DISTS 0.1609/0.1724, detail 0.5616/0.5182 and PSNR 26.4320/28.4203 for `upscale_msreal_scale.onnx`,
+  so: NRR leads **five of the seven** at the trained tier (+0.14 dB over bilinear), VMAF and detail go to FSR1,
+  "sharpest" becomes "sharpest of the neural arms", the low tier is 0.28 dB behind XeSS rather than 0.10 (and
+  second on SSIM rather than first), and the high-frequency advantage over XeSS/DLSS is 1.7x-3.2x rather than
+  1.9x-2.7x. LPIPS and DISTS - best of every arm, fixed-function baselines included, in both tables - are the
+  claims that survive.
+* **A prerequisite row was flatly wrong**: "NVIDIA GPU ... Not present (no nvcc)". The GPU is present and M2's CUDA
+  execution provider ran on it; what is missing is the toolkit, for NRR's own kernels - plus the crash-on-load
+  caveat that makes the engine verifications CPU runs on this host.
+* Historical counts (`92/92`, `113/113`, `171/171`, `192/192`, `43 -> 44`) are annotated as measured at their
+  revision instead of rewritten, and the current numbers now sit at the top of the status section together with how
+  204 is derived, so a dated section cannot be misread as today's status.
+
 ### The README stops describing a repository that no longer exists, and the model exports become Hub-only
 
 The status line still said "Unity plugin code is present but has never been run in an editor; the Unreal plugin is
