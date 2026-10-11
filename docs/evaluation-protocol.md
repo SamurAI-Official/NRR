@@ -109,6 +109,7 @@ and the same commands:
 | --- | --- | --- |
 | 128x128 -> 256x256 | `models/training-data/godot-v6-warp` | `docs/parity.md` |
 | 256x256 -> 512x512 | `models/training-data/godot-mid` | `docs/parity-512.md` (run with `-Suffix '-512' -Data models/training-data/godot-mid -Limit 24`) |
+| 768x432 -> 1920x1080 (2.5x) | procedural pairs (`tools/gen_training_pairs.py --size 128 --ratio 2.5`; the target is rendered at 320, not resampled onto it) | `docs/measurements/ratio25-release-cuda.txt`, `...-cpu.txt` |
 
 Two rules follow, and the second is the one that keeps the comparison honest:
 

@@ -1,0 +1,31 @@
+{
+  "tool": "nrr_bench",
+  "model": "G:\\Program Prototype\\NRR\\models\\nrr_upscaler_25x.onnx",
+  "configuration": "build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn",
+  "ratio": 2.5000,
+  "frames": 5,
+  "warmup": 3,
+  "tiers": {
+    "768x432->1920x1080": {
+      "input": [768, 432],
+      "output": [1920, 1080],
+      "runtime_output": [1920, 1080],
+      "runtime_output_confirmed": true,
+      "frames": 5,
+      "reported_ms": 100.0284,
+      "inference_ms": 11.5756,
+      "host_overhead_ms": 88.4528,
+      "wall_ms": 102.6262,
+      "p50_ms": 103.5572,
+      "p99_ms": 106.5438,
+      "min_ms": 98.4835,
+      "max_ms": 106.6366,
+      "stddev_ms": 2.9383,
+      "fps": 9.7441,
+      "stages_ms": {"dlc": 0.1071,"dld": 0.0846,"dlm": 0.0000,"cv": 2.0693,"mk": 0.0000,"wp": 0.0000,"jt": 0.0000,"in": 10.8518,"rgb": 8.1626,"bl": 76.5074,"up": 1.1171,"q": 0.0005,"ot": 1.1280},
+      "frame_hash": "0x7bd190fbab0961e1",
+      "provider": "CUDAExecutionProvider",
+      "runtime_debug": "ONNX CUDAExecutionProvider via accel 768x432 -> 1920x1080 | prep 2.228ms infer 13.392ms post 88.698ms | temporal accumulated: alpha=0.700 hist=2 change=0.0000 | quality unmeasured: no reference set presented"
+    }
+  }
+}

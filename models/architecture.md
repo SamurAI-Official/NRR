@@ -4,7 +4,15 @@
 
 > **Status: an aspirational design, not the network that ships.** This document describes the colour+depth+motion
 > model intended for the 1080p->4K tier. What actually runs today is `models/nrr_upscaler_v0.1.onnx` (a ~45 KB
-> untrained fixture from `tools/gen_sample_model.py`, used by the test suite) and `upscale_msreal_scale.onnx`
+> untrained fixture from `tools/gen_sample_model.py`, used by the test suite), the same generator's
+> `models/nrr_upscaler_25x.onnx` (the identical fixture at 2.5x - the ratio of the 768x432 -> 1920x1080 tier,
+> M11.11), `models/nrr_upscaler_25x_procedural.onnx` (that ratio trained by `tools/train_nrr.py --ratio 2.5`:
+> 11,494 parameters, 5 epochs on 8 procedural pairs, gates failed and stamped unqualified - it establishes that
+> the ratio is the model's own rather than a claim about quality),
+> **`models/ratio25/upscale_25x_procedural_depth.onnx`** (the same ratio trained *to the gates* and published
+> under `ratio25/` on the Hub: **90,974** parameters, inputs `color`, `depth`, 2.5x output with dynamic H/W,
+> held-out val L1 0.01058 against that ratio's bilinear baseline's 0.02542 - 58.37% better - trained by
+> `tools/run_ratio25.ps1`), and `upscale_msreal_scale.onnx`
 > (**68,955** parameters, 461,501 bytes; inputs `color`, `jitter`, `scale`), the trained model published at
 > [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) and rendered by all three engine
 > verifications. **No 2.5M-parameter 1080p->4K model exists in this repository.** The numbers below - the

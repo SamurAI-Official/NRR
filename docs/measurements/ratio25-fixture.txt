@@ -1,0 +1,20 @@
+﻿NRR tier measurement: ratio25-fixture
+  when          : 2026-10-11 18:53:50 UTC
+  commit        : c441a3a1fc7c243b49a5683130fa3f23456be817 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:51:04)
+  model         : models/nrr_upscaler_25x.onnx  (1962 bytes)
+  model sha256  : 595eaf35ace004c2f24127345ab417116cfd1c9cd22baef2647d71bdd723bd1e
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  (the frames reported CUDAExecutionProvider, as requested)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_25x.onnx (1962 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=102.63ms  reported=100.03ms  (inference=11.58ms, host overhead=88.45ms)  p50=103.56ms  p99=106.54ms  fps=9.7
+      spread: min 98.48  max 106.64  stddev 2.94  inference share 11.6%  provider CUDAExecutionProvider  frame-hash 0x7bd190fbab0961e1
+      stages: dlc=0.107ms(0.11%) dld=0.085ms(0.08%) dlm=0.000ms(0.00%) cv=2.069ms(2.07%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=10.852ms(10.85%) rgb=8.163ms(8.16%) bl=76.507ms(76.49%) up=1.117ms(1.12%) q=0.001ms(0.00%) ot=1.128ms(1.13%)
+      blend: blend-state=0.000ms blend-convert-in=3.192ms blend-history-copy=6.903ms blend-motion-plane=6.590ms blend-warp=12.213ms blend-arithmetic=18.223ms blend-convert-out=3.171ms blend-phase-aligned=0.000ms blend-displayed-delta=5.020ms blend-record=10.320ms blend-other=10.151ms  | resolve=75.782ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-fixture-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-fixture.json

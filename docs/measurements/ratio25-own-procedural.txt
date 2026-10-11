@@ -1,0 +1,20 @@
+﻿NRR tier measurement: ratio25-own-procedural
+  when          : 2026-10-11 19:24:38 UTC
+  commit        : c441a3a1fc7c243b49a5683130fa3f23456be817 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:51:04)
+  model         : models/nrr_upscaler_25x_procedural.onnx  (51361 bytes)
+  model sha256  : 026e73fcdd20a8e1f8ae7f62928f7b971f3ff4640bc82cf2f224edef18bba04b
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested nvidia  attached=CUDAExecutionProvider  (the frames reported CUDAExecutionProvider, as requested)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_25x_procedural.onnx (51361 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=137.20ms  reported=134.53ms  (inference=32.84ms, host overhead=101.70ms)  p50=137.64ms  p99=153.91ms  fps=7.3
+      spread: min 125.53  max 154.46  stddev 10.35  inference share 24.4%  provider CUDAExecutionProvider  frame-hash 0x2dcf1f0be9712f39
+      stages: dlc=0.224ms(0.17%) dld=0.273ms(0.20%) dlm=0.157ms(0.12%) cv=5.420ms(4.03%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=28.111ms(20.90%) rgb=10.475ms(7.79%) bl=86.698ms(64.44%) up=1.379ms(1.02%) q=0.001ms(0.00%) ot=1.795ms(1.33%)
+      blend: blend-state=0.001ms blend-convert-in=3.672ms blend-history-copy=8.712ms blend-motion-plane=7.653ms blend-warp=13.627ms blend-arithmetic=18.786ms blend-convert-out=3.642ms blend-phase-aligned=0.000ms blend-displayed-delta=5.572ms blend-record=11.242ms blend-other=13.071ms  | resolve=85.976ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-own-procedural-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-own-procedural.json

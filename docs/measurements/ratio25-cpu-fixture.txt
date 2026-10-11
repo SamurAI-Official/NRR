@@ -1,0 +1,20 @@
+﻿NRR tier measurement: ratio25-cpu-fixture
+  when          : 2026-10-11 18:54:08 UTC
+  commit        : c441a3a1fc7c243b49a5683130fa3f23456be817 (tracked files modified)
+  tool          : build/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:53:54)
+  model         : models/nrr_upscaler_25x.onnx  (1962 bytes)
+  model sha256  : 595eaf35ace004c2f24127345ab417116cfd1c9cd22baef2647d71bdd723bd1e
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested cpu  attached=CPUExecutionProvider  (the frames reported CPUExecutionProvider, as requested)
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\nrr_upscaler_25x.onnx (1962 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=123.77ms  reported=122.19ms  (inference=16.02ms, host overhead=106.17ms)  p50=122.58ms  p99=138.98ms  fps=8.1
+      spread: min 113.97  max 139.55  stddev 8.82  inference share 13.1%  provider CPUExecutionProvider  frame-hash 0x7bd190fbab0961e1
+      stages: dlc=0.000ms(0.00%) dld=0.000ms(0.00%) dlm=0.000ms(0.00%) cv=2.263ms(1.85%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=16.021ms(13.11%) rgb=11.457ms(9.38%) bl=90.464ms(74.03%) up=1.521ms(1.24%) q=0.001ms(0.00%) ot=0.467ms(0.38%)
+      blend: blend-state=0.000ms blend-convert-in=3.694ms blend-history-copy=9.640ms blend-motion-plane=8.623ms blend-warp=14.801ms blend-arithmetic=17.993ms blend-convert-out=3.964ms blend-phase-aligned=0.000ms blend-displayed-delta=6.203ms blend-record=13.942ms blend-other=10.790ms  | resolve=89.649ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-cpu-fixture-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-cpu-fixture.json

@@ -2599,6 +2599,70 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
   the capture, and the trainer's validation RAM ceiling recorded with the streamed numbers unchanged from the
   materialised ones (the requirement M10.7 states).
 
+### M11.11 - A 2.5x tier: the model takes 768x432 and displays 1920x1080
+
+The first tier in this repository whose ratio is not a power of two (768 x 2.5 = 1920, 432 x 2.5 = 1080, both
+exact, 16:9 throughout). The runtime side was verified before anything was built for it, because a ratio that
+was never structural needs no work and a ratio that was would have decided the design.
+
+- [x] **The runtime carries a model whose ratio is not 2, unchanged.** The display grid is the model's own
+      output tensor (`nchw_to_rgb8(out_data, out_shape, ...)` -> `get_or_create_output_texture`), never
+      `input x ratio`; the accumulator works at that grid and the trust mask at the input grid. Verified with
+      `models/nrr_upscaler_25x.onnx` (new; `tools/gen_sample_model.py` now takes the ratio as a parameter) - a
+      768x432 frame displays 1920x1080, asserted through `nrr_texture_get_desc` rather than inferred from the
+      ratio, because a download is clamped and an inferred size is therefore unfalsifiable.
+- [x] **The measurement path stopped assuming 2.** `nrr_bench` reads the runtime's own answer for the display
+      grid and refuses a tier where it disagrees with `--ratio` (measured before the check: the 2x fixture at
+      `--ratio 2.5` produced a real frame hash and a full row from a 1536x864 texture); the JSON records it as
+      `runtime_output` with `runtime_output_confirmed`. `tools/measure_tiers.ps1` takes `-Ratio` and records it
+      rather than writing the literal `ratio=2`. Two rows recorded (`ratio25-fixture` CUDA 100.0 ms reported /
+      75.8 ms resolve, `ratio25-cpu-fixture` CPU EP 122.2 / 89.6, both `0x7bd190fbab0961e1`).
+- [x] **`tools/train_nrr.py` at a non-integer ratio: the model owns the ratio.** `--ratio` (default 2) builds the
+      head from p/q in lowest terms: 2x keeps `channels * 4` through `PixelShuffle(2)` verbatim (byte-identical
+      export, sha256 `55589FAE...`, 11,123 parameters, from this trainer and the one at HEAD), and any other
+      ratio synthesises p*p polyphase components (`PixelShuffle(p)`) and selects the phase with a **learned**
+      q-tap stride-q convolution - which lands on the baseline's lattice exactly (`(j - 0.75)/2.5` for 5/2,
+      identical to `interpolate(scale_factor=2.5, align_corners=False)`), so an untrained model is exactly that
+      ratio's baseline. `baseline_upscale`/`base_plane` take the ratio, the crop guard checks it instead of
+      demanding an integer scale, and crops are drawn on a lattice of the denominator so the target's window is
+      exactly aligned rather than half a pixel out on odd plans. `tools/gen_training_pairs.py --ratio` renders
+      the target at that ratio (ratio-2 pairs byte-identical to the recorded dataset). Verified end to end:
+      `models/nrr_upscaler_25x_procedural.onnx` (5 epochs, 11,494 parameters, gates failed and stamped as
+      unqualified) renders `768x432 -> 1920x1080` in the runtime with `runtime_output` confirmed and frame hash
+      `0x2dcf1f0be9712f39` (docs/measurements/ratio25-own-procedural.txt). The trainer's own dynamic-size check
+      was found asserting `output == input * 2` and refusing a correct 2.5x export; it now checks the run's ratio.
+- [ ] **The capture and the packer's gate at 2.5x.** `capture.gd` renders its low-resolution pass at
+      `_size / 2`, so the low grid has to become a parameter (768 = 1920 / 2.5); and the packer's margin test
+      scores against a 2x baseline (`_upscale2x`, `downscale2`), so a 2.5x pair would be gated against the wrong
+      baseline - the gate that decides whether the pair is worth training on.
+- [x] **The tier is in `docs/evaluation-protocol.md`**, judged with the artifact published under `ratio25/`
+      (`models/ratio25/upscale_25x_procedural_depth.onnx`, 90,974 parameters, inputs `color`, `depth`): held-out
+      val L1 **0.01058** against that ratio's bilinear baseline's **0.02542** - 58.37% better, against the 5% bar -
+      with `depth` ablation 0.02742 and 58.9% training progress. Its rows are the runtime's
+      (`docs/measurements/ratio25-release-cuda.txt`, `...-cpu.txt`, `runtime_output` 1920x1080 confirmed) plus the
+      trainer's own held-out measurement, because `evaluate_model.py`/`compare_upscalers.py`/`score_models.py`
+      group frames into scenes of at least two and the procedural pairs are single frames - a commercial table at
+      this tier therefore waits for the captured sequence dataset the item above builds.
+- [ ] **A 2.5x model trained to the gates on *captured* 2.5x pairs.** The procedural artifact above is trained to
+      the gates but on data we generate, so its 58.37% is an in-family number: the same family of scenes, the same
+      renderer, no held-out style. The head's cost is known - 25 phases per colour channel at the input grid,
+      narrowed to 3 channels before the shuffle (75 channels at 768x432 = ~100 MB, against the 2x model's ~170 MB
+      at 1536x864) - so the FLOP and peak-activation accounting M11.9 asks for includes the phase stage, and this
+      item is blocked on the capture and packer work above.
+- [ ] **Make motion earn its place, or stop carrying it.** Declaring `depth,motion` trained a *better* model (val
+      L1 0.00541, 78.73% better than the ratio's baseline, against 58.37% for `color,depth`) and was still refused
+      by the conditioning gate, correctly: zeroing motion moved the trained artifact's output by **0.000032**
+      against the 0.0001 bar. So the measurement is that motion helps *training* and not the *artifact*, on data
+      whose target is a sharp instant and whose single mover is a small part of the frame. Either the data has to
+      make the vector necessary (a longer shutter, a mover covering more of the frame) or the artifact has to be
+      exported without the branch it does not use - and the second was refused here only because a 2-input export
+      of the trained graph is a change to the export path, not to the data.
+- **Gate (met on procedural pairs; the captured half is open).** A model trained at 768x432 -> 1920x1080 that
+  clears the trainer's own gates *at that tier* - val L1 at least 5% below the 2.5x bilinear baseline's and above
+  the baseline floor - recorded in `docs/measurements/` with its ratio in the scenario line, and the tier added to
+  the protocol with the model's training tier named in any claim made from its row. The artifact satisfies all
+  four; what it does not yet satisfy is being trained on captured 2.5x pairs.
+
 ### What this section corrects in the record
 
 - The M2 postmortem's tier table was measured with the 45 KB fixture and now says so; the 1080p->4K row is
@@ -2610,7 +2674,7 @@ the accelerator path on the CPU provider matches the CPU backend to within 1.3%,
   verification rather than absence; and `glslc` is missing for desktop hosts only, which is what makes M11.5/M11.6
   wait on a CI decision (M4/V6) instead of on the toolchain existing nowhere.
 
-**Order:** M11.1 -> M11.2 -> M11.4 -> M11.3 -> M11.5 -> M11.6 -> M11.7 -> M11.8 -> M11.9, with M11.10 riding
+**Order:** M11.1 -> M11.2 -> M11.4 -> M11.3 -> M11.5 -> M11.6 -> M11.7 -> M11.8 -> M11.9 -> M11.11, with M11.10 riding
 along with the M10.7 capture run. One commit per milestone, each with a CHANGELOG entry quoting its hash.
 
 ## Engineering rules

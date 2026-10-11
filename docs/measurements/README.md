@@ -101,6 +101,75 @@ what made the three copies below findable. `buffers=0 (0 MB) over 5 resolves` in
 after the reuse work a frame acquires nothing, so the only genuinely *necessary* buffer is the first one at a new
 size. Recorded as `blend-attributed-fixture`, with the frame hash unchanged at `0x9c3d3479ea20eec5`.
 
+## A 2.5x tier: 768x432 -> 1920x1080 (M11.11)
+
+The first tier here whose ratio is not a power of two (768 x 2.5 = 1920, 432 x 2.5 = 1080, both exact). The model
+is `models/nrr_upscaler_25x.onnx` - the same identity-preserving fixture as `nrr_passthrough_2x`, at 2.5x
+instead of 2x, which `tools/gen_sample_model.py` can now generate because the ratio is one of its parameters.
+
+| row | provider | reported | wall | inference | host | blend (stage) | resolve | frame hash |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ratio25-fixture` (accumulating) | CUDA | 100.0 | 102.6 | 11.6 | 88.5 | 76.5 (76.5%) | 75.8 | `0x7bd190fbab0961e1` |
+| `ratio25-cpu-fixture` (accumulating) | CPU EP | 122.2 | 123.8 | 16.0 | 106.2 | 90.5 (74.0%) | 89.6 | `0x7bd190fbab0961e1` |
+| `ratio25-own-procedural` (accumulating) | CUDA | 134.5 | 137.2 | 32.8 | 101.7 | 86.7 (64.4%) | 86.0 | `0x2dcf1f0be9712f39` |
+| `ratio25-release-cuda` (accumulating) | CUDA | 222.4 | 224.6 | 102.1 | 120.3 | 104.2 (46.9%) | 103.6 | `0x45317f2470dc61ac` |
+| `ratio25-release-cpu` (accumulating) | CPU EP | 2101.6 | 2104.3 | 2006.2 | 95.4 | n/a (no `--stages`) | n/a | `0x8aded9efba8d036a` |
+
+The third row is **a model this repository trained**, not a fixture: `models/nrr_upscaler_25x_procedural.onnx`,
+11,494 parameters, 5 epochs on 8 procedural pairs at `--ratio 2.5`, exported under `--export-unqualified`
+because its gates fail (0.7% progress against the 5% bar; its report says so). It exists to establish
+*ownership* rather than quality: the ratio is the model's own graph - `Resize` (the 2.5x bilinear skip) ->
+`DepthToSpace` (25 synthesised polyphase components) -> `Conv` (the learned stride-2 phase selection) -> the
+residual stack - so nothing outside it resamples the frame. Its hash differs from the fixture's because it is
+a different model's frame; the runtime confirms `runtime_output` for all three rows.
+
+The last two rows are the tier's **release artifact**, `models/ratio25/upscale_25x_procedural_depth.onnx` (90,974
+parameters, inputs `color`, `depth`) - the first model in this repository trained at a ratio that is not 2 *and*
+qualified at it: held-out val L1 0.01058 against the 2.5x bilinear baseline's 0.02542 (58.37% better), `depth`
+ablation 0.02742. Both rows confirm `runtime_output` 1920x1080, and the recorder cross-checks the artifact's
+sha256 against the model's own report - which travels to the Hub beside the weights, because `models/**/*.json`
+is gitignored here and a number whose configuration is not shipped is not a reproducible number.
+
+Their frame hashes differ, and the cause is the execution provider rather than nondeterminism: an independent
+onnxruntime comparison of this graph on one input measures max |CPU - CUDA| **6.341e-04** (mean 1.558e-05) at the
+CUDA execution provider's default, and **2.176e-06** (mean 5.443e-08) at `use_tf32=0` - so the CUDA EP is
+computing convolutions in TF32 and the CPU EP is not - while a re-run on the same provider reproduces its hash
+exactly (`0x45317f2470dc61ac`). Two rows that disagree on a bit-exact digest disagree here for a named reason.
+The fixture rows above agree, so the sensitivity belongs to a trained graph rather than to the runtime.
+
+Five frames after three warm-ups, one host, one session per row, `ratio=2.5` in each record's scenario line, and
+each record naming the commit it was taken at (`c441a3a1`, tracked files modified - the change *is* the binary
+that produced it, the same situation `blend-attributed-fixture` records two commits earlier).
+**Both providers produce the same frame hash.** The resolve is where the 2x tier's is at the same *display* grid
+(75.8 here against 79.0 ms at 540p->1080p above, whose input grid is different and whose output grid is not):
+the blend's cost follows the output grid, so the grid an engine renders at moves the renderer's load and not the
+upscaler's. The blend split, CUDA, per resolve: arithmetic 18.2 ms, warp 12.2, record 10.3, other 10.2,
+history-copy 6.9, motion-plane 6.6, displayed-delta 5.0, convert-in 3.2, convert-out 3.2, state and
+phase-aligned 0.0 - the same ordering as the 4K row, at a quarter of the output pixels.
+
+## The runtime's own answer for the display grid: `runtime_output`
+
+Every JSON here carries `runtime_output` beside `output`, and they are not one number written twice. `output` is
+the tool's arithmetic (`input x --ratio`, and what sizes the frame-hash readback); `runtime_output` is what the
+runtime reports for the texture it actually returned (`nrr_texture_get_desc`), with
+`runtime_output_confirmed` saying whether that descriptor could be read at all - `false` is unconfirmed, which is
+not the same as agreeing.
+
+The second is needed because the first can be wrong silently. A download is clamped to what the texture really
+holds, so a model whose own ratio disagrees with `--ratio` still produces a frame hash and a whole row of timings
+- of an image the row does not name. Measured before the check existed: the **2x** fixture run at `--ratio 2.5`
+printed `768x432->1920x1080: ... frame-hash 0x94b2af79f773c8e5` with a plausible number beside it, from a
+**1536x864** texture. `nrr_bench` now refuses that tier instead -
+
+```
+nrr_bench: 768x432->1920x1080: the runtime produced 1536x864 from 768x432, not the 1920x1080 the tier's --ratio
+names, so the tier has no number: pass the ratio the model was built for
+```
+
+- exit 2, no row, like every other tier that could not be measured. All four rows of `blend-pool-fixture` were
+re-run under the check and report their hashes unchanged (`0x54908619d860b3f5`, `0x675657715c63f3f5`,
+`0xebb4f2f86d22cc5`, `0x9c3d3479ea20eec5`), so the check moved nothing it measures.
+
 ## Every row also carries a frame hash
 
 `nrr_bench` reports `frame-hash` per tier: FNV-1a over the displayed RGB8 plane, chained across the measured

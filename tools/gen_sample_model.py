@@ -14,6 +14,14 @@
 #     x      [1,3,H,W] float32
 #     y      [1,3,2H,2W] float32
 #
+#  models/nrr_upscaler_25x.onnx     the same identity-preserving bilinear upsample at a
+#                                   2.5x ratio - the ratio is the only difference, and it
+#                                   is a parameter rather than a property of the graph.
+#                                   Written for the 768x432 -> 1920x1080 tier, which is
+#                                   not a power of two: the graph reaches the display grid
+#                                   with a `Resize` whose `scales` tensor is a float, so
+#                                   nothing structural ever required an integer ratio.
+#
 #  models/nrr_history_probe.onnx    reports its own `history` input as its output, so
 #                                   tests/unit/test_history_delivery.cpp can read back the tensor the
 #                                   runtime fed a model.
@@ -44,7 +52,7 @@ def _conv_weight(rng, out_c, in_c, k, scale=0.05):
 
 
 def _make_upscaler(path, model_name, model_version, description,
-                   with_depth_motion=True):
+                   with_depth_motion=True, scale=2.0, graph_name=None):
     rng = np.random.RandomState(20260910)
 
     if with_depth_motion:
@@ -66,7 +74,7 @@ def _make_upscaler(path, model_name, model_version, description,
     initializers = []
     nodes = []
     scales = numpy_helper.from_array(
-        np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "upscale_scales")
+        np.array([1.0, 1.0, scale, scale], dtype=np.float32), "upscale_scales")
 
     if with_depth_motion:
         # --- Feature extraction (color) -------------------------------------
@@ -125,7 +133,7 @@ def _make_upscaler(path, model_name, model_version, description,
             name="conv_identity", kernel_shape=[1, 1]))
         features_src = "feat"
 
-    # --- Upsample features and color 2x -------------------------------------
+    # --- Upsample features and color by the model's ratio -------------------
     initializers.append(scales)
     nodes.append(helper.make_node(
         "Resize", [features_src, "", "upscale_scales"], ["feat_up"],
@@ -171,7 +179,7 @@ def _make_upscaler(path, model_name, model_version, description,
 
     graph = helper.make_graph(
         nodes,
-        "nrr_upscaler_v0_1" if with_depth_motion else "nrr_passthrough_2x",
+        graph_name or ("nrr_upscaler_v0_1" if with_depth_motion else "nrr_passthrough_2x"),
         inputs, [output], initializer=initializers)
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 17)])
@@ -327,6 +335,16 @@ def main():
                     "(identity-preserving 2x bilinear upsample).",
         with_depth_motion=False)
 
+    _make_upscaler(
+        os.path.join(models, "nrr_upscaler_25x.onnx"),
+        model_name="nrr_upscaler_25x",
+        model_version="0.1.0",
+        description="NRR 2.5x upscaler fixture (identity-preserving 2.5x bilinear upsample), "
+                    "for the 768x432 -> 1920x1080 tier.",
+        with_depth_motion=False,
+        scale=2.5,
+        graph_name="nrr_upscaler_25x")
+
     _make_history_probe(
         os.path.join(models, "nrr_history_probe.onnx"),
         model_name="nrr_history_probe",
@@ -352,8 +370,9 @@ def main():
         token_input_name="zzz_unknown")
 
     # Final validation pass with the checker on the saved files.
-    for name in ("nrr_upscaler_v0.1.onnx", "nrr_passthrough_2x.onnx", "nrr_history_probe.onnx",
-                 "nrr_scale_token_probe.onnx", "nrr_unrecognised_input_probe.onnx"):
+    for name in ("nrr_upscaler_v0.1.onnx", "nrr_passthrough_2x.onnx", "nrr_upscaler_25x.onnx",
+                 "nrr_history_probe.onnx", "nrr_scale_token_probe.onnx",
+                 "nrr_unrecognised_input_probe.onnx"):
         m = onnx.load(os.path.join(models, name))
         onnx.checker.check_model(m)
         print(f"checker OK: {name}")

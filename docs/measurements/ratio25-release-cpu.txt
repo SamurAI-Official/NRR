@@ -1,0 +1,28 @@
+﻿NRR tier measurement: ratio25-release-cpu
+  when          : 2026-10-11 22:04:24 UTC
+  commit        : c441a3a1fc7c243b49a5683130fa3f23456be817 (tracked files modified)
+  tool          : build/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:53:54)
+  model         : models/ratio25/upscale_25x_procedural_depth.onnx  (369025 bytes)
+  model sha256  : 86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9  (matches the sha256 in upscale_25x_procedural_depth.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested auto  attached=CPUExecutionProvider
+
+nrr_bench.exe : [1;31m2026-10-11 15:04:01.9653058 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be found.")
+At G:\Program Prototype\NRR\tools\measure_tiers.ps1:130 char:17
++     $measured = & $binary @arguments 2>&1 | Out-String
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1;31m2026-10-...not be found."):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[m
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_procedural_depth.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=off  threads=8  workers=spawn
+  768x432->1920x1080: wall=2104.27ms  reported=2101.56ms  (inference=2006.15ms, host overhead=95.41ms)  p50=2072.14ms  p99=2279.43ms  fps=0.5
+      spread: min 2001.81  max 2286.79  stddev 96.96  inference share 95.5%  provider CPUExecutionProvider  frame-hash 0x8aded9efba8d036a
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-release-cpu-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-release-cpu.json

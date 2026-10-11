@@ -56,7 +56,14 @@ try {
         @{ From = "models/phase4/upscale_msreal_scale.onnx";    To = "upscale_msreal_scale.onnx";           What = "the released model" },
         @{ From = "models/phase4/upscale_mid.onnx";             To = "phases/upscale_mid.onnx";            What = "mid-tier model" },
         @{ From = "models/phase4/upscale_mid_regression.onnx";  To = "phases/upscale_mid_regression.onnx"; What = "mid-tier regression model" },
-        @{ From = "models/phase3/upscale_subsampled.onnx";      To = "phases/upscale_subsampled.onnx";     What = "the 128->256 model the protocol names" }
+        @{ From = "models/phase3/upscale_subsampled.onnx";      To = "phases/upscale_subsampled.onnx";     What = "the 128->256 model the protocol names" },
+        # The 2.5x tier, added beside the released 2x model rather than replacing it: the ratio is the model's own
+        # head, so 768x432 -> 1920x1080 cannot be produced by the 2x graph (fed 768x432 it returns 1536x864). The
+        # report travels with the weights because it is the artifact's provenance - the gates it passed, the
+        # baseline it was scored against and the configuration that produced it - and it is gitignored in the
+        # repository, so without this copy the numbers would only exist in a changelog.
+        @{ From = "models/ratio25/upscale_25x_procedural_depth.onnx";        To = "ratio25/upscale_25x_procedural_depth.onnx";        What = "the 2.5x model (768x432 -> 1920x1080)" },
+        @{ From = "models/ratio25/upscale_25x_procedural_depth.report.json"; To = "ratio25/upscale_25x_procedural_depth.report.json"; What = "its gate report" }
     )
 
     # The Unity verification project's tests take the highest-dated models/p5/p4_tjit_*.onnx and score their

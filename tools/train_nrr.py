@@ -6,14 +6,22 @@ an identity-preserving bilinear upsample with no learned weights. This is the fi
 repository whose weights come from data we own and whose quality is measured against the baseline it
 has to beat.
 
-What is trained: a small 2x upscaler - feature extraction, depth and motion fusion, PixelShuffle
-upsampling, two residual blocks, output projection, and a bilinear skip. The skip is deliberate: the
-network learns the *correction* to the naive baseline rather than the image, so "beats bilinear" is a
-statement about something learned, and a zero residual is exactly the baseline - which the gates below
-detect instead of assuming.
+What is trained: a small ratio-parameterised upscaler - feature extraction, depth and motion fusion, learned
+polyphase upsampling, two residual blocks, output projection, and a bilinear skip at the same ratio. The skip
+is deliberate: the network learns the *correction* to the naive baseline rather than the image, so "beats
+bilinear" is a statement about something learned, and a zero residual is exactly the baseline - which the
+gates below detect instead of assuming.
+
+The ratio is the model's own (`--ratio`, default 2), not something a caller applies afterwards. The head
+reaches the display grid by synthesising the ratio's polyphase components: `PixelShuffle(2)` at 2x, and for any
+other p/q a `PixelShuffle(p)` with a learned q-strided phase selection, which lands on the *same* lattice as
+`interpolate(scale_factor=p/q, align_corners=False)` - so the untrained model at any ratio is exactly that
+ratio's bilinear baseline. 768x432 -> 1920x1080 is `--ratio 2.5`.
 
 The gates, all measured on held-out scenes rather than read off the training loss:
-    beats the baseline   val L1 must be at least MIN_IMPROVEMENT below the bilinear upscale's
+    beats the baseline   val L1 must be at least MIN_IMPROVEMENT below the bilinear upscale's, at the run's
+                         own ratio (a baseline fixed at 2 would score every other ratio against a plane the
+                         model was never asked to beat)
     is not the baseline  the output must differ from the bilinear upscale by more than BASELINE_FLOOR
     uses conditioning    zeroing depth, and zeroing motion, must each change the output. A model that
                          ignores an input the roadmap asked for has not been trained on it, and no
@@ -60,6 +68,7 @@ import sys
 import tempfile
 import threading
 import time
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -569,7 +578,7 @@ def load_dataset(data_dir, lazy=False, input_source="noisy"):
     return manifest, dataset
 
 
-def augment_scale(height, width, crop_sizes, generator):
+def augment_scale(height, width, crop_sizes, generator, quantum=1):
     """The crop size this batch is trained at, drawn once per batch from `crop_sizes`.
 
     Per batch and not per sample, because a batch is one tensor: samples cropped to different sizes cannot be
@@ -578,6 +587,12 @@ def augment_scale(height, width, crop_sizes, generator):
     the lever anyway: the tier varies between batches, while each sample in the batch still gets its own
     window and its own mirrors below. So multi-scale training is many tiers over an epoch, not one tier per
     sample within a step.
+
+    `quantum` floors the crop to a multiple of the ratio's denominator, which is what keeps the *target* window
+    exactly aligned at a fractional ratio: the window's origin and size are integers on the input grid, and the
+    target's share of them is `round(offset * p/q)` and `round(crop * p/q)`, which are exact only when both are
+    multiples of q. At 5/2 that is every even size and every even offset; at 2 (q = 1) it is every size, so this
+    is a no-op for every run this repository has recorded.
     """
     if not crop_sizes:
         return height, width
@@ -586,15 +601,23 @@ def augment_scale(height, width, crop_sizes, generator):
     # Width follows the frame's aspect ratio, so --crop-sizes names a height and a non-square capture is
     # cropped rather than squashed.
     crop_w = max(min(int(round(side * width / float(height))), width), 1)
+    if quantum > 1:
+        crop_h = max(crop_h - crop_h % quantum, quantum)
+        crop_w = max(crop_w - crop_w % quantum, quantum)
     return crop_h, crop_w
 
 
-def augment_draw(height, width, crop_h, crop_w, flip, generator):
+def augment_draw(height, width, crop_h, crop_w, flip, generator, quantum=1):
     """One sample's mirror and crop position, drawn from `generator`.
 
     Kept apart from the application below so a test can hand-build a decision - "mirror horizontally, crop
     here" - and check what the application does with it, rather than hoping a random draw happened to produce
-    the case under test."""
+    the case under test.
+
+    The offset is drawn on a `quantum` lattice for the same reason `augment_scale` floors the size: at a
+    fractional ratio only offsets that are multiples of the denominator put the target's window exactly where
+    the correspondence says it is. The draw itself is unchanged at quantum == 1, which is every recorded run.
+    """
     if flip:
         # The two axes are drawn independently: a horizontal and a vertical mirror are different transforms
         # with different consequences for the direction fields below (one negates x, the other y), and a
@@ -603,8 +626,14 @@ def augment_draw(height, width, crop_h, crop_w, flip, generator):
         flip_v = bool(torch.randint(2, (1,), generator=generator))
     else:
         flip_h = flip_v = False
-    offset_y = int(torch.randint(height - crop_h + 1, (1,), generator=generator)) if crop_h < height else 0
-    offset_x = int(torch.randint(width - crop_w + 1, (1,), generator=generator)) if crop_w < width else 0
+    if quantum > 1:
+        offset_y = (quantum * int(torch.randint((height - crop_h) // quantum + 1, (1,), generator=generator))
+                    if crop_h < height else 0)
+        offset_x = (quantum * int(torch.randint((width - crop_w) // quantum + 1, (1,), generator=generator))
+                    if crop_w < width else 0)
+    else:
+        offset_y = int(torch.randint(height - crop_h + 1, (1,), generator=generator)) if crop_h < height else 0
+        offset_x = int(torch.randint(width - crop_w + 1, (1,), generator=generator)) if crop_w < width else 0
     return {"flip_h": flip_h, "flip_v": flip_v, "crop_h": crop_h, "crop_w": crop_w,
             "offset_y": offset_y, "offset_x": offset_x}
 
@@ -658,7 +687,7 @@ def augment_sample(pair, plan):
     return out
 
 
-def augment_batch(batch, crop_sizes, flip, generator):
+def augment_batch(batch, crop_sizes, flip, generator, ratio=2.0):
     """Augments a training batch: one crop tier per batch, one window and mirror per sample.
 
     The crop size is drawn once for the whole batch because samples cropped to different sizes cannot be
@@ -666,23 +695,33 @@ def augment_batch(batch, crop_sizes, flip, generator):
     batch is a stack of unrelated frames and a single mirror for all four is a much smaller change than it
     looks. `generator` is the training loop's own generator, which is why an augmented run is still pinned by
     --deterministic.
+
+    `ratio` is the upscale factor the pair is built for, and it enters two ways. It decides the alignment
+    lattice (see augment_scale/augment_draw - at 5/2 the windows have to be even, or half of them would pair
+    the input's window with a target window shifted by half a target pixel), and it is what the pair's target
+    is checked against. That check used to be an integer-scale test - `target_h // input_h` and an exactness
+    comparison - which refused a 2.5x pair outright: not because the alignment was wrong, but because the
+    arithmetic that noticed the ratio also assumed it was whole. The per-key windows in augment_sample were
+    never integer-only (each key's window is `round(plan * own_grid / colour_grid)`), so relaxing the guard to
+    the ratio the run declares is all the crop path needed.
     """
     color = batch["color"]
     height, width = int(color.shape[-2]), int(color.shape[-1])
     target = batch.get("target")
     if target is None:
         raise SystemExit("augmentation needs the target: there is nothing to align a crop against")
-    scale_y = target.shape[-2] // height
-    scale_x = target.shape[-1] // width
-    if target.shape[-2] != height * scale_y or target.shape[-1] != width * scale_x:
+    expected_h = int(round(height * ratio))
+    expected_w = int(round(width * ratio))
+    if (int(target.shape[-2]), int(target.shape[-1])) != (expected_h, expected_w):
         raise SystemExit(
-            "the target is %dx%d against a %dx%d input, which is not an integer scale, so a crop of the pair "
-            "cannot be aligned to the same part of the image"
-            % (target.shape[-2], target.shape[-1], height, width))
-    crop_h, crop_w = augment_scale(height, width, crop_sizes, generator)
+            "the target is %dx%d against a %dx%d input, which is not the %gx ratio this run trains at "
+            "(that would be %dx%d), so a crop of the pair cannot be aligned to the same part of the image"
+            % (target.shape[-2], target.shape[-1], height, width, ratio, expected_h, expected_w))
+    quantum = ratio_factors(ratio)[1]
+    crop_h, crop_w = augment_scale(height, width, crop_sizes, generator, quantum)
     pieces = []
     for index in range(color.shape[0]):
-        plan = augment_draw(height, width, crop_h, crop_w, flip, generator)
+        plan = augment_draw(height, width, crop_h, crop_w, flip, generator, quantum)
         pieces.append(augment_sample({key: value[index:index + 1] for key, value in batch.items()},
                                      plan))
     return {key: torch.cat([piece[key] for piece in pieces], dim=0) for key in batch}
@@ -917,6 +956,7 @@ def run(args, log):
                                                      augment=augment,
                                                      refine=args.refine,
                                                      refine_blend=args.refine_blend,
+                                                     ratio=args.ratio,
                                                      de_jitter=args.input_source not in PLACED_SOURCES)
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -942,7 +982,7 @@ def run(args, log):
             % (measured_history["mode"],
                "" if measured_history["source"] is None else " (read from %s)" % measured_history["source"]))
         log("  delivers rather than the one this model trained on")
-    full = measure(model, val, chunk=args.measure_batch, refine=args.refine)
+    full = measure(model, val, chunk=args.measure_batch, refine=args.refine, ratio=args.ratio)
     keys = list(val.keys())
 
     def ablation(name):
@@ -952,7 +992,7 @@ def run(args, log):
         if name not in model.inputs:
             return 0.0
         return float((full["output"] - measure(model, val, zero=name, chunk=args.measure_batch,
-                                               refine=args.refine)["output"]).abs().mean())
+                                               refine=args.refine, ratio=args.ratio)["output"]).abs().mean())
 
     depth_ablation = ablation("depth")
     motion_ablation = ablation("motion")
@@ -1025,6 +1065,10 @@ def run(args, log):
     failures = check_gates(numbers, zeroed, model.inputs)
     report = {"model": "nrr_upscaler_trained", "parameters": parameters, "inputs": list(model.inputs),
               "channels": args.channels,
+              # The ratio the model is responsible for, and the phase factors its head was built from. Part of
+              # the model's identity rather than a runtime setting: it decides the head's shape and the plane
+              # every gate scored against, so a report that omitted it would not say which model produced it.
+              "ratio": float(args.ratio), "ratio_phases": [model.phase_p, model.phase_q],
               "depth_channels": args.depth_channels, "motion_channels": args.motion_channels,
               "naive_channels": args.naive_channels,
               "epochs": args.epochs, "batch_size": args.batch_size,
@@ -1112,9 +1156,13 @@ def run(args, log):
         produced = list(session.run([OUTPUT_NAME], {
             name: np.zeros((1, widths[name], other, other), np.float32)
             for name in model.inputs})[0].shape)
-        expected = [1, 3, other * 2, other * 2]
+        # The graph is dynamic in H/W when a size it was not traced at comes back at the run's ratio - the
+        # point of the check is that the *size* is free, and the ratio is not a property of the size. A
+        # hardcoded 2 here would fail every model trained at another ratio, which is this check doing its job
+        # on the wrong question: it would have refused a correct 2.5x export as "not dynamic".
+        expected = [1, 3, int(round(other * args.ratio)), int(round(other * args.ratio))]
         report["export"]["dynamic_size_check"] = {"input_size": other, "output_shape": produced,
-                                                  "expected": expected}
+                                                  "expected": expected, "ratio": float(args.ratio)}
         if produced != expected:
             log("  FAILED: the exported graph is not dynamic in H/W (got %s, expected %s)"
                 % (produced, expected))
@@ -1746,6 +1794,96 @@ def self_test():
                 check_ok = False
     print("  %-44s %s" % ("a cropped batch stacks at every tier and seed", "OK" if check_ok else "FAIL"))
     problems += 0 if check_ok else 1
+    # -----------------------------------------------------------------------------------------------------
+    # The ratio. Three different assumptions of 2 were removed above, and each gets a check: the head's shape
+    # (what the model is *responsible* for), the skip and the gates' baseline (what it is measured against),
+    # and the crop lattice (what it is trained on). A ratio parameter that nothing pins is a parameter that
+    # silently does nothing.
+    at_two = Upscaler(channels=8, inputs=("color",)).eval()
+    check_ok = (type(at_two.shuffle).__name__ == "PixelShuffle"
+                and at_two.shuffle.upscale_factor == 2
+                and at_two.fusion.weight.shape[0] == 8 * 4
+                and not hasattr(at_two, "phase"))
+    print("  %-44s %s" % ("ratio 2 keeps the shipped head, 4 phases and no phase conv",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    at_25 = Upscaler(channels=8, inputs=("color",), ratio=2.5).eval()
+    probe = torch.rand(1, 3, 432, 768)
+    with torch.no_grad():
+        produced = at_25(probe)
+        baseline = torch.nn.functional.interpolate(probe, scale_factor=2.5, mode="bilinear",
+                                                   align_corners=False)
+    # 768x432 -> 1920x1080 is the tier this exists for, and the graph produces it with no resampler outside
+    # itself. `interpolate`'s own output size is the floor of the product, and the polyphase head reaches the
+    # same number by a different route (5*H through a stride-2 phase selection), so an odd height is where the
+    # two can disagree by one - which would be a shape error in `skip + correction`, not a subtle one.
+    odd = torch.rand(1, 3, 435, 768)
+    with torch.no_grad():
+        odd_out = at_25(odd)
+        odd_baseline = torch.nn.functional.interpolate(odd, scale_factor=2.5, mode="bilinear",
+                                                       align_corners=False)
+    check_ok = (tuple(produced.shape) == (1, 3, 1080, 1920)
+                and tuple(odd_out.shape) == tuple(odd_baseline.shape)
+                and float((produced - baseline).abs().max()) < 1e-6
+                and float((odd_out - odd_baseline).abs().max()) < 1e-6)
+    print("  %-44s %s" % ("768x432 -> 1920x1080 and an untrained 2.5x model is the 2.5x baseline",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    check_ok = (at_25.phase.weight.shape[0] == 3 * 5 * 5
+                and at_25.shuffle.upscale_factor == 5
+                and at_25.decimate.stride[0] == 2 and at_25.decimate.kernel_size[0] == 2)
+    print("  %-44s %s" % ("2.5 is built as 25 synthesised phases, decimated by the learned q=2",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # The crop lattice. A fractional ratio only keeps the pair's two windows on the same part of the image
+    # when the offset and the size are multiples of the denominator: the target's share is round(plan * 2.5),
+    # which is exact there and half a target pixel out everywhere else - a misalignment that would be trained
+    # into the weights as a blur, on half the samples, with nothing reporting it.
+    five_color = torch.rand(1, 3, 16, 12)
+    five_sample = {"color": five_color,
+                   "target": torch.nn.functional.interpolate(five_color, scale_factor=2.5, mode="nearest"),
+                   "depth": torch.rand(1, 1, 16, 12), "history": torch.rand(1, 3, 16, 12),
+                   "motion": torch.rand(1, 2, 16, 12), "jitter": torch.full((1, 2, 16, 12), 0.25)}
+    five_plan = {"flip_h": False, "flip_v": False, "crop_h": 8, "crop_w": 6, "offset_y": 2, "offset_x": 4}
+    five_crop = augment_sample(five_sample, five_plan)
+    check_ok = (tuple(five_crop["color"].shape[-2:]) == (8, 6)
+                and tuple(five_crop["target"].shape[-2:]) == (20, 15)
+                and bool(torch.allclose(five_crop["target"],
+                                        torch.nn.functional.interpolate(
+                                            five_sample["color"][..., 2:10, 4:10], scale_factor=2.5,
+                                            mode="nearest"))))
+    print("  %-44s %s" % ("a 2.5x crop keeps the target on the same part of the image",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    five_batch = {"color": torch.rand(2, 3, 16, 12),
+                  "target": torch.nn.functional.interpolate(torch.rand(2, 3, 16, 12), scale_factor=2.5,
+                                                            mode="nearest"),
+                  "depth": torch.rand(2, 1, 16, 12), "history": torch.rand(2, 3, 16, 12),
+                  "motion": torch.rand(2, 2, 16, 12), "jitter": torch.full((2, 2, 16, 12), 0.25)}
+    five_stacked = augment_batch(five_batch, (8,), False, torch.Generator().manual_seed(3), ratio=2.5)
+    check_ok = (tuple(five_stacked["color"].shape[-2:]) == (8, 6)
+                and tuple(five_stacked["target"].shape[-2:]) == (20, 15)
+                and tuple(five_stacked["depth"].shape[-2:]) == (8, 6))
+    print("  %-44s %s" % ("and a 2.5x batch stacks with every key's own window",
+                          "OK" if check_ok else "FAIL"))
+    problems += 0 if check_ok else 1
+
+    # The guard the integer test was: a pair that is not the run's ratio is still refused, so relaxing it
+    # admits 2.5 rather than admitting anything.
+    wrong_pair = {"color": torch.rand(1, 3, 8, 8), "target": torch.rand(1, 3, 16, 16)}
+    try:
+        augment_batch(wrong_pair, (8,), False, torch.Generator().manual_seed(1), ratio=2.5)
+        refused = False
+    except SystemExit:
+        refused = True
+    print("  %-44s %s" % ("a target that is not the run's ratio is still refused",
+                          "OK" if refused else "FAIL"))
+    problems += 0 if refused else 1
+
     return 1 if problems else 0
 
 
@@ -1818,6 +1956,12 @@ def main(argv):
     parser.add_argument("--seed", type=int, default=20260930)
     parser.add_argument("--size", type=int, default=64,
                         help="the input size the model was trained at, used for the export example")
+    parser.add_argument("--ratio", type=float, default=2.0,
+                        help="the upscale factor the model is responsible for (default 2). It is the model's "
+                             "own head, not a runtime preference: the graph synthesises the ratio's polyphase "
+                             "components (p*p per pixel for p/q, so 2.5 = 5/2 builds 25 phases), its skip is the "
+                             "same ratio's bilinear upsample - so an untrained model is exactly that baseline - "
+                             "and the gates score against it. 768x432 -> 1920x1080 is --ratio 2.5")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                         help="auto uses the GPU whenever torch can provide one; cuda refuses to run "
                              "on the CPU instead of pretending")
@@ -1905,6 +2049,31 @@ def conv(in_channels, out_channels, kernel=3):
     return nn.Conv2d(in_channels, out_channels, kernel, padding=kernel // 2)
 
 
+def ratio_factors(ratio, max_phase=8):
+    """The upscale ratio as p/q in lowest terms - the shape the head is built from, and its guard.
+
+    The head synthesises p*p polyphase components at the input grid (see Upscaler), so p is a *memory* term
+    rather than a knob: an unbounded numerator is not a configuration, it is an out-of-memory report. q is
+    bounded because the crop alignment and the phase selection are exact only for small denominators.
+
+    2.5 -> (5, 2), 2 -> (2, 1), 3 -> (3, 1), 1.5 -> (3, 2). A ratio with no small-denominator form (pi, or a
+    float that is a rounding artefact of something else) is refused rather than approximated, because the
+    approximation would be silently trained into the weights.
+    """
+    value = Fraction(float(ratio)).limit_denominator(16)
+    if value <= 0 or value.numerator > max_phase or value.denominator > 4:
+        raise SystemExit(
+            "--ratio %g has no p/q form with p <= %d and q <= 4, and this head is built from p/q: the ratio "
+            "decides how many polyphase components are synthesised (p*p per colour channel at the input grid), "
+            "so an unbounded or irrational ratio is not a configuration" % (ratio, max_phase))
+    if abs(float(value) - float(ratio)) > 1e-6:
+        raise SystemExit(
+            "--ratio %g is not %d/%d (its closest small-denominator form is %.6f), and training at an "
+            "approximated ratio would build a mapping neither the capture nor the baseline shares"
+            % (ratio, value.numerator, value.denominator, float(value)))
+    return int(value.numerator), int(value.denominator)
+
+
 def dejitter(color, jitter):
     """Resample a captured low-resolution frame back onto the grid it was *not* sampled on.
 
@@ -1983,7 +2152,7 @@ class Upscaler(nn.Module):
     def __init__(self, channels=32, depth_channels=8, motion_channels=8, history_channels=8,
                  jitter_channels=8, inputs=("color", "depth", "motion"), validity_channels=8,
                  history_jitter_channels=8, naive_channels=8, scale_channels=8, refine=False,
-                 refine_blend=False, de_jitter=True):
+                 refine_blend=False, de_jitter=True, ratio=2.0):
         super().__init__()
         self.inputs = tuple(inputs)
         # The refinement task: the same stack at one resolution, correcting the plane it is given rather than
@@ -2044,8 +2213,43 @@ class Upscaler(nn.Module):
             # than average over them. Convolved rather than concatenated raw, for the same reason as the others.
             self.scale = conv(1, scale_channels)
             fused += scale_channels
-        self.fusion = conv(fused, channels if self.refine_task else channels * 4)
-        self.shuffle = nn.Identity() if self.refine_task else nn.PixelShuffle(2)
+        # How the features reach the *display* grid. This is the model's own upsampling, and it is why "the
+        # model is responsible for the ratio" is a structural claim rather than a slogan: nothing downstream
+        # resamples the correction, and no engine-side pass supplies the missing resolution.
+        #
+        #  * the refinement task: no upsampling at all - the plane is already at the display grid;
+        #  * ratio 2: `channels * 4` at the input grid through `PixelShuffle(2)`. ESPCN's sub-pixel form: the
+        #    four polyphase components are *synthesised by the fusion convolution*, so the 2x grid is learned
+        #    rather than interpolated. Kept verbatim, because every recorded row of this repository was
+        #    produced by this exact graph and a generalisation that changed it would move its own baseline;
+        #  * any other ratio p/q in lowest terms: the same idea at p phases per axis. `PixelShuffle(p)`
+        #    synthesises p*p polyphase components and a learned q-tap convolution with stride q selects the
+        #    phase, which lands *exactly* on the baseline's sampling lattice rather than near it. For 5/2, the
+        #    stride-2 window at output index j reads 5x-grid columns in whose input coordinates centre at
+        #    (j - 0.75)/2.5 - identical to `interpolate(scale_factor=2.5, align_corners=False)`. Same geometry
+        #    as the baseline, with the between-sample detail learned instead of filtered.
+        #
+        # The phase stage is narrowed to 3 channels before the shuffle: p*p channels at the input grid is the
+        # memory term (75 channels for 5/2, 800 for a hypothetical 5-phase-per-axis colour width), and the
+        # colour width is what the graph needs at that stage - the feature width is restored by the decimation
+        # convolution, whose output is the grid the rest of the stack works on.
+        self.ratio = float(ratio)
+        self.phase_p, self.phase_q = (1, 1) if self.refine_task else ratio_factors(self.ratio)
+        self.polyphase = (not self.refine_task) and (self.phase_p, self.phase_q) != (2, 1)
+        if self.refine_task:
+            self.fusion = conv(fused, channels)
+            self.shuffle = nn.Identity()
+        elif not self.polyphase:
+            self.fusion = conv(fused, channels * 4)
+            self.shuffle = nn.PixelShuffle(2)
+        else:
+            self.fusion = conv(fused, channels)
+            self.phase = conv(channels, 3 * self.phase_p * self.phase_p)
+            self.shuffle = nn.PixelShuffle(self.phase_p)
+            # Stride q with no padding: the windows tile the p-times grid exactly (p*q output pixels per q
+            # input pixels on each axis), which is what makes the phase selection exact. q == 1 is an ordinary
+            # 1x1 projection, so 3x and 1.5x are the same code path rather than two.
+            self.decimate = nn.Conv2d(3, channels, self.phase_q, stride=self.phase_q)
         self.refine = nn.Sequential(conv(channels, channels), nn.LeakyReLU(0.01, inplace=True))
         self.block1 = ResidualBlock(channels)
         self.block2 = ResidualBlock(channels)
@@ -2067,8 +2271,11 @@ class Upscaler(nn.Module):
             # recoverable run was refused as "is the baseline" with a drift of 0.000714 against a 0.001 floor.
             nn.init.zeros_(self.blend.weight)
             nn.init.zeros_(self.blend.bias)
-        self.skip = nn.Identity() if self.refine_task else nn.Upsample(scale_factor=2, mode="bilinear",
-                                                                      align_corners=False)
+        # The skip is the ratio's own bilinear upsample - the *same* resampler the correction's geometry lands
+        # on (above) - so the zeroed output convolution below still makes the untrained model exactly the
+        # baseline the trainer's gates score against, at every ratio rather than only at 2.
+        self.skip = nn.Identity() if self.refine_task else nn.Upsample(
+            scale_factor=(2 if self.ratio == 2.0 else self.ratio), mode="bilinear", align_corners=False)
         # Start as the baseline: a zeroed output convolution plus the skip means the untrained model is
         # exactly the bilinear upsample, so any improvement measured later is something learned.
         nn.init.zeros_(self.output.weight)
@@ -2121,7 +2328,16 @@ class Upscaler(nn.Module):
         # network can use it as a global signal rather than only as something to read off a feature map.
         if "scale" in self.inputs:
             parts.append(self.scale(scale))
-        features = self.refine(self.shuffle(self.fusion(torch.cat(parts, dim=1))))
+        features = self.fusion(torch.cat(parts, dim=1))
+        # The ratio's own upsampling. For the sub-pixel form (2x, and the refinement task's identity) there is
+        # one step; for a general p/q the phases are synthesised at the input grid, shuffled into the p-times
+        # grid, and the q-strided convolution selects the phase the display grid lands on. Either way the tensor
+        # entering `refine` is at the display grid, so the rest of the stack has exactly one definition.
+        if self.polyphase:
+            features = self.decimate(self.shuffle(self.phase(features)))
+        else:
+            features = self.shuffle(features)
+        features = self.refine(features)
         features = self.block2(self.block1(features))
         correction = self.output(features)
         if self.refine_blend:
@@ -2144,23 +2360,31 @@ class Upscaler(nn.Module):
                                                               validity, history_jitter, naive, scale)
 
 
-def baseline_upscale(color):
-    """The thing the model has to beat, computed exactly the way the model's own skip does."""
-    return torch.nn.functional.interpolate(color, scale_factor=2, mode="bilinear", align_corners=False)
+def baseline_upscale(color, ratio=2.0):
+    """The thing the model has to beat, computed exactly the way the model's own skip does.
+
+    The ratio is a parameter because the skip is: `Upscaler.skip` is this same
+    `interpolate(scale_factor=ratio, mode="bilinear")`, so an untrained model at any ratio *is* this baseline
+    (the output convolution is zero-initialised). A baseline that stayed at 2 would have made every gate at a
+    non-2 ratio a comparison against the wrong plane - which is the failure mode the ratio parameter exists to
+    make impossible rather than to remember.
+    """
+    return torch.nn.functional.interpolate(color, scale_factor=(2 if float(ratio) == 2.0 else float(ratio)),
+                                           mode="bilinear", align_corners=False)
 
 
-def base_plane(color, refine=False):
+def base_plane(color, refine=False, ratio=2.0):
     """The plane the model's correction is added to, and therefore its own baseline.
 
-    For the upscaling task that is the bilinear upsample (the skip `Upscaler` is born as). For the refinement
-    task it is the frame *itself*: `color` is already the frame the runtime displays - see
+    For the upscaling task that is the bilinear upsample at the run's ratio (the skip `Upscaler` is born as).
+    For the refinement task it is the frame *itself*: `color` is already the frame the runtime displays - see
     tools/refinement_base_dataset.py - so the model refines it, and the number it has to beat is that plane's
     own distance from the ground truth rather than a bilinear upsample of an input render.
 
     One function because three places have to agree about it or the comparison is meaningless: the training loss
     (which optimises the correction against `target - plane`), the held-out measurement, and the reference the
     report prints beside the model."""
-    return color if refine else baseline_upscale(color)
+    return color if refine else baseline_upscale(color, ratio)
 
 
 def _gaussian_line(window_size, sigma):
@@ -2323,7 +2547,7 @@ def substitute_history(val, mode, primary_dir):
     return {"mode": mode, "source": mode, "planes": planes.to(val["history"].device)}
 
 
-def measure(model, batch, zero=None, chunk=32, refine=False):
+def measure(model, batch, zero=None, chunk=32, refine=False, ratio=2.0):
     """The numbers the gates use. `zero` names an input to replace with zeros, which is how each input's
     contribution is measured rather than assumed - including history, which is the whole point of the
     comparison this exists to settle.
@@ -2384,7 +2608,7 @@ def measure(model, batch, zero=None, chunk=32, refine=False):
                                 naive[start:end] if naive is not None else None,
                                 scale[start:end] if scale is not None else None))
         output = torch.cat(pieces, dim=0)
-        baseline = base_plane(color, refine)
+        baseline = base_plane(color, refine, ratio)
         return {"l1": float(torch.nn.functional.l1_loss(output, batch["target"])),
                 "baseline_l1": float(torch.nn.functional.l1_loss(baseline, batch["target"])),
                 "drift": float((output - baseline).abs().mean()),
@@ -2396,16 +2620,24 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
           history_channels, learning_rate, warmup_epochs, seed, device, log,
           loss_name="l1", ssim_weight=0.1, lr_schedule="linear-warmup", detail_weight=0.0,
           jitter_channels=8, validity_channels=8, history_jitter_channels=8, naive_channels=8,
-          augment=None, refine=False, refine_blend=False, de_jitter=True):
+          augment=None, refine=False, refine_blend=False, de_jitter=True, ratio=2.0):
     torch.manual_seed(seed)
     model = Upscaler(channels, depth_channels, motion_channels, history_channels,
                      jitter_channels, inputs=inputs, validity_channels=validity_channels,
                      history_jitter_channels=history_jitter_channels, naive_channels=naive_channels,
-                     refine=refine, refine_blend=refine_blend, de_jitter=de_jitter).to(device)
+                     refine=refine, refine_blend=refine_blend, de_jitter=de_jitter,
+                     ratio=ratio).to(device)
     parameters = sum(p.numel() for p in model.parameters())
     log("  model: %d parameters, inputs=%s, channels=%d, batch=%d, epochs=%d, lr=%g, loss=%s, schedule=%s"
         % (parameters, ",".join(inputs), channels, batch_size, epochs, learning_rate,
            loss_name, lr_schedule))
+    # The ratio is part of the model's identity, not a runtime preference: it decides the head's shape, the
+    # plane the loss is measured against, and the lattice the crops are drawn on. Two runs that differ here are
+    # not two settings of one experiment.
+    if float(ratio) != 2.0:
+        log("  ratio: %g (%d/%d in lowest terms), so the head synthesises %d polyphase components per pixel "
+            "and every gate scores against the %gx bilinear baseline"
+            % (ratio, model.phase_p, model.phase_q, model.phase_p * model.phase_p, float(ratio)))
 
     train_split = dataset["train"]
     count = train_split.count
@@ -2431,7 +2663,7 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             # never be transformed, or the held-out number would be measured on pictures the model was allowed
             # to have seen mirrored.
             if augment is not None:
-                batch = augment_batch(batch, augment["crop_sizes"], augment["flip"], generator)
+                batch = augment_batch(batch, augment["crop_sizes"], augment["flip"], generator, ratio=ratio)
             optimizer.zero_grad()
             # The loss is on the correction the skip cannot supply, not on the whole image: the skip
             # already carries the low frequencies, and weighting those equally would let the model coast
@@ -2439,7 +2671,7 @@ def train(dataset, inputs, epochs, batch_size, channels, depth_channels, motion_
             prediction = model.residual(batch["color"], batch.get("depth"), batch.get("motion"),
                                         batch.get("history"), batch.get("jitter"), batch.get("validity"),
                                         batch.get("history_jitter"), batch.get("naive"), batch.get("scale"))
-            skip = base_plane(batch["color"], refine)
+            skip = base_plane(batch["color"], refine, ratio)
             truth = batch["target"] - skip
             weight = detail_weight_map(batch["target"], detail_weight) if detail_weight > 0.0 else None
             loss = compute_loss(loss_name, prediction, truth, ssim_weight, weight=weight,

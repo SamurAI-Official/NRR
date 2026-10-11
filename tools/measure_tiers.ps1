@@ -39,6 +39,12 @@ param(
     [int]$Frames = 5,
     [int]$Warmup = 3,
     [double]$Motion = 0.0,
+    # The upscale factor the run was taken at, passed through to the tool and written into the record. It was
+    # implicit (the tool's default 2) and recorded as the literal "ratio=2" - which is the same defect this
+    # script exists to remove, one field over: a 2.5x row (768x432 -> 1920x1080) recorded as a 2x row would
+    # have been a false record of a true measurement. The tool now also refuses a run whose ratio disagrees
+    # with the model's own output grid, so a wrong value here fails loudly instead of being believed.
+    [double]$Ratio = 2.0,
     [string]$Provider = '',
     [string]$OutRoot = 'docs/measurements',
     [switch]$Stages,
@@ -100,6 +106,7 @@ if (-not (Test-Path $csvDir)) { New-Item -ItemType Directory -Path $csvDir -Forc
 $arguments = @()
 foreach ($t in $Tier) { $arguments += @('--tier', $t) }
 $arguments += @('--frames', "$Frames", '--warmup', "$Warmup",
+                '--ratio', $Ratio.ToString('0.####', $invariant),
                 '--motion', $Motion.ToString('0.####', $invariant),
                 '--model', $modelItem.FullName,
                 '--json', $jsonPath, '--csv', $csvDir)
@@ -169,7 +176,7 @@ $record += "  commit        : $commit$(if ($dirty) { ' (tracked files modified)'
 $record += "  tool          : $Target  ($($binaryItem.Length) bytes, built $($binaryItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss', $invariant)))"
 $record += "  model         : $Model  ($($modelItem.Length) bytes)"
 $record += "  model sha256  : $modelHash$hashNote"
-$record += "  scenario      : tiers=$($Tier -join ',')  ratio=2  frames=$Frames  warmup=$Warmup  motion=$($Motion.ToString('0.####', $invariant))$(if ($Stages) { '  stages=on' } else { '' })"
+$record += "  scenario      : tiers=$($Tier -join ',')  ratio=$($Ratio.ToString('0.####', $invariant))  frames=$Frames  warmup=$Warmup  motion=$($Motion.ToString('0.####', $invariant))$(if ($Stages) { '  stages=on' } else { '' })"
 $record += "  host          : $($cpu.Name.Trim())  cores=$($cpu.NumberOfCores)  logical=$($cpu.NumberOfLogicalProcessors)"
 $record += "  gpu           : $(if ($gpu) { "$($gpu.Name)  driver $($gpu.DriverVersion)" } else { 'none reported' })"
 $record += "  os            : $os"

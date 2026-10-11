@@ -10,12 +10,16 @@ tags:
   - nrr
 ---
 
-# NRR upscaler - the released model
+# NRR upscalers - the released 2x model, and a 2.5x tier
 
 A 2x neural upscaler as a single ONNX graph of about 461 KB, trained in the
 [NRR repository](https://github.com/SamurAI-Official/NRR) and used there as *the released model*: the one the
 Unreal, Godot and Unity plugins load, the one `docs/parity.md` measures, and the one this repository's headless
 verifications render.
+
+The same repository publishes a **2.5x** model under [`ratio25/`](#the-25x-tier-ratio25), which is what the
+768x432 -> 1920x1080 tier needs. The released 2x model cannot be asked for that tier: the ratio is the graph's own
+head, so fed a 768x432 frame it returns 1536x864, and it reaches 1920x1080 only from a 960x540 input.
 
 It is a prototype model from a research repository rather than a shipping upscaler. It is published so the
 plugin side of that repository can be verified against a real model instead of a sample.
@@ -50,11 +54,55 @@ That is a comparison of *these frames at this tier*, which is what it is. No row
 upscaler, and a timing taken on a host doing other work is a timing on a busy host. The repository's
 `docs/evaluation-protocol.md` states the rules the table is held to.
 
+## The 2.5x tier (`ratio25/`)
+
+`ratio25/upscale_25x_procedural_depth.onnx` upscales by **2.5** on both axes, and it is the first model in that
+repository trained at a ratio that is not a power of two *and* qualified at it by the repository's own gates - a
+model that fails one is refused, not exported with a warning next to it.
+
+| | |
+| --- | --- |
+| inputs | `color` - the low-resolution frame; `depth` - per-pixel ray distance on the input's grid |
+| output | one frame, **2.5x** the input on both axes (768x432 -> 1920x1080) |
+| spatial | dynamic H/W: the graph takes whatever size the input is |
+| parameters | 90,974 (369,025 bytes) |
+| sha256 | `86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9` |
+| how the ratio is reached | `PixelShuffle(5)` synthesises 25 polyphase components per colour channel, a learned stride-2 convolution selects the phase, and the skip is the 2.5x bilinear upsample - so nothing outside the graph resamples the frame, and an untrained model *is* that ratio's bilinear baseline |
+
+Measured on the run's own held-out split (120 procedural pairs, `color` being the noisy packed input the runtime
+supplies), with the 2.5x bilinear baseline scored on the same frames by the same code:
+
+| arm | L1 | SSIM | PSNR dB | MS-SSIM |
+| --- | --- | --- | --- | --- |
+| bilinear at 2.5x | 0.02542 | 0.8897 | 21.55 | 0.9427 |
+| **this model** | **0.01058** | **0.9479** | **27.38** | **0.9739** |
+
+58.37% below the baseline on the metric the training gates score (the bar is 5%), with training progress 58.9% and
+a `depth` ablation of 0.02742 - the gate that refuses an input the model does not actually use. Through the
+runtime at the tier: **224.6 ms/frame** on an RTX 4070 Ti (CUDA provider, 102.1 ms of it inference) and 2104.3 ms
+on the same host's CPU execution provider; the benchmark seeds a synthetic depth ramp for depth-consuming models,
+so those rows measure speed and the quality numbers above come from the trainer's held-out split instead.
+
+What is **not** claimed. The data is procedural - the repository generates it (`tools/gen_training_pairs.py
+--ratio 2.5`, each scene rendered twice, at 128 and at 320, so the target is a real render at the ratio rather
+than a resample onto it) - so the 58.37% is an **in-family** number: held-out pairs, but the same scenes, the same
+renderer and no held-out style. It is not comparable to the 2x table below, which is measured on captured frames
+by a different harness at a different tier. A model trained on *captured* 2.5x pairs, and the commercial
+comparison at this tier, are recorded follow-ups in the repository's roadmap.
+
+One thing to know before comparing this model's output across hardware: ONNX Runtime's CUDA execution provider
+computes convolutions in TF32 by default, so this graph's CPU and CUDA outputs differ by up to **6.341e-04** (mean
+1.558e-05) while agreeing to **2.176e-06** with `use_tf32=0`. The two recorded runtime rows therefore carry
+different frame hashes for a named reason rather than a mysterious one, and a re-run on one provider reproduces
+its hash exactly.
+
 ## Files
 
 | file | bytes | what it is |
 | --- | --- | --- |
 | `upscale_msreal_scale.onnx` | 461,501 | the released model: the two-tier (`scale` token) upscaler described above |
+| `ratio25/upscale_25x_procedural_depth.onnx` | 369,025 | the 2.5x model: 768x432 -> 1920x1080, inputs `color`, `depth` |
+| `ratio25/upscale_25x_procedural_depth.report.json` | 2,934 | that model's gate report: the configuration, the sha256, the held-out numbers and the baselines they were scored against - the repository gitignores `models/**/*.json`, so this copy is the one that travels with the weights |
 | `phases/upscale_subsampled.onnx` | 424,038 | the 128 -> 256 model `docs/evaluation-protocol.md` names when it explains why a model must be judged at the tier it was trained for |
 | `phases/upscale_mid.onnx` | 424,038 | mid-training model, kept because the phase tables compare against it |
 | `phases/upscale_mid_regression.onnx` | 424,038 | the mid model as a regression baseline |
@@ -66,8 +114,19 @@ upscaler, and a timing taken on a host doing other work is a timing on a busy ho
 With NRR itself:
 
 ```c
-nrr_model_load(device, "upscale_msreal_scale.onnx", &model);   /* the runtime feeds jitter, derives scale */
-nrr_render(device, model, /*tensors=*/NULL, &input, &output);
+nrr_model_load(device, "upscale_msreal_scale.onnx", &model);
+nrr_render(device, model, /*references=*/NULL, &input, &output);   /* the runtime derives scale from the width */
+```
+
+The third argument is the reference set, not the inputs: NRR hands a model the planes it *declares*, and takes
+them from the frame - `NRRFrameInput.color` / `.depth` / `.motion_vectors`, `NRRTemporalState.jitter` and
+`.previous_output` for a temporal model, and `scale` derived from the frame's width. That is the whole difference
+between the two contracts on this page. The released 2x model declares `color`, `jitter`, `scale`, which the
+runtime already has; the 2.5x model declares `color` and `depth`, so a caller has to populate `input.depth`:
+
+```c
+nrr_model_load(device, "ratio25/upscale_25x_procedural_depth.onnx", &model);
+nrr_render(device, model, /*references=*/NULL, &input, &output);   /* input.depth carries the frame's depth */
 ```
 
 Fetching it into a checkout, which puts it exactly where the repository expects it
@@ -89,6 +148,11 @@ session = onnxruntime.InferenceSession("upscale_msreal_scale.onnx")
 Trained in the NRR repository's own trainer on frames captured from Godot; the training configuration, the
 comparison harness, the plugins that load it and every number above live in that repository. The released model
 is not tracked by git there (`models/phase4/` is working state), which is why it is here.
+
+The 2.5x model in `ratio25/` was trained in the same repository, by `tools/run_ratio25.ps1` on data it generates
+rather than data it captured (`tools/gen_training_pairs.py --ratio 2.5`), and its gate report travels with it
+because the repository gitignores `models/**/*.json` - without that copy the artifact's provenance would live only
+in a changelog. The weights are tracked there, so the two copies can be compared byte for byte.
 
 Verification status, stated because a model that loads is not a model that ran: NRR's Unreal project renders this
 model at three tiers headless and prints `RESULT: PASS` (`engine_plugins/unreal_verify/README.md`), and the Godot

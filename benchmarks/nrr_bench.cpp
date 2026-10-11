@@ -25,6 +25,12 @@
  *             [--model <path.onnx>] [--csv <dir>] [--json <path>]
  *   nrr_bench --tier 960x540 --frames 200 --csv work/parity/nrr-bench --json work/parity/nrr-bench.json
  *
+ * `--ratio` is a claim about the model, not a setting. Every tier's output grid is read back from the texture
+ * the runtime returned (nrr_texture_get_desc) and compared with the grid the ratio names; a model whose own
+ * ratio disagrees is refused rather than measured. The reason is that a download is clamped to what the
+ * texture really holds, so a mismatched pair produces a frame hash, and a row of timings, of an image the row
+ * does not name - silently. The runtime's answer is written to the JSON as `runtime_output` either way.
+ *
  * Every tier it measures also prints one line in the shape the parity harness already parses, extended with
  * the distribution and named by input -> output so the tiers line up with the commercial arms':
  *
@@ -160,7 +166,9 @@ void usage() {
         "\n"
         "  --tier WxH     input size, repeatable. Output is W*ratio x H*ratio.\n"
         "                 default: 960x540 and 1920x1080, the two tiers the XeSS arm is measured at\n"
-        "  --ratio N      upscale factor (default 2)\n"
+        "  --ratio N      upscale factor (default 2). It must be the model's own output ratio: a tier whose\n"
+        "                 runtime output grid disagrees with it is refused, because the frame hash below is\n"
+        "                 read back from the returned texture and a download is clamped to its real size\n"
         "  --frames N     measured frames per tier (default 60)\n"
         "  --warmup N     frames discarded before measuring (default 5)\n"
         "  --model PATH   the .onnx to measure\n"
@@ -235,6 +243,12 @@ struct TierResult {
     uint64_t frame_hash = 0;
     /* The resolve's internal split over this tier's measured frames (M11.3), and the buffers it acquired. */
     nrr::BlendProfile blend;
+    /* The display grid the *runtime* produced, read from the texture it returned rather than recomputed from
+     * --ratio, and whether that descriptor could be read at all. Zero/unknown is a different answer from a
+     * grid, and is reported as one - a check that could not be made is not a check that passed. */
+    uint32_t runtime_w = 0;
+    uint32_t runtime_h = 0;
+    bool runtime_size_known = false;
     bool ok = false;
 };
 
@@ -410,6 +424,36 @@ TierResult measure_tier(const Tier& tier, const char* model_path, const std::str
                   << last_error_text() << "\n";
         release();
         return result;
+    }
+
+    /* The tier's name is `input -> output`, and that `output` is this binary's own arithmetic: in * ratio.
+     * Every hash below is read back at that size, and a download is clamped to what the texture really holds
+     * - so a model whose own ratio disagrees with --ratio yields a hash, and a row of timings, that describe
+     * an image the row does not name, with nothing failing. That is the silent layout mismatch
+     * nrr_texture_get_desc was added to end (see include/nrr.h), one level below the mismatch it already
+     * ended, so the grid is asked for here rather than assumed: the ratio that names a row has to be the
+     * ratio the model was built for, or the row is not a measurement of that model. */
+    NRRTextureDesc runtime_desc = {};
+    if (nrr_texture_get_desc(device, probe.color, &runtime_desc) == NRR_SUCCESS) {
+        result.runtime_w = runtime_desc.width;
+        result.runtime_h = runtime_desc.height;
+        result.runtime_size_known = true;
+        if (result.runtime_w != tier.out_w || result.runtime_h != tier.out_h) {
+            std::cerr << "nrr_bench: " << tier.name() << ": the runtime produced "
+                      << result.runtime_w << "x" << result.runtime_h << " from " << tier.in_w << "x"
+                      << tier.in_h << ", not the " << tier.out_w << "x" << tier.out_h
+                      << " the tier's --ratio names, so the tier has no number: pass the ratio the model "
+                      << "was built for\n";
+            release();
+            return result;
+        }
+    } else {
+        /* Reported rather than refused: the descriptor is the only way to confirm the grid, and a backend
+         * that cannot answer is not a model that disagreed. The JSON records the field as 0x0 so an absent
+         * answer is visible in the artifact instead of looking like a grid. */
+        std::cerr << "nrr_bench: " << tier.name()
+                  << ": the runtime's output descriptor could not be read, so the tier's output grid is "
+                  << "unconfirmed\n";
     }
     for (int i = 0; i < warmup; ++i) {
         NRRFrameOutput out = {};
@@ -709,6 +753,14 @@ int main(int argc, char** argv) {
             json << "    \"" << json_escape(r.tier.name()) << "\": {\n";
             json << "      \"input\": [" << r.tier.in_w << ", " << r.tier.in_h << "],\n";
             json << "      \"output\": [" << r.tier.out_w << ", " << r.tier.out_h << "],\n";
+            /* The runtime's own answer for the same grid, asked for rather than recomputed (see
+             * measure_tier). It equals `output` for every tier that was reported at all, because a
+             * disagreement refuses the tier - and it is in the file so that equality is a recorded fact
+             * rather than something a reader has to assume from this binary's arithmetic. [0, 0] means the
+             * descriptor could not be read: unconfirmed, which is not the same as agreeing. */
+            json << "      \"runtime_output\": [" << r.runtime_w << ", " << r.runtime_h << "],\n";
+            json << "      \"runtime_output_confirmed\": "
+                 << (r.runtime_size_known ? "true" : "false") << ",\n";
             json << "      \"frames\": " << r.wall.count << ",\n";
             /* Every figure the runtime and the clock produced, so a reader can see which half moved: the
              * harness publishes `reported_ms` as the row and cites the rest in its source string. */
