@@ -106,12 +106,59 @@ $arguments += @('--frames', "$Frames", '--warmup', "$Warmup",
 if ($Provider) { $arguments += @('--provider', $Provider) }
 if ($Stages) { $arguments += '--stages' }
 
-$measured = & $binary @arguments 2>&1 | Out-String
+# Native tools write progress and warnings to stderr, and with $ErrorActionPreference = 'Stop' a
+# *captured* stderr line becomes a terminating error - so this script first failed on an ONNX Runtime
+# warning (its "Memcpy nodes are added ... for CUDAExecutionProvider" note) and on the
+# entirely-expected "the CUDA provider could not be loaded" note a CPU-flavour build prints. That is
+# the same defect tools/build.ps1 documents and fixes the same way: relax the preference around the
+# native call and judge the run by its exit code, which is what actually reports success. The stderr
+# text is kept - it is evidence about which provider was available, and it belongs in the record.
+function Invoke-NativeTool {
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $text = & $Command 2>&1 | Out-String
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return $text
+}
+
+$measured = Invoke-NativeTool { & $binary @arguments }
 $exit = $LASTEXITCODE
-if ($exit -ne 0) { throw "measure_tiers: $Target exited $exit`n$measured" }
+if ($exit -ne 0) {
+    Write-Host $measured
+    throw "measure_tiers: $Target exited $exit"
+}
+
+# What the frames actually reported, per tier, read out of the renders' own debug strings by the tool.
+# A requested backend is not evidence that it ran - the first version of this script recorded a row
+# labelled "cpu" that had in fact attached CUDA, because a CUDA runtime on PATH made the auto-selected
+# backend NVIDIA - so the record states both, and says so loudly when they disagree.
+$seen = [regex]::Matches($measured, '(?m)provider\s+(\w+)') |
+        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+$seenNote = if ($seen.Count -gt 0) { $seen -join ', ' } else { 'none reported' }
+$providerNote = ''
+if ($Provider) {
+    $expected = switch ($Provider.ToLowerInvariant()) {
+        'cpu'    { 'CPUExecutionProvider' }
+        'nvidia' { 'CUDAExecutionProvider' }
+        default  { $null }
+    }
+    if ($expected -and ($seen -notcontains $expected)) {
+        $providerNote = "  (MISMATCH: requested $Provider and the frames reported '$seenNote' - the runtime fell back to the CPU execution provider)"
+    } elseif ($expected) {
+        $providerNote = "  (the frames reported $expected, as requested)"
+    } else {
+        $providerNote = ''
+    }
+}
 
 $commit = (& git -C $repo rev-parse HEAD).Trim()
-$dirty = (& git -C $repo status --porcelain)
+# Tracked modifications only: the untracked files a run writes into the repository are its own output,
+# and reporting them as a dirty tree made every record claim the code had been modified.
+$dirty = (& git -C $repo status --porcelain --untracked-files=no)
 $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1)
 $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA|AMD|Intel|Radeon' } |
         Select-Object -First 1)
@@ -120,7 +167,7 @@ $os = (Get-CimInstance Win32_OperatingSystem).Caption
 $record = @()
 $record += "NRR tier measurement: $Label"
 $record += "  when          : $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss', $invariant)) UTC"
-$record += "  commit        : $commit$(if ($dirty) { ' (working tree dirty)' } else { '' })"
+$record += "  commit        : $commit$(if ($dirty) { ' (tracked files modified)' } else { '' })"
 $record += "  tool          : $Target  ($($binaryItem.Length) bytes, built $($binaryItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss', $invariant)))"
 $record += "  model         : $Model  ($($modelItem.Length) bytes)"
 $record += "  model sha256  : $modelHash$hashNote"
@@ -128,7 +175,7 @@ $record += "  scenario      : tiers=$($Tier -join ',')  ratio=2  frames=$Frames 
 $record += "  host          : $($cpu.Name.Trim())  cores=$($cpu.NumberOfCores)  logical=$($cpu.NumberOfLogicalProcessors)"
 $record += "  gpu           : $(if ($gpu) { "$($gpu.Name)  driver $($gpu.DriverVersion)" } else { 'none reported' })"
 $record += "  os            : $os"
-$record += "  provider      : $(if ($Provider) { "requested $Provider" } else { 'requested auto' })"
+$record += "  provider      : $(if ($Provider) { "requested $Provider" } else { 'requested auto' })  attached=$seenNote$providerNote"
 $record += ""
 $record += $measured.TrimEnd()
 
