@@ -16,7 +16,7 @@ actually printed rather than estimates.
 ### M11.3, first step: the blend stops allocating per pixel, and the frames are provably unchanged
 
 M11.1 measured the temporal blend as the largest single host stage of a 1080p->4K frame - 1227.9 ms, 84.5% of it
-with the blend engaged. This is the first change against it, in `__M113_COMMIT__`, and the finding was an
+with the blend engaged. This is the first change against it, in `07f476e1`, and the finding was an
 allocation rather than an algorithm.
 
 * **~16.6M heap allocations per frame, inside the 84.5%.** `TemporalRenderer::warp_previous_output` reprojects
