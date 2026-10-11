@@ -13,6 +13,59 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The hardware floor: the measurements say it is the code, not the hardware
+
+M2 measured that 85-88% of a 1080p->4K frame is host-side pixel work, and M4/V2 recorded that two verified GPU
+kernels for the two largest conversions are never called by the frame path. Read together, those two facts say
+the tier's cost is what `runtime/` *does*, not what the machine has. This is the write-up of that reading, in
+`__M11_COMMIT__`; every item it adds is unchecked, because the numbers below are the ones it starts from.
+
+* **A correction that had to come first: the tier table was measured with a fixture.** Those four rows used
+  `models/nrr_upscaler_v0.1.onnx` (`CMakeLists.txt`'s `NRR_SAMPLE_MODEL`), a ~45 KB *untrained* identity fixture
+  from `tools/gen_sample_model.py` - not the released network. So "the GPU is not the bottleneck" was measured
+  against a model that does almost no work: the host share (85-88%) stands, but the inference column is a floor
+  rather than a representative share, because most of the 157.4 ms at that tier is ONNX Runtime's own transfer,
+  arena and graph bookkeeping at 4K tensor sizes. The M2 postmortem, the status table's performance row and the
+  README paragraph now all say so, and re-measuring that row with the released model is a task (M11.1) rather
+  than a reinterpretation.
+* **Why the host share is 85-88%, from the code rather than the numbers.** There is no SIMD and no threading
+  anywhere in `runtime/` - no `std::thread`, no OpenMP, no `_mm_`/`immintrin.h` in any file, and `CMakeLists.txt`
+  sets no `/arch:` flag - so every conversion, warp and blend is a scalar single-threaded loop over output
+  pixels. ONNX Runtime is pinned to two intra-op threads on every path (`runtime/onnx_runtime.cpp:252-253`). The
+  frame path allocates four download vectors, a 100 MB output, an RGB8 buffer and a motion buffer *per frame*
+  (`runtime/accel_kernel.cpp:200-228,436,475,488` and friends). ~600 MB of traffic in 866.8 ms is **~0.7 GB/s**:
+  an order of magnitude below what a single core streams, and the signature of scalar per-pixel code, not of a
+  bandwidth wall. A larger GPU would move none of it.
+* **The finding that reorders the work.** `nchw_pack` and `rgb8_unpack` are already compiled by `glslc`, embedded
+  with their SHA-256, dispatched on a real GPU and compared against a CPU reference (5.96e-08 worst error, and
+  zero differing bytes including alpha) - and the accelerator frame path, in M4/V2's own words, "still moves
+  frames through host staging". The cheapest real win in this tree is therefore **wiring two verified kernels**,
+  on any Vulkan device, with no CUDA toolkit, no model change and no new hardware - not buying a bigger GPU.
+* **A new roadmap section, M11**, with ten milestones that each end in the measurement that closes them, ordered
+  so nothing is optimised before it is measured: M11.1 the per-stage split (stage budgets, the stage sum asserted
+  against the reported total, free when disabled); M11.2 an arena (zero allocation per frame, byte-identical
+  output); M11.3 vectorized and threaded loops with the floor *stated* (SSE2 required, AVX2 dispatched, a
+  scalar-vs-vector parity test, a thread sweep, and the SSE2-only path proved by forcing the dispatch off);
+  M11.4 intra-op threads from physical cores (one line today, measured A/B, bit-identical); M11.5 wire pack/unpack
+  into the frame path; M11.6 the two remaining shaders, of which the blend is the largest stage left because it
+  runs at output resolution; M11.7 a hash-pinned DirectML source with a *measured* attach; M11.8 `fp16` only where
+  a device provider has executed it; M11.9 the model's own floor - refine *before* the shuffle, since the
+  residual stack currently runs at 3840x2160 and ~1 GB of activation at 32 channels is what the VRAM is spent on;
+  M11.10 the capture/training cost levers M10.7 identified plus the streamed validation that unblocks the tier.
+* **`models/architecture.md` is truth-upped at the point of claim**, not only in the roadmap: a status banner
+  (68,955 parameters shipped, 461,501 bytes, and **no 2.5M-parameter network exists in this repository**), the
+  parameter budget labelled *target* with the note that as drawn the refinement block runs after the pixel shuffle
+  and is where the FLOPs and the VRAM go, `minimum_vram_mb: 4096` labelled a target no test asserts, and the
+  `< 16 ms at 1080p -> 4K` line labelled a data-path target that is open rather than met.
+* **Two prerequisite rows corrected rather than restated.** DirectML *is* published for Windows
+  (`onnxruntime-directml` on PyPI, `Microsoft.ML.OnnxRuntime.DirectML` on NuGet), so its blocker is verification
+  and a hash-pinned source, not absence - which is exactly what M11.7 measures. And `glslc`/`glslangValidator` is
+  missing for *desktop* hosts only: the kernels are compiled and hashed where the NDK is present, which is why
+  M11.5/M11.6 wait on a CI decision (M4/V6) rather than on the toolchain existing nowhere.
+* **Three risk-register rows**, because this section creates risks of its own: a vectorized conversion that stops
+  being bit-identical, AVX2 becoming a floor by accident, and instrumentation that perturbs the number it
+  publishes - each with the assertion that must hold.
+
 ### The 1080p->4K tier: capturable and costed, and it was the *content* that had to change
 
 `models/architecture.md` promises a colour+depth+motion network at 1080p -> 4K, and `docs/evaluation-protocol.md`

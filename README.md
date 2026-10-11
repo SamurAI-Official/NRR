@@ -117,7 +117,12 @@ and the NVIDIA backend is selected automatically on NVIDIA hardware (AMD/Intel/R
 compiled but not registered yet). Browsers, consoles and phones therefore have no working
 GPU path today, and the frame contract still hands NRR host memory, which is where the frame
 budget actually goes - measured at 85-88% host-side pixel work with the CUDA provider
-attached (see the M2 postmortem in `docs/roadmap.md`).
+attached (see the M2 postmortem in `docs/roadmap.md`, including which model that was
+measured with: the 45 KB test fixture, so the host share is measured and the inference
+share is a floor). **M11** in the roadmap is the work that lowers that floor, and the
+first lever is not a bigger GPU: the runtime has no SIMD and no threading, ONNX Runtime
+is pinned to two intra-op threads, and two of the four host conversion stages already
+have verified GPU kernels (`nchw_pack`, `rgb8_unpack`) that the frame path never calls.
 
 ### Phase 0 - Specification (complete)
 - [x] API specification

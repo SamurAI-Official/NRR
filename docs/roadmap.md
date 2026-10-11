@@ -12,7 +12,7 @@ an ONNX Runtime session, and engine plugins that contained no executable code.
 
 ---
 
-## Verified status (re-checked after the engine-verification round; M10 active)
+## Verified status (re-checked after the engine-verification round; M10 and M11 active)
 
 Current numbers for this tree, because the counts inside the dated sections below are as-measured at their
 revision: **51** entry points in `include/nrr.h` (`NRR_ENTRY_POINT_COUNT`), and **204** executed tests
@@ -32,7 +32,7 @@ and 23 of the 227 are compiled out of a desktop build).
 | Unreal plugin | Phase 10 items checked | **Built and verified in-engine.** Two modules that did not exist before - `NRRRuntime` loads `nrr.dll` at run time and resolves all 51 entry points of `include/nrr.h` from the header, and `NRRPlugin` provides `UNRRComponent` and the `NRRVerify` commandlet - and `engine_plugins/unreal_verify/` builds them into UE 5.8.3's **Editor** target (a Launcher *Installed* engine cannot link a standalone Game target) and renders the released model at three tiers headless: `RESULT: PASS`, exit code 0 (2026-10-10, **CPU** execution provider, because the CUDA provider crashes inside `nrr.dll` during model load on this host). What the plugin deliberately does not do is listed in M5. |
 | Godot plugin | Phase 11 items checked | **Built and run.** `plugin.cfg` is the INI shape Godot actually parses (the XML variant was never read), with a `@tool` EditorPlugin, the GDScript `NRR` API, a renderer-agnostic `NRRPostProcess` node, a per-platform `nrr.gdextension` and a GDExtension C++ binding. Compiled against godot-cpp 10.0.0 and loaded by Godot 4.7.2-stable, which registered `NRRNative`, created a CPU device, loaded an ONNX model and rendered a non-passthrough frame (M1.5, `engine_plugins/godot_verify/`). Re-verified once the NVIDIA backend became first-class: `backend=NVIDIA`, `caps.active_backend=NVIDIA` with `neural_acceleration=0` before a model is loaded and `caps.active_backend=CUDAExecutionProvider` with `neural_acceleration=3` (FULL) after, `first_frame_ms=571.712` against `steady_state_ms=0.578`, `RESULT: PASS`. `verify.gd` now reports the cold frame and the steady state separately and asserts the steady state. Windows x86_64 **debug** variant only; the other `nrr.gdextension` entries are unbuilt. Wiring is measured by 9 drift guards in `tests/unit/test_engine_plugins.cpp`. |
 | Mobile | Phase 13 kernels real | Structural: the mobile kernel and vendor backends compile and pass guarded tests on Windows; nothing has executed on an Android/iOS device (`tests/mobile/test_android.cpp` and `test_ios.cpp` are compiled out on Windows). |
-| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. |
+| Performance | "GPU-ready" | Measured per tier with the CUDA execution provider (M2 postmortem): 256->512 31.7 ms, 512->1024 128.6 ms, 540p->1080p 260.6 ms, 1080p->4K 1031.3 ms - and **85-88% of each frame is host-side pixel work rather than GPU work**. That is far from the specification target of <16 ms at 1080p -> 4K, and the gap is in the data path, not the model. A perf gate now exists (`latency_frame_budget_breakdown`, thresholds derived from these measurements) but it can only enforce the device-provider tiers on hardware that has one - GitHub-hosted runners do not. Those rows were measured with the 45 KB sample fixture rather than the released model, so the **host share is measured and the inference share is a floor** (see the correction in M2's postmortem). **M11 is the section that lowers this floor**, and its first milestone is the stage split that makes the 866.8 ms attributable. |
 | CI | none | `.github/workflows/ci.yml` added in M0 and now **eight jobs**: Windows x64 build + the full suite (**204** tests) against a real ONNX Runtime SDK, where the job fails outright when the SDK is missing rather than passing on a build that cannot honour a frame; a **blocking** AddressSanitizer job over the same suite with the 17 wall-clock benchmarks excluded, so it runs **187 of 204** (`NRR_SKIP_TIMING_TESTS`); `windows-gpu-link`, which fetches the CUDA-flavoured ONNX Runtime and builds, links and tests that configuration because the CPU-flavour job compiles none of that path; the Android cross-build (NDK r27, arm64-v8a); the Vulkan branch with headers only and no SDK; the metrics-harness self-check; the C ABI / managed mirror audit (`tools/check_abi.py`); and the trainer self-checks. |
 
 ---
@@ -730,6 +730,16 @@ It also explains why the "22x speedup" measurement - which isolated a single ses
 translates into a far more modest end-to-end change. The honest target is the device-resident
 path listed above, and the honest ordering is to make that path possible before optimising
 anything else.
+
+**One correction to the table, because it decides what may be concluded from it.** Those four rows were measured
+with `models/nrr_upscaler_v0.1.onnx` (`CMakeLists.txt` sets `NRR_SAMPLE_MODEL`), a ~45 KB *untrained* fixture from
+`tools/gen_sample_model.py` - not the released network. So "the GPU is not the bottleneck" is measured against a
+model that does almost no work, and the inference column is a floor rather than a representative share: at this
+tier most of the 157.4 ms is ONNX Runtime's own host-to-device transfer, arena and graph bookkeeping at 4K tensor
+sizes, and a real colour+depth+motion upscaler would move milliseconds into that column and out of the host
+column without changing the conclusion. The honest reading is therefore **the host overhead is measured and the
+inference share is not yet**, which is why M11.1 re-measures this row with the released model rather than
+reinterpreting it.
 
 **Three defects this reachability exposed, all fixed.** The accelerator frame path was passing
 only input 0, so `Run()` failed for every three-input model in the project and the path silently
@@ -2287,6 +2297,151 @@ score quality against". This is the work that changes that clause. Probed before
       lost to ch32 inside the seed noise). `models/architecture.md` is rewritten to describe what ships once the
       tier is trained and measured - not before
 
+## M11 - The hardware floor: make the shipped path use the hardware it already has `started`
+
+M2 measured that **85-88% of a 1080p->4K frame is host-side pixel work** - 1031.3 ms wall at that tier, 157.4 ms
+of it inference - and drew the right conclusion ("the gap is in the data path, not the model") without yet saying
+why the data path is slow. Read against the code rather than the numbers, it is not a bandwidth wall and not a
+hardware requirement: it is what the code does. `runtime/` contains **no SIMD and no threading at all** (no
+`std::thread`, no OpenMP, no `_mm_`/`immintrin.h` in any file; `CMakeLists.txt` sets no `/arch:` and no OpenMP
+flags), so every conversion, warp and blend is a scalar single-threaded loop over output pixels. ONNX Runtime is
+pinned to two intra-op threads and one inter-op thread on every path (`runtime/onnx_runtime.cpp:252-253`). And the
+two largest conversions have **verified GPU kernels that the frame path never calls**: M4/V2 records `nchw_pack`
+(5.96e-08 worst error against a CPU reference) and `rgb8_unpack` (zero differing bytes, alpha included) as
+dispatched and compared - then records as unchecked, "wire pack/unpack into the frame path: the accelerator
+kernel still moves frames through host staging". ~600 MB of traffic in 866.8 ms is **~0.7 GB/s**: an order of
+magnitude below what one core streams, and the arithmetic signature of per-pixel scalar code with a fresh
+allocation per frame (the frame path allocates four download vectors, a 100 MB output, an RGB8 buffer and a
+motion buffer every frame: `runtime/accel_kernel.cpp:200-228,436,475,488`; `runtime/nrr_inference.cpp:175,243`;
+`runtime/nrr_temporal.cpp:727-744`). A larger GPU would not move any of it, which is why this is its own frontier
+rather than more M2.
+
+The target this section is trying to make arithmetically possible is `< 16 ms at 1080p -> 4K`
+(`models/architecture.md` section 7.3) - a data-path claim, which is why M11.9 (the model's own floor) cannot be
+skipped even if M11.1-M11.8 all land perfectly.
+
+The order below is deliberate: **nothing is judged until M11.1 can attribute the 866.8 ms**, and every lever that
+needs no toolchain and no retrain is measured before the ones that do.
+
+### M11.1 - The stage split: the instrument every other milestone is judged by
+
+- [ ] Per-stage timing and byte counters in the frame path - download (colour/depth/motion), NCHW conversion,
+      trust mask, history warp, jitter plane, inference, RGB8 conversion, blend, upload, quality - published in
+      the stats record and `debug_info`, at **zero cost when disabled** so the instrument does not perturb the
+      number it publishes.
+- [ ] `latency_frame_budget_breakdown` extended in its existing style (`tests/performance/test_latency.cpp`):
+      each stage printed with its unit and a budget derived from measurement, and the stage sum asserted against
+      the reported total - the prep+infer+post assertion at `test_latency.cpp:739` generalised, so a stage that
+      stops being measured cannot silently vanish from the sum.
+- [ ] The breakdown measured with **three models**: the passthrough fixture, `models/nrr_upscaler_v0.1.onnx`
+      (continuity with the M2 table) and the released trained model - because the M2 table's inference column
+      describes a 45 KB fixture, so the inference *share* at the tier is not yet known for a real network.
+- **Gate:** the extended breakdown passes on all four tiers, the stages sum to the reported total within 5%, and
+  the disabled instrumentation costs under 1% of the frame over five steady-state samples.
+
+### M11.2 - An arena: zero allocation after warm-up
+
+- [ ] Preallocated per-stage buffers sized from the frame and the model's declared shapes, reused across frames,
+      on both the accelerator and the CPU path (the CPU path allocates the same way).
+- [ ] A bytes-allocated-per-frame counter, published in the timing breakdown and asserted in a test.
+- **Gate:** the counter reads **0** on frames 2..N at all four tiers, with the rendered frame **byte-identical**
+  (SHA-256 of the RGB8 output, as the parity tests already compare) and the before/after milliseconds recorded on
+  a named host.
+
+### M11.3 - Vectorize and thread the host loops, and state the floor
+
+- [ ] The four hot loops vectorized: `texture_to_nchw` (`runtime/nrr_inference.cpp:164-229` - a `switch` on the
+      source format *inside* the per-channel loop, a per-pixel `memcpy`/`half_to_float`), `nchw_to_rgb8`
+      (`:231-258`), the history warp (`runtime/nrr_temporal.cpp:746-771`) and the blend.
+- [ ] The independent stages row-banded across threads (a small pool, created once), because the runtime
+      currently has none.
+- [ ] AVX2 as a **dispatched fast path**, with the baseline stated: SSE2 required, AVX2 optional, selected by
+      CPUID, so no build drops the floor without saying so.
+- **Gate:** a scalar-vs-vector parity test - **byte-exact** for the integer conversions, and the one inexact
+  operation (`half -> float`) documented with its bound; a thread sweep (1/2/4/max) with speedup and parity
+  recorded; and the SSE2-only path **proved** by forcing the dispatch off and running the suite.
+
+### M11.4 - Provider thread policy
+
+- [ ] `SetIntraOpNumThreads` from the host's physical cores (currently a hard-coded 2,
+      `runtime/onnx_runtime.cpp:252`), with the value reported in `debug_info`.
+- **Gate:** an A/B on the CPU execution provider at all four tiers with **bit-identical output** and the same
+  attached provider; and the load-sensitive timing tests re-measured, because more threads is more scheduling
+  variance on a busy host (the existing risk-register entry).
+
+### M11.5 - Wire the verified Vulkan kernels into the frame path (M4/V2's last unchecked item)
+
+- [ ] `nchw_pack` and `rgb8_unpack` dispatched from the accelerator frame path in place of the host conversions,
+      on devices where the kernel reports itself present.
+- [ ] The kernels-absent configuration keeps building and keeps reporting them absent (the honesty rule M4/V2
+      already applies), so a build without `glslc` says so rather than falling back silently.
+- **Gate:** on a Vulkan device the two conversion stages are produced by the kernels, with the parity already
+  measured for them (pack <= 1 float ulp, unpack byte-exact), and the timing breakdown records both stages' host
+  share as ~0.
+- **Blocked by (soft):** `glslc` for the desktop hosts and a software ICD so the kernels *run* in CI instead of
+  skipping (M4/V6 lists both). Without them this is measured on the development machine and recorded as such,
+  per the `gated` convention.
+
+### M11.6 - The remaining two shaders: the blend and the bilinear upscale
+
+- [ ] `runtime/vulkan/shaders/temporal_blend.comp` and `upscale_bilinear.comp` verified the way the first two
+      were (`vulkan_pipeline.h` says explicitly that they are "the next two shaders rather than" implied), then
+      wired.
+- **Gate:** each kernel compared against a CPU reference with its worst error recorded, and the blend stage - the
+  largest single stage left, because it runs at output resolution - measured at ~0 host share.
+
+### M11.7 - A second execution provider, for hardware that is not NVIDIA
+
+- [ ] `tools/fetch_ort.ps1` gains a hash-pinned DirectML source (`onnxruntime-directml` on PyPI, or
+      `Microsoft.ML.OnnxRuntime.DirectML` on NuGet) the way it already handles the CUDA runtime, and the provider
+      is attached where present.
+- **Gate:** the attach is **measured** - attached, or skipped with ONNX Runtime's own reason recorded, exactly
+  the `test_cuda_ep_is_measurably_faster_than_cpu` shape - and if no package verifies, the row stays
+  `gated: package not verified` with the attempt recorded rather than implied.
+
+### M11.8 - `fp16` where a device provider exists
+
+- [ ] An fp16 export, run only where a device provider is attached; `supports_fp16` becomes true only on paths
+      that have executed it (the existing capability rule).
+- **Gate:** the fp16 session runs, its VRAM and bandwidth delta is recorded, and its quality is judged with the
+  jitter-aware reference under `docs/evaluation-protocol.md` - not by eye, and not before the fp32 arm at the
+  same tier is measured.
+
+### M11.9 - The model's own floor: refine before the shuffle
+
+- [ ] The residual stack moved **before** the pixel shuffle - which is what `models/architecture.md` draws and
+      what `tools/train_nrr.py` does not do today (`PixelShuffle` precedes `refine`/`block1`/`block2`), because
+      32 channels at 3840x2160 is where the VRAM (~1 GB of activation) and the FLOPs are spent.
+- [ ] Tiling with a computed halo, so peak VRAM is bounded by tile height rather than by 2160.
+- **Gate:** parameter, FLOP and peak-activation accounting published; quality compared against the shipped model
+  under the protocol with the trainer's ten-seed noise floor; and `models/architecture.md` rewritten to what
+  ships, its hardware claims replaced by measurements and its aspirational banner removed.
+
+### M11.10 - The capture and training floor (cross-referenced from M10.7, not duplicated)
+
+- [ ] The two cost levers M10.7 identified, each measured before adoption: depth+motion rendered at the **low**
+      grid (-74% of the capture's bytes, and the grid the model and the runtime's warp consume) and a **16:9**
+      capture (-44% of the data, and exactly the spec tier).
+- [ ] Streamed validation in `tools/train_nrr.py`, removing the ~8.5 GB the held-out split needs today.
+- [ ] The tier model trained on 1920-resolution crops.
+- **Gate:** bytes-per-frame measured at the tier and recorded in the dataset manifest, the data gate accepting
+  the capture, and the trainer's validation RAM ceiling recorded with the streamed numbers unchanged from the
+  materialised ones (the requirement M10.7 states).
+
+### What this section corrects in the record
+
+- The M2 postmortem's tier table was measured with the 45 KB fixture and now says so; the 1080p->4K row is
+  re-measured with the released model by M11.1. The status table and README carry the same correction.
+- `models/architecture.md`'s hardware claims - "~2.5M" parameters, `minimum_vram_mb: 4096`, `< 16 ms at 1080p ->
+  4K` - are labelled targets rather than specifications, with the shipped model's real size (68,955 parameters,
+  461,501 bytes) stated at the top and at the point of each claim.
+- Two prerequisite rows are corrected rather than restated: DirectML is published for Windows, so its blocker is
+  verification rather than absence; and `glslc` is missing for desktop hosts only, which is what makes M11.5/M11.6
+  wait on a CI decision (M4/V6) instead of on the toolchain existing nowhere.
+
+**Order:** M11.1 -> M11.2 -> M11.4 -> M11.3 -> M11.5 -> M11.6 -> M11.7 -> M11.8 -> M11.9, with M11.10 riding
+along with the M10.7 capture run. One commit per milestone, each with a CHANGELOG entry quoting its hash.
+
 ## Engineering rules
 
 1. **No cosmetic capability.** Every advertised capability, enum value or README
@@ -2307,11 +2462,11 @@ score quality against". This is the work that changes that clause. Probed before
 
 | Decision | Why it blocks | Current status |
 | --- | --- | --- |
-| DirectML-capable GPU + ORT flavour with the DML provider | M2 is unverifiable without it | Not present (CPU-only SDK) |
+| DirectML-capable GPU + ORT flavour with the DML provider | M2 is unverifiable without it, and M11.7 is where it stops being theoretical | **Not present** - the SDK in `third_party/` is CPU-only. But the release *is* published for Windows: `onnxruntime-directml` on PyPI (win_amd64) and `Microsoft.ML.OnnxRuntime.DirectML` on NuGet, so the route is to hash-pin one of those into `tools/fetch_ort.ps1` the way the CUDA runtime already is, and then **measure the attach**. M11.7 does that; until it runs, this row stays absent rather than assumed |
 | NVIDIA GPU + CUDA toolkit matching the ORT build | M2 CUDA path, M7 NVIDIA kernels | **The GPU is present** - `NVIDIA GeForce RTX 4070 Ti`, and M2's CUDA execution provider ran on it (22x the CPU provider, bit-identical output, capability read from the device). What is absent is the CUDA **toolkit** (`nvcc`), which is why NRR's *own* CUDA kernels (M7) stay structural: the execution provider needs the runtime DLLs, not the toolkit, and `tools/fetch_cuda_runtime.ps1` installs those. Caveat measured since: on this driver + ONNX Runtime 1.30 + cuDNN 9, model load **crashes inside `nrr.dll`** with the CUDA provider attached, which is why the Unreal and Unity verifications run on the CPU provider |
 | AMD (HIP/ROCm) and Intel (oneAPI) toolchains + hardware | M7 AMD/Intel kernels | Not present |
 | RISC-V toolchain + board | M7 RVV validation | Not present |
-| Vulkan: headers, loader, and `glslc` for SPIR-V | M4 | **Headers and loader: present.** `tools/fetch_vulkan_headers.ps1` fetches the Khronos header set (`vulkan-sdk-1.4.363.0`), the loader is installed by the graphics driver (`vulkan-1.dll`), and the runtime resolves it at run time - so the Vulkan configuration compiles and enumerates a real device with no SDK and no admin rights. **Still missing: `glslc`/`glslangValidator`** for the SPIR-V build step |
+| Vulkan: headers, loader, and `glslc` for SPIR-V | M4 | **Headers and loader: present.** `tools/fetch_vulkan_headers.ps1` fetches the Khronos header set (`vulkan-sdk-1.4.363.0`), the loader is installed by the graphics driver (`vulkan-1.dll`), and the runtime resolves it at run time - so the Vulkan configuration compiles and enumerates a real device with no SDK and no admin rights. **Still missing *for the desktop hosts*: `glslc`/`glslangValidator`** for the SPIR-V build step - the kernels *are* compiled and hashed where the NDK is present (the Android job, M4/V2), so the gap is desktop CI rather than the toolchain existing nowhere. M4/V6 lists the options (fetch glslc from the NDK cache, or keep the split and say so), and M11.5/M11.6 are the milestones blocked by the choice because the verified kernels cannot be wired into a frame path that no desktop job can run |
 | Unreal Engine install | M5 | **Present** - UE 5.8.3 at `G:\Unreal\UE_5.8`, a launcher **Installed** build (`InstalledBuild.txt`; `Engine/Binaries/Win64` holds 1239 `.dll` and no engine import libraries (565 editor `.lib` files live under `Engine/Intermediate/Build/Win64/x64/UnrealEditor`)), with the VS 2022 14.44 toolchain and the 10.0.22621 Windows SDK. **The .NET Framework 4.6+ SDK is installed now (2026-10-10, elevated, as `Microsoft.Net.Component.4.8.SDK`)**, which the *editor* target's `SwarmInterface` dependency requires (UBT: "Could not find NetFxSDK install dir"); the *Game* target needs no NetFxSDK but cannot link a standalone executable against an Installed build (no import libraries are shipped). M5's plugin is implemented and compiles; its verification run passes - `RESULT: PASS`, exit code 0, on the CPU execution provider, because the CUDA provider crashes during model load on this host |
 | Godot install | M6 | **Present** - Godot 4.7.2-stable at `G:\godot`; a godot-cpp 10.x checkout is still needed to build the binding |
 | Android / iOS device + toolchain | M8 | **Android toolchain: present.** NDK r27 (`27.0.12077973`), adopted if installed and otherwise fetched by `tools/fetch_ndk.ps1` (cached in CI), so the Android configuration now compiles in the `android-ndk` job (arm64-v8a, `nrr_static`, Vulkan from the NDK sysroot). No device and no emulator image, so device behaviour is still evidenced only by the consumer's `nrr_probe` run. **iOS: no toolchain** (needs macOS/Xcode) |
@@ -2331,6 +2486,9 @@ score quality against". This is the work that changes that clause. Probed before
 | Weights trained on content we do not have redistribution rights to (commercial games, platform SDK samples) | M10.6 tiers, a licence field per dataset, and a trainer refusal rather than a convention |
 | Injection paths (a present-hook) read by anti-cheat as cheating, and their input is not the product scenario | M10.5: offline, research-only, never shipped; the product path is engine integration |
 | Documentation drift from code | This roadmap is authoritative; README summarises it |
+| A vectorized or threaded conversion that stops being bit-identical (the two GPU kernels are already verified against a CPU reference: pack 5.96e-08 worst error, unpack zero differing bytes) | M11.3 asserts scalar-vs-vector parity: byte-exact for the integer conversions, and the one inexact operation (`half -> float`) documented with its bound rather than assumed away |
+| A new hardware floor adopted by accident (AVX2 reached for as if universal) | M11.3 states the baseline - SSE2 required, AVX2 dispatched - and proves the SSE2-only path by forcing the dispatch off and running the suite |
+| Instrumentation that changes the number it publishes | M11.1 asserts the disabled path costs under 1% of the frame; the flag is off by default and the timing tests run with it off |
 
 ## Running the project
 
