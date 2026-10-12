@@ -32,8 +32,8 @@ plugin side of that repository can be verified against a real model instead of a
 | --- | --- |
 | inputs | `color` - the low-resolution frame; `jitter` - the sub-pixel offset the frame was rendered at (all zeros for a render that does not jitter); `scale` - **the tier token** |
 | output | one frame, **2x** the input on both axes |
-| spatial | dynamic H/W: the graph takes whatever size the input is |
-| the `scale` token | `0.0` for the **128 -> 256** grid, `1.0` for the **256 -> 512** grid. The model was trained at both, so it is measured at both - `docs/parity.md` and `docs/parity-512.md` are two halves of one result rather than two results. NRR's own harness derives the token from the frame's width, so each tier is handed the value it was trained with |
+| spatial | dynamic H/W: the graph takes whatever size the input is, **including non-square**. Verified with `tools/verify_rect_upscale.py` in the NRR repository on a 160x90 rectangular frame: the output is exactly `(1, 3, 180, 320)` - 2x on both axes, finite, no square reshape anywhere. The 2.5x graphs below are checked the same way |
+| the `scale` token | `0.0` for the **128 -> 256** grid, `1.0` for the **256 -> 512** grid. The model was trained at both, so it is measured at both - `docs/parity.md` and `docs/parity-512.md` are two halves of one result rather than two results. NRR's own harness derives the token from the frame's width (`log2(width / 128)`), so each tier is handed the value it was trained with |
 | depth, motion | **not inputs.** This model declares neither; those belong to the temporal models in the repository, not to this one |
 
 ## Measured quality (this repository's own harness, not a vendor's)

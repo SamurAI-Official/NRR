@@ -651,6 +651,27 @@ verification project fetches the one it needs and checks its SHA-256. Nothing in
 ships a compiled binary - Godot's libraries are per-platform build output under
 `engine_plugins/godot/bin/`, which is `.gitignore`d.
 
+## Releases
+
+Each engine plugin ships as its own **independent GitHub Release** (one tag per engine), built by
+`tools/package_plugins.ps1`. Every package is self-contained: the plugin source, the native
+binaries it needs to run (`nrr.dll` where the engine loads it, or the GDExtension library for
+Godot), the **CPU** ONNX Runtime DLLs (~17 MB total, so the smallest usable install), the released
+model `upscale_msreal_scale.onnx`, and a copy of [LICENSE](LICENSE). The CUDA provider and its
+~2.6 GB of runtime are deliberately **not** bundled - attach those with each engine's own setup
+script when you want the GPU path.
+
+| Release tag | Asset | Install |
+| --- | --- | --- |
+| `nrr-godot-v1.0.0` | `nrr-godot-addon-1.0.0.zip` | Extract to `<your project>/addons/` (gives `addons/nrr/`) |
+| `nrr-unity-v1.0.0` | `nrr-unity-package-1.0.0.zip` | Extract to `<your project>/Packages/` |
+| `nrr-unreal-v1.0.0` | `nrr-unreal-plugin-1.0.0.zip` | Extract to `<YourProject>/Plugins/` |
+
+The verification projects (`engine_plugins/*_verify/`) remain the evidence that each plugin runs
+in its engine - the releases are the convenience packaging of the same source and the same
+verified binaries. Windows x86_64 only, matching what has actually been built and run; the other
+platform entries in `nrr.gdextension` are still unbuilt.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds on Windows x64 against a cached ONNX Runtime SDK and runs the full
