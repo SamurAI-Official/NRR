@@ -1,0 +1,20 @@
+﻿NRR tier measurement: vulkan-conv-threads8
+  when          : 2026-10-12 01:30:12 UTC
+  commit        : 7efc0c023e752a28abee6521cf120cdbd4de8345 (tracked files modified)
+  tool          : build-vulkan/Release/nrr_bench.exe  (295424 bytes, built 2026-10-11 18:29:34)
+  model         : models/ratio25/upscale_25x_procedural_depth.onnx  (369025 bytes)
+  model sha256  : 86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9  (matches the sha256 in upscale_25x_procedural_depth.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested vulkan  attached=CUDAExecutionProvider
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_procedural_depth.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=126.07ms  reported=123.85ms  (inference=43.80ms, host overhead=80.05ms)  p50=125.61ms  p99=130.70ms  fps=7.9
+      spread: min 122.48  max 130.91  stddev 2.71  inference share 35.4%  provider CUDAExecutionProvider  frame-hash 0x45317f2470dc61ac
+      stages: dlc=0.114ms(0.09%) dld=0.172ms(0.14%) dlm=0.000ms(0.00%) cv=2.337ms(1.89%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=42.411ms(34.24%) rgb=4.350ms(3.51%) bl=72.496ms(58.54%) up=0.927ms(0.75%) q=0.001ms(0.00%) ot=1.041ms(0.84%)
+      blend: blend-state=0.000ms blend-convert-in=2.677ms blend-history-copy=6.800ms blend-motion-plane=6.068ms blend-warp=12.271ms blend-arithmetic=16.977ms blend-convert-out=2.990ms blend-phase-aligned=0.000ms blend-displayed-delta=5.064ms blend-record=9.222ms blend-other=9.761ms  | resolve=71.829ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\vulkan-conv-threads8-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\vulkan-conv-threads8.json

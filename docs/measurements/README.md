@@ -137,6 +137,35 @@ computing convolutions in TF32 and the CPU EP is not - while a re-run on the sam
 exactly (`0x45317f2470dc61ac`). Two rows that disagree on a bit-exact digest disagree here for a named reason.
 The fixture rows above agree, so the sensitivity belongs to a trained graph rather than to the runtime.
 
+### The Vulkan configuration's frame path (M4/V2): where its host time goes
+
+`build-vulkan` (the `NRR_ENABLE_VULKAN` configuration, glslc from the NDK's shader-tools, `vulkan-1.dll` from the
+driver) runs the frame path on this machine with all four SPIR-V kernels passing against their CPU references.
+Its frames are **byte-identical to the CUDA path's** - every row below carries `0x45317f2470dc61ac`, the hash the
+CUDA rows carry for the same model and input - so what these rows measure is cost, not correctness.
+
+| row | provider | reported | wall | inference | host | blend | conv (`cv`/`rgb`) | frame hash |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vulkan-baseline-25x` (before the conversion was banded) | CUDA EP via Vulkan backend | 134.8 | 137.2 | 45.3 | 89.5 | 76.80 (57%) | 2.46 / 9.32 | `0x45317f2470dc61ac` |
+| `vulkan-conv-threads1` (same binary, `NRR_THREADS=1`) | CUDA EP via Vulkan backend | 222.5 | 224.7 | 46.7 | 175.8 | 162.67 | 2.63 / 9.55 | `0x45317f2470dc61ac` |
+| `vulkan-conv-threads8` (same binary, `NRR_THREADS=8`) | CUDA EP via Vulkan backend | 123.9 | 126.1 | 43.8 | 80.1 | 72.50 | 2.34 / **4.35** | `0x45317f2470dc61ac` |
+| `ratio25-conv-threads1` (CUDA config, `NRR_THREADS=1`) | CUDA | 277.8 | 280.5 | 53.8 | 224.0 | 207.84 | 3.04 / 11.56 | `0x45317f2470dc61ac` |
+| `ratio25-conv-threads8` (CUDA config, `NRR_THREADS=8`) | CUDA | 162.6 | 165.2 | 57.3 | 105.3 | 94.83 | 2.78 / **5.91** | `0x45317f2470dc61ac` |
+
+* **The host overhead is the blend, and then the conversion.** In the baseline row the temporal blend is 76.80 ms
+  of the 89.50 ms host time: the GPU is idle for most of the frame at this tier. Moving the blend's *arithmetic*
+  alone is a wash - its planes are ~64 MB/frame to upload against the 13.04 ms the arithmetic costs on the CPU -
+  which is why the row exists before the wiring rather than after it. See `docs/roadmap.md` M4/V2 for what the
+  whole-post-chain move needs.
+* **The `rgb` column is the part that moved.** `nchw_to_rgb8` is banded now: 11.56 -> 5.91 ms in the CUDA
+  configuration and 9.55 -> 4.35 in the Vulkan one, with the frame hash unchanged in both. The pairs are the
+  *same binary* with `NRR_THREADS` changed, which is the switch `runtime/nrr_parallel.h` documents for exactly
+  this question and what `measure_tiers` sweeps - not two builds compared across a host doing other work. The
+  thread count is in each record's `configuration:` line.
+* **`texture_to_nchw` is deliberately still serial**, and the threading attempt is recorded rather than reverted
+  silently: banding it measured 3.149 ms against 3.962 ms at 768x432, because the input plane at a 2.5x ratio is
+  ratio^2 smaller than the output plane and the per-call worker spawn costs more than the band saves.
+
 ### The captured 2.5x models (M11.11, continued)
 
 The procedural artifacts above are trained on pairs this repository *generates*. These rows are two models

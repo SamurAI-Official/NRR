@@ -1,0 +1,20 @@
+﻿NRR tier measurement: vulkan-baseline-25x
+  when          : 2026-10-12 01:22:51 UTC
+  commit        : 7efc0c023e752a28abee6521cf120cdbd4de8345
+  tool          : build-vulkan/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 18:19:32)
+  model         : models/ratio25/upscale_25x_procedural_depth.onnx  (369025 bytes)
+  model sha256  : 86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9  (matches the sha256 in upscale_25x_procedural_depth.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested vulkan  attached=CUDAExecutionProvider
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_procedural_depth.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=137.19ms  reported=134.82ms  (inference=45.33ms, host overhead=89.50ms)  p50=137.98ms  p99=140.21ms  fps=7.3
+      spread: min 134.04  max 140.29  stddev 2.22  inference share 33.6%  provider CUDAExecutionProvider  frame-hash 0x45317f2470dc61ac
+      stages: dlc=0.117ms(0.09%) dld=0.179ms(0.13%) dlm=0.000ms(0.00%) cv=2.458ms(1.82%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=43.861ms(32.53%) rgb=9.317ms(6.91%) bl=76.801ms(56.97%) up=1.045ms(0.78%) q=0.001ms(0.00%) ot=1.044ms(0.77%)
+      blend: blend-state=0.001ms blend-convert-in=3.167ms blend-history-copy=6.869ms blend-motion-plane=7.429ms blend-warp=11.972ms blend-arithmetic=18.243ms blend-convert-out=3.352ms blend-phase-aligned=0.000ms blend-displayed-delta=5.130ms blend-record=9.689ms blend-other=10.248ms  | resolve=76.099ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\vulkan-baseline-25x-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\vulkan-baseline-25x.json

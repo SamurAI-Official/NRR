@@ -1,0 +1,20 @@
+﻿NRR tier measurement: ratio25-conv-threads1
+  when          : 2026-10-12 01:28:53 UTC
+  commit        : 7efc0c023e752a28abee6521cf120cdbd4de8345 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (295424 bytes, built 2026-10-11 18:28:34)
+  model         : models/ratio25/upscale_25x_procedural_depth.onnx  (369025 bytes)
+  model sha256  : 86326c5d7c4ca5b7b5e7b5e206b55de2909f80a7fee7d1938d3d661545c545d9  (matches the sha256 in upscale_25x_procedural_depth.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested auto  attached=CUDAExecutionProvider
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_procedural_depth.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=1  workers=spawn
+  768x432->1920x1080: wall=280.45ms  reported=277.76ms  (inference=53.76ms, host overhead=224.00ms)  p50=282.13ms  p99=309.67ms  fps=3.6
+      spread: min 252.88  max 310.82  stddev 18.58  inference share 19.4%  provider CUDAExecutionProvider  frame-hash 0x45317f2470dc61ac
+      stages: dlc=0.245ms(0.09%) dld=0.384ms(0.14%) dlm=0.000ms(0.00%) cv=3.041ms(1.09%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=51.551ms(18.56%) rgb=11.559ms(4.16%) bl=207.835ms(74.82%) up=1.406ms(0.51%) q=0.001ms(0.00%) ot=1.740ms(0.63%)
+      blend: blend-state=0.000ms blend-convert-in=4.193ms blend-history-copy=9.926ms blend-motion-plane=9.286ms blend-warp=53.151ms blend-arithmetic=93.666ms blend-convert-out=7.238ms blend-phase-aligned=0.000ms blend-displayed-delta=5.716ms blend-record=11.628ms blend-other=12.208ms  | resolve=207.010ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-conv-threads1-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-conv-threads1.json

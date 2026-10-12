@@ -1226,8 +1226,22 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
       and the generated header, so the kernels are verified where they are compiled.
 - [ ] The temporal blend and the bilinear upscale kernels (the next two shaders), plus a YUV input
       kernel for video/mobile sources.
-- [ ] Wire pack/unpack into the frame path: the accelerator kernel still moves frames through host
-      staging, so today the GPU does this work only when it is called directly.
+- [ ] **Wire the kernels into the frame path - now scoped by measurement.** `vulkan-baseline-25x` (768x432 ->
+      1920x1080, in `docs/measurements/`): wall 137.19 ms, host overhead **89.50 ms**, of which the temporal blend
+      is **76.80 ms - 86% of the host overhead and 57% of the frame** - and the two conversions 11.8 ms together.
+      The Vulkan backend's frames already carry the same hash as the CUDA path's (`0x45317f2470dc61ac`), so this is
+      a cost item, not a correctness one, and what each move is worth is now arithmetic rather than hope:
+      * the **blend's arithmetic alone is a wash**: `temporal_blend` exists and matches the CPU rule to 5.96e-08,
+        but its planes are ~64 MB/frame to upload (~5-6 ms at this tier) against the 13.04 ms the arithmetic costs
+        on the CPU;
+      * the **whole post chain** is the real target (~89 ms) and needs three things that do not exist yet: a
+        **warp kernel** (the blend kernel takes the previous frame already warped, deliberately), the **history as
+        device buffers** instead of `TemporalAccumulator`'s host vectors, and the accumulator's **trust mask,
+        colour clamp and phase rules** in GLSL - the last being what the blend shader's own comment calls out;
+      * the **output conversion is done**: `nchw_to_rgb8` is banded (11.559 -> 5.910 ms in the CUDA configuration,
+        9.552 -> 4.350 in the Vulkan one, frame hash unchanged in both), and `texture_to_nchw` is deliberately
+        left serial because banding it measured *slower* (3.149 -> 3.962 ms; at a ratio above 1 the input plane is
+        ratio^2 smaller than the output).
 
 ### M4/V5 - execution-provider bridges (the acceleration behind the vendor front-doors)
 
