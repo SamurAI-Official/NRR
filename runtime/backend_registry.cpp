@@ -13,6 +13,7 @@
  * nrr_cuda_driver.h), so a machine without the vendor simply never selects them.
  * NRR_ENABLE_* gates their toolkit-level extras instead of their existence. */
 #include "backend_nvidia.h"
+#include "backend_vulkan.h"
 #include "backend_amd.h"
 #include "backend_intel.h"
 #include "backend_riscv.h"
@@ -81,6 +82,20 @@ std::unique_ptr<Backend> select_best_backend(const NRRDeviceOptions& options) {
     auto& registry = get_backend_registry();
     if (registry.empty()) {
         return nullptr;
+    }
+
+    /* Diagnostic, temporary: which backend object a caller's request actually resolves to. The frame path's
+     * debug string cannot answer that - every accelerator backend shares one string ("via accel") - and
+     * M4/V2's blend attach depends on the answer. */
+    if (std::getenv("NRR_TRACE_BACKEND") != nullptr) {
+        std::fprintf(stderr, "nrr-registry: preferred='%s' force=%d registered=",
+                     options.preferred_backend ? options.preferred_backend : "(none)",
+                     options.force_backend ? 1 : 0);
+        for (auto& info : registry) {
+            std::fprintf(stderr, "%s(supported=%d) ", info.name,
+                         info.is_supported(options) ? 1 : 0);
+        }
+        std::fprintf(stderr, "\n");
     }
 
     // If a specific backend is requested
@@ -202,6 +217,27 @@ static struct NvidiaBackendRegistrar {
     }
 } g_nvidia_backend_registrar;
 #endif
+
+/* Vulkan, registered unconditionally and declared in both configurations - which is not a contradiction:
+ * `backend_vulkan_is_supported()` probes the loader and a real device, so the no-SDK branch is registered and
+ * never selected, and registering it costs nothing where it cannot run.
+ *
+ * It was **not registered at all** until now, in any configuration. The backend compiled, passed its own tests
+ * (which call `backend_vulkan_create` directly) and reported a real device, while `--provider vulkan` found no
+ * match in the registry, fell through to the priority table and ran frames on NVIDIA - so
+ * `BackendVulkan::execute_model` - and with it the device-side blend's attach (M4/V2) - was unreachable from
+ * every entry point a caller has. A backend that only its own tests can construct is a backend no measured row
+ * has ever used, which is the same class of gap the CUDA registrar's comment above records. */
+static struct VulkanBackendRegistrar {
+    VulkanBackendRegistrar() {
+        register_backend({
+            "Vulkan",
+            "1.0",
+            backend_vulkan_is_supported,
+            backend_vulkan_create
+        });
+    }
+} g_vulkan_backend_registrar;
 
 #ifdef NRR_ENABLE_AMD
 static struct AmdBackendRegistrar {
