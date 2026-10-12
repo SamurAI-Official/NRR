@@ -353,10 +353,11 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     }
 
     vk::ComputeKernel kernel;
-    /* Three storage buffers and eight bytes of push constants: the rule needs the two frames and the frame's
-     * alpha scalar, and it does not take a motion field or any geometry at all - with an interleaved layout an
-     * element index carries its own plane and pixel, which is the point of the rewrite rather than an omission. */
-    NRR_ASSERT(kernel.create(device, words, word_count, 3, 2 * sizeof(uint32_t), why),
+    /* Four storage buffers - the two frames, the destination, and the per-workgroup partial sums - and eight
+     * bytes of push constants: the rule needs the two frames and the frame's alpha scalar, and it takes no
+     * motion field or geometry at all, because with an interleaved layout an element index carries its own
+     * plane and pixel. */
+    NRR_ASSERT(kernel.create(device, words, word_count, 4, 2 * sizeof(uint32_t), why),
                "the blend kernel builds a pipeline from its SPIR-V");
     vk::VulkanDevice::Buffer* cur = device.create_buffer(count * 3 * sizeof(float));
     vk::VulkanDevice::Buffer* prev = device.create_buffer(count * 3 * sizeof(float));
@@ -374,9 +375,13 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     NRR_ASSERT(vk::plan_dispatch(static_cast<uint32_t>(count * 3), 64,
                                  device.info().workgroup_max_invocations, plan, why),
                "the blend dispatch plans");
+    /* One float per workgroup, sized from the plan the dispatch will use - so the buffer and the dispatch cannot
+     * disagree about how many partials there are. */
+    vk::VulkanDevice::Buffer* partials = device.create_buffer(plan.groups_x * sizeof(float));
+    NRR_ASSERT(partials != nullptr, "the partial-sum buffer could be created");
     vk::DispatchRequest request;
     request.kernel = &kernel;
-    request.buffers = {cur->buffer, prev->buffer, out->buffer};
+    request.buffers = {cur->buffer, prev->buffer, out->buffer, partials->buffer};
     request.push_constants = &params;
     request.push_constant_bytes = sizeof(params);
     request.plan = plan;
@@ -400,6 +405,28 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
               << ", the frame's own scalar)" << std::endl;
     NRR_EXPECT_TRUE(worst <= 1e-6, "the blend kernel matches the accumulator's rule");
 
+    /* The statistic the kernel now also produces: the sum of |blended - current|, which is the numerator of
+     * blend_frame()'s mean_abs_delta. The GPU adds it in a different order from the CPU (per workgroup, then
+     * here), so this is compared with a relative tolerance - the same situation the blend's own row-banded
+     * reduction is in - and the check is against the CPU's sum rather than against a remembered number. */
+    std::vector<float> partial_host(plan.groups_x, 0.0f);
+    NRR_ASSERT(device.download_buffer(partials, partial_host.data(),
+                                      partial_host.size() * sizeof(float), 0),
+               "the blend's partial sums come back");
+    double gpu_delta_sum = 0.0;
+    for (float value : partial_host) gpu_delta_sum += value;
+    double cpu_delta_sum = 0.0;
+    for (size_t at = 0; at < produced.size(); ++at) {
+        const float expected = current[at] * (1.0f - alpha) + previous[at] * alpha;
+        cpu_delta_sum += std::fabs(static_cast<double>(expected) - static_cast<double>(current[at]));
+    }
+    const double delta_relative =
+        (cpu_delta_sum > 0.0) ? std::fabs(gpu_delta_sum - cpu_delta_sum) / cpu_delta_sum : 0.0;
+    std::cout << "  blend delta: gpu sum " << gpu_delta_sum << " against the CPU's " << cpu_delta_sum
+              << " (relative " << delta_relative << " over " << plan.groups_x << " partial(s))" << std::endl;
+    NRR_EXPECT_TRUE(delta_relative <= 1e-4,
+                    "the blend's partial sums are the CPU's mean_abs_delta numerator");
+
     /* The two endpoints, which pin the rule down in a way no single alpha can. At alpha = 0 the output must be
      * the current frame exactly; at alpha = 1 the warped history exactly. A per-pixel decay cannot produce
      * either - at any alpha_base it is still a mixture, per pixel - so these dispatches are what distinguish the
@@ -408,7 +435,7 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
         const Params at = {static_cast<uint32_t>(count * 3), value};
         vk::DispatchRequest again;
         again.kernel = &kernel;
-        again.buffers = {cur->buffer, prev->buffer, out->buffer};
+        again.buffers = {cur->buffer, prev->buffer, out->buffer, partials->buffer};
         again.push_constants = &at;
         again.push_constant_bytes = sizeof(at);
         again.plan = plan;
@@ -426,6 +453,7 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     device.destroy_buffer(cur);
     device.destroy_buffer(prev);
     device.destroy_buffer(out);
+    device.destroy_buffer(partials);
     release_test_device(device);
 #else
     std::cout << "  SKIP: built without NRR_ENABLE_VULKAN (the stub configuration)" << std::endl;

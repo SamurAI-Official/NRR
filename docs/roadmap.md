@@ -1238,11 +1238,18 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
         this line used to record: the motion field no longer has to be uploaded (16 MB/frame here) and the blend
         takes the model's NCHW output directly, so `rgb` and the accumulator's convert-in/out leave the path -
         ~24 ms of CPU work against ~48 MB of uploads (~4-5 ms);
-      * two obstacles are left, and they are interface work rather than shader work: the blend's
-        `displayed_delta` statistic is a whole-frame CPU pass the kernel cannot return (a GLSL float reduction
-        needs atomics or a second stage), and the display texture is written through `upload(...)`, which takes
-        host bytes - a device-side result needs a new `nrr_backend.h` primitive (`copy_buffer_to_texture`-shaped)
-        and every backend to implement it;
+      * the two things that looked like obstacles are now out of the way: the blend's `mean_abs_delta` **is
+        produced by the kernel** (each workgroup reduces its band through shared memory into one partial, the
+        host adds them - measured `gpu sum 45.36 against the CPU's 45.36`, relative 5.19e-08, over 3 partials),
+        and the texture write needs **no new backend primitive** because the bridge would live inside the backend
+        that owns the device and can resolve its own `void* backend_texture`;
+      * so what is left is a trade and one decision. The accumulator hook saves ~13.0 ms of CPU arithmetic against
+        ~5 ms of up/down transfers - **~8 ms**, not the ~19-20 ms the line above estimates, because the history
+        ring and `displayed_delta` still need the blended frame on the host until the history itself moves to the
+        device. And the GPU evaluates the same expression in float, so its result differs from the CPU's by about
+        a float ulp (measured 5.96e-08 on the kernel), which the RGB8 quantisation will almost always absorb and
+        cannot be *proved* to absorb - so the move is opt-in with its rounding stated, the way the CUDA EP's TF32
+        difference is recorded, rather than a silent change to a frame hash the whole repository quotes;
       * the **whole post chain** is the real target (~89 ms) and needs three things that do not exist yet: a
         **warp kernel** (the blend kernel takes the previous frame already warped, deliberately), the **history as
         device buffers** instead of `TemporalAccumulator`'s host vectors, and the accumulator's **trust mask,

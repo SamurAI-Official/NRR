@@ -33,6 +33,16 @@ layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer Current { float current_values[]; };
 layout(std430, binding = 1) readonly buffer Previous { float previous_values[]; };
 layout(std430, binding = 2) writeonly buffer Dest { float out_values[]; };
+/* One partial sum per workgroup, of |blended - current| - the blend's own `mean_abs_delta`, which
+ * nrr_temporal.cpp's blend_frame() reports as TemporalBlendStats::mean_abs_delta and the frame path turns into
+ * displayed_delta. It is computed here because the pass that produced it on the CPU was a second full read of
+ * the same two planes (~5 ms at this tier) and this kernel has both of them in registers already.
+ *
+ * A two-stage reduction, deliberately: the workgroup sums its own band through shared memory, and the caller
+ * adds the few thousand partials on the host. GLSL 4.50 has no float atomics without an extension, so the
+ * alternative is a second kernel - and the sum's order is not the CPU's either way, which is why the caller
+ * compares it against the CPU's statistic with a tolerance rather than by equality (see the test). */
+layout(std430, binding = 3) writeonly buffer Partials { float partial_sums[]; };
 
 layout(push_constant) uniform Params {
     /* The element count is all the geometry the rule needs: with a fixed three channels and an interleaved
@@ -41,10 +51,29 @@ layout(push_constant) uniform Params {
     float alpha;
 } params;
 
+shared float band[64];
+
 void main() {
     const uint index = gl_GlobalInvocationID.x;
-    if (index >= params.element_count) return;
+    const uint local = gl_LocalInvocationID.x;
 
-    out_values[index] = (1.0 - params.alpha) * current_values[index] +
-                        params.alpha * previous_values[index];
+    /* Out-of-range threads write nothing and contribute nothing - but they still reach every barrier below.
+     * Returning early here was the first version of this kernel and it is a deadlock, not a saving: the other
+     * invocations in the workgroup wait for a barrier this one would never reach. */
+    const bool in_range = index < params.element_count;
+    float delta = 0.0;
+    if (in_range) {
+        const float blended = (1.0 - params.alpha) * current_values[index] +
+                              params.alpha * previous_values[index];
+        out_values[index] = blended;
+        delta = abs(blended - current_values[index]);
+    }
+
+    band[local] = delta;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (local < stride) band[local] += band[local + stride];
+        barrier();
+    }
+    if (local == 0u) partial_sums[gl_WorkGroupID.x] = band[0];
 }
