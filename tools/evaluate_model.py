@@ -144,6 +144,13 @@ def build_feed(pair, inputs, use_clean):
         offset = pair["jitter"] if pair.get("jitter") is not None else np.zeros(2, np.float32)
         feed["jitter"] = np.ascontiguousarray(
             np.broadcast_to(offset.reshape(1, 2, 1, 1), (1, 2, color.shape[0], color.shape[1])))
+    if "scale" in inputs:
+        # The resolution token, `log2(width / 128)` - the same octave measure the trainer computes and
+        # tools/compare_upscalers.py derives (128 -> 0.0, 256 -> 1.0, 512 -> 2.0). Derived from the input's own
+        # width rather than taken as an argument, so a caller cannot score a model at the wrong tier: without it
+        # a model that declares the input cannot be evaluated at all, which is how this was found.
+        feed["scale"] = np.full((1, 1, color.shape[0], color.shape[1]),
+                                np.log2(max(color.shape[1], 1) / 128.0), np.float32)
     return feed
 
 
@@ -538,12 +545,8 @@ def print_summary(report):
             log("  vmaf           model %s | baseline %s   (reference motion %s)"
                 % (_stat(vmaf["model"], "vmaf_mean"), _stat(vmaf["baseline"], "vmaf_mean"),
                    vmaf.get("reference_motion")))
-            scenes[name] = scenes[name][:limit]
-        if len(scenes[name]) < 2:
-            # A one-frame scene cannot contribute a temporal measurement, and pretending it can by
-            # duplicating the frame would report perfect stability for a video nobody rendered.
-            del scenes[name]
-    return scenes
+
+
 def self_test():
     """The numpy-only checks that gate the harness on CI, where torch, ffmpeg, the model and the dataset are
     all absent. It pins the measurement *logic* - accumulation, the detail proxy, sequence ordering, tensor
@@ -663,6 +666,15 @@ def self_test():
           build_feed({"input": np.zeros((8, 8, 3), np.float32),
                       "input_clean": np.ones((8, 8, 3), np.float32)},
                      ["color"], use_clean=True)["color"].min() == 1.0)
+    # The released model declares `scale`, and build_feed used to omit it - the session then refused the feed
+    # with "Required inputs (['scale']) are missing", so the released model could not be evaluated at all.
+    # The token is log2(width / 128), so a 128-wide fixture is exactly 0.0.
+    scale_feed = build_feed({"input": np.zeros((8, 128, 3), np.float32)},
+                            ["color", "scale"], use_clean=False)
+    check("build_feed fills the scale token for a model that declares it", "scale" in scale_feed)
+    check("build_feed's scale token is log2(width / 128)",
+          scale_feed["scale"].shape == (1, 1, 8, 128)
+          and float(scale_feed["scale"][0, 0, 0, 0]) == 0.0)
 
     print("RESULT: %s (%d checks)" % ("PASS" if failures == 0 else "FAIL", total))
     return 1 if failures else 0

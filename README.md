@@ -249,6 +249,24 @@ have verified GPU kernels (`nchw_pack`, `rgb8_unpack`) that the frame path never
       one the three engine verifications render, and it is published with its card at
       [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) - its measured numbers
       are in [docs/parity.md](docs/parity.md) and [docs/parity-512.md](docs/parity-512.md). See M10
+- [x] **The pipeline is not square-only: a rectangular canvas runs end to end.**
+      `tools/capture_godot_v4.ps1 -Width/-Height` captures a non-square grid (the low-resolution pass is
+      `width x height` and the target is `width*ratio x height*ratio`, e.g. 160x90 -> 320x180; `-Size` and
+      `-Width/-Height` are mutually refused rather than defaulted, because a half-specified grid is a typo),
+      `tools/check_capture.py` and `tools/pack_godot_pairs.py` read `width`/`height` from the manifest instead
+      of the square-only `size` (older square captures still pack: both fields are read, and a scalar would be a
+      lie for a non-square grid), and `tools/pack_godot_pairs.py` gates the pairs on the ratio the two grids
+      imply. `tools/verify_rect_upscale.py` then feeds a 160x90 frame through any exported graph and asserts
+      the output is exactly that graph's ratio on both axes (`1, 3, 180, 320` at 2x) - it passes for the
+      released `upscale_msreal_scale.onnx`, for the Hub's 2.5x models (`path@ratio` notation), and for a model
+      trained on a 160x90 capture (`G:\NRR-capture\rect-model.onnx`, 112,907 parameters, exported from 18
+      packed pairs; `evaluate_model.py` scores it on the packed val split at **SSIM 0.9085 against the 0.9003
+      bilinear baseline**, PSNR 28.70 against 28.78 dB). Along the way `evaluate_model.py` was fixed: its
+      `build_feed` never filled the released model's `scale` input, so ONNX Runtime refused the feed with
+      `Required inputs (['scale']) are missing` and **the released model could not be evaluated at all** -
+      it now derives the token from the input's own width (`log2(width / 128)`, 128 -> 0.0, 256 -> 1.0,
+      the same octave measure the trainer and `tools/compare_upscalers.py` use) and two regression
+      self-tests pin it. That fix is why an evaluation of the released model means anything.
 
 ### Phase 4 - Temporal Neural Rendering (wired into the render path; the fixtures are untrained)
 - [x] Temporal history buffer (ring buffer; depth 2 - only the previous displayed frame

@@ -1900,7 +1900,7 @@ def main(argv):
                              "over the base plane and the `naive` view (plus a residual), rather than a "
                              "correction to the plane alone. The head starts at sigmoid(6) = 0.9975, so an "
                              "untrained model is still the plane; the structure is the oracle's own family, "
-                             "measured at 36.6% of headroom between the two views "
+                             "measured at 36.6%% of headroom between the two views "
                              "(tools/refinement_headroom_probe.py). Requires --refine and `naive` in --inputs")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -1928,7 +1928,7 @@ def main(argv):
     parser.add_argument("--naive-channels", type=int, default=8,
                         help="width of the branch that consumes the refinement task's second view - the "
                              "renderer's own reconstruction of the same frame. Its per-pixel mixture with the "
-                             "placed samples measures 36.6% of oracle headroom "
+                             "placed samples measures 36.6%% of oracle headroom "
                              "(tools/refinement_headroom_probe.py); only loaded for the refinement task's base "
                              "planes, and only built when 'naive' is in --inputs")
     parser.add_argument("--inputs", default="depth,motion",
@@ -1951,7 +1951,7 @@ def main(argv):
                         help="P3 lever 3: linear-warmup holds the warmup peak; cosine anneals to 1e-3 of it")
     parser.add_argument("--warmup-epochs", type=int, default=5,
                         help="linear learning-rate warmup. Added because 2 of 10 seeds failed early - one "
-                             "froze with the output at the baseline, one learned only 2.9% better than it - "
+                             "froze with the output at the baseline, one learned only 2.9%% better than it - "
                              "and both are the pathology a warmup addresses on a zero-initialised head")
     parser.add_argument("--seed", type=int, default=20260930)
     parser.add_argument("--size", type=int, default=64,
