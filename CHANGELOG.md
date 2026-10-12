@@ -13,6 +13,47 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### Where the Vulkan frame path's CPU actually goes, and the conversion that was left on one thread
+
+The Vulkan configuration now builds on this machine with glslc from the NDK's shader-tools and **all four
+SPIR-V kernels run on the GPU and pass against their CPU references**: `nchw_pack`/`rgb8_unpack` (5.96e-08 worst
+error over 2257 pixels), `upscale_bilinear` (3.28e-07, 9x5 -> 27x15) and `temporal_blend` (5.96e-08, alpha rule
+included), against a measured device (`NVIDIA GeForce RTX 4070 Ti`, api 1.4, subgroup 32, workgroup <= 1024,
+11992 MB). What is *not* done is the wiring the roadmap names, and this entry is the measurement that scopes it.
+
+* **The Vulkan backend's frames are already byte-identical to the CUDA path's** - `vulkan-baseline-25x` carries
+  the same frame hash (`0x45317f2470dc61ac`) as the recorded CUDA rows at the same tier, same model, same input.
+  So the path is correct; what it costs is where the work happens.
+* **The host overhead is the blend, then the output conversion.** `vulkan-baseline-25x` (768x432 -> 1920x1080,
+  the 2.5x artifact): wall **137.19 ms**, of which host overhead **89.50 ms** - `bl` (the temporal blend)
+  **76.80 ms = 86% of the host overhead and 57% of the frame**, `rgb` (NCHW -> RGB8) 9.32 ms, `cv` (texture ->
+  NCHW) 2.46 ms, everything else under 1.5 ms. The GPU is idle for the blend's 77 ms.
+* **Moving only the blend's arithmetic is a wash, and that is measured arithmetic rather than an opinion.** The
+  kernel exists and matches, but its planes (`current` 24 MB, warped `previous` 24 MB, `motion` 16 MB at this
+  tier) would have to be uploaded: ~64 MB per frame, roughly 5-6 ms over the link, against the 13.04 ms the
+  arithmetic costs on the CPU. The win only exists if the planes are *produced* on the device - which needs a
+  warp kernel that does not exist yet, history held as device buffers rather than in `TemporalAccumulator`'s
+  host vectors, and the accumulator's trust mask, colour clamp and phase rules expressed in GLSL. That is the
+  milestone, not this entry, and it is now scoped by the numbers above instead of by an estimate.
+* **What was moved: the output conversion, off one thread.** `nchw_to_rgb8` was a scalar single-threaded pass
+  over output pixels while the runtime's own thread helpers (`runtime/nrr_parallel.h`, M11.3's pattern) sat
+  unused in this file. Banded now, with every element keeping the expression it had - which is why the frames are
+  byte-identical rather than close, asserted by hash in both configurations:
+
+  | stage, 768x432 -> 1920x1080 | `NRR_THREADS=1` | `NRR_THREADS=8` | frame hash |
+  | --- | --- | --- | --- |
+  | `rgb` (NCHW -> RGB8), CUDA config | 11.559 ms | **5.910 ms** | `0x45317f2470dc61ac` (both) |
+  | `rgb` (NCHW -> RGB8), Vulkan config | 9.552 ms | **4.350 ms** | `0x45317f2470dc61ac` (both) |
+
+  The A/B is one binary with `NRR_THREADS` changed, which is the runtime's own documented switch for exactly
+  this question - not two builds compared across a host that was doing other things.
+* **And what was deliberately left alone: the input conversion.** `texture_to_nchw` was banded first, measured,
+  and **reverted**: 3.149 ms serial against 3.962 ms with eight workers at 768x432, because at a 2.5x ratio the
+  input plane is ratio^2 = 6.25 times smaller than the output plane and the per-call worker spawn costs more than
+  the band saves. The measurement is in the code, next to the decision, with the tier at which it should be
+  revisited (an 8.3 Mpx input at 1080p/2x). Threading that was assumed to be an improvement; it was not one.
+* **Suites: 205/205 in both configurations**, the Vulkan one including the four kernel tests that run on the GPU.
+
 ### The 2.5x path is captured, and its number is out-of-family
 
 The 2.5x artifact published before this was trained on pairs this repository *generates*, so its 58.37% was an
