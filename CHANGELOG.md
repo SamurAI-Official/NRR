@@ -42,14 +42,34 @@ frame's bytes, and with them every recorded frame hash, the parity docs and ever
   364 words, sha256 `4d12a890a3a897b0551d0b473338780125ce48426a8bf87c2cf5550da5c9a73a`. With the rule *and* the
   layout agreeing, the move is ~24 ms of CPU work against ~48 MB of uploads (~4-5 ms): **~19-20 ms, ≈14% of a
   137 ms frame**, as the first step of the whole-post-chain move in `docs/roadmap.md` M4/V2.
-* **Two obstacles remain, and naming them is why this is a milestone rather than a patch.** (1) The blend's
-  `displayed_delta` statistic - `mean |blended - current|`, which feeds `Result.displayed_delta` and the debug
-  line - is a separate pass over the whole frame on the CPU; the kernel returns no statistic, and a float
-  reduction in GLSL needs atomics or a second stage, so the delta has to be produced some other way rather than
-  dropped. (2) The display texture is written through the backend's `upload(...)` primitive, which takes *host
-  bytes*: a result that stays on the device has nowhere to go without a new backend primitive
-  (`copy_buffer_to_texture`-shaped) declared in `nrr_backend.h` and implemented by every backend. Both are
-  recorded with their sizes here rather than discovered halfway through the wiring.
+* **The statistic the move needs is now produced by the kernel.** `blend_frame()` reports
+  `TemporalBlendStats::mean_abs_delta` - the sum of `|blended - current|` - which the CPU computed in a *second*
+  full pass over the same two planes (~5 ms at this tier). The kernel now has both planes in registers, so it
+  accumulates the same quantity: each workgroup reduces its band through shared memory into one partial, and the
+  caller adds the partials on the host (GLSL 4.50 has no float atomics without an extension, so the alternatives
+  were a second kernel or a two-stage reduction - and the two-stage form keeps the result comparable to the CPU's
+  by a tolerance instead of by luck). Measured on the GPU against the CPU's own sum:
+  `gpu sum 45.36 against the CPU's 45.36 (relative 5.19455e-08 over 3 partial(s))`. One defect was found in the
+  prototype and is worth recording because it hangs rather than fails: the out-of-range threads must not `return`
+  before the reduction's barriers, so they compute nothing and still reach every `barrier()`. Recompiled:
+  `temporal_blend.spv`, 615 words, sha256
+  `4dd7d3541d670ad763eace7d5e115eb76a1736ac339e1178662e3c43e86b879d`.
+* **Obstacle (c) turned out not to be one.** The display texture is written through `upload(...)`, which takes
+  host bytes - but the bridge that would dispatch the kernels belongs to the *backend* that owns the device, and
+  that backend is the only thing that can interpret its own `void* backend_texture`. So the handle can be
+  resolved on the side that understands it, and no new primitive is needed in `nrr_backend.h` for every backend
+  to implement. What that leaves is the honest scope below rather than an interface project.
+* **What is actually left is a trade, not a blocker.** The blend's *arithmetic* can move today behind an
+  accumulator hook: the hook is handed the interleaved current frame, the already-warped previous and the alpha,
+  dispatches the kernel, brings the blended plane back and fills the same `TemporalBlendStats`. That is ~13.0 ms
+  of CPU arithmetic against ~5 ms of up/down transfers, so **~8 ms** now - not the ~19-20 ms the earlier estimate
+  claimed, because the history ring and `displayed_delta` both need the blended frame *on the host*, so the round
+  trip cannot be avoided until the history itself moves to the device. And there is one thing to decide rather
+  than discover: the GPU evaluates the same expression in float, so its result differs from the CPU's by about a
+  float ulp (the test measures 5.96e-08), which the RGB8 quantisation will almost always absorb and cannot be
+  *proved* to absorb. That makes the move opt-in with its rounding stated - the same way the CUDA EP's TF32
+  difference is recorded rather than hidden - instead of silently changing a frame hash the whole repository
+  quotes.
 * **The guarded blend stays on the CPU, deliberately.** A validity mask with the `(2*TEMPORAL_CLAMP_RADIUS+1)^2`
   neighbourhood clamp is the path a model that declares `validity` takes, and it is not this kernel: it needs the
   mask and the clamp's min/max over the current frame, so it is written and tested as its own kernel or not at
