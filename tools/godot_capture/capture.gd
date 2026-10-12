@@ -395,6 +395,16 @@ const SCENES := {
 var _scene_id := "train"
 var _frames := 24
 var _size := 512
+# `--size` is the backwards-compatible square flag: the target is `size` on a side and the low-resolution pass
+# is `size / ratio` on a side. When `--width`/`--height` are given instead, they name the *low*-resolution grid
+# directly and the target is `width*ratio` x `height*ratio`, which is how a capture becomes rectangular
+# (768x432 -> 1920x1080 at 2.5) rather than square.
+var _width := 0
+var _height := 0
+# The grids _ready() resolves from those flags, stored so _run() and _write_manifest() read the validated value
+# rather than re-deriving it. The target is the colour/motion raster; the low grid is the temporal pass's input.
+var _target_size := Vector2i.ZERO
+var _lowres_grid := Vector2i.ZERO
 # The upscale factor the capture is a pair *for*. The low-resolution pass is `size / ratio` on a side, so the
 # pair is only at the ratio it claims when that division lands on whole pixels - which is why a fractional ratio
 # needs a divisible size (768 = 1920 / 2.5 is the 768x432 -> 1920x1080 tier) and why an indivisible one is
@@ -446,27 +456,63 @@ func _ready() -> void:
 		print("RESULT: FAIL")
 		get_tree().quit(1)
 		return
-	# The ratio's own precondition, checked before anything is rendered: the low-resolution pass is
-	# `size / ratio` pixels on a side, and an indivisible size would silently floor it (512 / 2.5 = 204.8 -> 204),
-	# which puts the two views half a pixel out of step, leaves the pair at a ratio it does not declare, and
-	# corrupts the jitter calibration that is measured from the two frustums. Refused rather than rounded:
+	# The ratio's own precondition, checked before anything is rendered. The pair has to land on whole pixels on
+	# *both* grids, or the two views sit half a pixel out of step, leave the pair at a ratio it does not declare,
+	# and corrupt the jitter calibration that is measured from the two frustums. Refused rather than rounded:
 	# get_tree().quit(1) rather than a warning, because the frames are the dataset.
 	if not is_finite(_ratio) or _ratio <= 0.0:
 		print("FAILURE: --ratio must be finite and positive (got %s)" % str(_ratio))
 		print("RESULT: FAIL")
 		get_tree().quit(1)
 		return
-	var lowres_exact := float(_size) / _ratio
-	if absf(lowres_exact - roundf(lowres_exact)) > 1e-9 or int(roundf(lowres_exact)) < 8:
-		print(("FAILURE: --size %d does not divide by --ratio %s into whole pixels (%.4f), and a low-resolution "
-			+ "pass of fewer than 8 pixels is not a frame. For 2.5 the size has to be a multiple of 5: "
-			+ "320 -> 128 and 1920 -> 768 are the tier's grids, where 512 -> 204.8 is not one.")
-			% [_size, str(_ratio), lowres_exact])
-		print("RESULT: FAIL")
-		get_tree().quit(1)
-		return
-	print("capture: scene=%s frames=%d size=%d ratio=%s lowres=%d detail_scale=%.4f out=%s"
-		% [_scene_id, _frames, _size, str(_ratio), int(roundf(lowres_exact)), _detail_scale, _out_dir])
+	# Resolve the two grids. --width/--height name the *low*-resolution raster and the target is width*ratio x
+	# height*ratio; --size names the *high*-resolution square and the low grid is size/ratio on a side, which is
+	# the 2x behaviour every earlier capture used. A width without a height (or vice versa) is refused rather than
+	# defaulted, because a grid half-specified silently means a square no one asked for.
+	var lowres_w := 0
+	var lowres_h := 0
+	var target_w := 0
+	var target_h := 0
+	if _width > 0 or _height > 0:
+		if _width <= 0 or _height <= 0:
+			print("FAILURE: --width and --height must be given together (got %d x %d)" % [_width, _height])
+			print("RESULT: FAIL")
+			get_tree().quit(1)
+			return
+		var target_w_exact := float(_width) * _ratio
+		var target_h_exact := float(_height) * _ratio
+		lowres_w = _width
+		lowres_h = _height
+		target_w = int(roundf(target_w_exact))
+		target_h = int(roundf(target_h_exact))
+		if absf(target_w_exact - roundf(target_w_exact)) > 1e-9 \
+				or absf(target_h_exact - roundf(target_h_exact)) > 1e-9 \
+				or lowres_w < 8 or lowres_h < 8:
+			print(("FAILURE: --width %d x --height %d does not multiply by --ratio %s into whole target pixels "
+				+ "(%.4f x %.4f), and a low-resolution pass of fewer than 8 pixels on a side is not a frame. "
+				+ "For 2.5 the low grid has to be even on each axis: 768 x 432 -> 1920 x 1080.")
+				% [_width, _height, str(_ratio), target_w_exact, target_h_exact])
+			print("RESULT: FAIL")
+			get_tree().quit(1)
+			return
+	else:
+		target_w = _size
+		target_h = _size
+		var lowres_exact := float(_size) / _ratio
+		if absf(lowres_exact - roundf(lowres_exact)) > 1e-9 or int(roundf(lowres_exact)) < 8:
+			print(("FAILURE: --size %d does not divide by --ratio %s into whole pixels (%.4f), and a low-resolution "
+				+ "pass of fewer than 8 pixels is not a frame. For 2.5 the size has to be a multiple of 5: "
+				+ "320 -> 128 and 1920 -> 768 are the tier's grids, where 512 -> 204.8 is not one.")
+				% [_size, str(_ratio), lowres_exact])
+			print("RESULT: FAIL")
+			get_tree().quit(1)
+			return
+		lowres_w = int(roundf(lowres_exact))
+		lowres_h = lowres_w
+	_target_size = Vector2i(target_w, target_h)
+	_lowres_grid = Vector2i(lowres_w, lowres_h)
+	print("capture: scene=%s frames=%d target=%dx%d lowres=%dx%d ratio=%s detail_scale=%.4f out=%s"
+		% [_scene_id, _frames, target_w, target_h, lowres_w, lowres_h, str(_ratio), _detail_scale, _out_dir])
 	_run()
 
 
@@ -481,14 +527,14 @@ func _run() -> void:
 	var motion_world := World3D.new()
 
 	var color_view := SubViewport.new()
-	color_view.size = Vector2i(_size, _size)
+	color_view.size = _target_size
 	color_view.world_3d = color_world
 	color_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	color_view.transparent_bg = false
 	add_child(color_view)
 
 	var motion_view := SubViewport.new()
-	motion_view.size = Vector2i(_size, _size)
+	motion_view.size = _target_size
 	motion_view.use_hdr_2d = true          # linear float target: the vectors are not sRGB-encoded
 	motion_view.world_3d = motion_world
 	motion_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
@@ -517,11 +563,10 @@ func _run() -> void:
 	# temporal pass to resolve). It shares the colour world, so it draws the same scene - the same objects,
 	# lit by the same light - and only the projection and the target size differ. That is the only pair of
 	# differences the comparison is allowed to depend on.
-	# The pair's baseline, in pixels: the ratio's low grid rather than half the frame. `_size / ratio` was
-	# already checked to be whole and at least 8 pixels in _ready(), so this is the same division the check made.
-	var lowres_size := maxi(8, int(roundf(float(_size) / _ratio)))
+	# The pair's baseline, in pixels: the ratio's low grid rather than half the frame. `_lowres_grid` was already
+	# checked to be whole and at least 8 pixels on each axis in _ready(), so this is the same grid the check made.
 	var lowres_view := SubViewport.new()
-	lowres_view.size = Vector2i(lowres_size, lowres_size)
+	lowres_view.size = _lowres_grid
 	lowres_view.world_3d = color_world
 	lowres_view.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	lowres_view.transparent_bg = false
@@ -532,7 +577,7 @@ func _run() -> void:
 	lowres_camera.far = 100.0
 	lowres_view.add_child(lowres_camera)
 	lowres_camera.current = true
-	var calibration := _calibrate_jitter(lowres_camera, color_camera, lowres_size, 0.05)
+	var calibration := _calibrate_jitter(lowres_camera, color_camera, _lowres_grid, 0.05)
 	if calibration.is_empty():
 		print("RESULT: FAIL")
 		get_tree().quit(1)
@@ -717,18 +762,24 @@ func _run() -> void:
 		if frame % 8 == 0 or frame == _frames - 1:
 			print("  frame %d/%d written" % [frame, _frames - 1])
 
-	_write_manifest(int(scene["checker"]), camera_velocity, int(calibration["lowres_size"]))
+	_write_manifest(int(scene["checker"]), camera_velocity)
 	print("RESULT: PASS (%d frames, scene=%s)" % [_frames, _scene_id])
 	get_tree().quit(0)
 
 
-func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -> void:
+func _write_manifest(checker: int, camera_velocity: Vector3) -> void:
 	# Everything needed to interpret the data without guessing: the scales the shader used, the convention
 	# the vectors follow, and the parameters that generated each frame. The packer adds file hashes.
+	# The grids are recorded as explicit width/height pairs because a capture can now be rectangular. The
+	# square-only `size`/`lowres_size` scalars are kept as a convenience for the pre-rectangular readers that
+	# only know those fields, and are omitted when the grid is not square (where a scalar would be a lie).
 	var manifest := {
 		"scene": _scene_id,
 		"frames": _frames,
-		"size": _size,
+		"width": _target_size.x,
+		"height": _target_size.y,
+		"lowres_width": _lowres_grid.x,
+		"lowres_height": _lowres_grid.y,
 		# The upscale factor the frames are a pair for, recorded so nothing downstream has to infer it from the
 		# two sizes - an inference that is ambiguous for an indivisible pair and wrong for a downscale-only one.
 		"ratio": _ratio,
@@ -749,8 +800,7 @@ func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -
 		"motion_files": "motion_%04d.bin (RGB half-float, 6 bytes per pixel, row-major)",
 		# The low-resolution pass. Its existence is what makes the dataset usable by a temporal upscaler, so
 		# what it is (a render, not a downscale) and how it was sampled are recorded rather than implied.
-		"lowres_size": lowres_size,
-		"lowres_files": "lowres_%04d.png (RGB8: a real render at lowres_size = size / ratio, not a filtered downscale)",
+		"lowres_files": "lowres_%04d.png (RGB8: a real render at lowres_width x lowres_height, not a filtered downscale)",
 		"lowres_reads": "colour, in [0,1], read the same way color_%04d.png is: pixel / 255",
 		"jitter_mode": _jitter_mode,
 		# Whether the scene was frozen. A downstream tool that integrates frames needs to know this:
@@ -765,6 +815,9 @@ func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -
 		"jitter_pixels": _jitter_log,
 		"jitter_decode": "jitter = jitter_pixels[frame]; the low-res sample was shifted by (jx, jy) pixels",
 	}
+	if _target_size.x == _target_size.y and _lowres_grid.x == _lowres_grid.y:
+		manifest["size"] = _target_size.x
+		manifest["lowres_size"] = _lowres_grid.x
 	var path := ProjectSettings.globalize_path("%s/manifest.json" % _out_dir)
 	var handle := FileAccess.open(path, FileAccess.WRITE)
 	if handle == null:
@@ -816,7 +869,7 @@ func _jitter_for(frame: int) -> Vector2:
 	return Vector2(_halton(index, JITTER_BASES.x) - 0.5, _halton(index, JITTER_BASES.y) - 0.5)
 
 
-func _calibrate_jitter(camera: Camera3D, color_camera: Camera3D, lowres_size: int, near: float) -> Dictionary:
+func _calibrate_jitter(camera: Camera3D, color_camera: Camera3D, lowres_grid: Vector2i, near: float) -> Dictionary:
 	# Two things are measured from the cameras' own projection matrices - the values the renderer itself uses
 	# - rather than derived from a formula: how `size` sets the frustum, and how `frustum_offset` moves the
 	# matrix. Godot's own temporal antialiasing shifts the projection by adding to columns[2][0] and [2][1],
@@ -846,6 +899,14 @@ func _calibrate_jitter(camera: Camera3D, color_camera: Camera3D, lowres_size: in
 	if absf(height - wanted) > 1e-3 * wanted:
 		print("FAILURE: frustum camera frames %.6f, perspective camera frames %.6f" % [height, wanted])
 		return {}
+	# The horizontal framing has to match too: with a rectangular grid, a vertical match alone would still let
+	# the two views frame different widths if their aspects ever diverged, and the pair would then compare two
+	# different scenes. The two viewports share an aspect (target = lowres * ratio), so this is a guard, not a
+	# correction.
+	var wanted_width := 2.0 * near / color_camera.get_camera_projection().x.x
+	if absf(width - wanted_width) > 1e-3 * wanted_width:
+		print("FAILURE: frustum camera frames %.6f wide, perspective camera frames %.6f" % [width, wanted_width])
+		return {}
 
 	camera.frustum_offset = Vector2(1.0, 0.0)
 	var gain_x := camera.get_camera_projection().z.x - base.z.x
@@ -856,20 +917,22 @@ func _calibrate_jitter(camera: Camera3D, color_camera: Camera3D, lowres_size: in
 		print("FAILURE: frustum_offset does not reach the projection matrix (gains %.9f, %.9f)"
 			% [gain_x, gain_y])
 		return {}
-	print("  lowres: %dpx, frustum %.4f x %.4f at near, jitter gain (%.4f, %.4f), offset per pixel (%.6f, %.6f)"
-		% [lowres_size, width, height, gain_x, gain_y,
-		   2.0 / (float(lowres_size) * gain_x), 2.0 / (float(lowres_size) * gain_y)])
-	return {"size": camera.size, "lowres_size": lowres_size, "near": near,
+	print("  lowres: %dx%d, frustum %.4f x %.4f at near, jitter gain (%.4f, %.4f), offset per pixel (%.6f, %.6f)"
+		% [lowres_grid.x, lowres_grid.y, width, height, gain_x, gain_y,
+		   2.0 / (float(lowres_grid.x) * gain_x), 2.0 / (float(lowres_grid.y) * gain_y)])
+	return {"size": camera.size, "lowres_w": lowres_grid.x, "lowres_h": lowres_grid.y, "near": near,
 			"height": height, "width": width, "gain_x": gain_x, "gain_y": gain_y}
 
 
 func _apply_jitter(camera: Camera3D, calibration: Dictionary, jitter: Vector2) -> void:
-	# One low-resolution pixel spans 2/size of NDC, and the matrix's [2][0] entry shifts NDC by -offset *
-	# gain. Solving that for the offset that produces the wanted pixel shift is exact rather than approximate.
-	var size := float(calibration["lowres_size"])
+	# One low-resolution pixel spans 2/width of NDC on x and 2/height on y - distinct values once the grid is
+	# rectangular - and the matrix's [2][0] entry shifts NDC by -offset * gain. Solving that for the offset that
+	# produces the wanted pixel shift is exact rather than approximate.
+	var width := float(calibration["lowres_w"])
+	var height := float(calibration["lowres_h"])
 	camera.frustum_offset = Vector2(
-		-2.0 * jitter.x / (size * float(calibration["gain_x"])),
-		2.0 * jitter.y / (size * float(calibration["gain_y"])))
+		-2.0 * jitter.x / (width * float(calibration["gain_x"])),
+		2.0 * jitter.y / (height * float(calibration["gain_y"])))
 
 
 func _verify_jitter(camera: Camera3D, calibration: Dictionary, view: SubViewport, movers: Array) -> bool:
@@ -982,6 +1045,10 @@ func _parse_args() -> void:
 				_frames = int(args[index + 1])
 			"--size":
 				_size = int(args[index + 1])
+			"--width":
+				_width = int(args[index + 1])
+			"--height":
+				_height = int(args[index + 1])
 			"--detail-scale":
 				_detail_scale = float(args[index + 1])
 			"--ratio":

@@ -31,6 +31,34 @@ def load_manifest(capture_dir):
         return json.load(handle)
 
 
+def target_grid(manifest):
+    """The render target's (width, height), from whichever fields the capture recorded.
+
+    A rectangular capture records width/height and omits the square-only `size`; an older square capture
+    records only `size`. Both are read here so a capture taken either way is checked without a branch at
+    every call site - a scalar `size` would be a lie for a non-square grid.
+    """
+    if "width" in manifest and "height" in manifest:
+        return int(manifest["width"]), int(manifest["height"])
+    side = int(manifest["size"])
+    return side, side
+
+
+def lowres_grid(manifest):
+    """The low-resolution pass's (width, height), or None when the capture has no low-resolution pass.
+
+    The same width/height-vs-size split as target_grid, and None - rather than a zero grid - for a
+    downscale-only capture, because "no low-resolution pass" and "a zero-sized one" are different states
+    and only the first is what such a capture means.
+    """
+    if "lowres_width" in manifest and "lowres_height" in manifest:
+        return int(manifest["lowres_width"]), int(manifest["lowres_height"])
+    if "lowres_size" in manifest:
+        side = int(manifest["lowres_size"])
+        return side, side
+    return None
+
+
 def read_color(path):
     """Returns float RGB in [0,1]."""
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
@@ -41,8 +69,8 @@ def read_motion(path, manifest):
     floats, 6 bytes per pixel - because saving it as PNG silently quantised it to 8 bits, which is a
     detail that cost a whole capture to find. Values are the shader's [0,1]; motion is
     (value - 0.5) * 2 / motion_scale and blue is view_distance / depth_scale."""
-    size = int(manifest["size"])
-    raw = np.fromfile(path, dtype=np.float16).astype(np.float32).reshape(size, size, 3)
+    width, height = target_grid(manifest)
+    raw = np.fromfile(path, dtype=np.float16).astype(np.float32).reshape(height, width, 3)
     scale = float(manifest["motion_scale"])
     depth_scale = float(manifest["depth_scale"])
     motion = (raw[..., :2] - 0.5) * 2.0 / scale
@@ -120,9 +148,10 @@ def main(argv):
     # recorded one - what its two sizes imply. Checked against those sizes below, because everything this script
     # measures about the low-resolution pass is relative to the grid it should be.
     ratio = float(manifest.get("ratio", 0.0)) or (
-        (float(manifest["size"]) / float(manifest["lowres_size"])) if manifest.get("lowres_size") else 2.0)
-    print("capture: scene=%s frames=%d size=%d ratio=%g motion_scale=%g depth_scale=%g"
-          % (manifest["scene"], frames, manifest["size"], ratio, manifest["motion_scale"],
+        (float(target_grid(manifest)[0]) / float(lowres_grid(manifest)[0])) if lowres_grid(manifest) is not None else 2.0)
+    target_w, target_h = target_grid(manifest)
+    print("capture: scene=%s frames=%d target=%dx%d ratio=%g motion_scale=%g depth_scale=%g"
+          % (manifest["scene"], frames, target_w, target_h, ratio, manifest["motion_scale"],
              manifest["depth_scale"]))
 
     failures = []
@@ -134,8 +163,9 @@ def main(argv):
     magnitudes = []
     largest = []
     distance_range = []
-    has_lowres = "lowres_size" in manifest
-    lowres_size = int(manifest.get("lowres_size", 0))
+    lowres = lowres_grid(manifest)
+    has_lowres = lowres is not None
+    lowres_w, lowres_h = lowres if has_lowres else (0, 0)
     lowres_std = []
     lowres_edge = []
     downscale_edge = []
@@ -149,8 +179,7 @@ def main(argv):
             lowres_edge.append(edge_energy(lowres))
             downscale_edge.append(edge_energy(downscale(color, ratio)))
         raw = np.fromfile(os.path.join(capture_dir, "motion_%04d.bin" % index),
-                          dtype=np.float16).astype(np.float32).reshape(int(manifest["size"]),
-                                                                      int(manifest["size"]), 3)
+                          dtype=np.float16).astype(np.float32).reshape(target_h, target_w, 3)
         motion, distance = read_motion(os.path.join(capture_dir, "motion_%04d.bin" % index), manifest)
         # Pixels with no geometry read as raw zero - the clear value, and the only thing a ray that hit
         # nothing can report. They are not errors: the runtime's own frames have them too (sky). But they
@@ -210,9 +239,9 @@ def main(argv):
     # whole capture, that the pass really is a low-resolution raster and that the recorded offsets are the
     # sequence they claim to be.
     if has_lowres:
-        if lowres_size * ratio != int(manifest["size"]):
-            failures.append("lowres_size %d is not the target size %d divided by the ratio %g"
-                            % (lowres_size, int(manifest["size"]), ratio))
+        if abs(lowres_w * ratio - target_w) > 1e-6 or abs(lowres_h * ratio - target_h) > 1e-6:
+            failures.append("the %dx%d low-resolution pass is not the %dx%d target divided by the ratio %g"
+                            % (lowres_w, lowres_h, target_w, target_h, ratio))
         if min(lowres_std) <= 1e-4:
             failures.append("a low-resolution frame is flat (std %.6f): nothing was drawn into it"
                             % min(lowres_std))
@@ -261,9 +290,9 @@ def main(argv):
             if frames > 1 and moves < frames - 1:
                 failures.append("the jitter repeats between consecutive frames (%d of %d differ)"
                                 % (moves, frames - 1))
-        print("lowres: %dpx, edge energy %.3f-%.3f vs downscale %.3f-%.3f (min ratio %.2fx), "
+        print("lowres: %dx%d, edge energy %.3f-%.3f vs downscale %.3f-%.3f (min ratio %.2fx), "
               "jitter %.3f..%.3f, mean (%.4f, %.4f)"
-              % (lowres_size, min(lowres_edge), max(lowres_edge),
+              % (lowres_w, lowres_h, min(lowres_edge), max(lowres_edge),
                  min(downscale_edge), max(downscale_edge),
                  min(a / b for a, b in zip(lowres_edge, downscale_edge)),
                  min(abs(v) for pair in jitter for v in pair),

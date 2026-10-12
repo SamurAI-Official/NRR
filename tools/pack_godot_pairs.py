@@ -63,6 +63,34 @@ def load_capture(capture_dir):
         return json.load(handle)
 
 
+def target_grid(manifest):
+    """The render target's (width, height), from whichever fields the capture recorded.
+
+    A rectangular capture records width/height and omits the square-only `size`; an older square capture
+    records only `size`. Both are read here so a capture taken either way packs without a branch at every
+    call site - the point being that a scalar would be a lie for a non-square grid.
+    """
+    if "width" in manifest and "height" in manifest:
+        return int(manifest["width"]), int(manifest["height"])
+    side = int(manifest["size"])
+    return side, side
+
+
+def lowres_grid(manifest):
+    """The low-resolution pass's (width, height), or None when the capture has no low-resolution pass.
+
+    The same width/height-vs-size split as target_grid, and None - rather than a zero grid - for a
+    downscale-only capture, because "no low-resolution pass" and "a zero-sized one" are different states
+    and only the first is what such a capture means.
+    """
+    if "lowres_width" in manifest and "lowres_height" in manifest:
+        return int(manifest["lowres_width"]), int(manifest["lowres_height"])
+    if "lowres_size" in manifest:
+        side = int(manifest["lowres_size"])
+        return side, side
+    return None
+
+
 def read_color(capture_dir, frame):
     """The captured frame as float RGB in [0,1]."""
     path = os.path.join(capture_dir, "color_%04d.png" % frame)
@@ -78,9 +106,9 @@ def read_lowres(capture_dir, frame):
 
 def read_motion(capture_dir, manifest, frame):
     """The motion/depth pass exactly as the capture wrote it: RGB half floats, 6 bytes per pixel."""
-    size = int(manifest["size"])
+    width, height = target_grid(manifest)
     raw = np.fromfile(os.path.join(capture_dir, "motion_%04d.bin" % frame),
-                      dtype=np.float16).astype(np.float32).reshape(size, size, 3)
+                      dtype=np.float16).astype(np.float32).reshape(height, width, 3)
     motion = (raw[..., :2] - 0.5) * 2.0 / float(manifest["motion_scale"])
     distance = raw[..., 2] / float(manifest["depth_scale"])
     return motion, distance
@@ -238,28 +266,31 @@ def downscale(image, ratio=2.0):
 
 def resolve_ratio(manifest, requested, capture_dir):
     """The ratio these pairs are at: what the caller asked for, or what the capture recorded, or what its two
-    sizes imply.
+    grids imply.
 
-    A disagreement is refused rather than resolved in the caller's favour. The two sizes are the capture's own
+    A disagreement is refused rather than resolved in the caller's favour. The two grids are the capture's own
     statement about what it rendered, and a packer that overrode it would gate the pair against a baseline its
     frames are not at - which is the failure the ratio parameter exists to prevent, and the one the data gate
     cannot detect for itself, since it only ever sees the pair it is handed.
 
-    A capture taken before the ratio was recorded still packs: `size / lowres_size` is exact for those, and 2
+    A capture taken before the ratio was recorded still packs: `width / lowres_width` is exact for those, and 2
     for every one of them. A capture with no low-resolution pass has nothing to divide, so its declared ratio is
     used and the pair's input is a downscale at that ratio.
     """
     declared = manifest.get("ratio")
-    if declared is None and manifest.get("lowres_size"):
-        declared = float(manifest["size"]) / float(manifest["lowres_size"])
+    if declared is None:
+        lowres = lowres_grid(manifest)
+        if lowres is not None:
+            width, _ = target_grid(manifest)
+            declared = float(width) / float(lowres[0])
     if declared is None:
         declared = 2.0
     declared = float(declared)
     if requested is not None and abs(float(requested) - declared) > 1e-9:
-        raise SystemExit("%s: --ratio %s was asked for, but this capture is at %s (size %s, lowres_size %s) - "
+        raise SystemExit("%s: --ratio %s was asked for, but this capture is at %s (target %s, lowres %s) - "
                          "the pair's margin gate scores against the declared ratio's baseline, so packing it at "
                          "another one would measure the wrong grid"
-                         % (capture_dir, requested, declared, manifest.get("size"), manifest.get("lowres_size")))
+                         % (capture_dir, requested, declared, target_grid(manifest), lowres_grid(manifest)))
     return declared
 
 
@@ -380,14 +411,17 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
     manifest = load_capture(capture_dir)
     ratio = resolve_ratio(manifest, ratio, capture_dir)
     frames = int(manifest["frames"])
-    has_lowres = "lowres_size" in manifest
+    lowres = lowres_grid(manifest)
+    has_lowres = lowres is not None
     if input_mode == "jittered" and not has_lowres:
         raise SystemExit("%s: --input jittered, but this capture has no low-resolution pass" % capture_dir)
     use_lowres = has_lowres if input_mode == "auto" else input_mode == "jittered"
-    if use_lowres and abs(int(manifest["lowres_size"]) * ratio - float(manifest["size"])) > 1e-6:
-        raise SystemExit("%s: lowres_size %s is not the target size %s divided by the ratio %s, so the input "
-                         "cannot be upscaled to the target"
-                         % (capture_dir, manifest["lowres_size"], manifest["size"], ratio))
+    if use_lowres:
+        target_w, target_h = target_grid(manifest)
+        if abs(lowres[0] * ratio - target_w) > 1e-6 or abs(lowres[1] * ratio - target_h) > 1e-6:
+            raise SystemExit("%s: the low-resolution pass is %dx%d, which is not the %dx%d target divided by the "
+                             "ratio %g, so the input cannot be upscaled to the target"
+                             % (capture_dir, lowres[0], lowres[1], target_w, target_h, ratio))
     jitter_log = manifest.get("jitter_pixels", [])
     # A capture whose manifest says --jitter none records a zero offset per frame, which is what it applied. A
     # capture with *no* log at all is still refused: those offsets are the one input a consumer cannot derive,
@@ -417,7 +451,9 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
         validity = float(pair["validity"].mean())
         entry = {"file": name, "split": split, "seed": seed + frame,
                  "scene": manifest["scene"], "frame": frame,
-                 "size": int(pair["input"].shape[0]), "ratio": ratio,
+                 "size": int(pair["input"].shape[0]),
+                 "width": int(pair["input"].shape[1]), "height": int(pair["input"].shape[0]),
+                 "ratio": ratio,
                  "jitter": [float(jitter[0]), float(jitter[1])],
                  "margin": stats["margin"], "noise": stats["noise"],
                  "detail_ratio": stats["detail_ratio"], "valid_fraction": validity,
@@ -690,7 +726,7 @@ def main(argv):
     # problems, so it is refused rather than averaged over. `--input downscale` is the deliberate way to
     # build the comparison, and saying so is the point of this check.
     if args.input == "auto":
-        sources = {"lowres" if "lowres_size" in load_capture(capture_dir) else "downscale"
+        sources = {"lowres" if lowres_grid(load_capture(capture_dir)) is not None else "downscale"
                    for capture_dir in list(args.train) + list(args.val)}
         if len(sources) > 1:
             raise SystemExit("these captures disagree about whether they have a low-resolution pass; pass "
@@ -768,6 +804,8 @@ def main(argv):
         "generator": os.path.basename(__file__),
         "count": len(entries),
         "size": int(train_entries[0]["size"]),
+        "width": int(train_entries[0]["width"]),
+        "height": int(train_entries[0]["height"]),
         # The ratio the pairs are at, and the baseline every margin in this file was scored against. Recorded
         # rather than left to be inferred from the two sizes, because the trainer's gates score a run against
         # *its* ratio's baseline and a dataset that does not say which one it is can be trained against the
