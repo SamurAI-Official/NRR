@@ -353,10 +353,10 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     }
 
     vk::ComputeKernel kernel;
-    /* Three storage buffers and twelve bytes of push constants: the rule needs the two frames and the frame's
-     * alpha scalar, and it does not take a motion field at all - which is the point of the rewrite rather than
-     * an omission. */
-    NRR_ASSERT(kernel.create(device, words, word_count, 3, 3 * sizeof(uint32_t), why),
+    /* Three storage buffers and eight bytes of push constants: the rule needs the two frames and the frame's
+     * alpha scalar, and it does not take a motion field or any geometry at all - with an interleaved layout an
+     * element index carries its own plane and pixel, which is the point of the rewrite rather than an omission. */
+    NRR_ASSERT(kernel.create(device, words, word_count, 3, 2 * sizeof(uint32_t), why),
                "the blend kernel builds a pipeline from its SPIR-V");
     vk::VulkanDevice::Buffer* cur = device.create_buffer(count * 3 * sizeof(float));
     vk::VulkanDevice::Buffer* prev = device.create_buffer(count * 3 * sizeof(float));
@@ -368,10 +368,10 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     NRR_ASSERT(device.upload_buffer(prev, previous.data(), previous.size() * sizeof(float), 0),
                "the previous frame uploads");
 
-    struct Params { uint32_t width, height; float alpha; };
-    const Params params = {w, h, alpha};
+    struct Params { uint32_t element_count; float alpha; };
+    const Params params = {static_cast<uint32_t>(count * 3), alpha};
     vk::DispatchPlan plan;
-    NRR_ASSERT(vk::plan_dispatch(static_cast<uint32_t>(count), 64,
+    NRR_ASSERT(vk::plan_dispatch(static_cast<uint32_t>(count * 3), 64,
                                  device.info().workgroup_max_invocations, plan, why),
                "the blend dispatch plans");
     vk::DispatchRequest request;
@@ -405,7 +405,7 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
      * either - at any alpha_base it is still a mixture, per pixel - so these dispatches are what distinguish the
      * frame path's rule from a lookalike, which is the defect this kernel was rewritten to remove. */
     auto blend_with = [&](float value, std::vector<float>& got) -> bool {
-        const Params at = {w, h, value};
+        const Params at = {static_cast<uint32_t>(count * 3), value};
         vk::DispatchRequest again;
         again.kernel = &kernel;
         again.buffers = {cur->buffer, prev->buffer, out->buffer};

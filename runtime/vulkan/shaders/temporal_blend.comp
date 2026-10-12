@@ -1,28 +1,32 @@
 #version 450
 /*
- * NRR kernel: the temporal accumulator's blend, 3-plane NCHW fp32 -> NCHW fp32.
+ * NRR kernel: the temporal accumulator's blend, interleaved RGB fp32 -> interleaved RGB fp32.
  *
- * Contract - and it is the *runtime's* rule, not a similar-looking one:
- *   current  : 3*width*height floats, plane-major - the frame about to be displayed
+ * Contract - the runtime's rule AND the runtime's layout, not a similar-looking one:
+ *   current  : element_count floats, R,G,B per pixel (interleaved) - the frame about to be displayed
  *   previous : the same shape, ALREADY warped onto this frame's grid (this kernel does not resample)
- *   out[c]   = (1 - alpha) * current[c] + alpha * previous[c]      for every pixel and every channel
+ *   out[i]   = (1 - alpha) * current[i] + alpha * previous[i]      for every element i
  *   alpha    : ONE scalar for the whole frame, passed in the push constants.
  *
- * Why the alpha is a scalar and not a per-pixel decay, which is what this kernel used to compute:
- * that was a different policy. nrr_temporal.cpp's blend_frame() - the expression this replaces, at its
- * `(1.0f - alpha) * current[i] + alpha * history` - takes the frame's alpha as an argument, and the frame's
- * `alpha` comes from the *scene's* motion through TEMPORAL_ALPHA_MOTION_GATE_PX / _FULL_PX in nrr_temporal.h,
- * which are documented in frame-grid pixels per frame and are a property of the scene, not of a pixel. The
- * per-pixel `alpha_base * (1 - clamp(|motion| / threshold))` this shader used to evaluate was therefore not the
- * frame path's rule, and a kernel that does not reproduce the rule cannot be wired into the path: it would
- * change every frame's bytes, and the recorded hashes and every dataset built on them. The motion field is not
- * an input here at all - which is the honest form of "this is the same rule": a caller cannot pass a field and
- * get a different frame.
+ * Interleaved rather than plane-major, deliberately: nrr_temporal.cpp's blend_frame() indexes
+ * `current[p * channels + c]`, so this layout is what makes the kernel *that* operation instead of one that
+ * needs a conversion pass in front of it - and a conversion over the same plane costs about what the
+ * arithmetic does, which would leave a partial move worth nothing. The other kernels in this directory are
+ * NCHW because the *tensors* are; this one mirrors the accumulator, which is the thing it replaces.
  *
- * The guarded blend - a validity mask with a (2*TEMPORAL_CLAMP_RADIUS+1)^2 neighbourhood clamp on the history -
- * is deliberately NOT here. It is the path a model that declares `validity` takes, and it needs the mask and
- * the clamp's min/max over the current frame, so it stays on the CPU until it is written and tested as its own
- * kernel rather than approximated by this one.
+ * Why the alpha is a scalar and not a per-pixel decay, which is what this kernel used to compute:
+ * that was a different policy. The frame's alpha comes from the *scene's* motion through
+ * TEMPORAL_ALPHA_MOTION_GATE_PX / _FULL_PX in nrr_temporal.h - a property of the scene, not of a pixel - and
+ * the per-pixel `alpha_base * (1 - clamp(|motion| / threshold))` this shader used to evaluate was therefore
+ * not the frame path's rule. A kernel that does not reproduce the rule cannot be wired into the path: it
+ * would change every frame's bytes, and with them every recorded frame hash and every dataset built on one.
+ * There is no motion input here at all, which is the honest form of "this is the same rule": a caller cannot
+ * pass a field and get a different frame.
+ *
+ * The guarded blend - a validity mask with a (2*TEMPORAL_CLAMP_RADIUS+1)^2 neighbourhood clamp on the
+ * history - is deliberately NOT here. It is the path a model that declares `validity` takes, and it needs
+ * the mask and the clamp's min/max over the current frame, so it stays on the CPU until it is written and
+ * tested as its own kernel rather than approximated by this one.
  */
 layout(local_size_x = 64) in;
 
@@ -31,22 +35,16 @@ layout(std430, binding = 1) readonly buffer Previous { float previous_values[]; 
 layout(std430, binding = 2) writeonly buffer Dest { float out_values[]; };
 
 layout(push_constant) uniform Params {
-    uint width;
-    uint height;
+    /* The element count is all the geometry the rule needs: with a fixed three channels and an interleaved
+     * layout, an element index carries its own plane and pixel, so there is no stride to be got wrong. */
+    uint element_count;
     float alpha;
 } params;
 
 void main() {
     const uint index = gl_GlobalInvocationID.x;
-    const uint count = params.width * params.height;
-    if (index >= count) return;
+    if (index >= params.element_count) return;
 
-    /* Three channels because the frame path is RGB: a generic channel count would make a mismatch between the
-     * three planes' strides unrepresentable, and the runtime's blend is called with three. */
-    for (uint c = 0u; c < 3u; ++c) {
-        const uint plane = c * count;
-        out_values[plane + index] =
-            (1.0 - params.alpha) * current_values[plane + index] +
-            params.alpha * previous_values[plane + index];
-    }
+    out_values[index] = (1.0 - params.alpha) * current_values[index] +
+                        params.alpha * previous_values[index];
 }
