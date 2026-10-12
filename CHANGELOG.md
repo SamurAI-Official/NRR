@@ -34,12 +34,22 @@ frame's bytes, and with them every recorded frame hash, the parity docs and ever
   at alpha 0 the output must be the current frame exactly, at alpha 1 the warped history exactly, and a per-pixel
   decay can produce neither at *any* `alpha_base` because it is still a mixture per pixel. Measured on the GPU:
   `worst |gpu - cpu| = 5.96046e-08 (alpha 0.7, the frame's own scalar)`, and 205/205.
-* **What it changes about the wiring estimate.** With the corrected rule the move is worth more than the wash the
-  previous entry recorded, and for two reasons that are arithmetic rather than optimism: the motion field no
-  longer has to be uploaded (16 MB/frame at this tier), and the blend can take the model's NCHW output directly,
-  so the accumulator's convert-in and convert-out - and the `rgb` conversion - stop being on the path at all.
-  That is ~24 ms of CPU work against ~48 MB of uploads (~4-5 ms): **~19-20 ms, ≈14% of a 137 ms frame**, and it
-  is the first step of the whole-post-chain move in `docs/roadmap.md` M4/V2 rather than a substitute for it.
+* **The layout matches the accumulator's too, which is what makes it a drop-in.** `blend_frame()` mixes
+  interleaved floats (`current[p * channels + c]`); the kernel was plane-major, so wiring it would have needed a
+  conversion over the same 6.2 M-float plane - costing about what the arithmetic costs, which would have left the
+  partial move worth nothing. The kernel is interleaved now and needs only an element count, so an element index
+  carries its own plane and pixel and there is no stride left to get wrong. Recompiled: `temporal_blend.spv`,
+  364 words, sha256 `4d12a890a3a897b0551d0b473338780125ce48426a8bf87c2cf5550da5c9a73a`. With the rule *and* the
+  layout agreeing, the move is ~24 ms of CPU work against ~48 MB of uploads (~4-5 ms): **~19-20 ms, ≈14% of a
+  137 ms frame**, as the first step of the whole-post-chain move in `docs/roadmap.md` M4/V2.
+* **Two obstacles remain, and naming them is why this is a milestone rather than a patch.** (1) The blend's
+  `displayed_delta` statistic - `mean |blended - current|`, which feeds `Result.displayed_delta` and the debug
+  line - is a separate pass over the whole frame on the CPU; the kernel returns no statistic, and a float
+  reduction in GLSL needs atomics or a second stage, so the delta has to be produced some other way rather than
+  dropped. (2) The display texture is written through the backend's `upload(...)` primitive, which takes *host
+  bytes*: a result that stays on the device has nowhere to go without a new backend primitive
+  (`copy_buffer_to_texture`-shaped) declared in `nrr_backend.h` and implemented by every backend. Both are
+  recorded with their sizes here rather than discovered halfway through the wiring.
 * **The guarded blend stays on the CPU, deliberately.** A validity mask with the `(2*TEMPORAL_CLAMP_RADIUS+1)^2`
   neighbourhood clamp is the path a model that declares `validity` takes, and it is not this kernel: it needs the
   mask and the clamp's min/max over the current frame, so it is written and tested as its own kernel or not at
