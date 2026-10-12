@@ -14,9 +14,13 @@
 
 #include "backend_vulkan.h"
 #include "nrr_device.h"
+#include "vulkan/vulkan_compute_blend.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace nrr {
@@ -152,7 +156,54 @@ bool BackendVulkan::initialize_vulkan(const NRRDeviceOptions& options) {
 #endif
 }
 
+namespace {
+
+/* Opt-in by name, and the name is the caller's statement that a frame's rounding may differ from the CPU
+ * path's: the GPU evaluates the blend's expression in float, so its result differs by about a float ulp
+ * (measured 5.96e-08 on the kernel), which the RGB8 quantisation usually absorbs and cannot be proved to
+ * absorb. Unset, empty, or starting with 0/n/f means "do not" - the frames this repository has always
+ * produced. See docs/roadmap.md M4/V2 and runtime/nrr_compute_blend.h. */
+bool gpu_blend_requested() {
+    const char* value = std::getenv("NRR_GPU_BLEND");
+    if (value == nullptr || *value == '\0') return false;
+    const char first = value[0];
+    return first != '0' && first != 'n' && first != 'N' && first != 'f' && first != 'F';
+}
+
+} // namespace
+
+void BackendVulkan::attach_compute_blend() {
+#ifdef NRR_ENABLE_VULKAN
+    if (!gpu_blend_requested()) return;
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel == nullptr) return;
+    if (!compute_blend_) {
+        std::string why;
+        ComputeBlend* blend = create_vulkan_compute_blend(device_.get(), &why);
+        if (blend == nullptr) {
+            /* Recorded rather than swallowed: the two answers a caller can get here - "this build carries no
+             * shader compiler" and "your driver refused this pipeline" - send them to different places, and
+             * "the blend was on the GPU" is not something a report may claim without it having happened. */
+            vulkan_error_ = "NRR_GPU_BLEND is set, but the device-side blend is unavailable: " + why;
+            std::fprintf(stderr, "nrr-vulkan: %s\n", vulkan_error_.c_str());
+            return;
+        }
+        compute_blend_.reset(blend);
+    }
+    kernel->set_compute_blend(compute_blend_.get());
+#endif
+}
+
+const char* BackendVulkan::compute_blend_kernel_sha256() const {
+    return compute_blend_ ? compute_blend_->kernel_sha256() : nullptr;
+}
+
 void BackendVulkan::shutdown_vulkan() {
+    /* Detach before the device goes away: the accumulator is process-wide and outlives this backend's device,
+     * so a pointer left behind would be dispatched against a destroyed VkDevice. */
+    AcceleratorExecutionKernel* kernel = get_accel_kernel();
+    if (kernel != nullptr) kernel->set_compute_blend(nullptr);
+    compute_blend_.reset();
     cleanup_vulkan();
     vulkan_available_ = false;
 }
@@ -172,6 +223,10 @@ NRRResult BackendVulkan::execute_model(ModelImpl* model, const NRRFrameInput& in
      * carries, so the frame it is about to execute has to be told which references belong to
      * it - the same forwarding every vendor backend does. */
     kernel->set_frame_references(references);
+    /* The device-side blend, when the caller asked for it: attached here rather than at initialize() because
+     * the device and the shared kernel both have to exist first, and re-attaching per frame is what makes it
+     * survive a shutdown/initialize cycle without a stale pointer. */
+    attach_compute_blend();
     return kernel->execute_frame(
         model, input, output,
         [this](void* bt, void* data, size_t sz) { return download_texture(bt, data, sz); },

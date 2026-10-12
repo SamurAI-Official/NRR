@@ -1243,7 +1243,21 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
         host adds them - measured `gpu sum 45.36 against the CPU's 45.36`, relative 5.19e-08, over 3 partials),
         and the texture write needs **no new backend primitive** because the bridge would live inside the backend
         that owns the device and can resolve its own `void* backend_texture`;
-      * so what is left is a trade and one decision. The accumulator hook saves ~13.0 ms of CPU arithmetic against
+      * **the wire-up now exists and is opt-in**: `runtime/nrr_compute_blend.h` (a Vulkan-free interface the
+        accumulator can hold), `runtime/vulkan/vulkan_compute_blend.cpp` (reused buffers, a plan from the
+        device's limits, the partial-sum readback), the `blend_frame` hook, and `NRR_GPU_BLEND` to ask for it -
+        with all three configurations 205/205 and every recorded frame hash unchanged while it is off. What is
+        **not** done is the attach: `BackendVulkan::execute_model` calls it, a diagnostic in that method never
+        fired for a `--provider vulkan` frame, so those frames do not go through that method - a
+        backend-selection question, and the next step is instrumenting the registry. The ~8 ms is therefore not
+        claimed yet;
+      * once attached, the trade and the decision are: ~13.0 ms of CPU arithmetic against ~5 ms of up/down
+        transfers - **~8 ms**, not the ~19-20 ms an earlier line here estimated, because the history ring and
+        `displayed_delta` still need the blended frame on the host until the history itself moves to the device;
+        and the GPU's float rounding differs from the CPU's by ~1 ulp (measured 5.96e-08), which the RGB8
+        quantisation will almost always absorb and cannot be proved to absorb - so it stays opt-in with its
+        rounding stated, like the CUDA EP's TF32 difference, rather than a silent change to a frame hash the
+        repository quotes;
         ~5 ms of up/down transfers - **~8 ms**, not the ~19-20 ms the line above estimates, because the history
         ring and `displayed_delta` still need the blended frame on the host until the history itself moves to the
         device. And the GPU evaluates the same expression in float, so its result differs from the CPU's by about

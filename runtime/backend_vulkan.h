@@ -20,6 +20,7 @@
 #include "nrr_backend.h"
 #include "accel_kernel.h"
 #include "accel_texture.h"
+#include "nrr_compute_blend.h"
 
 #include <cstdint>
 #include <memory>
@@ -78,6 +79,13 @@ public:
      * so a caller can print the reason instead of "the backend was unavailable" - which is how the
      * first CI run of this configuration became diagnosable. */
     const std::string& last_device_error() const { return vulkan_error_; }
+
+    /* The device-side temporal blend, when NRR_GPU_BLEND asks for it and this device can run it (M4/V2). Owned
+     * here because the device is: the accumulator that dispatches on it holds a borrowed pointer, and
+     * shutdown_vulkan detaches it before the device goes away. */
+    void attach_compute_blend();
+    ComputeBlend* compute_blend() const { return compute_blend_.get(); }
+    const char* compute_blend_kernel_sha256() const;
 
 private:
     /* Vulkan-only state. `score_physical_device` takes a Vulkan type, so its declaration is
@@ -154,6 +162,9 @@ private:
 
     std::vector<ModelImpl*> loaded_models_;
     std::vector<ReferenceImpl*> loaded_references_;
+    /* The device-side blend, when the caller asked for it by name (NRR_GPU_BLEND) and this device can run it.
+     * Owned here because the device is; the accumulator that dispatches on it borrows the pointer. */
+    std::unique_ptr<ComputeBlend> compute_blend_;
 };
 
 /* Factory functions (aggregation-friendly, used by the backend registry). The supported predicate

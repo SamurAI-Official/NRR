@@ -365,7 +365,8 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
                                    float motion_vectors_scale, float alpha,
                                    TemporalBlendStats* stats,
                                    const std::vector<float>* validity,
-                                   BlendProfile* profile) {
+                                   BlendProfile* profile,
+                                   ComputeBlend* compute_blend) {
     if (stats) {
         stats->mean_abs_delta = 0.0f;
         stats->blended_pixels = 0;
@@ -407,6 +408,26 @@ bool TemporalRenderer::blend_frame(std::vector<float>& current, uint32_t width, 
     uint32_t channels = 0;
     if (!current.empty()) channels = static_cast<uint32_t>(current.size() / pixel_count);
     if (channels == 0) channels = 1;
+
+    /* The device-side mix, when the caller has one and the frame needs no guard. The rule, the layout and the
+     * statistic are the kernel's own - `temporal_blend.comp`, which the V2 tests hold against this very
+     * expression - and a device that refuses (no kernels embedded in this build, a dispatch the driver
+     * rejected, a size it cannot plan) falls through to the loop below instead of failing the frame: this is a
+     * speed choice and never a correctness one. The *guarded* path stays here deliberately, because the trust
+     * mask and the neighbourhood clamp are not in the kernel. */
+    if (!has_validity && compute_blend != nullptr) {
+        float device_delta = 0.0f;
+        BlendScope device_scope(profile ? &profile->arithmetic_ms : nullptr);
+        if (compute_blend->blend(current, warped_color, width, height, alpha, &device_delta)) {
+            if (stats) {
+                stats->mean_abs_delta = device_delta;
+                stats->blended_pixels = width * height;
+                stats->rejected_pixels = 0;
+                stats->clamped_pixels = 0;
+            }
+            return true;
+        }
+    }
 
     double accumulated_delta = 0.0;
     uint32_t rejected = 0;
@@ -1251,7 +1272,7 @@ TemporalAccumulator::Result TemporalAccumulator::apply(
         result.blended = renderer_.blend_frame(
             displayed_, width, height, previous, frame_motion,
             input.temporal.motion_vectors_scale, result.state.temporal_alpha,
-            &result.blend_stats, validity, profiling ? &profile : nullptr);
+            &result.blend_stats, validity, profiling ? &profile : nullptr, compute_blend_);
         result.note = result.blended ? "accumulated"
                                      : "no motion field to reproject with";
     }

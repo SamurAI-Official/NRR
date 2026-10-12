@@ -171,6 +171,11 @@ public:
      * on the same shared accumulator. Reached the same way:
      * the Backend defaults forward here, so no vendor backend has to know the switch exists. */
     void set_disocclusion_rejection(bool enabled);
+
+    /* The device-side blend, when this process has a device that can run it (M4/V2). Forwarded to the
+     * accumulator, because the mix happens where the history is - and detached with nullptr by the owner before
+     * the device it dispatches on goes away, which is why it is a borrowed pointer rather than an owned one. */
+    void set_compute_blend(ComputeBlend* blend) { temporal_.set_compute_blend(blend); }
     bool is_disocclusion_rejection_enabled() const;
 
     /* Applies the disocclusion guard's *default* - the value the device derived from this backend's

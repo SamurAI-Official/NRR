@@ -696,6 +696,16 @@ NRRResult AcceleratorExecutionKernel::execute_frame(
             info += phase;
         }
         info += quality_debug_note(quality);
+        /* Whether the blend's arithmetic ran on a device, stated in the frame's own record rather than inferred
+         * from a timing - because "the GPU did it" and "the caller asked and the CPU did it anyway" are
+         * different facts about the same number (M4/V2). Kept short on purpose: the stage clause below yields to
+         * what is already in the buffer, and a longer note here would push measured stages out of the record. */
+        if (ComputeBlend* blend = temporal_.compute_blend()) {
+            char device_blend[48];
+            std::snprintf(device_blend, sizeof(device_blend), " [gpu-blend %llu]",
+                          blend->blended_frames());
+            info += device_blend;
+        }
         copy_string(output.stats.debug_info, sizeof(output.stats.debug_info), info);
         /* The stage clause is optional and yields to what is already in the buffer: a record
          * that truncated the measured quality note would be worse than no record, so this

@@ -10,6 +10,7 @@
 
 #include "nrr.h"
 #include "nrr_jitter.h"
+#include "nrr_compute_blend.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -493,7 +494,13 @@ public:
                       * the two are one stage at frame level (nrr_frame_stages.h) and only the M11.3 work needs
                       * them apart - and they happen inside this function, which is why it takes the record
                       * rather than the caller wrapping the call. */
-                     BlendProfile* profile = nullptr);
+                     BlendProfile* profile = nullptr,
+                     /* The device-side mix, when the caller has one: the same rule, the same layout and the
+                      * same statistic, evaluated by a GPU kernel instead of by the loop below
+                      * (runtime/nrr_compute_blend.h). Null - the default - is that loop, which is what every
+                      * recorded frame in this repository was produced with. A device that cannot run it returns
+                      * false and the loop runs anyway, so this is a speed choice and never a correctness one. */
+                     ComputeBlend* compute_blend = nullptr);
     float calculate_temporal_stability(const NRRFrameOutput& current, const NRRFrameOutput& previous) const;
     void reset();
 
@@ -766,6 +773,14 @@ public:
      * trusting everything on a guess. */
     void set_disocclusion_rejection_enabled(bool enabled) { disocclusion_rejection_enabled_ = enabled; }
     bool is_disocclusion_rejection_enabled() const { return disocclusion_rejection_enabled_; }
+
+    /* The device-side blend, when this device has one. Opt-in and off by default, and the reason is rounding
+     * rather than safety: the kernel evaluates the same expression in float, so its result differs from the
+     * CPU's by about a float ulp (measured 5.96e-08), which the RGB8 quantisation usually absorbs and cannot be
+     * proved to absorb. A caller that has not asked for it gets exactly the frames this repository has always
+     * produced - which is also why every recorded frame hash stays valid until a row says otherwise. */
+    void set_compute_blend(ComputeBlend* blend) { compute_blend_ = blend; }
+    ComputeBlend* compute_blend() const { return compute_blend_; }
     /* Frames in the current accumulation, 0 when nothing is being integrated. */
     uint32_t phase_aligned_frames() const { return phase_aligned_.frame_count(); }
 
@@ -818,6 +833,9 @@ private:
     TemporalHistory history_;
     TemporalStateManager state_;
     TemporalRenderer renderer_;
+    /* Not owned: the backend that makes the device owns the object that dispatches on it, and it detaches this
+     * before the device goes away (see BackendVulkan::shutdown_vulkan). */
+    ComputeBlend* compute_blend_ = nullptr;
 
     /* The resolve's working buffers, owned here rather than declared per frame (M11.3). Each is fully written
      * before it is read, so surviving between frames changes no value; what it changes is how many buffers a
