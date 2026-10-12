@@ -51,15 +51,40 @@ def read_motion(path, manifest):
 
 
 def read_lowres(capture_dir, frame):
-    """The low-resolution pass as float RGB in [0,1] - the same read as the colour pass, at half the size."""
+    """The low-resolution pass as float RGB in [0,1] - the same read as the colour pass, at the ratio's low
+    grid (size / ratio, so half the size at the 2x the repository captured at first)."""
     path = os.path.join(capture_dir, "lowres_%04d.png" % frame)
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
 
-def downscale2(image):
-    """Area average by 2 - the filtered resize the low-resolution pass must not be."""
+def downscale(image, ratio=2.0):
+    """The filtered resize the low-resolution pass must not be, at the pair's ratio.
+
+    Written here rather than imported from the packer, for the same reason the readers above are: this file
+    checks a capture, and a check that shares its arithmetic with the tool it is checking cannot fail where that
+    tool was wrong. At a whole ratio it is the block mean; at a fractional one it is the footprint-weighted mean
+    - the pixels straddling a footprint's edge contribute the fraction they cover, which is what makes the
+    reference *filtered*. That distinction is not academic here: a reference that sampled each footprint's
+    centre instead kept the source's high-frequency content and measured 1.23x against a real low-resolution
+    render where the filtered one measures well above the 2x the check requires, so the check would have
+    reported good captures as resizes.
+    """
     height, width = image.shape[:2]
-    return image.reshape(height // 2, 2, width // 2, 2, image.shape[2]).mean(axis=(1, 3))
+    if abs(float(ratio) - round(float(ratio))) < 1e-9:
+        step = max(1, int(round(float(ratio))))
+        return image.reshape(height // step, step, width // step, step, image.shape[2]).mean(axis=(1, 3))
+    out_h = int(round(height / float(ratio)))
+    out_w = int(round(width / float(ratio)))
+
+    def weights(out_size, src_size):
+        spans = np.stack([np.arange(out_size) * ratio - 0.5, (np.arange(out_size) + 1) * ratio - 0.5], axis=1)
+        edges = np.stack([np.arange(src_size) - 0.5, np.arange(src_size) + 0.5], axis=1)
+        overlap = np.maximum(0.0, np.minimum(spans[:, None, 1], edges[None, :, 1])
+                                  - np.maximum(spans[:, None, 0], edges[None, :, 0]))
+        return overlap / overlap.sum(axis=1, keepdims=True)
+
+    rows = np.einsum("oh,hwc->owc", weights(out_h, height), image)
+    return np.einsum("owc,wp->opc", rows, weights(out_w, width).T)
 
 
 def edge_energy(image):
@@ -91,8 +116,13 @@ def main(argv):
     capture_dir = argv[1]
     manifest = load_manifest(capture_dir)
     frames = int(manifest["frames"])
-    print("capture: scene=%s frames=%d size=%d motion_scale=%g depth_scale=%g"
-          % (manifest["scene"], frames, manifest["size"], manifest["motion_scale"],
+    # The ratio the frames are a pair for: what the capture recorded, or - for a capture taken before it
+    # recorded one - what its two sizes imply. Checked against those sizes below, because everything this script
+    # measures about the low-resolution pass is relative to the grid it should be.
+    ratio = float(manifest.get("ratio", 0.0)) or (
+        (float(manifest["size"]) / float(manifest["lowres_size"])) if manifest.get("lowres_size") else 2.0)
+    print("capture: scene=%s frames=%d size=%d ratio=%g motion_scale=%g depth_scale=%g"
+          % (manifest["scene"], frames, manifest["size"], ratio, manifest["motion_scale"],
              manifest["depth_scale"]))
 
     failures = []
@@ -117,7 +147,7 @@ def main(argv):
             lowres = read_lowres(capture_dir, index)
             lowres_std.append(float(lowres.std()))
             lowres_edge.append(edge_energy(lowres))
-            downscale_edge.append(edge_energy(downscale2(color)))
+            downscale_edge.append(edge_energy(downscale(color, ratio)))
         raw = np.fromfile(os.path.join(capture_dir, "motion_%04d.bin" % index),
                           dtype=np.float16).astype(np.float32).reshape(int(manifest["size"]),
                                                                       int(manifest["size"]), 3)
@@ -180,9 +210,9 @@ def main(argv):
     # whole capture, that the pass really is a low-resolution raster and that the recorded offsets are the
     # sequence they claim to be.
     if has_lowres:
-        if lowres_size * 2 != int(manifest["size"]):
-            failures.append("lowres_size %d is not half the target size %d"
-                            % (lowres_size, int(manifest["size"])))
+        if lowres_size * ratio != int(manifest["size"]):
+            failures.append("lowres_size %d is not the target size %d divided by the ratio %g"
+                            % (lowres_size, int(manifest["size"]), ratio))
         if min(lowres_std) <= 1e-4:
             failures.append("a low-resolution frame is flat (std %.6f): nothing was drawn into it"
                             % min(lowres_std))
@@ -192,7 +222,22 @@ def main(argv):
         if ratio < 1.3:
             failures.append("low-resolution edge energy is only %.2fx a filtered downscale of the same frame:"
                             " this looks like a resize, not a render" % ratio)
-        if len(jitter) != frames:
+        jitter_mode = manifest.get("jitter_mode", "halton")
+        if jitter_mode == "none":
+            # The ablation capture: the low-resolution sample is held still, so every frame's phase is zero by
+            # construction and there is no sequence to reproduce. What is checked instead is that the record
+            # agrees with itself - a capture that claims "none" and moved the sample anyway would train a model
+            # against a misalignment its own `jitter` input says does not exist, which is worse than the
+            # misalignment itself. The mechanism is not left unverified either: the capture renders a one-pixel
+            # offset and confirms it translates the frame before it writes anything.
+            if len(jitter) != frames:
+                failures.append("manifest records %d jitter offsets for %d frames" % (len(jitter), frames))
+            elif any(abs(value) > 1e-9 for pair in jitter for value in pair):
+                failures.append("--jitter none, but the recorded offsets are not zero (worst %.6f)"
+                                % max(abs(value) for pair in jitter for value in pair))
+            else:
+                print("  jitter: held still (--jitter none); %d frames recorded as zero" % frames)
+        elif len(jitter) != frames:
             failures.append("manifest records %d jitter offsets for %d frames" % (len(jitter), frames))
         else:
             extremes = [abs(value) for pair in jitter for value in pair]

@@ -83,12 +83,42 @@ runtime at the tier: **224.6 ms/frame** on an RTX 4070 Ti (CUDA provider, 102.1 
 on the same host's CPU execution provider; the benchmark seeds a synthetic depth ramp for depth-consuming models,
 so those rows measure speed and the quality numbers above come from the trainer's held-out split instead.
 
-What is **not** claimed. The data is procedural - the repository generates it (`tools/gen_training_pairs.py
---ratio 2.5`, each scene rendered twice, at 128 and at 320, so the target is a real render at the ratio rather
-than a resample onto it) - so the 58.37% is an **in-family** number: held-out pairs, but the same scenes, the same
-renderer and no held-out style. It is not comparable to the 2x table below, which is measured on captured frames
-by a different harness at a different tier. A model trained on *captured* 2.5x pairs, and the commercial
-comparison at this tier, are recorded follow-ups in the repository's roadmap.
+What is **not** claimed about the procedural model. Its data is generated (`tools/gen_training_pairs.py
+--ratio 2.5`: each scene rendered twice, at 128 and at 320, so the target is a real render at the ratio rather
+than a resample onto it), so its 58.37% is an **in-family** number: held-out pairs, but the same scenes, the same
+renderer and no held-out content. It is not comparable to the 2x table below either, which is measured on
+captured frames by a different harness at a different tier.
+
+## The same ratio trained on captured frames (`ratio25/`)
+
+These are the out-of-family numbers: the same ratio, trained on frames *captured* from Godot - the content
+pipeline the released 2x model was trained on - over 840 pairs (360 train / 480 held out) of seven scenes the
+model has never seen.
+
+| model | inputs | parameters | held-out L1 vs the 2.5x bilinear baseline | SSIM | PSNR dB | MS-SSIM |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ratio25/upscale_25x_captured_nj_depth_s2.onnx` | `color`, `depth` | 90,974 | **0.01359 vs 0.01516 → 10.37% better** | 0.9035 vs 0.8947 | 26.81 vs **27.22** | 0.9715 vs 0.9624 |
+| `ratio25/upscale_25x_captured_depthjitter.onnx` | `color`, `depth`, `jitter` | 93,430 | **0.01399 vs 0.01541 → 9.24% better** | 0.9008 vs 0.8936 | 27.66 vs 27.10 | 0.9689 vs 0.9600 |
+
+Three things a reader should know before choosing between them:
+
+* **The `color,depth` model loses PSNR.** It is 0.41 dB *below* the bilinear baseline (26.81 against 27.22)
+  while gaining on L1, SSIM and MS-SSIM. The training gates score L1, and the column that disagrees is shown
+  rather than dropped. The `color,depth,jitter` model is above the baseline on all four metrics.
+* **The `color,depth` configuration is seed-fragile on captured content: 1 of 4 seeds qualified.** One seed froze
+  at the bilinear plane and then diverged (residual L1 0.01756 → 0.29974), one reached 1.9% progress with its
+  output 0.000302 from the plane, one reached 2.5%. The published weights are the seed that qualified
+  (20261112). The spread is part of the result - the procedural configuration in the section above qualified on
+  its first seed with 58.37%.
+* **The phase is what makes a jittered capture learnable.** On the *jittered* capture - the low-resolution
+  sample moving up to half a pixel between frames - `color,depth` measured val L1 equal to the baseline's to five
+  decimals (0.01541 against 0.01541), with an output 0.000155 from the plane: a half-pixel misalignment the model
+  was never told about has the bilinear plane as its L1 optimum. Declaring `jitter` on the same frames reached
+  9.24%, with both declared inputs measurably used (depth 0.00540, jitter 0.00695).
+
+Both graphs are trained at 128 -> 320 and are dynamic in H/W, so both render 768x432 -> 1920x1080; the runtime
+rows are `docs/measurements/ratio25-captured-*` in the repository, and the training configuration, the captures
+and the packing script are there too.
 
 One thing to know before comparing this model's output across hardware: ONNX Runtime's CUDA execution provider
 computes convolutions in TF32 by default, so this graph's CPU and CUDA outputs differ by up to **6.341e-04** (mean
@@ -103,6 +133,10 @@ its hash exactly.
 | `upscale_msreal_scale.onnx` | 461,501 | the released model: the two-tier (`scale` token) upscaler described above |
 | `ratio25/upscale_25x_procedural_depth.onnx` | 369,025 | the 2.5x model: 768x432 -> 1920x1080, inputs `color`, `depth` |
 | `ratio25/upscale_25x_procedural_depth.report.json` | 2,934 | that model's gate report: the configuration, the sha256, the held-out numbers and the baselines they were scored against - the repository gitignores `models/**/*.json`, so this copy is the one that travels with the weights |
+| `ratio25/upscale_25x_captured_nj_depth_s2.onnx` | 369,025 | the same ratio trained on **captured** frames: inputs `color`, `depth`, 10.37% below its ratio's bilinear baseline on 480 held-out captured pairs |
+| `ratio25/upscale_25x_captured_nj_depth_s2.report.json` | 2,955 | its gate report, including the baselines every number was scored against |
+| `ratio25/upscale_25x_captured_depthjitter.onnx` | 384,090 | the same capture with the phase declared: inputs `color`, `depth`, `jitter`, 9.24% better and above the baseline on all four metrics |
+| `ratio25/upscale_25x_captured_depthjitter.report.json` | 2,991 | its gate report |
 | `phases/upscale_subsampled.onnx` | 424,038 | the 128 -> 256 model `docs/evaluation-protocol.md` names when it explains why a model must be judged at the tier it was trained for |
 | `phases/upscale_mid.onnx` | 424,038 | mid-training model, kept because the phase tables compare against it |
 | `phases/upscale_mid_regression.onnx` | 424,038 | the mid model as a regression baseline |

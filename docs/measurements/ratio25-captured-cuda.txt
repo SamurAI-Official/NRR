@@ -1,0 +1,20 @@
+﻿NRR tier measurement: ratio25-captured-cuda
+  when          : 2026-10-11 23:58:45 UTC
+  commit        : 198dba707eae79470d49c70402a7e1fd129946d7 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:51:04)
+  model         : models/ratio25/upscale_25x_captured_nj_depth_s2.onnx  (369025 bytes)
+  model sha256  : c72525f6e66f96d5e89c7b604183142000e87611fd3db5fff6678bbc6fbd891e  (matches the sha256 in upscale_25x_captured_nj_depth_s2.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0  stages=on
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested auto  attached=CUDAExecutionProvider
+
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_captured_nj_depth_s2.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=on  threads=8  workers=spawn
+  768x432->1920x1080: wall=152.24ms  reported=150.09ms  (inference=47.22ms, host overhead=102.87ms)  p50=151.02ms  p99=164.73ms  fps=6.6
+      spread: min 144.29  max 165.12  stddev 7.55  inference share 31.5%  provider CUDAExecutionProvider  frame-hash 0x2a5ed7c3d9235209
+      stages: dlc=0.166ms(0.11%) dld=0.288ms(0.19%) dlm=0.000ms(0.00%) cv=2.963ms(1.97%) mk=0.000ms(0.00%) wp=0.000ms(0.00%) jt=0.000ms(0.00%) in=45.104ms(30.05%) rgb=11.227ms(7.48%) bl=87.696ms(58.43%) up=1.045ms(0.70%) q=0.001ms(0.00%) ot=1.599ms(1.07%)
+      blend: blend-state=0.000ms blend-convert-in=3.589ms blend-history-copy=8.249ms blend-motion-plane=7.402ms blend-warp=13.972ms blend-arithmetic=20.247ms blend-convert-out=4.921ms blend-phase-aligned=0.000ms blend-displayed-delta=5.594ms blend-record=11.151ms blend-other=11.899ms  | resolve=87.024ms  buffers=0 (0 MB) over 5 resolves
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-cuda-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-cuda.json

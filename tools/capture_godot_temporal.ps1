@@ -25,7 +25,11 @@ param(
     [double]$DetailScale = 1.0,
     # 0 keeps each scene's own frame count from the table below.
     [int]$Frames = 0,
-    [string]$OutRoot = "temporal"
+    [string]$OutRoot = "temporal",
+    # The upscale factor the frames are a pair *for*. 2.0 reproduces the temporal captures exactly (the low
+    # grid is size / 2); 2.5 makes it size / 2.5, which is the 768x432 -> 1920x1080 tier's ratio and needs a
+    # size that divides by it exactly - 320 -> 128 is the geometry the 2.5x model is trained at.
+    [double]$Ratio = 2.0
 )
 $ErrorActionPreference = "Continue"
 # The same binary, the same flags and the same jitter convention as capture_godot_v4.ps1, so the two datasets
@@ -44,12 +48,12 @@ $order = @("temporal", "temporal3", "temporal4", "temporal5", "temporal2", "temp
 $failed = @()
 # The configuration goes into the transcript, because a capture's content is part of what its pairs mean: two runs
 # of one scene at two detail scales produce datasets that must not be compared (M10.7).
-Write-Output "capture_godot_temporal: size=$Size detail_scale=$DetailScale out=user://capture/$OutRoot"
+Write-Output "capture_godot_temporal: size=$Size detail_scale=$DetailScale ratio=$Ratio out=user://capture/$OutRoot"
 foreach ($scene in $order) {
     $count = if ($Frames -gt 0) { $Frames } else { $frames[$scene] }
     Write-Output "=== $scene ($count frames) ==="
     & $godot --path tools\godot_capture res://capture.tscn -- `
-        --scene $scene --frames $count --size $Size --detail-scale $DetailScale --jitter halton `
+        --scene $scene --frames $count --size $Size --detail-scale $DetailScale --ratio $Ratio --jitter halton `
         --out "user://capture/$OutRoot/$scene"
     if ($LASTEXITCODE -ne 0) { $failed += $scene }
 }

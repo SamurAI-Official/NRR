@@ -1,0 +1,32 @@
+﻿NRR tier measurement: ratio25-captured-dj-cuda
+  when          : 2026-10-11 23:59:07 UTC
+  commit        : 198dba707eae79470d49c70402a7e1fd129946d7 (tracked files modified)
+  tool          : build-gpu/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:51:04)
+  model         : models/ratio25/upscale_25x_captured_depthjitter.onnx  (384090 bytes)
+  model sha256  : 5a4aa2d18f71773aa934e40ac404285499f121e769b7ddf5ae6ae9d42ae07693  (matches the sha256 in upscale_25x_captured_depthjitter.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested auto  attached=CUDAExecutionProvider
+
+nrr_bench.exe : [0;93m2026-10-11 16:59:03.7451448 [W:onnxruntime:, transformer_memcpy.cc:111 onnxruntime::MemcpyTransformer::ApplyImpl] 2 Memcpy nodes are added 
+to the graph main_graph for CUDAExecutionProvider. It might have negative impact on performance (including unable to run CUDA graph). Set 
+session_options.log_severity_level=1 to see the detail logs before this message.[m
+At G:\Program Prototype\NRR\tools\measure_tiers.ps1:130 char:17
++     $measured = & $binary @arguments 2>&1 | Out-String
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([0;93m2026-10-...his message.[m:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[0;93m2026-10-11 16:59:03.7483082 [W:onnxruntime:, session_state.cc:1397 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Some nodes were not assigned to the 
+preferred execution providers which may or may not have an negative impact on performance. e.g. ORT explicitly assigns shape related ops to CPU to improve 
+perf.[m
+[0;93m2026-10-11 16:59:03.7486410 [W:onnxruntime:, session_state.cc:1399 onnxruntime::VerifyEachNodeIsAssignedToAnEp] Rerunning with verbose output on a 
+non-minimal build will show node assignments.[m
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_captured_depthjitter.onnx (384090 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=off  threads=8  workers=spawn
+  768x432->1920x1080: wall=137.75ms  reported=135.37ms  (inference=45.99ms, host overhead=89.37ms)  p50=137.63ms  p99=147.05ms  fps=7.3
+      spread: min 132.19  max 147.39  stddev 5.55  inference share 34.0%  provider CUDAExecutionProvider  frame-hash 0xa49bf660d675529
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-dj-cuda-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-dj-cuda.json

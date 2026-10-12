@@ -1,0 +1,29 @@
+﻿NRR tier measurement: ratio25-captured-cpubackend
+  when          : 2026-10-12 00:02:17 UTC
+  commit        : 198dba707eae79470d49c70402a7e1fd129946d7 (tracked files modified)
+  tool          : build/Release/nrr_bench.exe  (294400 bytes, built 2026-10-11 11:53:54)
+  model         : models/ratio25/upscale_25x_captured_nj_depth_s2.onnx  (369025 bytes)
+  model sha256  : c72525f6e66f96d5e89c7b604183142000e87611fd3db5fff6678bbc6fbd891e  (matches the sha256 in upscale_25x_captured_nj_depth_s2.report.json)
+  scenario      : tiers=768x432  ratio=2.5  frames=5  warmup=3  motion=0
+  host          : AMD Ryzen 7 3700X 8-Core Processor  cores=8  logical=16
+  gpu           : NVIDIA GeForce RTX 4070 Ti  driver 32.0.16.1088
+  os            : Microsoft Windows 11 Home
+  provider      : requested CPU  attached=CPUExecutionProvider  (the frames reported CPUExecutionProvider, as requested)
+
+nrr_bench.exe : [1;31m2026-10-11 17:01:59.2230730 [E:onnxruntime:NRR, provider_bridge_ort.cc:2137 onnxruntime::CudaProviderFactoryCreator::Create] 
+N:\_work\1\s\onnxruntime\core\session\provider_bridge_ort.cc:1988 onnxruntime::ProviderLibrary::Get [ONNXRuntimeError] : 1 : FAIL : Error loading "G:\Program 
+Prototype\NRR\build\Release\onnxruntime_providers_cuda.dll" which depends on "cublasLt64_12.dll" which is missing. (Error 126: "The specified module could not be 
+found.")
+At G:\Program Prototype\NRR\tools\measure_tiers.ps1:130 char:17
++     $measured = & $binary @arguments 2>&1 | Out-String
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1;31m2026-10-...not be found."):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[m
+NRR benchmark: model=G:\Program Prototype\NRR\models\ratio25\upscale_25x_captured_nj_depth_s2.onnx (369025 bytes)  ratio=2.5  frames=5  warmup=3  motion=0.0000  tiers=1
+  configuration: build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=off  threads=8  workers=spawn
+  768x432->1920x1080: wall=1809.04ms  reported=1807.45ms  (inference=1721.32ms, host overhead=86.13ms)  p50=1807.47ms  p99=2016.15ms  fps=0.6
+      spread: min 1663.05  max 2024.52  stddev 121.08  inference share 95.2%  provider CPUExecutionProvider  frame-hash 0x8d3c5164483835d3
+  csv: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-cpubackend-csv/frames-768x432--1920x1080.csv
+  json: G:\Program Prototype\NRR\docs\measurements\ratio25-captured-cpubackend.json

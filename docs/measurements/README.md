@@ -137,6 +137,37 @@ computing convolutions in TF32 and the CPU EP is not - while a re-run on the sam
 exactly (`0x45317f2470dc61ac`). Two rows that disagree on a bit-exact digest disagree here for a named reason.
 The fixture rows above agree, so the sensitivity belongs to a trained graph rather than to the runtime.
 
+### The captured 2.5x models (M11.11, continued)
+
+The procedural artifacts above are trained on pairs this repository *generates*. These rows are two models
+trained on **captured** frames - the seven godot-v4 scenes at `--size 320 --ratio 2.5`, so a pair is 128 -> 320 -
+because that is what turns the 2.5x number from an in-family one into a measurement of generalisation.
+
+| row | provider | reported | wall | inference | host | blend (stage) | resolve | frame hash |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `ratio25-captured-cuda` (accel, `color,depth` model) | CUDA | 150.1 | 152.2 | 47.2 | 102.9 | 87.7 (58.4%) | n/a | `0x2a5ed7c3d9235209` |
+| `ratio25-captured-cpu` (accel, same model, CUDA runtime off `PATH`) | CPU EP | 1802.1 | 1804.3 | 1715.4 | 86.6 | n/a (no `--stages`) | n/a | `0x8d3c5164483835d3` |
+| `ratio25-captured-cpubackend` (the CPU *backend* path, same model) | CPU EP | 1807.5 | 1809.0 | 1721.3 | 86.1 | n/a | n/a | `0x8d3c5164483835d3` |
+| `ratio25-captured-dj-cuda` (accel, `color,depth,jitter` model) | CUDA | 135.4 | 137.7 | 46.0 | 89.4 | n/a | n/a | `0xa49bf660d675529` |
+
+Three notes, because each of them is a way these rows could be read wrongly:
+
+* The two models are `models/ratio25/upscale_25x_captured_nj_depth_s2.onnx` (90,974 parameters, `color`, `depth`:
+  **10.37%** below the 2.5x baseline over 480 held-out captured pairs, **and 0.41 dB of PSNR *below* it** - 26.81
+  against 27.22 - while gaining on L1, SSIM and MS-SSIM) and
+  `models/ratio25/upscale_25x_captured_depthjitter.onnx` (93,430 parameters, `color`, `depth`, `jitter`: 9.24%
+  better, and above the baseline on all four). The first qualified on **one of four seeds**; the other three were
+  refused, one of them after diverging to 0.29974. That spread is in the record rather than averaged away.
+* A CPU row taken with the CUDA runtime DLLs loadable **is not a CPU row**. `-Provider CPU` selects the CPU
+  *backend*, whose debug string is `"ONNX CPU EP ..."`, and with `third_party/cuda-runtime-cu12/bin` on `PATH`
+  that path ran in **45.6 ms** and produced the CUDA accel row's hash (`0x2a5ed7c3d9235209`) while reporting
+  `CPUExecutionProvider`; with the CUDA runtime off `PATH` it ran in **1721 ms** and produced the accel CPU row's
+  hash. Both paths are recorded above, and the row that was first taken the wrong way was re-taken rather than
+  kept.
+* The accel rows' `resolve` column is `n/a` because this build's debug line for the accelerator path reports
+  `prep`/`infer`/`post` and not the blend's own `resolve=` figure the earlier rows were read from. Nothing is
+  inferred to fill the gap.
+
 Five frames after three warm-ups, one host, one session per row, `ratio=2.5` in each record's scenario line, and
 each record naming the commit it was taken at (`c441a3a1`, tracked files modified - the change *is* the binary
 that produced it, the same situation `blend-attributed-fixture` records two commits earlier).

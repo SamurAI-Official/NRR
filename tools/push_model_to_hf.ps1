@@ -63,7 +63,15 @@ try {
         # baseline it was scored against and the configuration that produced it - and it is gitignored in the
         # repository, so without this copy the numbers would only exist in a changelog.
         @{ From = "models/ratio25/upscale_25x_procedural_depth.onnx";        To = "ratio25/upscale_25x_procedural_depth.onnx";        What = "the 2.5x model (768x432 -> 1920x1080)" },
-        @{ From = "models/ratio25/upscale_25x_procedural_depth.report.json"; To = "ratio25/upscale_25x_procedural_depth.report.json"; What = "its gate report" }
+        @{ From = "models/ratio25/upscale_25x_procedural_depth.report.json"; To = "ratio25/upscale_25x_procedural_depth.report.json"; What = "its gate report" },
+        # The captured model: the same ratio trained on the content pipeline the released 2x model was trained
+        # on, rather than on pairs this repository generates. Its number is the out-of-family one - the
+        # procedural model's 58.37% is in-family by construction - so both are published and the card says which
+        # is which. Additive, as with the released model: nothing here is renamed or overwritten.
+        @{ From = "models/ratio25/upscale_25x_captured_depthjitter.onnx";        To = "ratio25/upscale_25x_captured_depthjitter.onnx";        What = "the 2.5x model trained on captured frames" },
+        @{ From = "models/ratio25/upscale_25x_captured_depthjitter.report.json"; To = "ratio25/upscale_25x_captured_depthjitter.report.json"; What = "its gate report" },
+        @{ From = "models/ratio25/upscale_25x_captured_nj_depth_s2.onnx";        To = "ratio25/upscale_25x_captured_nj_depth_s2.onnx";        What = "the 2.5x model trained on captured frames, un-jittered contract" },
+        @{ From = "models/ratio25/upscale_25x_captured_nj_depth_s2.report.json"; To = "ratio25/upscale_25x_captured_nj_depth_s2.report.json"; What = "its gate report" }
     )
 
     # The Unity verification project's tests take the highest-dated models/p5/p4_tjit_*.onnx and score their

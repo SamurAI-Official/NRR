@@ -2631,10 +2631,16 @@ was never structural needs no work and a ratio that was would have decided the d
       unqualified) renders `768x432 -> 1920x1080` in the runtime with `runtime_output` confirmed and frame hash
       `0x2dcf1f0be9712f39` (docs/measurements/ratio25-own-procedural.txt). The trainer's own dynamic-size check
       was found asserting `output == input * 2` and refusing a correct 2.5x export; it now checks the run's ratio.
-- [ ] **The capture and the packer's gate at 2.5x.** `capture.gd` renders its low-resolution pass at
-      `_size / 2`, so the low grid has to become a parameter (768 = 1920 / 2.5); and the packer's margin test
-      scores against a 2x baseline (`_upscale2x`, `downscale2`), so a 2.5x pair would be gated against the wrong
-      baseline - the gate that decides whether the pair is worth training on.
+- [x] **The capture and the packer's gate at 2.5x.** The low grid is `size / ratio` (`capture.gd --ratio`,
+      default 2), and a size that does not divide into whole pixels is refused *before* anything is rendered:
+      `--size 512 --ratio 2.5` prints `FAILURE: ... (204.8000)`, `RESULT: FAIL`, exit 1. The manifest records
+      `ratio`, so nothing downstream infers it from two sizes; the packer's margin gate now scores against the
+      run's own ratio (`gen.gate_pair(name, pair, ratio)`, was the fixed `_upscale2x`), `--ratio` cross-checks
+      the capture's record and refuses a disagreement, and `check_capture.py` validates the low pass, its offset
+      log and the two sizes at that ratio. `--jitter none` is supported end to end as a first-class capture mode
+      (it records a zero offset per frame and the validator checks that the zeroes are zeroes). Two captures
+      taken at `--size 320 --ratio 2.5 --detail-scale 1.25` (128 -> 320, the trained geometry): 840 pairs each,
+      no frame skipped, all fourteen captures `RESULT: PASS`.
 - [x] **The tier is in `docs/evaluation-protocol.md`**, judged with the artifact published under `ratio25/`
       (`models/ratio25/upscale_25x_procedural_depth.onnx`, 90,974 parameters, inputs `color`, `depth`): held-out
       val L1 **0.01058** against that ratio's bilinear baseline's **0.02542** - 58.37% better, against the 5% bar -
@@ -2643,25 +2649,36 @@ was never structural needs no work and a ratio that was would have decided the d
       trainer's own held-out measurement, because `evaluate_model.py`/`compare_upscalers.py`/`score_models.py`
       group frames into scenes of at least two and the procedural pairs are single frames - a commercial table at
       this tier therefore waits for the captured sequence dataset the item above builds.
-- [ ] **A 2.5x model trained to the gates on *captured* 2.5x pairs.** The procedural artifact above is trained to
-      the gates but on data we generate, so its 58.37% is an in-family number: the same family of scenes, the same
-      renderer, no held-out style. The head's cost is known - 25 phases per colour channel at the input grid,
-      narrowed to 3 channels before the shuffle (75 channels at 768x432 = ~100 MB, against the 2x model's ~170 MB
-      at 1536x864) - so the FLOP and peak-activation accounting M11.9 asks for includes the phase stage, and this
-      item is blocked on the capture and packer work above.
-- [ ] **Make motion earn its place, or stop carrying it.** Declaring `depth,motion` trained a *better* model (val
-      L1 0.00541, 78.73% better than the ratio's baseline, against 58.37% for `color,depth`) and was still refused
-      by the conditioning gate, correctly: zeroing motion moved the trained artifact's output by **0.000032**
-      against the 0.0001 bar. So the measurement is that motion helps *training* and not the *artifact*, on data
-      whose target is a sharp instant and whose single mover is a small part of the frame. Either the data has to
-      make the vector necessary (a longer shutter, a mover covering more of the frame) or the artifact has to be
-      exported without the branch it does not use - and the second was refused here only because a 2-input export
-      of the trained graph is a change to the export path, not to the data.
-- **Gate (met on procedural pairs; the captured half is open).** A model trained at 768x432 -> 1920x1080 that
-  clears the trainer's own gates *at that tier* - val L1 at least 5% below the 2.5x bilinear baseline's and above
-  the baseline floor - recorded in `docs/measurements/` with its ratio in the scenario line, and the tier added to
-  the protocol with the model's training tier named in any claim made from its row. The artifact satisfies all
-  four; what it does not yet satisfy is being trained on captured 2.5x pairs.
+- [x] **A 2.5x model trained to the gates on *captured* pairs.** `models/ratio25/upscale_25x_captured_nj_depth_s2.onnx`
+      (90,974 parameters, inputs `color`, `depth`, sha256 `c72525f6...`) is **10.37%** below the 2.5x bilinear
+      baseline over 480 held-out captured pairs, where the procedural artifact's in-family number was 58.37% - and
+      it *loses 0.41 dB of PSNR* (26.81 against 27.22) while gaining on L1, SSIM and MS-SSIM, which the Hub card
+      states rather than omits. The jitter-aware arm
+      (`models/ratio25/upscale_25x_captured_depthjitter.onnx`, 93,430 parameters, `color`, `depth`, `jitter`) is
+      9.24% better and gains on all four (PSNR 27.66 against 27.10), with both declared inputs measurably used
+      (depth 0.00540, jitter 0.00695). What is left is not the number but its stability: the aligned
+      `color,depth` configuration **qualified on 1 of 4 seeds** (one froze at the plane and then diverged to
+      0.29974, one reached 1.9%, one 2.5%), where the procedural configuration qualified on its first. More
+      captured frames per scene (120 today, against the v4 captures' 400), a wider model, or a lower learning
+      rate is the next lever; the FLOP and peak-activation accounting M11.9 asks for should include the phase
+      stage (75 channels at the input grid, ~100 MB at 768x432).
+- [ ] **Make motion earn its place, or stop carrying it - now measured twice.** Declaring `depth,motion` trained
+      a *better* procedural model (val L1 0.00541, 78.73% better than the ratio's baseline, against 58.37% for
+      `color,depth`) and was still refused: zeroing motion moved the trained artifact's output by **0.000032**
+      against the 0.0001 bar. On captured content it is refused again and by more - 3.8% progress, motion
+      ablation 0.000025 - so the procedural result was not an artefact of that scene's single small mover. What
+      *did* earn its place on the captured frames was the **phase**: `color,depth,jitter` qualifies at 9.24% with
+      jitter used at 0.00695 where the identical frames without the phase sat on the bilinear plane. Either the
+      data has to make the motion vector necessary (a longer shutter, a mover covering more of the frame) or the
+      artifact has to be exported without the branch it does not use.
+- **Gate (met, in-family and out-of-family).** A model trained at 768x432 -> 1920x1080 that clears the trainer's
+  own gates *at that tier* - val L1 at least 5% below the 2.5x bilinear baseline's and above the baseline floor -
+  recorded in `docs/measurements/` with its ratio in the scenario line, and the tier added to the protocol with
+  the model's training tier named in any claim made from its row. Three artifacts satisfy it: the procedural one
+  at **58.37%** (in-family, and labelled as such wherever the number appears) and two trained on captured
+  content, at **10.37%** (`color`, `depth`) and **9.24%** (`color`, `depth`, `jitter`) over 480 held-out captured
+  pairs. The captured half of the gate is no longer open. What it has not certified is *stability* - 1 of 4
+  seeds qualified on the aligned configuration - and no artifact here carries a number it was not measured on.
 
 ### What this section corrects in the record
 

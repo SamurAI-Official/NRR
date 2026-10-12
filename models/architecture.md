@@ -12,7 +12,15 @@
 > **`models/ratio25/upscale_25x_procedural_depth.onnx`** (the same ratio trained *to the gates* and published
 > under `ratio25/` on the Hub: **90,974** parameters, inputs `color`, `depth`, 2.5x output with dynamic H/W,
 > held-out val L1 0.01058 against that ratio's bilinear baseline's 0.02542 - 58.37% better - trained by
-> `tools/run_ratio25.ps1`), and `upscale_msreal_scale.onnx`
+> `tools/run_ratio25.ps1`), **`models/ratio25/upscale_25x_captured_nj_depth_s2.onnx`** (the same ratio trained on
+> *captured* frames - the seven godot-v4 scenes at `--size 320 --ratio 2.5`: **90,974** parameters, inputs
+> `color`, `depth`, **10.37%** below that ratio's baseline over 480 held-out captured pairs, which is the
+> out-of-family number, and **0.41 dB of PSNR *below*** the baseline - trained by `tools/run_ratio25_captured.ps1`
+> on `models/training-data/godot-v4-25x-nj`, packed by `tools/pack_godot_25x.ps1`),
+> **`models/ratio25/upscale_25x_captured_depthjitter.onnx`** (the same capture with the phase declared:
+> **93,430** parameters, inputs `color`, `depth`, `jitter`, 9.24% better and above the baseline on every metric;
+> this is the arm that qualified on the *jittered* capture, where `color,depth` sat on the plane), and
+> `upscale_msreal_scale.onnx`
 > (**68,955** parameters, 461,501 bytes; inputs `color`, `jitter`, `scale`), the trained model published at
 > [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR) and rendered by all three engine
 > verifications. **No 2.5M-parameter 1080p->4K model exists in this repository.** The numbers below - the

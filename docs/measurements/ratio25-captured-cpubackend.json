@@ -1,0 +1,30 @@
+{
+  "tool": "nrr_bench",
+  "model": "G:\\Program Prototype\\NRR\\models\\ratio25\\upscale_25x_captured_nj_depth_s2.onnx",
+  "configuration": "build=Release (optimized: NDEBUG)  compiler=MSVC 1944  onnxruntime=onnxruntime-win-x64-gpu_cuda12-1.30.0  stage-timing=off  threads=8  workers=spawn",
+  "ratio": 2.5000,
+  "frames": 5,
+  "warmup": 3,
+  "tiers": {
+    "768x432->1920x1080": {
+      "input": [768, 432],
+      "output": [1920, 1080],
+      "runtime_output": [1920, 1080],
+      "runtime_output_confirmed": true,
+      "frames": 5,
+      "reported_ms": 1807.4505,
+      "inference_ms": 1721.3241,
+      "host_overhead_ms": 86.1263,
+      "wall_ms": 1809.0367,
+      "p50_ms": 1807.4672,
+      "p99_ms": 2016.1536,
+      "min_ms": 1663.0503,
+      "max_ms": 2024.5208,
+      "stddev_ms": 121.0769,
+      "fps": 0.5528,
+      "frame_hash": "0x8d3c5164483835d3",
+      "provider": "CPUExecutionProvider",
+      "runtime_debug": "ONNX CPU EP 768x432 -> 1920x1080 (prep 2.902ms infer 1722.270ms) | temporal accumulated: alpha=0.700 hist=2 change=0.0000 [blend delta 0.0000] | quality unmeasured: no reference set presented"
+    }
+  }
+}

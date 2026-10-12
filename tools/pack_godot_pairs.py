@@ -147,7 +147,7 @@ def warp_history_bilinear(previous, motion):
     return top + (bottom - top) * fy, inside
 
 
-def temporal_reference_margins(pair, previous_clean, previous_jitter, motion_low):
+def temporal_reference_margins(pair, previous_clean, previous_jitter, motion_low, ratio=2.0):
     """The two margins a temporal pair can be judged by: the single-frame baseline's, and the one a *reference*
     temporal resolve achieves.
 
@@ -183,21 +183,84 @@ def temporal_reference_margins(pair, previous_clean, previous_jitter, motion_low
     previous = placed(np.asarray(previous_clean, dtype=np.float32), previous_jitter)
     previous, _ = warp_history_bilinear(previous, motion_low)
     fused = 0.5 * (current + previous)
-    single = float(np.mean(np.abs(gen._upscale2x(pair["input_clean"]) - pair["target"])))
-    fused_margin = float(np.mean(np.abs(gen._upscale2x(fused) - pair["target"])))
+    single = float(np.mean(np.abs(gen._upscale(pair["input_clean"], ratio) - pair["target"])))
+    fused_margin = float(np.mean(np.abs(gen._upscale(fused, ratio) - pair["target"])))
     return {"single": single, "fused": fused_margin, "gain": single - fused_margin}
 
 
-def downscale2(image):
-    """Area average by 2. Deliberately not a point sample: a runtime's low-resolution frame holds the
-    average of what the higher resolution contained, not one sample of it."""
+def footprint_weights(out_size, src_size, ratio):
+    """Each source pixel's overlap with each output pixel's footprint, normalised per output pixel.
+
+    This is what makes a resize *filtered*, and it is the definition the capture's low-resolution pass has to
+    differ from. Pixel j covers [j - 0.5, j + 0.5) and output pixel i covers [i*ratio - 0.5, (i + 1)*ratio -
+    0.5), so the weight is the length of their intersection over the footprint's length. Every row sums to 1
+    over its source axis, and at a whole ratio every weight is 1/ratio - so this matrix reproduces the block
+    mean exactly and reduces to it. At a fractional ratio the pixels at a footprint's edges carry the fraction
+    they contribute, which is the difference between averaging a footprint and sampling one point inside it.
+    """
+    spans = np.stack([np.arange(out_size) * ratio - 0.5, (np.arange(out_size) + 1) * ratio - 0.5], axis=1)
+    edges = np.stack([np.arange(src_size) - 0.5, np.arange(src_size) + 0.5], axis=1)
+    overlap = np.maximum(0.0, np.minimum(spans[:, None, 1], edges[None, :, 1])
+                              - np.maximum(spans[:, None, 0], edges[None, :, 0]))
+    return (overlap / overlap.sum(axis=1, keepdims=True)).astype(np.float32)
+
+
+def downscale(image, ratio=2.0):
+    """The high-resolution plane reduced to the pair's low grid: the grid of the *input*, not of the target.
+
+    Deliberately not a point sample: a runtime's low-resolution frame holds the *mean* of what the higher
+    resolution contained, not one sample of it. At an integer ratio that mean is exact and is taken as a block
+    mean - at 2 the four-pixel average, byte-identical to what every dataset in this repository was packed
+    with. At a fractional ratio (2.5 = 5/2) no pixel-aligned block exists, so the same mean is taken with the
+    footprint weights of `footprint_weights`: the pixels straddling a footprint's edge contribute the fraction
+    they cover. That is a real difference and not a formality - a sampler of the footprint's centre behaves
+    like the source's *high* frequency content survives the reduction, which is the opposite of what a
+    low-resolution plane is, and check_capture.py's whole job is to tell a filtered resize from a real render.
+    """
     height, width = image.shape[:2]
     single_plane = image.ndim == 2
-    planes = 1 if single_plane else image.shape[2]
     if single_plane:
         image = image[..., None]
-    reshaped = image.reshape(height // 2, 2, width // 2, 2, planes).mean(axis=(1, 3))
+    if abs(float(ratio) - round(float(ratio))) < 1e-9:
+        step = int(round(float(ratio)))
+        if step < 1:
+            raise SystemExit("downscale: ratio %s is not at least 1" % ratio)
+        reshaped = image.reshape(height // step, step, width // step, step, image.shape[2]).mean(axis=(1, 3))
+    else:
+        out_h = int(round(height / float(ratio)))
+        out_w = int(round(width / float(ratio)))
+        weights_y = footprint_weights(out_h, height, float(ratio))
+        weights_x = footprint_weights(out_w, width, float(ratio))
+        rows = np.einsum("oh,hwc->owc", weights_y, image)
+        reshaped = np.einsum("owc,wp->opc", rows, weights_x.T)
     return reshaped[..., 0] if single_plane else reshaped
+
+
+def resolve_ratio(manifest, requested, capture_dir):
+    """The ratio these pairs are at: what the caller asked for, or what the capture recorded, or what its two
+    sizes imply.
+
+    A disagreement is refused rather than resolved in the caller's favour. The two sizes are the capture's own
+    statement about what it rendered, and a packer that overrode it would gate the pair against a baseline its
+    frames are not at - which is the failure the ratio parameter exists to prevent, and the one the data gate
+    cannot detect for itself, since it only ever sees the pair it is handed.
+
+    A capture taken before the ratio was recorded still packs: `size / lowres_size` is exact for those, and 2
+    for every one of them. A capture with no low-resolution pass has nothing to divide, so its declared ratio is
+    used and the pair's input is a downscale at that ratio.
+    """
+    declared = manifest.get("ratio")
+    if declared is None and manifest.get("lowres_size"):
+        declared = float(manifest["size"]) / float(manifest["lowres_size"])
+    if declared is None:
+        declared = 2.0
+    declared = float(declared)
+    if requested is not None and abs(float(requested) - declared) > 1e-9:
+        raise SystemExit("%s: --ratio %s was asked for, but this capture is at %s (size %s, lowres_size %s) - "
+                         "the pair's margin gate scores against the declared ratio's baseline, so packing it at "
+                         "another one would measure the wrong grid"
+                         % (capture_dir, requested, declared, manifest.get("size"), manifest.get("lowres_size")))
+    return declared
 
 
 def history_phase(jitter_log, frame, use_lowres=True):
@@ -214,7 +277,7 @@ def history_phase(jitter_log, frame, use_lowres=True):
 
 
 def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 0.0), use_lowres=True,
-               history_mode="raw", previous_jitter=(0.0, 0.0)):
+               history_mode="raw", previous_jitter=(0.0, 0.0), ratio=2.0):
     """One training pair, in the layout tools/train_nrr.py reads.
 
     `previous_frame` is None for the first frame of a capture, which legitimately has no history - the same
@@ -227,12 +290,12 @@ def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 
     color = read_color(capture_dir, frame)
     motion, distance = read_motion(capture_dir, manifest, frame)
 
-    clean = read_lowres(capture_dir, frame) if use_lowres else downscale2(color)
+    clean = read_lowres(capture_dir, frame) if use_lowres else downscale(color, ratio)
     rng = np.random.default_rng(seed)
     noisy = np.clip(clean + rng.normal(0.0, gen.INPUT_NOISE_SIGMA, size=clean.shape), 0.0, 1.0)
 
-    motion_low = downscale2(motion)
-    distance_low = downscale2(distance)
+    motion_low = downscale(motion, ratio)
+    distance_low = downscale(distance, ratio)
     geometry = distance_low > 1e-6
     height, width = distance_low.shape
 
@@ -253,9 +316,9 @@ def build_pair(capture_dir, manifest, frame, previous_frame, seed, jitter=(0.0, 
         px = np.clip((prev_uv[..., 0] * width).astype(int), 0, width - 1)
         py = np.clip((prev_uv[..., 1] * height).astype(int), 0, height - 1)
         _, previous_distance_full = read_motion(capture_dir, manifest, previous_frame)
-        previous_distance = downscale2(previous_distance_full)
+        previous_distance = downscale(previous_distance_full, ratio)
         history = (read_lowres(capture_dir, previous_frame) if use_lowres
-                   else downscale2(read_color(capture_dir, previous_frame)))
+                   else downscale(read_color(capture_dir, previous_frame), ratio))
         if history_mode == "warped":
             # The previous frame as the runtime shows it to a model for *this* frame: reprojected by this
             # frame's motion field, the way runtime/nrr_temporal.cpp does it before a model ever sees history.
@@ -295,7 +358,7 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", history_mode="raw"):
+def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", history_mode="raw", ratio=None):
     """Packs one capture into pairs, running each through the procedural generator's data gates.
 
     `offset` shifts the output file numbering, so several captures can be packed into one split without
@@ -305,21 +368,30 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
     the downscale when it does not, "jittered" insists on the low-resolution pass, and "downscale" forces the
     old behaviour so the two can be compared on identical frames.
 
+    `ratio` is the upscale factor the pairs are for, and it is also the baseline every margin is scored
+    against. None - what a caller should almost always pass - takes it from the capture's own manifest, where
+    the frames recorded what they were rendered at (see resolve_ratio).
+
     A frame whose pair fails a gate is skipped and the reason recorded, rather than the run ending with no
     dataset at all. A long capture legitimately contains frames whose content has drifted out of the useful
     range - a camera approaching the geometry, an object leaving frame - and the gate exists to reject a
     pair, not to abort a capture. Nothing is silent: skipped frames are counted, printed with their reason,
     and listed in the manifest."""
     manifest = load_capture(capture_dir)
+    ratio = resolve_ratio(manifest, ratio, capture_dir)
     frames = int(manifest["frames"])
     has_lowres = "lowres_size" in manifest
     if input_mode == "jittered" and not has_lowres:
         raise SystemExit("%s: --input jittered, but this capture has no low-resolution pass" % capture_dir)
     use_lowres = has_lowres if input_mode == "auto" else input_mode == "jittered"
-    if use_lowres and int(manifest["lowres_size"]) * 2 != int(manifest["size"]):
-        raise SystemExit("%s: lowres_size %s is not half of size %s, so the input cannot be upscaled to the "
-                         "target" % (capture_dir, manifest["lowres_size"], manifest["size"]))
+    if use_lowres and abs(int(manifest["lowres_size"]) * ratio - float(manifest["size"])) > 1e-6:
+        raise SystemExit("%s: lowres_size %s is not the target size %s divided by the ratio %s, so the input "
+                         "cannot be upscaled to the target"
+                         % (capture_dir, manifest["lowres_size"], manifest["size"], ratio))
     jitter_log = manifest.get("jitter_pixels", [])
+    # A capture whose manifest says --jitter none records a zero offset per frame, which is what it applied. A
+    # capture with *no* log at all is still refused: those offsets are the one input a consumer cannot derive,
+    # and reconstructing zeros for a capture that did not record them would be inventing the record.
     if use_lowres and len(jitter_log) != frames:
         raise SystemExit("%s: %d jitter offsets recorded for %d frames"
                          % (capture_dir, len(jitter_log), frames))
@@ -331,11 +403,11 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
         # cannot derive it, so it travels with the pair.
         previous_jitter = history_phase(jitter_log, frame, use_lowres)
         pair, warped_fraction = build_pair(capture_dir, manifest, frame, frame - 1 if frame > 0 else None,
-                                           seed + frame, jitter, use_lowres, history_mode, previous_jitter)
+                                           seed + frame, jitter, use_lowres, history_mode, previous_jitter, ratio)
         name = "%s_%03d.npz" % (split, offset + frame)
         path = os.path.join(out_dir, name)
         try:
-            stats = gen.gate_pair("%s frame %d" % (capture_dir, frame), pair)
+            stats = gen.gate_pair("%s frame %d" % (capture_dir, frame), pair, ratio)
         except SystemExit as refused:
             reason = str(refused).split(": ", 1)[-1]
             skipped.append({"frame": frame, "reason": reason})
@@ -345,7 +417,7 @@ def pack(capture_dir, split, out_dir, seed_base, offset=0, input_mode="auto", hi
         validity = float(pair["validity"].mean())
         entry = {"file": name, "split": split, "seed": seed + frame,
                  "scene": manifest["scene"], "frame": frame,
-                 "size": int(pair["input"].shape[0]),
+                 "size": int(pair["input"].shape[0]), "ratio": ratio,
                  "jitter": [float(jitter[0]), float(jitter[1])],
                  "margin": stats["margin"], "noise": stats["noise"],
                  "detail_ratio": stats["detail_ratio"], "valid_fraction": validity,
@@ -488,6 +560,90 @@ def self_test():
            % (history_phase(log, 0), history_phase(log, 1, use_lowres=False)))
     report("the phase is never read past the end of the log",
            history_phase(log, 9) == (0.0, 0.0), "frame 9 gave %s" % (history_phase(log, 9),))
+
+    # The downsample and the ratio it is taken at, checked against ground truth rather than against the upscaler
+    # it inverts: a linear ramp is the one field where both paths have an analytic answer, so this does not need
+    # the code under test to agree with itself. At 2 the answer is the block mean; at 2.5 it is the field's value
+    # at the low grid's own pixel centre. The two are different numbers at the same position, which is what a
+    # single hard-coded path could not have produced.
+    ramp_h, ramp_w = 40, 40
+    ramp = np.repeat(np.arange(ramp_w, dtype=np.float32)[None, :], ramp_h, axis=0)
+    halved = downscale(ramp, 2.0)
+    expect_two = np.repeat((2.0 * np.arange(ramp_w // 2) + 0.5)[None, :], ramp_h // 2, axis=0)
+    report("a 2x downsample of a ramp is its block mean",
+           halved.shape == (ramp_h // 2, ramp_w // 2) and bool(np.allclose(halved, expect_two, atol=1e-4)),
+           "shape %s, worst %.3e" % (halved.shape, float(np.abs(halved - expect_two).max())))
+
+    low_h, low_w = int(round(ramp_h / 2.5)), int(round(ramp_w / 2.5))
+    five_halves = downscale(ramp, 2.5)
+    # The continuous mean of a ramp over a footprint is the ramp at the footprint's centroid, (i + 0.5) * 2.5 -
+    # 0.5, and the discrete footprint mean is not exactly that: a pixel's value describes the whole pixel, so
+    # the pixel an edge cuts through contributes its centre rather than the mean of the covered part. The gap is
+    # bounded by half the partial weight times the ramp's slope - 0.05 here - and it is asserted rather than
+    # ignored, because "close to the right answer" is exactly the kind of claim that hides a wrong weighting.
+    expect_25 = np.repeat((2.5 * (np.arange(low_w) + 0.5) - 0.5)[None, :], low_h, axis=0)
+    report("a 2.5x downsample of a ramp is the footprint mean",
+           five_halves.shape == (low_h, low_w) and bool(np.allclose(five_halves, expect_25, atol=0.05)),
+           "shape %s, worst %.3e against the continuous mean (the edge pixels' discretisation)"
+           % (five_halves.shape, float(np.abs(five_halves - expect_25).max())))
+    # A ramp cannot tell a footprint mean from a sample of the footprint's centre, because the two agree on
+    # anything linear. A step can, and it is the property the capture check depends on: the footprint straddling
+    # the edge has to come out fractional, where a centre sample would have returned an exact 0.0 or 1.0 - and a
+    # reference that keeps the source's edges sharp cannot be told apart from a real low-resolution render at all.
+    # The edge sits at pixel 161 rather than 160 on purpose: 5/2's footprint boundaries fall at 2.5i - 0.5, so
+    # pixel 160's own boundary (159.5) is *on* one of them and no footprint straddles it.
+    step = np.zeros((40, 320), dtype=np.float32)
+    step[:, 161:] = 1.0
+    step_low = downscale(step, 2.5)[0]
+    straddling = step_low[(step_low > 0.0) & (step_low < 1.0)]
+    report("a fractional downsample filters rather than samples",
+           bool(straddling.size) and bool(np.allclose(straddling, 0.6, atol=1e-5))
+           and bool(np.allclose(step_low[0], 0.0)) and bool(np.allclose(step_low[-1], 1.0)),
+           "%d fractional footprint(s), first %.4f (a centre sample would be 0.0 or 1.0)"
+           % (int(straddling.size), float(straddling[0]) if straddling.size else float("nan")))
+    # The two grids have to be each other's inverse at the ratio, or the pair is at a ratio it does not declare
+    # and the target window is off the input's lattice: upscaling the downsampled ramp at 2.5 has to land back on
+    # the frame it came from.
+    report("the two grids agree at a fractional ratio",
+           gen._upscale(five_halves, 2.5).shape[:2] == (ramp_h, ramp_w),
+           "upscaled back to %s, not %s" % (gen._upscale(five_halves, 2.5).shape[:2], (ramp_h, ramp_w)))
+
+    # And the ratio reaches the *gate*, which is the reason the packer takes one at all: a pair whose target is
+    # the declared ratio's own baseline must be refused as an identity pair, and the refusal must name that
+    # ratio. Scored against 2 instead, it would be a comparison between two different grids.
+    identity = ramp.astype(np.float32)[..., None].repeat(3, axis=-1)
+    try:
+        gen.gate_pair("packer self-test", {"input": identity, "input_clean": identity,
+                                           "target": gen._upscale(identity, 2.5),
+                                           "depth": ramp, "motion": np.dstack([ramp, ramp])}, 2.5)
+    except SystemExit as refused:
+        report("the gate is scored against the pair's ratio",
+               "2.5x" in str(refused), "the refusal reads %r" % str(refused)[:70])
+    else:
+        report("the gate is scored against the pair's ratio", False,
+               "the pair whose target IS the 2.5x baseline was not refused")
+
+    # A capture that recorded no ratio - every dataset packed before this existed - still resolves, and one that
+    # recorded a ratio the caller contradicts is refused rather than obeyed: the manifest is the authority here
+    # because it is the only record of what the frames were actually rendered at.
+    def refuses_ratio(manifest_fields, requested):
+        try:
+            resolve_ratio(manifest_fields, requested, "self-test")
+        except SystemExit:
+            return True
+        return False
+
+    report("a capture without a recorded ratio reads as 2",
+           abs(resolve_ratio({"size": 512, "lowres_size": 256}, None, "old") - 2.0) < 1e-9,
+           "resolved %s" % resolve_ratio({"size": 512, "lowres_size": 256}, None, "old"))
+    report("a capture with no low-resolution pass reads as 2",
+           abs(resolve_ratio({"size": 512}, None, "downscale-only") - 2.0) < 1e-9,
+           "resolved %s" % resolve_ratio({"size": 512}, None, "downscale-only"))
+    report("a capture that disagrees with --ratio is refused",
+           refuses_ratio({"size": 320, "lowres_size": 128, "ratio": 2.5}, 2.0)
+           and not refuses_ratio({"size": 320, "lowres_size": 128, "ratio": 2.5}, 2.5),
+           "resolve_ratio %s refuse --ratio 2 for a 2.5 capture"
+           % ("did" if refuses_ratio({"size": 320, "lowres_size": 128, "ratio": 2.5}, 2.0) else "did NOT"))
     return 1 if failures else 0
 
 
@@ -502,8 +658,16 @@ def main(argv):
     parser.add_argument("--out", default="models/training-data/godot-v1")
     parser.add_argument("--seed", type=int, default=20261001)
     parser.add_argument("--input", choices=("auto", "jittered", "downscale"), default="auto",
-                        help="what the input is: the capture's jittered low-resolution render, the 2x "
-                             "area-downscale, or auto (jittered when the capture has that pass)")
+                        help="what the input is: the capture's jittered low-resolution render, the "
+                             "area-downscale at the pair's ratio, or auto (jittered when the capture has that "
+                             "pass)")
+    parser.add_argument("--ratio", type=float, default=0.0,
+                        help="the upscale factor these pairs are for, which is also the baseline their margin gate "
+                             "is scored against. 0 (the default) reads it from each capture's manifest, which is "
+                             "what a caller almost always wants; a value that disagrees with a capture is "
+                             "refused rather than obeyed. 2.5 is the 768x432 -> 1920x1080 tier and needs a "
+                             "capture whose size divides by it (320 -> 128, 1920 -> 768). Captures taken before "
+                             "the ratio was recorded are read as size / lowres_size - 2 for all of them")
     parser.add_argument("--history", choices=("raw", "warped"), default="raw",
                         help="what the 'history' key holds. raw (the default, and what every dataset in this "
                              "repository was packed with) is the previous frame as captured. warped reprojects "
@@ -532,18 +696,32 @@ def main(argv):
             raise SystemExit("these captures disagree about whether they have a low-resolution pass; pass "
                              "--input downscale or --input jittered to say what this dataset's input is")
 
+    # The pair's ratio, and the same argument one level up: one dataset whose captures are at different ratios
+    # would gate each frame against a baseline that is right for some of the captures and wrong for the rest, so
+    # it is refused rather than averaged over. Each capture's own manifest is the authority - --ratio is a
+    # cross-check that fails loudly when it disagrees with what the frames recorded.
+    requested_ratio = args.ratio if args.ratio > 0.0 else None
+    ratios = {resolve_ratio(load_capture(capture_dir), requested_ratio, capture_dir)
+              for capture_dir in list(args.train) + list(args.val)}
+    if len(ratios) > 1:
+        raise SystemExit("these captures are not all at one ratio (%s); pack them as separate datasets"
+                         % ", ".join("%g" % value for value in sorted(ratios)))
+    ratio = sorted(ratios)[0]
+    print("  pair ratio: %g (the baseline every margin below is scored against)" % ratio)
+
     captures = []
     train_entries, train_skipped = [], []
     input_sources = set()
     offset = 0
     for capture_dir in args.train:
         manifest, entries, skipped, use_lowres = pack(capture_dir, "train", args.out, args.seed, offset,
-                                                      args.input, args.history)
+                                                      args.input, args.history, requested_ratio)
         input_sources.add("jittered lowres render" if use_lowres else "area downscale")
         train_entries += entries
         train_skipped += skipped
         captures.append({"split": "train", "dir": capture_dir, "scene": manifest["scene"],
                          "frames": manifest["frames"],
+                         "ratio": manifest.get("ratio", ratio),
                          "input": "lowres" if use_lowres else "downscale",
                          # The content parameters the capture rendered with. Recorded because a dataset is only
                          # comparable to one produced the same way, and at a raised tier this difference is
@@ -558,12 +736,13 @@ def main(argv):
     offset = 0
     for capture_dir in args.val:
         manifest, entries, skipped, use_lowres = pack(capture_dir, "val", args.out, args.seed, offset,
-                                                      args.input, args.history)
+                                                      args.input, args.history, requested_ratio)
         input_sources.add("jittered lowres render" if use_lowres else "area downscale")
         val_entries += entries
         val_skipped += skipped
         captures.append({"split": "val", "dir": capture_dir, "scene": manifest["scene"],
                          "frames": manifest["frames"],
+                         "ratio": manifest.get("ratio", ratio),
                          "input": "lowres" if use_lowres else "downscale",
                          "content": {key: manifest[key] for key in ("checker_period", "checker_uv_scale",
                                                                     "detail_scale") if key in manifest},
@@ -589,6 +768,11 @@ def main(argv):
         "generator": os.path.basename(__file__),
         "count": len(entries),
         "size": int(train_entries[0]["size"]),
+        # The ratio the pairs are at, and the baseline every margin in this file was scored against. Recorded
+        # rather than left to be inferred from the two sizes, because the trainer's gates score a run against
+        # *its* ratio's baseline and a dataset that does not say which one it is can be trained against the
+        # wrong one without anything failing.
+        "ratio": ratio,
         "seed": args.seed,
         "min_identity_margin": gen.MIN_IDENTITY_MARGIN,
         "max_detail_ratio": gen.MAX_DETAIL_RATIO,
@@ -605,9 +789,9 @@ def main(argv):
         # What the input actually is. Two datasets built from the same scenes but different input sources
         # measure different things, so which one this is lives in the file rather than in someone's memory.
         "input": {"source": sorted(input_sources),
-                  "detail": "the capture's own low-resolution render - a real raster at half size, sub-pixel "
-                            "jittered - when the capture has one; otherwise the 2x area-downscale of the "
-                            "colour frame",
+                  "detail": "the capture's own low-resolution render - a real raster at size / ratio, sub-pixel "
+                            "jittered - when the capture has one; otherwise the area-downscale of the colour "
+                            "frame at that ratio",
                   "jitter": "per pair, npz key 'jitter': [x, y] in low-resolution pixels, +x right +y down"},
         "motion": {"source": "the capture's motion pass: current and previous MVP matrices applied to the "
                              "model-space vertex, so the vector is derived from geometry, not estimated",

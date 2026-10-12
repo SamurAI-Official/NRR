@@ -395,6 +395,13 @@ const SCENES := {
 var _scene_id := "train"
 var _frames := 24
 var _size := 512
+# The upscale factor the capture is a pair *for*. The low-resolution pass is `size / ratio` on a side, so the
+# pair is only at the ratio it claims when that division lands on whole pixels - which is why a fractional ratio
+# needs a divisible size (768 = 1920 / 2.5 is the 768x432 -> 1920x1080 tier) and why an indivisible one is
+# refused below rather than truncated. It is the ratio the packer's data gate then scores the pair against: a
+# pair's identity margin is a statement about a *specific* baseline, and scoring a 2.5x pair against a 2x
+# upscale would compare two different grids' worth of detail and pass or fail for the wrong reason.
+var _ratio := 2.0
 # Multiplies the checker's UV frequency, and it exists because detail authored in UV space does not survive a
 # change of tier: the same scenes at 3840 measure a recoverable margin of 0.0031 against the data gate's 0.0100,
 # because a tile that spans a few pixels at 256 spans fifteen times as many there and the frame is locally
@@ -439,8 +446,27 @@ func _ready() -> void:
 		print("RESULT: FAIL")
 		get_tree().quit(1)
 		return
-	print("capture: scene=%s frames=%d size=%d detail_scale=%.4f out=%s"
-		% [_scene_id, _frames, _size, _detail_scale, _out_dir])
+	# The ratio's own precondition, checked before anything is rendered: the low-resolution pass is
+	# `size / ratio` pixels on a side, and an indivisible size would silently floor it (512 / 2.5 = 204.8 -> 204),
+	# which puts the two views half a pixel out of step, leaves the pair at a ratio it does not declare, and
+	# corrupts the jitter calibration that is measured from the two frustums. Refused rather than rounded:
+	# get_tree().quit(1) rather than a warning, because the frames are the dataset.
+	if not is_finite(_ratio) or _ratio <= 0.0:
+		print("FAILURE: --ratio must be finite and positive (got %s)" % str(_ratio))
+		print("RESULT: FAIL")
+		get_tree().quit(1)
+		return
+	var lowres_exact := float(_size) / _ratio
+	if absf(lowres_exact - roundf(lowres_exact)) > 1e-9 or int(roundf(lowres_exact)) < 8:
+		print(("FAILURE: --size %d does not divide by --ratio %s into whole pixels (%.4f), and a low-resolution "
+			+ "pass of fewer than 8 pixels is not a frame. For 2.5 the size has to be a multiple of 5: "
+			+ "320 -> 128 and 1920 -> 768 are the tier's grids, where 512 -> 204.8 is not one.")
+			% [_size, str(_ratio), lowres_exact])
+		print("RESULT: FAIL")
+		get_tree().quit(1)
+		return
+	print("capture: scene=%s frames=%d size=%d ratio=%s lowres=%d detail_scale=%.4f out=%s"
+		% [_scene_id, _frames, _size, str(_ratio), int(roundf(lowres_exact)), _detail_scale, _out_dir])
 	_run()
 
 
@@ -491,7 +517,9 @@ func _run() -> void:
 	# temporal pass to resolve). It shares the colour world, so it draws the same scene - the same objects,
 	# lit by the same light - and only the projection and the target size differ. That is the only pair of
 	# differences the comparison is allowed to depend on.
-	var lowres_size := maxi(8, _size / 2)
+	# The pair's baseline, in pixels: the ratio's low grid rather than half the frame. `_size / ratio` was
+	# already checked to be whole and at least 8 pixels in _ready(), so this is the same division the check made.
+	var lowres_size := maxi(8, int(roundf(float(_size) / _ratio)))
 	var lowres_view := SubViewport.new()
 	lowres_view.size = Vector2i(lowres_size, lowres_size)
 	lowres_view.world_3d = color_world
@@ -701,6 +729,9 @@ func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -
 		"scene": _scene_id,
 		"frames": _frames,
 		"size": _size,
+		# The upscale factor the frames are a pair for, recorded so nothing downstream has to infer it from the
+		# two sizes - an inference that is ambiguous for an indivisible pair and wrong for a downscale-only one.
+		"ratio": _ratio,
 		"fps": FPS,
 		"motion_scale": MOTION_SCALE,
 		"depth_scale": DEPTH_SCALE,
@@ -719,7 +750,7 @@ func _write_manifest(checker: int, camera_velocity: Vector3, lowres_size: int) -
 		# The low-resolution pass. Its existence is what makes the dataset usable by a temporal upscaler, so
 		# what it is (a render, not a downscale) and how it was sampled are recorded rather than implied.
 		"lowres_size": lowres_size,
-		"lowres_files": "lowres_%04d.png (RGB8: a real render at lowres_size, not a filtered downscale)",
+		"lowres_files": "lowres_%04d.png (RGB8: a real render at lowres_size = size / ratio, not a filtered downscale)",
 		"lowres_reads": "colour, in [0,1], read the same way color_%04d.png is: pixel / 255",
 		"jitter_mode": _jitter_mode,
 		# Whether the scene was frozen. A downstream tool that integrates frames needs to know this:
@@ -932,7 +963,7 @@ func _mesh_for(shape: String) -> Mesh:
 
 func _checker_texture(period: int) -> ImageTexture:
 	# A deterministic procedural texture: a checkerboard gives the pair real high-frequency content, which
-	# is what a 2x upscaler is judged on, and it costs no committed asset.
+	# is what an upscaler at this ratio is judged on, and it costs no committed asset.
 	var image := Image.create(period * 8, period * 8, false, Image.FORMAT_RGB8)
 	for y in image.get_height():
 		for x in image.get_width():
@@ -953,6 +984,8 @@ func _parse_args() -> void:
 				_size = int(args[index + 1])
 			"--detail-scale":
 				_detail_scale = float(args[index + 1])
+			"--ratio":
+				_ratio = float(args[index + 1])
 			"--out":
 				_out_dir = args[index + 1]
 			"--jitter":
