@@ -13,6 +13,76 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The 2.5x path is captured, and its number is out-of-family
+
+The 2.5x artifact published before this was trained on pairs this repository *generates*, so its 58.37% was an
+in-family number: the same scenes, the same renderer, held-out pairs but no held-out content. This step takes the
+ratio through the capture itself, packs real captures at it, and measures the model on content it has never seen
+- which is what makes a published number a measurement of generalisation rather than of memorisation.
+
+* **The ratio reached the capture, the packer and the validator, and each refuses a disagreement rather than
+  resolving it.** `tools/godot_capture/capture.gd --ratio` (default 2) renders the low-resolution pass at
+  `size / ratio` instead of `size / 2`, and refuses a size that does not divide into whole pixels *before*
+  rendering anything: `--size 512 --ratio 2.5` prints `FAILURE: ... into whole pixels (204.8000)`, `RESULT:
+  FAIL` and exits 1 (measured). The manifest records `ratio`; `tools/pack_godot_pairs.py --ratio` cross-checks it
+  against the capture's own record and refuses a disagreement, because the margin gate scores against the
+  declared ratio's baseline and a packer that overrode the record would measure the wrong grid;
+  `tools/check_capture.py` validates the low pass, its offset log and the two sizes at that ratio. The drivers
+  take `-Ratio` (`-Jitter` too), and the capture's own jitter self-test now runs at the new low grid.
+* **Two 2.5x captures of the same seven scenes, differing in one flag** - the same content pipeline the released
+  2x model was trained on: `--size 320 --ratio 2.5 --detail-scale 1.25` (320 / 2.5 = 128 exactly), so a pair is
+  128 -> 320 and the trained geometry is identical to the procedural run's. 840 pairs each (360 train / 480 held
+  out), **no frame skipped** by the data gate, margins 0.0120-0.0232 and 0.0120-0.0226 against the 0.0100 bar,
+  and all fourteen captures `RESULT: PASS` from `check_capture.py`. The flag is `--jitter halton` versus
+  `--jitter none`: whether the low-resolution sample moves between frames, which is the difference between a
+  pair that is spatially aligned with its target and one that asks a spatial model to undo a sub-pixel shift.
+* **A defect the capture check found in the new downsample, and the fix it forced.** The first fractional
+  `downscale()` sampled each footprint's centre, which keeps the source's high-frequency content - so the
+  check's "filtered resize" reference was not filtered, and the low pass of two good captures measured only
+  **1.23x** the reference against the 2x the check requires (`train2`, `heldout3`; it would have reported them
+  as resizes). It now takes the footprint-weighted mean, with the exact block mean kept for whole ratios so
+  every recorded dataset repacks byte-for-byte (verified: 569 pairs, every shared plane CRC-identical, stats
+  identical). The same captures then measure **2.45x** and **3.02x**. A step edge is the test that separates a
+  footprint mean from a centre sample, because on a ramp the two agree.
+* **On captured content, the configuration published for the procedural artifact freezes - and the reason is
+  measurable.** Same trainer, same ratio, same geometry, same 0.005 input noise, same config (ch32, batch 8, 60
+  epochs, lr 0.002, warmup 5, `--deterministic`), same seed, so the only difference is the content:
+  `color,depth` on the jittered capture **refused** with val L1 **0.01541 against the baseline's 0.01541** - to
+  five decimals the plane itself - 4.6% progress and an output 0.000155 from the plane it corrects;
+  `color,depth,motion` **refused** at 3.8% with motion ignored (0.000025). Neither was short of capacity: a
+  half-pixel misalignment the model was never told about has the bilinear plane as its L1 optimum.
+* **The arm that works, and what it proves.** `color,depth,jitter` on the same jittered frames **qualified**:
+  val L1 **0.01399** against the baseline's 0.01541 (**9.24%** better), 24.5% training progress, and both
+  declared inputs measurably used (depth 0.00540, jitter 0.00695) - so the phase is what makes a jittered pair
+  learnable, which is the whole reason the released 2x model declares `jitter`. Verified end to end: 93,430
+  parameters, sha256 `5a4aa2d18f71773aa934e40ac404285499f121e769b7ddf5ae6ae9d42ae07693`, onnxruntime agrees with
+  PyTorch to 4.56e-06, dynamic H/W checked at the run's own ratio (160 -> 400).
+* **The aligned contract, across four seeds, because one frozen run is a seed's outcome rather than a
+  configuration's.** `color,depth` on the un-jittered capture: seed 20261112 **qualified** (val L1 **0.01359**
+  against the baseline's 0.01516, **10.37%** better, 45.2% progress, depth ablation 0.01436); seed 20261111
+  froze at the plane for 36 epochs and then *diverged* (0.01756 -> 0.29974, depth ablation 11.99); seed
+  20261113 reached 1.9% with its output 0.000302 from the plane; seed 20261114 reached 2.5%. **1 of 4 seeds
+  qualifies** and that spread is the result - the procedural configuration qualified on its first seed with
+  58.37%, and real content is a harder task.
+* **What the published numbers now are, without flattering any of them.** The in-family 58.37% is kept and
+  labelled as in-family. The out-of-family artifact is `models/ratio25/upscale_25x_captured_nj_depth_s2.onnx`
+  (90,974 parameters, inputs `color`, `depth`, sha256
+  `c72525f6e66f96d5e89c7b604183142000e87611fd3db5fff6678bbc6fbd891e`): **10.37%** below the 2.5x bilinear
+  baseline over 480 held-out captured pairs - and it **loses 0.41 dB of PSNR** to that baseline (26.81 against
+  27.22) while gaining on L1, SSIM (0.9035 against 0.8947) and MS-SSIM (0.9715 against 0.9624). The
+  jitter-aware artifact (`models/ratio25/upscale_25x_captured_depthjitter.onnx`) is 9.24% better and gains on
+  all four (SSIM 0.9008 against 0.8936, PSNR 27.66 against 27.10). Both are published beside the procedural
+  one, and `models/HUB_README.md` says which is which and what each is for.
+* **One runtime row had to be re-taken, and why is a finding.** `-Provider CPU` selects the CPU *backend*, not
+  the accelerator path with the CPU EP, and the two are different frame paths (`"ONNX CPU EP"` versus
+  `"CPUExecutionProvider via accel"`). With the CUDA runtime on `PATH` that path ran in **45.6 ms** and produced
+  the CUDA accel row's frame hash (`0x2a5ed7c3d9235209`) while naming itself a CPU path and reporting
+  `CPUExecutionProvider`; with the CUDA runtime off `PATH` it ran in **1721 ms** and produced the CPU accel
+  row's hash (`0x8d3c5164483835d3`). So a CPU row taken with the CUDA DLLs loadable is a GPU row that says it is
+  a CPU row - the class of false record `tools/measure_tiers.ps1` exists to prevent. Both paths are now
+  recorded separately (`ratio25-captured-cpubackend` for the backend, `ratio25-captured-cpu` for the accel path
+  with the CUDA runtime off `PATH`), and the misnaming is recorded here rather than smoothed over.
+
 ### The 2.5x model is trained, qualified and published: 768x432 -> 1920x1080
 
 The head could synthesise 2.5; now an artifact that does it has cleared the trainer's own gates and is on the
