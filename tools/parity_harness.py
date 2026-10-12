@@ -853,7 +853,11 @@ def build_offline_arms(methods, args, pooled, perceptual_pooled, vmaf_by_arm, sc
         if vmaf_by_arm.get(name):
             quality["vmaf"] = {"vmaf_mean": float(np.mean(vmaf_by_arm[name])),
                                "scenes": len(vmaf_by_arm[name])}
-        version, backend, preset = OFFLINE_IDENTITY.get(name, ("?", "?", "%.0fx" % args.ratio))
+        version, backend, _preset = OFFLINE_IDENTITY.get(name, ("?", "?", "2x"))
+        # The preset is the ratio the arm ran at, not a literal 2: a 2.5x table that labels its own
+        # bilinear row "2x" under a "768x768->1920x1920" tier contradicts itself, and "%.0f" would
+        # round 2.5 down to 2 (banker's rounding), which is the same lie in a different costume.
+        preset = "%gx" % args.ratio
         # The tier is a column, not a header: two datasets at different resolutions produce two tables, and a
         # reader must be able to see from the row itself which grid produced the number.
         identity = {"version": version, "backend": backend, "preset": preset, "tier": scene_tier}
@@ -883,7 +887,11 @@ def main(argv):
     # The tier every offline arm ran at, taken from the packed dataset's own record of its frames rather than
     # from the file name: `size` is the input grid, and a 2x pack makes the target twice it.
     side = int(manifest.get("size") or 0)
-    scene_tier = "%dx%d->%dx%d" % (side, side, side * 2, side * 2) if side else "-"
+    # The ratio is the run's, not a literal 2: a 2.5x pack makes the target `side * 2.5`, and a tier
+    # that renders `768x768->1536x1536` for a 768x768->1920x1920 dataset misnames the grid the number
+    # came from. The manifest stores the width; the capture is square, so the height is the width.
+    target = int(side * args.ratio) if side else 0
+    scene_tier = "%dx%d->%dx%d" % (side, side, target, target) if side else "-"
 
     methods = offline_upscalers(args.model, args.provider, args.ratio)
     if not args.model:

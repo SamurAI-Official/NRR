@@ -126,6 +126,39 @@ computes convolutions in TF32 by default, so this graph's CPU and CUDA outputs d
 different frame hashes for a named reason rather than a mysterious one, and a re-run on one provider reproduces
 its hash exactly.
 
+## The 2.5x tier against the field (`docs/parity-ratio25.md`)
+
+`docs/parity-ratio25.md` scores the 2.5x ratio against the offline field and one commercial arm, all driven from
+the same captured frames and scored against the same targets. It is a *2.5x* table, so its offline baselines
+upscale by 2.5 (a 2x-tier table's baselines upscale by 2 - a row that says `768x768->1920x1920` while its bilinear
+arm upscaled by 2 would be scoring one grid and labelling it another):
+
+| arm | tier | PSNR dB | SSIM | MS-SSIM | LPIPS | DISTS | detail |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bilinear | 768x768->1920x1920 | 27.1135 | 0.88770 | 0.94527 | 0.1168 | 0.2992 | 0.1330 |
+| bicubic | 768x768->1920x1920 | 26.4337 | 0.87777 | 0.93720 | 0.1343 | 0.3095 | 0.2052 |
+| lanczos | 768x768->1920x1920 | 26.1083 | 0.87372 | 0.93362 | 0.1432 | 0.3106 | 0.2178 |
+| fsr1 (EASU + RCAS) | 768x768->1920x1920 | 25.6000 | 0.86508 | 0.92990 | 0.1402 | 0.3447 | 0.3919 |
+| nrr - the procedural model | 768x768->1920x1920 | 26.9605 | 0.87093 | 0.94155 | 0.1332 | 0.3312 | 0.2919 |
+| DLSS (NGX) | 768x768->1920x1920 | 26.9670 | 0.89735 | 0.95684 | 0.0934 | 0.2684 | 0.1567 |
+
+24 frames, one held-out scene, RTX 4070 Ti, driver 610.88. What a reader should hold on to:
+
+* **The grid is square, not 16:9.** The capture renders a square viewport, so this tier is `768x768 -> 1920x1920`
+  rather than the `768x432 -> 1920x1080` the model's README names. The ratio is the same, the crop is not; the
+  graph is dynamic in H/W and renders either, so the measured table is the square one.
+* **The procedural model loses to bilinear here, and that is the point of the section above.** Its 58.37% is an
+  *in-family* number from generated data; scored on captured frames it lands below its own bilinear baseline on
+  PSNR (26.96 vs 27.11), SSIM and MS-SSIM, keeping only `detail` (0.2919 vs 0.1330). That is the out-of-family gap
+  the captured models above close - `upscale_25x_captured_depthjitter.onnx` is the nrr row this table wants next.
+* **XeSS has no 2.5x row.** Its presets are fixed input sizes: `balanced` at a 1920 output wants 960, which is
+  exactly 2.0x. The row is absent because XeSS refuses to produce one, not because it was dropped.
+* **FSR 2/4 are absent by structure, not omission.** FSR 4 is not distributed as a runtime this harness can call,
+  and FSR 2/3/4 are temporal and consume an engine's motion/jitter/history planes, so their rows come from the
+  engines that ship them.
+* **VMAF is skipped** (`--skip-vmaf`): `evaluate_model`'s VMAF path writes into a temp directory that is not
+  there, so this run omits the column rather than being quietly shortened.
+
 ## Files
 
 | file | bytes | what it is |
