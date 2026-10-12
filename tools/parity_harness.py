@@ -161,8 +161,14 @@ def merge_metrics(into, other):
     return into
 
 
-def offline_upscalers(model_path, provider):
+def offline_upscalers(model_path, provider, ratio=2.0):
     """The arms this harness drives from our own frames: name -> callable(image, entry) -> upscaled image.
+
+    `ratio` is passed straight to `compare_upscalers.make_upscalers`, and it is the whole reason this
+    signature changed: the harness had `--ratio` for the *online* arms and the scenes' identity, while the
+    offline baselines were built with the module default of 2 - so a 2.5x tier scored bilinear/bicubic/Lanczos/
+    FSR 1.0 that upscaled by 2 against 1920x1920 targets and died on the shapes
+    (`operands could not be broadcast together with shapes (1536,1536,3) (1920,1920,3)`).
 
     Built by `tools/compare_upscalers.py`, deliberately: the FSR 1.0 row of the parity table is then
     produced by the same code and the same resample discipline as the FSR 1.0 numbers this project has
@@ -174,7 +180,7 @@ def offline_upscalers(model_path, provider):
     different model's job while wearing this one's name.
     """
     import compare_upscalers as cu
-    arms = cu.make_upscalers(model_path, provider)
+    arms = cu.make_upscalers(model_path, provider, ratio)
     methods = {}
     for name, upscale in arms.items():
         if name == "nrr":
@@ -879,7 +885,7 @@ def main(argv):
     side = int(manifest.get("size") or 0)
     scene_tier = "%dx%d->%dx%d" % (side, side, side * 2, side * 2) if side else "-"
 
-    methods = offline_upscalers(args.model, args.provider)
+    methods = offline_upscalers(args.model, args.provider, args.ratio)
     if not args.model:
         # Without a model there is no nrr arm: an all-zeros feed would produce a row for a network that
         # does not exist, which is the kind of fabricated capability this project refuses.
