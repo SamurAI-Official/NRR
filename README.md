@@ -656,7 +656,7 @@ ships a compiled binary - Godot's libraries are per-platform build output under
 Each engine plugin ships as its own **independent GitHub Release** (one tag per engine), built by
 `tools/package_plugins.ps1`. Every package is self-contained: the plugin source, the native
 binaries it needs to run (`nrr.dll` where the engine loads it, or the GDExtension library for
-Godot), the **CPU** ONNX Runtime DLLs (~17 MB total, so the smallest usable install), the released
+Godot), the **CPU** ONNX Runtime DLLs (~6.7 MB per download, ~17 MB unpacked, so the smallest usable install), the released
 model `upscale_msreal_scale.onnx`, and a copy of [LICENSE](LICENSE). The CUDA provider and its
 ~2.6 GB of runtime are deliberately **not** bundled - attach those with each engine's own setup
 script when you want the GPU path.

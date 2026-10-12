@@ -5,14 +5,58 @@ All notable changes to NRR are documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The project is at `1.0.0-dev` and has no release tags, so **everything below is
-unreleased**. Commit hashes are quoted so each claim can be checked against the
+The project is at `1.0.0-dev`; its only release tags are the three per-engine
+plugin tags (`nrr-godot-v1.0.0`, `nrr-unity-v1.0.0`, `nrr-unreal-v1.0.0`), so
+**everything below is otherwise unreleased**. Commit hashes are quoted so each claim can be checked against the
 repository (`git show <hash>`), and measured numbers are the ones the test suite and CI
 actually printed rather than estimates.
 
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### License is All Rights Reserved, a non-square canvas runs end to end, and each engine plugin ships as its own GitHub Release
+
+**Licence: MIT -> All Rights Reserved** (`94799140`). `LICENSE` is rewritten: no permission is granted to
+use, reproduce, modify, distribute, sublicense or commercially exploit the software without prior written
+authorization from the copyright holder; the "as is" warranty disclaimer stays, and the README notes the change
+does not retract the MIT grant for copies already distributed. The Hub card carries the
+same terms (`license: other` with the name and link, in `models/HUB_README.md`), `docs/roadmap.md` records the
+change on its M10.6 licence line, and `engine_plugins/unity/package.json` points at SamurAI-Official instead of
+the placeholder nrr-project - author, documentation and license URLs all three.
+
+**The pipeline is not square-only** (`d49f3c31`, `95ccaa5c`). `tools/capture_godot_v4.ps1 -Width/-Height`
+captures a non-square grid - the low-resolution pass is `width x height` and the target is `width*ratio x
+height*ratio` (160x90 -> 320x180 at 2x) - and refuses `-Size` alongside `-Width/-Height` rather than guessing,
+because a half-specified grid is a typo; it also gained `-OutDir` (the captures had to leave the nearly-full
+C: drive) and `-Scenes` (re-run one scene without the rest). The scene table is `$sceneFrames` now, not
+`$frames`: PowerShell names are case-insensitive, so it collided with the `[int]$Frames` parameter and the
+unknown-scene guard called `ContainsKey` on an int. `capture.gd` validates the same path before anything renders
+(both axes together, whole target pixels, low grid at least 8 px a side); `check_capture.py` and
+`pack_godot_pairs.py` read `width`/`height` from the manifest when present and `size` otherwise, so older square
+captures still pack, and the pairs are gated on the ratio the two grids imply.
+
+Along the way `evaluate_model.py` was fixed (`95ccaa5c`): `build_feed` never filled the `scale` input the
+released model declares, so ONNX Runtime refused the feed and **the released model could not be evaluated at
+all** - the token now comes from the input's own width (`log2(width / 128)`, the same octave measure the
+trainer and `tools/compare_upscalers.py` use), two regression self-tests pin it (37 checks), and the orphaned
+`scenes[name]` block after `print_summary`'s loop is gone. `train_nrr.py` had three bare `%` in argparse help
+strings that `train --help` died on. `tools/verify_rect_upscale.py` (new) feeds a 160x90 frame through any
+exported graph and asserts the output is exactly that graph's ratio on both axes - it passes for the released
+2x model, the Hub's 2.5x models (`path@ratio`), and `G:\NRR-capture\rect-model.onnx`, a 112,907-parameter model
+trained on an 18-pair 160x90 capture that `evaluate_model.py` scores at **SSIM 0.9085 against the 0.9003
+bilinear baseline** (PSNR 28.70 vs 28.78 dB) on the packed val split.
+
+**Releases** (`ae5fc7ad`). Each engine plugin ships as its own independent GitHub Release
+(`nrr-godot-v1.0.0`, `nrr-unity-v1.0.0`, `nrr-unreal-v1.0.0`), built by `tools/package_plugins.ps1` into
+`work/dist/`: the Godot addon with its GDExtension library at `bin/windows/debug`, the Unity package with
+`nrr.dll` and generated `.meta` files at `Runtime/Plugins/x86_64`, the Unreal plugin with `nrr.dll` and
+`nrr.h` at `Binaries/Win64` and `ThirdParty/NRR/include`. Every package is self-contained - plugin source, the
+native binaries it needs to run, the **CPU** ONNX Runtime DLLs (~6.7 MB per download, ~17 MB unpacked), the released model
+under the SHA-256 the verify setups pin, an `INSTALL.md`, and the LICENSE - and each zip is re-extracted and
+asserted file-by-file before the script reports success. The CUDA provider and its ~2.6 GB runtime are
+deliberately not bundled; the engine setup scripts attach them for the GPU path. Windows x86_64 only, matching
+what has actually been built and run. The Hub card's `spatial` row now documents the non-square verification.
+
 ### The device-side blend is wired and opt-in, and the attach it needs does not happen yet
 
 The kernel's half is complete (rule, layout, statistic - the three entries below), so this step built the other
