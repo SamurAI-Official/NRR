@@ -44,6 +44,23 @@ and a frame record that states whether the arithmetic ran on a device.
   path (`ONNX CUDAExecutionProvider via accel ...`), so those frames are not going through
   `BackendVulkan::execute_model` at all. That is a backend-selection question rather than a blend question, and
   the next step instruments the registry instead of the blend.
+* **And the attach's blocker was two layers down: the Vulkan backend was never registered.** Chasing "the
+  attach never fires" through the registry (`NRR_TRACE_BACKEND=1` now prints what a request resolves to and which
+  backends exist) showed `registered=CPU NVIDIA` - no Vulkan entry at all, in any configuration.
+  `runtime/backend_registry.cpp` had registrars for CPU, NVIDIA, AMD, Intel, RISC-V and Apple and **none for
+  Vulkan**, so `backend_vulkan_create` was unreachable from every caller entry point: the backend compiled,
+  passed its own tests (which construct it directly) and reported a real device, while `--provider vulkan` matched
+  nothing, fell through to the priority table and rendered on NVIDIA. It is registered now, unconditionally
+  (the no-SDK branch is registered and never selected, because `is_supported()` probes the loader and a device),
+  registration does not change automatic selection (Vulkan's priority is below NVIDIA's), and **all three
+  configurations are 205/205**. Two things are recorded rather than tidied away: the trace shows the backend
+  registered **twice**, so a second registrar exists somewhere and one of the two is redundant; and with the
+  attach now succeeding - the frame record carries `[gpu-blend 0]`, so `compute_blend()` is non-null - the hook
+  still reports **0 blended frames**, so the blend is not being dispatched. The two candidates are the
+  accumulator supplying a validity mask for these frames (the guarded path deliberately stays on the CPU) and the
+  counter being read from a different accumulator instance than the one that renders. Until that is settled, the
+  ~8 ms remains **unclaimed**.
+
 * **A pair of rows was recorded for this A/B and deleted rather than committed.** Both runs had the blend off in
   effect (the attach never ran), so a label saying `gpublend-on` would have been a false record of a true
   measurement - the class of mistake `tools/measure_tiers.ps1` exists to prevent. **The ~8 ms the move is worth
