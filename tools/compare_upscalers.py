@@ -24,6 +24,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import evaluate_model as em  # noqa: E402  (reuses its loader, metrics and VMAF plumbing)
 import fsr1                   # noqa: E402
+import gen_training_pairs as gen  # noqa: E402  (the trainer's own baseline geometry, at any ratio)
 import quality_metrics as qm  # noqa: E402
 
 METHODS = ("bilinear", "bicubic", "lanczos", "fsr1", "nrr")
@@ -35,25 +36,45 @@ def pil_upscale(image, factor, resample):
     from PIL import Image
     u8 = (np.clip(image, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     h, w = u8.shape[:2]
-    out = np.asarray(Image.fromarray(u8, "RGB").resize((w * factor, h * factor), resample=resample))
+    out = np.asarray(Image.fromarray(u8, "RGB").resize((int(round(w * factor)), int(round(h * factor))),
+                                                       resample=resample))
     return out.astype(np.float32) / 255.0
 
 
-def make_upscalers(model_onnx, provider):
-    """Returns a dict name -> callable(image) -> upscaled image. `nrr` is present only when a model is given."""
+def make_upscalers(model_onnx, provider, ratio=2.0):
+    """Returns a dict name -> callable(image) -> upscaled image. `nrr` is present only when a model is given.
+
+    `ratio` is the factor every arm is measured at, and it defaults to 2 because every recorded row of this
+    table was taken at 2. It was a literal `2` in four places here - the same defect the generator, the packer,
+    the capture and the trainer have each had removed - and a 2.5x tier makes it visible rather than cosmetic:
+    the first attempt at 768x432 -> 1920x1080 died on the shapes (`operands could not be broadcast together with
+    shapes (1536,1536,3) (1920,1920,3)`), and had they agreed the comparison would have been between two
+    different grids.
+    """
     from PIL import Image
 
     def bicubic(image):
-        return pil_upscale(image, 2, Image.BICUBIC)
+        return pil_upscale(image, ratio, Image.BICUBIC)
 
     def lanczos(image):
-        return pil_upscale(image, 2, Image.LANCZOS)
+        return pil_upscale(image, ratio, Image.LANCZOS)
 
     def fsr1_u(image):
-        return fsr1.fsr1_upscale(image, image.shape[0] * 2, image.shape[1] * 2)
+        return fsr1.fsr1_upscale(image, int(round(image.shape[0] * ratio)),
+                                 int(round(image.shape[1] * ratio)))
+
+    def bilinear(image):
+        """The trainer's exact baseline. At a whole ratio that is the helper the published 2x rows were taken
+        with, so those rows keep their definition; at a fractional one it is the generator's own upscale, which
+        is documented as the trainer's skip geometry (`interpolate(scale_factor=ratio, align_corners=False)`) and
+        takes a float. The helper cannot: passing 2.5 to it raises `'float' object cannot be interpreted as an
+        integer`, which is how this was found."""
+        if abs(ratio - round(ratio)) < 1e-9:
+            return em.bilinear_upscale(image, int(round(ratio)))
+        return gen._upscale(image, ratio).astype(np.float32)
 
     methods = {
-        "bilinear": lambda image: em.bilinear_upscale(image, 2),
+        "bilinear": bilinear,
         "bicubic": bicubic,
         "lanczos": lanczos,
         "fsr1": fsr1_u,
@@ -118,6 +139,11 @@ def main(argv):
     parser.add_argument("--limit", type=int, default=0, help="cap frames per scene (0 = all)")
     parser.add_argument("--model", default="", help="the NRR .onnx to compare (omit to skip NRR)")
     parser.add_argument("--provider", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--ratio", type=float, default=2.0,
+                        help="the upscale factor every arm is measured at (default 2, which is what every "
+                             "recorded row of this table was taken at). 2.5 is the 768x432 -> 1920x1080 tier, "
+                             "and the arms take it too: a table whose baselines upscale by 2 against a 2.5x "
+                             "target is not a comparison")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
                         help="device for LPIPS/DISTS backbones")
     parser.add_argument("--skip-perceptual", action="store_true")
@@ -130,7 +156,7 @@ def main(argv):
     if not scenes:
         raise SystemExit("no %s scenes in %s" % (args.split, args.data))
 
-    upscalers = make_upscalers(args.model or None, args.provider)
+    upscalers = make_upscalers(args.model or None, args.provider, args.ratio)
     methods = [m for m in METHODS if m in upscalers]
 
     perceptual_device = "cuda" if (args.device == "auto" and em.torch is not None and
