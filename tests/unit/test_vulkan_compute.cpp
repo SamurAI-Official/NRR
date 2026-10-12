@@ -20,6 +20,11 @@
 // ---------------------------------------------------------------------------
 #include "test_framework.h"
 
+/* The blend kernel's rule is nrr_temporal.h's - the frame's alpha, from TEMPORAL_BASE_ALPHA and the scene's
+ * motion - so the test reads the one constant from the header rather than inventing a second number for the
+ * same thing. */
+#include "nrr_temporal.h"
+
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -334,46 +339,44 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     }
     const uint32_t w = 8, h = 6;
     const size_t count = static_cast<size_t>(w) * h;
-    const float alpha_base = 0.6f;
-    const float threshold = 2.0f;
+    /* The *frame's* alpha, which is what nrr_temporal.cpp's blend_frame() mixes with: one scalar for the whole
+     * frame, not a per-pixel decay. This kernel used to take alpha_base and a motion threshold and evaluate
+     * `alpha_base * (1 - clamp(|motion| / threshold))` per pixel, which is a different rule from the frame
+     * path's, so it could never have been wired into it - the test agreeing with the shader was the test
+     * agreeing with the wrong contract. */
+    const float alpha = TEMPORAL_BASE_ALPHA;
     auto sample = [](size_t i) { return static_cast<float>((i * 37 + 11) % 101) / 100.0f; };
-    std::vector<float> current(count * 3), previous(count * 3), motion(count * 2);
+    std::vector<float> current(count * 3), previous(count * 3);
     for (size_t i = 0; i < count * 3; ++i) {
         current[i] = sample(i);
         previous[i] = sample(i + 1000);
     }
-    /* Every other pixel is still; the rest sweeps past the threshold, so the alpha rule is exercised
-     * at both ends and in between rather than at one convenient value. */
-    for (size_t i = 0; i < count; ++i) {
-        motion[i] = (i % 2 == 0) ? 0.0f : static_cast<float>(i % 9);
-        motion[count + i] = 0.0f;
-    }
 
     vk::ComputeKernel kernel;
-    NRR_ASSERT(kernel.create(device, words, word_count, 4, 4 * sizeof(uint32_t), why),
+    /* Three storage buffers and twelve bytes of push constants: the rule needs the two frames and the frame's
+     * alpha scalar, and it does not take a motion field at all - which is the point of the rewrite rather than
+     * an omission. */
+    NRR_ASSERT(kernel.create(device, words, word_count, 3, 3 * sizeof(uint32_t), why),
                "the blend kernel builds a pipeline from its SPIR-V");
     vk::VulkanDevice::Buffer* cur = device.create_buffer(count * 3 * sizeof(float));
     vk::VulkanDevice::Buffer* prev = device.create_buffer(count * 3 * sizeof(float));
-    vk::VulkanDevice::Buffer* mot = device.create_buffer(count * 2 * sizeof(float));
     vk::VulkanDevice::Buffer* out = device.create_buffer(count * 3 * sizeof(float));
-    NRR_ASSERT(cur != nullptr && prev != nullptr && mot != nullptr && out != nullptr,
+    NRR_ASSERT(cur != nullptr && prev != nullptr && out != nullptr,
                "the blend buffers could be created");
     NRR_ASSERT(device.upload_buffer(cur, current.data(), current.size() * sizeof(float), 0),
                "the current frame uploads");
     NRR_ASSERT(device.upload_buffer(prev, previous.data(), previous.size() * sizeof(float), 0),
                "the previous frame uploads");
-    NRR_ASSERT(device.upload_buffer(mot, motion.data(), motion.size() * sizeof(float), 0),
-               "the motion field uploads");
 
-    struct Params { uint32_t width, height; float alpha_base, motion_threshold; };
-    const Params params = {w, h, alpha_base, threshold};
+    struct Params { uint32_t width, height; float alpha; };
+    const Params params = {w, h, alpha};
     vk::DispatchPlan plan;
     NRR_ASSERT(vk::plan_dispatch(static_cast<uint32_t>(count), 64,
                                  device.info().workgroup_max_invocations, plan, why),
                "the blend dispatch plans");
     vk::DispatchRequest request;
     request.kernel = &kernel;
-    request.buffers = {cur->buffer, prev->buffer, mot->buffer, out->buffer};
+    request.buffers = {cur->buffer, prev->buffer, out->buffer};
     request.push_constants = &params;
     request.push_constant_bytes = sizeof(params);
     request.plan = plan;
@@ -385,31 +388,43 @@ NRR_TEST(test_vulkan_temporal_blend_matches_the_cpu_reference) {
     NRR_ASSERT(device.download_buffer(out, produced.data(), produced.size() * sizeof(float), 0),
                "the blended frame comes back");
 
+    /* The reference is the runtime's own expression, transcribed from nrr_temporal.cpp's blend_frame():
+     * (1 - alpha) * current + alpha * history, with ONE alpha for the whole frame. */
     double worst = 0.0;
-    double still_pixel_alpha = -1.0;
-    for (size_t i = 0; i < count; ++i) {
-        float magnitude = motion[i] / threshold;
-        if (magnitude < 0.0f) magnitude = 0.0f;
-        if (magnitude > 1.0f) magnitude = 1.0f;
-        const float alpha = alpha_base * (1.0f - magnitude);
-        if (i % 2 == 0) still_pixel_alpha = alpha;
-        for (uint32_t c = 0; c < 3; ++c) {
-            const size_t at = static_cast<size_t>(c) * count + i;
-            const float expected = current[at] * (1.0f - alpha) + previous[at] * alpha;
-            const double diff = std::fabs(static_cast<double>(produced[at] - expected));
-            if (diff > worst) worst = diff;
-        }
+    for (size_t at = 0; at < produced.size(); ++at) {
+        const float expected = current[at] * (1.0f - alpha) + previous[at] * alpha;
+        const double diff = std::fabs(static_cast<double>(produced[at] - expected));
+        if (diff > worst) worst = diff;
     }
-    std::cout << "  blend 8x6: worst |gpu - cpu| = " << worst << " (alpha_base " << alpha_base
-              << ", still-pixel alpha " << still_pixel_alpha << ")" << std::endl;
-    NRR_EXPECT_TRUE(worst <= 1e-6, "the blend kernel matches the CPU reference alpha rule");
-    NRR_EXPECT_TRUE(still_pixel_alpha == alpha_base,
-                    "a pixel that did not move keeps the full history weight, by the rule");
+    std::cout << "  blend 8x6: worst |gpu - cpu| = " << worst << " (alpha " << alpha
+              << ", the frame's own scalar)" << std::endl;
+    NRR_EXPECT_TRUE(worst <= 1e-6, "the blend kernel matches the accumulator's rule");
+
+    /* The two endpoints, which pin the rule down in a way no single alpha can. At alpha = 0 the output must be
+     * the current frame exactly; at alpha = 1 the warped history exactly. A per-pixel decay cannot produce
+     * either - at any alpha_base it is still a mixture, per pixel - so these dispatches are what distinguish the
+     * frame path's rule from a lookalike, which is the defect this kernel was rewritten to remove. */
+    auto blend_with = [&](float value, std::vector<float>& got) -> bool {
+        const Params at = {w, h, value};
+        vk::DispatchRequest again;
+        again.kernel = &kernel;
+        again.buffers = {cur->buffer, prev->buffer, out->buffer};
+        again.push_constants = &at;
+        again.push_constant_bytes = sizeof(at);
+        again.plan = plan;
+        if (!vk::dispatch(device, again, why)) return false;
+        got.assign(count * 3, 0.0f);
+        return device.download_buffer(out, got.data(), got.size() * sizeof(float), 0);
+    };
+    std::vector<float> at_zero, at_one;
+    NRR_ASSERT(blend_with(0.0f, at_zero), "the blend dispatches at alpha 0");
+    NRR_ASSERT(blend_with(1.0f, at_one), "the blend dispatches at alpha 1");
+    NRR_EXPECT_TRUE(at_zero == current, "alpha 0 leaves the current frame untouched");
+    NRR_EXPECT_TRUE(at_one == previous, "alpha 1 is the warped history exactly");
 
     kernel.destroy();
     device.destroy_buffer(cur);
     device.destroy_buffer(prev);
-    device.destroy_buffer(mot);
     device.destroy_buffer(out);
     release_test_device(device);
 #else

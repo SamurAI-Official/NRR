@@ -1231,9 +1231,13 @@ Done, measured (numbers in `CHANGELOG.md`, "Vulkan: the branch no build ever com
       is **76.80 ms - 86% of the host overhead and 57% of the frame** - and the two conversions 11.8 ms together.
       The Vulkan backend's frames already carry the same hash as the CUDA path's (`0x45317f2470dc61ac`), so this is
       a cost item, not a correctness one, and what each move is worth is now arithmetic rather than hope:
-      * the **blend's arithmetic alone is a wash**: `temporal_blend` exists and matches the CPU rule to 5.96e-08,
-        but its planes are ~64 MB/frame to upload (~5-6 ms at this tier) against the 13.04 ms the arithmetic costs
-        on the CPU;
+      * the **blend kernel has been corrected to the runtime's rule first**, because it was a *different policy*:
+        it computed a per-pixel `alpha_base * (1 - clamp(|motion| / threshold))` from the motion field while
+        `blend_frame()` mixes one scalar alpha per frame, and its test agreed with the shader rather than with the
+        path. With the corrected kernel the move is worth **~19-20 ms** rather than the wash this line used to
+        record: the motion field no longer has to be uploaded (16 MB/frame here) and the blend takes the model's
+        NCHW output directly, so `rgb` and the accumulator's convert-in/out leave the path - ~24 ms of CPU work
+        against ~48 MB of uploads (~4-5 ms);
       * the **whole post chain** is the real target (~89 ms) and needs three things that do not exist yet: a
         **warp kernel** (the blend kernel takes the previous frame already warped, deliberately), the **history as
         device buffers** instead of `TemporalAccumulator`'s host vectors, and the accumulator's **trust mask,
