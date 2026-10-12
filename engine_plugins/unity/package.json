@@ -21,10 +21,10 @@
         "real-time rendering"
     ],
     "author": {
-        "name": "NRR Project",
-        "url": "https://github.com/nrr-project"
+        "name": "SamurAI-Official",
+        "url": "https://github.com/SamurAI-Official"
     },
-    "documentationUrl": "https://nrr-project.github.io/docs/unity",
-    "licenseUrl": "https://github.com/nrr-project/nrr/blob/main/LICENSE",
+    "documentationUrl": "https://github.com/SamurAI-Official/NRR#readme",
+    "licenseUrl": "https://github.com/SamurAI-Official/NRR/blob/main/LICENSE",
     "hideInEditor": false
 }

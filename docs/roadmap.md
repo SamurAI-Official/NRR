@@ -1439,10 +1439,11 @@ backends stay `structural` (compiled, gated by `NRR_ENABLE_*`, never executed).
       (`unreal_verify/setup.ps1`, `unity_verify/setup.ps1`), and that Hub publication is the distribution channel
       `models/HUB_README.md` and `.gitignore` document. What it deliberately is **not**: a versioned release - no
       tag, no archive, no ABI/spec version check at load time, which is what the first item above still owes.
-- [~] Licence/provenance review before any model weights ship: **the weights are shipped**, under the
-      repository's own MIT licence, with the card stating the graph contract, the measured tier numbers and the
-      provenance (trained in-repo on Godot captures). The remaining half is M10.6's enforcement point - per-source
-      terms in the dataset manifest, and the trainer refusing a Tier-2 dataset for a shippable export.
+- [~] Licence/provenance review before any model weights ship: **the weights are shipped**, now under the
+      repository's **All Rights Reserved** licence (changed from MIT at the licence commit; the card states the graph
+      contract, the measured tier numbers and the provenance - trained in-repo on Godot captures). The remaining half
+      is M10.6's enforcement point - per-source terms in the dataset manifest, and the trainer refusing a Tier-2
+      dataset for a shippable export.
 
 ## M10 - The trained model, its data, and the engine seam `active frontier`
 

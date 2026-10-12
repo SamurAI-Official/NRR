@@ -683,7 +683,21 @@ can be checked against the repository rather than taken on trust.
 
 ## License
 
-See [LICENSE](LICENSE).
+**All Rights Reserved.** Copyright (c) 2026 SamurAI-Official. No permission is
+granted to use, reproduce, modify, distribute, sublicense, or commercially
+exploit this software without prior written authorization from the copyright
+holder. See [LICENSE](LICENSE) for the full terms, which include an "as is"
+warranty disclaimer.
+
+This applies to the repository, the engine plugin packages published as GitHub
+Releases, and the model weights and card published on the Hub. The change from
+the repository's original MIT licence took effect at the commit that updated
+[LICENSE](LICENSE); it does not retract the MIT grant for copies already
+distributed under it.
+
+Third-party components are **not** covered by this licence and remain under
+their own terms: ONNX Runtime (MIT), FidelityFX FSR1 (MIT), Streamline, xeSS,
+DLSS and the CUDA runtime (see [docs/third-party-sdks.md](docs/third-party-sdks.md)).
 
 ---
 

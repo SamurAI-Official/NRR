@@ -1,5 +1,7 @@
 ---
-license: mit
+license: other
+license_name: All Rights Reserved
+license_link: https://github.com/SamurAI-Official/NRR/blob/main/LICENSE
 library_name: onnxruntime
 pipeline_tag: image-to-image
 tags:
@@ -231,4 +233,7 @@ One description in the repository does **not** match this model: `models/archite
 aspirational 1080p -> 4K color+depth+motion network, which is not what is published here. The contract above is
 this graph's real one, read from the model.
 
-Licence: MIT - see `LICENSE`.
+Licence: **All Rights Reserved** - see `LICENSE` (Copyright (c) 2026
+SamurAI-Official). The weights and this card are covered by the same terms as the
+repository; nothing here is granted under the MIT licence the repository
+originally carried.
