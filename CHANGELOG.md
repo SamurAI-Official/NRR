@@ -61,7 +61,18 @@ and a frame record that states whether the arithmetic ran on a device.
   counter being read from a different accumulator instance than the one that renders. Until that is settled, the
   ~8 ms remains **unclaimed**.
 
-* **A pair of rows was recorded for this A/B and deleted rather than committed.** Both runs had the blend off in
+* **The dispatch is 0 because the measured tier supplies a trust mask - and that is the whole of what remains.**
+  `TemporalAccumulator::apply` sets `validity` to a mask whenever the disocclusion guard is on, and the guard
+  defaults to the *device's* temporal-coherence claim (`backend_->apply_disocclusion_rejection_default()`), which
+  this GPU reports. So on the tier these rows measure, `blend_frame` takes its guarded path and the hook is
+  correctly skipped - correctly, because the guarded blend is not the same operation: a rejected pixel keeps the
+  current frame and an accepted one has its history clamped to the per-channel min/max of the current frame over
+  a (2*TEMPORAL_CLAMP_RADIUS+1)^2 box, and neither is in the kernel. **So "finishing" the move means writing
+  that second kernel** - a mask binding, the 3x3 min/max, the reject branch and a test that holds it against
+  `blend_frame`'s own expression - not attaching what exists. The ~8 ms is available only where no mask is
+  supplied, which is the one configuration the measured tier is not in. Recorded here so the next attempt starts
+  from the rule rather than from a counter reading 0.
+
   effect (the attach never ran), so a label saying `gpublend-on` would have been a false record of a true
   measurement - the class of mistake `tools/measure_tiers.ps1` exists to prevent. **The ~8 ms the move is worth
   is therefore not claimed**, and the CHANGELOG says so rather than leaving an estimate standing as a result.
