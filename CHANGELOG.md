@@ -13,6 +13,42 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The device-side blend is wired and opt-in, and the attach it needs does not happen yet
+
+The kernel's half is complete (rule, layout, statistic - the three entries below), so this step built the other
+half: an interface the accumulator can hold without naming Vulkan, a backend-owned dispatcher, an opt-in switch,
+and a frame record that states whether the arithmetic ran on a device.
+
+* **The interface** (`runtime/nrr_compute_blend.h`): `blend(current, warped_previous, width, height, alpha,
+  out_mean_abs_delta)`, plus `blended_frames()` and `kernel_sha256()` so a measurement can tell "the GPU did it"
+  from "the caller asked and the CPU did it anyway" - the distinction `parallel_call_count()` exists for in
+  nrr_parallel.h. Vulkan-free on purpose: the accumulator is compiled into every configuration, including the
+  ones with no Vulkan at all.
+* **The dispatcher** (`runtime/vulkan/vulkan_compute_blend.cpp`): four device buffers reused across frames, a
+  dispatch plan sized from the device's own measured limits, one upload per plane, one download of the result and
+  the partial-sum readback. A device that cannot run it returns false and the accumulator's own loop runs - so a
+  refusal costs speed and never a frame.
+* **The hook**: `TemporalRenderer::blend_frame` takes an optional `ComputeBlend*` and dispatches the mix instead
+  of looping when one is present and the frame needs no validity guard (the guard's mask and neighbourhood clamp
+  are deliberately not in the kernel). The kernel's statistic lands in the same `TemporalBlendStats`, and a
+  refusing device falls through to the loop.
+* **Opt-in by name** - `NRR_GPU_BLEND` - because this changes a frame's *rounding*, not its rule: the GPU
+  evaluates the same expression in float and differs by about a ulp (measured 5.96e-08), which the RGB8
+  quantisation usually absorbs and cannot be proved to absorb. Unset is the frames this repository has always
+  produced: **all three configurations' suites are 205/205 with the hook in place and off**, and every recorded
+  frame hash is unchanged.
+* **But the attach does not happen, and finding that out is this step's result.** `BackendVulkan::execute_model`
+  calls `attach_compute_blend()` per frame; a diagnostic print in that method never fired while a
+  `--provider vulkan` frame rendered in `build-vulkan`, and the failure path that prints why a *requested* blend
+  was unavailable never fired either. Both strings are in `nrr.dll`, and the frames take the shared accelerator
+  path (`ONNX CUDAExecutionProvider via accel ...`), so those frames are not going through
+  `BackendVulkan::execute_model` at all. That is a backend-selection question rather than a blend question, and
+  the next step instruments the registry instead of the blend.
+* **A pair of rows was recorded for this A/B and deleted rather than committed.** Both runs had the blend off in
+  effect (the attach never ran), so a label saying `gpublend-on` would have been a false record of a true
+  measurement - the class of mistake `tools/measure_tiers.ps1` exists to prevent. **The ~8 ms the move is worth
+  is therefore not claimed**, and the CHANGELOG says so rather than leaving an estimate standing as a result.
+
 ### The Vulkan blend kernel was a different policy, and its test agreed with it
 
 The frame path's blend is one scalar alpha per frame - `nrr_temporal.cpp`'s `blend_frame()` mixes
