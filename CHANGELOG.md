@@ -13,12 +13,45 @@ actually printed rather than estimates.
 ---
 
 ## [Unreleased] - 1.0.0-dev
+### The Vulkan blend kernel was a different policy, and its test agreed with it
+
+The frame path's blend is one scalar alpha per frame - `nrr_temporal.cpp`'s `blend_frame()` mixes
+`(1 - alpha) * current + alpha * history`, and the alpha comes from the *scene's* motion through
+`TEMPORAL_ALPHA_MOTION_GATE_PX`/`_FULL_PX`, which `nrr_temporal.h` documents in frame-grid pixels per frame.
+The `temporal_blend` kernel computed `alpha_base * (1 - clamp(|motion| / threshold))` **per pixel** from the
+motion field. Those are different rules wearing the same name, and its test passed because the test's CPU
+reference transcribed the *shader's* contract - so "the kernel matches the CPU reference" was true and said
+nothing about whether the kernel could be wired into the frame path. It could not: wiring it would change every
+frame's bytes, and with them every recorded frame hash, the parity docs and every dataset packed against them.
+
+* **The kernel now evaluates the runtime's expression.** The alpha is a push constant, the motion field is not an
+  input at all (a caller cannot pass a field and get a different frame - the honest form of "this is the same
+  rule"), and the shader's header states why the change happened, at the code it replaces. Recompiled from
+  source: `temporal_blend.spv`, 437 words, sha256 `46dc35ba682a8ad646afb00409dc806a3fb14561816c9e6ae797af7764539b96`.
+* **The test can now fail where it could not before.** It reads `TEMPORAL_BASE_ALPHA` from `nrr_temporal.h` - one
+  definition of the number, which the header says is the point of that file - and compares against
+  `blend_frame()`'s own expression. Two endpoint dispatches pin the rule down in a way no single alpha can:
+  at alpha 0 the output must be the current frame exactly, at alpha 1 the warped history exactly, and a per-pixel
+  decay can produce neither at *any* `alpha_base` because it is still a mixture per pixel. Measured on the GPU:
+  `worst |gpu - cpu| = 5.96046e-08 (alpha 0.7, the frame's own scalar)`, and 205/205.
+* **What it changes about the wiring estimate.** With the corrected rule the move is worth more than the wash the
+  previous entry recorded, and for two reasons that are arithmetic rather than optimism: the motion field no
+  longer has to be uploaded (16 MB/frame at this tier), and the blend can take the model's NCHW output directly,
+  so the accumulator's convert-in and convert-out - and the `rgb` conversion - stop being on the path at all.
+  That is ~24 ms of CPU work against ~48 MB of uploads (~4-5 ms): **~19-20 ms, ≈14% of a 137 ms frame**, and it
+  is the first step of the whole-post-chain move in `docs/roadmap.md` M4/V2 rather than a substitute for it.
+* **The guarded blend stays on the CPU, deliberately.** A validity mask with the `(2*TEMPORAL_CLAMP_RADIUS+1)^2`
+  neighbourhood clamp is the path a model that declares `validity` takes, and it is not this kernel: it needs the
+  mask and the clamp's min/max over the current frame, so it is written and tested as its own kernel or not at
+  all. The shader says so where a reader would otherwise assume coverage.
+
 ### Where the Vulkan frame path's CPU actually goes, and the conversion that was left on one thread
 
 The Vulkan configuration now builds on this machine with glslc from the NDK's shader-tools and **all four
 SPIR-V kernels run on the GPU and pass against their CPU references**: `nchw_pack`/`rgb8_unpack` (5.96e-08 worst
-error over 2257 pixels), `upscale_bilinear` (3.28e-07, 9x5 -> 27x15) and `temporal_blend` (5.96e-08, alpha rule
-included), against a measured device (`NVIDIA GeForce RTX 4070 Ti`, api 1.4, subgroup 32, workgroup <= 1024,
+error over 2257 pixels), `upscale_bilinear` (3.28e-07, 9x5 -> 27x15) and `temporal_blend` (5.96e-08 - see the
+entry above, which is where that kernel turned out to be a *different rule* from the frame path's and was
+rewritten), against a measured device (`NVIDIA GeForce RTX 4070 Ti`, api 1.4, subgroup 32, workgroup <= 1024,
 11992 MB). What is *not* done is the wiring the roadmap names, and this entry is the measurement that scopes it.
 
 * **The Vulkan backend's frames are already byte-identical to the CUDA path's** - `vulkan-baseline-25x` carries
