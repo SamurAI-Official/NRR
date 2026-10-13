@@ -16,7 +16,7 @@
                                     --export-unqualified and BELOW its bilinear baseline, published so the
                                     "the pipeline is not square-only" claim points at a downloadable artifact
         README.md                   the model card, from models/HUB_README.md
-        LICENSE                     the repository's licence
+        LICENSE                     the models' MIT licence, from models/LICENSE
 
     `hf upload SamurAI-Official/NRR .` - the obvious command - would have pushed all 18 GB and, worse, the
     project's own README.md, which would have replaced the model card on the Hub. This script exists so that is
@@ -106,7 +106,7 @@ try {
     )
 
     $card = "models/HUB_README.md"
-    $licence = "LICENSE"
+    $licence = "models/LICENSE"
 
     # The installer puts `hf` in %USERPROFILE%\.local\bin and tells you to reopen the terminal, so an old shell
     # will not find it on PATH. Resolve it here rather than making that the caller's problem.
@@ -163,7 +163,7 @@ try {
     }
     if (Test-Path $licence) {
         Copy-Item $licence (Join-Path $StagingDir "LICENSE") -Force
-        Write-Host ("  {0,10:N0} B  LICENSE" -f (Get-Item $licence).Length)
+        Write-Host ("  {0,10:N0} B  LICENSE  (the models' MIT licence, from {1})" -f (Get-Item $licence).Length, $licence)
     } else {
         $missing += $licence
     }

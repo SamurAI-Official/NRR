@@ -1,7 +1,5 @@
 ---
-license: other
-license_name: all-rights-reserved
-license_link: https://github.com/SamurAI-Official/NRR/blob/main/LICENSE
+license: mit
 library_name: onnxruntime
 pipeline_tag: image-to-image
 tags:
@@ -14,11 +12,16 @@ tags:
 
 # NRR upscalers - the released 2x model, and a 2.5x tier
 
-> **Licence: All Rights Reserved.** Copyright (c) 2026 SamurAI-Official. No permission is granted to use,
-> reproduce, modify, distribute, sublicense or commercially exploit these weights or this card without prior
-> written authorization from the copyright holder. Full terms: [LICENSE](https://github.com/SamurAI-Official/NRR/blob/main/LICENSE).
-> The front-matter tag `license_name: all-rights-reserved` is the lowercased spelling the Hub's metadata
-> validator requires; it names the same terms.
+> **Licence: MIT.** Copyright (c) 2026 SamurAI-Official. Permission is hereby granted, free of charge, to any
+> person obtaining a copy of these model weights and this card to deal in them without restriction, including the
+> rights to use, copy, modify, merge, publish, distribute, sublicense and/or sell copies, subject to the terms in
+> [LICENSE](https://huggingface.co/SamurAI-Official/NRR/raw/main/LICENSE) (the MIT warranty disclaimer included).
+> These are the models already distributed under MIT, and they stay MIT.
+>
+> **Future models:** from the commit the repository moved to an All Rights Reserved licence, code and model
+> weights developed *after* that change are All Rights Reserved and are **not** covered by this MIT grant. A
+> Hugging Face repo carries one `license:` field, so any such model belongs in its own repo or a clearly-marked
+> path rather than silently inheriting the MIT tag above.
 
 A 2x neural upscaler as a single ONNX graph of about 461 KB, trained in the
 [NRR repository](https://github.com/SamurAI-Official/NRR) and used there as *the released model*: the one the

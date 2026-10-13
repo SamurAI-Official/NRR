@@ -14,5 +14,9 @@ No permission is granted to use, reproduce, modify, distribute, sublicense,
 or commercially exploit this software without prior written authorization from the copyright holder, 
 except where otherwise permitted by applicable law.
 
+Model weights already published to the Hugging Face model repository (SamurAI-Official/NRR) were
+distributed under the MIT licence and remain under it. This All Rights Reserved licence governs the
+repository code and any model developed from the licence-change commit onward.
+
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.

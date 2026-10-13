@@ -10,7 +10,7 @@
 # (the GDExtension library for Godot; nrr.dll for Unity/Unreal), the CPU ONNX
 # Runtime DLLs (no CUDA runtime - ~17 MB per package instead of ~2.6 GB), the
 # released model upscale_msreal_scale.onnx (pinned SHA-256), an INSTALL.md and
-# the repository's LICENSE (All Rights Reserved).
+# the model's MIT LICENSE (as LICENSE) and the plugin code's All Rights Reserved licence (as CODE-LICENSE).
 #
 # Inputs that must already exist (gitignored build output and fetched deps):
 #   build/Release/nrr.dll                                  tools/build.ps1
@@ -103,8 +103,10 @@ if ($ort.Name -match 'gpu') {
 }
 Info "ONNX Runtime: $($ort.Name)"
 
-$licenseSrc = Join-Path $repoRoot 'LICENSE'
-Assert-File $licenseSrc 'the LICENSE must be shipped with every package'
+$licenseSrc = Join-Path $repoRoot 'models\LICENSE'
+$codeLicenseSrc = Join-Path $repoRoot 'LICENSE'
+Assert-File $licenseSrc "the model's MIT LICENSE (models/LICENSE) must be shipped with every package"
+Assert-File $codeLicenseSrc 'the code LICENSE (All Rights Reserved) must be shipped as CODE-LICENSE'
 
 # --- stage the three packages -----------------------------------------------
 
@@ -128,6 +130,7 @@ $godotModels = Join-Path $godotRoot 'models'
 New-Item -ItemType Directory -Force -Path $godotModels | Out-Null
 Copy-Item -LiteralPath $modelSrc -Destination (Join-Path $godotModels $modelName) -Force
 Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $godotRoot 'LICENSE') -Force
+Copy-Item -LiteralPath $codeLicenseSrc -Destination (Join-Path $godotRoot 'CODE-LICENSE') -Force
 
 # --- 2. Unity: com.nrr.rendering/ (extracted into <project>/Packages/) -----
 # The package's Runtime/ tree plus the native binaries at the documented
@@ -194,6 +197,7 @@ $unityModels = Join-Path $unityRoot 'Runtime\Models'
 New-Item -ItemType Directory -Force -Path $unityModels | Out-Null
 Copy-Item -LiteralPath $modelSrc -Destination (Join-Path $unityModels $modelName) -Force
 Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $unityRoot 'LICENSE') -Force
+Copy-Item -LiteralPath $codeLicenseSrc -Destination (Join-Path $unityRoot 'CODE-LICENSE') -Force
 
 # --- 3. Unreal: NRRPlugin/ (extracted into <YourProject>/Plugins/) ----------
 # Layout mirrors engine_plugins/unreal_verify/setup.ps1: nrr.dll and the ONNX
@@ -216,6 +220,7 @@ $unrealModels = Join-Path $unrealRoot 'Models'
 New-Item -ItemType Directory -Force -Path $unrealModels | Out-Null
 Copy-Item -LiteralPath $modelSrc -Destination (Join-Path $unrealModels $modelName) -Force
 Copy-Item -LiteralPath $licenseSrc -Destination (Join-Path $unrealRoot 'LICENSE') -Force
+Copy-Item -LiteralPath $codeLicenseSrc -Destination (Join-Path $unrealRoot 'CODE-LICENSE') -Force
 
 # The .gitignore is repo-internal plumbing; shipped inside a consumer's
 # Plugins/NRRPlugin/ it would wrongly ignore the Binaries/ we just staged.
@@ -228,8 +233,8 @@ $installCommon = @"
 
 Windows x86_64 only (the platform that has actually been built and run for
 this plugin). Carries the CPU ONNX Runtime DLLs; the CUDA provider and its
-~2.6 GB runtime are deliberately not bundled. Licensed under the repository's
-LICENSE (All Rights Reserved) - see the LICENSE file next to this one.
+~2.6 GB runtime are deliberately not bundled. The bundled model is MIT (see the
+LICENSE file next to this one); the plugin source is All Rights Reserved (CODE-LICENSE).
 Model and source: https://github.com/SamurAI-Official/NRR
 "@
 
@@ -309,6 +314,7 @@ $requiredByPackage = @{
         'nrr\bin\windows\debug\onnxruntime_providers_shared.dll'
         "nrr\models\$modelName"
         'nrr\LICENSE'
+        'nrr\CODE-LICENSE'
     )
     'nrr-unity-package'  = @(
         'com.nrr.rendering\package.json'
@@ -319,6 +325,7 @@ $requiredByPackage = @{
         'com.nrr.rendering\Runtime\Plugins\x86_64\onnxruntime_providers_shared.dll'
         "com.nrr.rendering\Runtime\Models\$modelName"
         'com.nrr.rendering\LICENSE'
+        'com.nrr.rendering\CODE-LICENSE'
     )
     'nrr-unreal-plugin'  = @(
         'NRRPlugin\NRRPlugin.uplugin'
@@ -329,6 +336,7 @@ $requiredByPackage = @{
         'NRRPlugin\ThirdParty\NRR\include\nrr.h'
         "NRRPlugin\Models\$modelName"
         'NRRPlugin\LICENSE'
+        'NRRPlugin\CODE-LICENSE'
     )
 }
 $modelInZip = @{

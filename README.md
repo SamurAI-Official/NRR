@@ -660,7 +660,8 @@ Each engine plugin ships as its own **independent GitHub Release** (one tag per 
 `tools/package_plugins.ps1`. Every package is self-contained: the plugin source, the native
 binaries it needs to run (`nrr.dll` where the engine loads it, or the GDExtension library for
 Godot), the **CPU** ONNX Runtime DLLs (~6.7 MB per download, ~17 MB unpacked, so the smallest usable install), the released
-model `upscale_msreal_scale.onnx`, and a copy of [LICENSE](LICENSE). The CUDA provider and its
+model `upscale_msreal_scale.onnx`, and both licences: `LICENSE` (the model's **MIT** terms) and `CODE-LICENSE` (the
+plugin source, All Rights Reserved). The CUDA provider and its
 ~2.6 GB of runtime are deliberately **not** bundled - attach those with each engine's own setup
 script when you want the GPU path.
 
@@ -725,11 +726,10 @@ exploit this software without prior written authorization from the copyright
 holder. See [LICENSE](LICENSE) for the full terms, which include an "as is"
 warranty disclaimer.
 
-This applies to the repository, the engine plugin packages published as GitHub
-Releases, and the model weights and card published on the Hub. The change from
-the repository's original MIT licence took effect at the commit that updated
-[LICENSE](LICENSE); it does not retract the MIT grant for copies already
-distributed under it.
+This applies to the repository and the engine plugin **source** published as GitHub Releases. It does **not**
+cover the model weights already on the Hub: those were distributed under **MIT** and stay MIT (the Hub card and
+its `LICENSE` carry the MIT terms). From the licence-change commit onward, new code and new models are All
+Rights Reserved.
 
 Third-party components are **not** covered by this licence and remain under
 their own terms: ONNX Runtime (MIT), FidelityFX FSR1 (MIT), Streamline, xeSS,
