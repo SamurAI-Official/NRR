@@ -11,8 +11,12 @@
         upscale_msreal_scale.onnx   the released model (the one setup.ps1 deploys and docs/parity.md measures)
         phases/*.onnx               the phase models the docs compare against
         probes/*.onnx               the sample and probe models the test suite and the drift guards load
+        ratio25/*.onnx              the 2.5x tier and the captured variants, each with its gate report
+        rect/*.onnx                 the 16:9 model (160x90 -> 320x180). A plumbing proof only: exported
+                                    --export-unqualified and BELOW its bilinear baseline, published so the
+                                    "the pipeline is not square-only" claim points at a downloadable artifact
         README.md                   the model card, from models/HUB_README.md
-        LICENSE                     the repository's licence (MIT)
+        LICENSE                     the repository's licence
 
     `hf upload SamurAI-Official/NRR .` - the obvious command - would have pushed all 18 GB and, worse, the
     project's own README.md, which would have replaced the model card on the Hub. This script exists so that is
@@ -71,7 +75,17 @@ try {
         @{ From = "models/ratio25/upscale_25x_captured_depthjitter.onnx";        To = "ratio25/upscale_25x_captured_depthjitter.onnx";        What = "the 2.5x model trained on captured frames" },
         @{ From = "models/ratio25/upscale_25x_captured_depthjitter.report.json"; To = "ratio25/upscale_25x_captured_depthjitter.report.json"; What = "its gate report" },
         @{ From = "models/ratio25/upscale_25x_captured_nj_depth_s2.onnx";        To = "ratio25/upscale_25x_captured_nj_depth_s2.onnx";        What = "the 2.5x model trained on captured frames, un-jittered contract" },
-        @{ From = "models/ratio25/upscale_25x_captured_nj_depth_s2.report.json"; To = "ratio25/upscale_25x_captured_nj_depth_s2.report.json"; What = "its gate report" }
+        @{ From = "models/ratio25/upscale_25x_captured_nj_depth_s2.report.json"; To = "ratio25/upscale_25x_captured_nj_depth_s2.report.json"; What = "its gate report" },
+        # The 16:9 model. This is NOT a released model and NOT a quality result: it was exported with
+        # --export-unqualified and scores BELOW its bilinear baseline (SSIM 0.89984 vs 0.90028). It is published
+        # because it is the artifact the "the pipeline is not square-only" claim in the README and the Hub card
+        # point at - tools/verify_rect_upscale.py renders a 160x90 frame through it and gets (1, 3, 180, 320)
+        # back, which is the only thing it proves. Its report travels with it so the three failed gates are
+        # downloadable rather than asserted. The capture lives outside the repository (G:\NRR-capture) because
+        # that is where the non-square captures were written; a checkout without it simply does not carry this
+        # row, which the staging loop below reports rather than hides.
+        @{ From = "G:/NRR-capture/rect-model.onnx";         To = "rect/rect-model.onnx";         What = "the 16:9 model (160x90 -> 320x180), a plumbing proof only - it is BELOW its bilinear baseline" },
+        @{ From = "G:/NRR-capture/rect-model.report.json";  To = "rect/rect-model.report.json";  What = "its provenance, including the three release gates it fails" }
     )
 
     # The Unity verification project's tests take the highest-dated models/p5/p4_tjit_*.onnx and score their

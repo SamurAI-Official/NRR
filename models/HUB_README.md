@@ -1,6 +1,6 @@
 ---
 license: other
-license_name: All Rights Reserved
+license_name: all-rights-reserved
 license_link: https://github.com/SamurAI-Official/NRR/blob/main/LICENSE
 library_name: onnxruntime
 pipeline_tag: image-to-image
@@ -13,6 +13,12 @@ tags:
 ---
 
 # NRR upscalers - the released 2x model, and a 2.5x tier
+
+> **Licence: All Rights Reserved.** Copyright (c) 2026 SamurAI-Official. No permission is granted to use,
+> reproduce, modify, distribute, sublicense or commercially exploit these weights or this card without prior
+> written authorization from the copyright holder. Full terms: [LICENSE](https://github.com/SamurAI-Official/NRR/blob/main/LICENSE).
+> The front-matter tag `license_name: all-rights-reserved` is the lowercased spelling the Hub's metadata
+> validator requires; it names the same terms.
 
 A 2x neural upscaler as a single ONNX graph of about 461 KB, trained in the
 [NRR repository](https://github.com/SamurAI-Official/NRR) and used there as *the released model*: the one the
@@ -161,11 +167,44 @@ arm upscaled by 2 would be scoring one grid and labelling it another):
 * **VMAF is skipped** (`--skip-vmaf`): `evaluate_model`'s VMAF path writes into a temp directory that is not
   there, so this run omits the column rather than being quietly shortened.
 
+## The 16:9 model (`rect/rect-model.onnx`) - a plumbing proof, not a quality result
+
+`rect-model.onnx` is **not** a released model and is **not** an alternative to the 2x graph above. It exists to
+answer one question: does a *non-square* canvas render end to end, or does something in the pipeline assume a
+square? It renders. `tools/verify_rect_upscale.py` in the NRR repository feeds a 160x90 frame through it and
+asserts the output is exactly `(1, 3, 180, 320)` - 2x on both axes, finite, no square reshape anywhere.
+
+Read its numbers with that in mind, because they are **worse than bilinear**:
+
+| arm | 160x90 -> 320x180, 6 held-out val pairs | PSNR dB | SSIM | MS-SSIM |
+| --- | --- | --- | --- | --- |
+| bilinear (the baseline) | 18 captured pairs, 12 train / 6 val | 28.7766 | 0.90028 | 0.96080 |
+| rect-model.onnx | same split | 28.7725 | 0.89984 | 0.96075 |
+
+It was exported with `--export-unqualified`, and its own `rect-model.report.json` records the three gates it
+fails:
+
+* **does not beat the baseline** - val L1 0.011708 against the baseline's 0.011638, which is not 5% lower;
+* **is the baseline** - its output differs from the plane it corrects by only 0.000724, against a 0.0010 floor,
+  so the network learned almost nothing;
+* **ignores motion** - zeroing the `motion` input changes the output by 0.000000, against a 0.0001 floor.
+
+So: 112,907 parameters trained for 3 epochs (6.91 s on CPU) over **18 pairs** from a single capture, which is
+a smoke test's worth of data. Its `motion` and `depth` ablations are near zero because the ablation, not the
+training, is the interesting part of the check - and `verify_rect_upscale.py` is what actually passes here.
+
+It is published beside the released model for the same reason the 2.5x tier is: it is the artifact a claim in
+the repository points at, and a claim a reader cannot download is a claim they have to take on trust. Its
+provenance travels with it as `rect/rect-model.report.json`, which is gitignored in the repository itself.
+
+
 ## Files
 
 | file | bytes | what it is |
 | --- | --- | --- |
 | `upscale_msreal_scale.onnx` | 461,501 | the released model: the two-tier (`scale` token) upscaler described above |
+| `rect/rect-model.onnx` | 456,548 | the 16:9 plumbing proof: 160x90 -> 320x180, inputs `color`, `depth`, `motion`, 112,907 parameters, exported `--export-unqualified` and **below its bilinear baseline** on all three image metrics - see the section above |
+| `rect/rect-model.report.json` | 3,714 | its provenance, including the three release gates it fails |
 | `ratio25/upscale_25x_procedural_depth.onnx` | 369,025 | the 2.5x model: 768x432 -> 1920x1080, inputs `color`, `depth` |
 | `ratio25/upscale_25x_procedural_depth.report.json` | 2,934 | that model's gate report: the configuration, the sha256, the held-out numbers and the baselines they were scored against - the repository gitignores `models/**/*.json`, so this copy is the one that travels with the weights |
 | `ratio25/upscale_25x_captured_nj_depth_s2.onnx` | 369,025 | the same ratio trained on **captured** frames: inputs `color`, `depth`, 10.37% below its ratio's bilinear baseline on 480 held-out captured pairs |

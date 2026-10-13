@@ -43,19 +43,52 @@ trainer and `tools/compare_upscalers.py` use), two regression self-tests pin it 
 strings that `train --help` died on. `tools/verify_rect_upscale.py` (new) feeds a 160x90 frame through any
 exported graph and asserts the output is exactly that graph's ratio on both axes - it passes for the released
 2x model, the Hub's 2.5x models (`path@ratio`), and `G:\NRR-capture\rect-model.onnx`, a 112,907-parameter model
-trained on an 18-pair 160x90 capture that `evaluate_model.py` scores at **SSIM 0.9085 against the 0.9003
-bilinear baseline** (PSNR 28.70 vs 28.78 dB) on the packed val split.
+trained on an 18-pair 160x90 capture. **That model is a plumbing proof, not a quality result, and an earlier
+version of this entry misreported it as one.** It was exported with `--export-unqualified`, and
+`evaluate_model.py` scores it on the packed val split at SSIM 0.8998 against the 0.9003 bilinear baseline
+(PSNR 28.77 vs 28.78 dB, MS-SSIM 0.9607 vs 0.9608) - i.e. *below* bilinear on all three - which is exactly
+what the three failed gates in its own `rect-model.report.json` say: `does not beat the baseline`, `is the
+baseline` (its output differs from the plane it corrects by 0.000724 against a 0.0010 floor), and
+`ignores motion` (zeroing motion changes the output by 0.000000). The quoted "SSIM 0.9085" was the *maximum*
+single-frame value, not the mean, so it was the wrong statistic and the wrong side of the baseline at once.
+What the model does prove is that a non-square grid renders: 160x90 in, `(1, 3, 180, 320)` out, finite.
 
 **Releases** (`ae5fc7ad`). Each engine plugin ships as its own independent GitHub Release
 (`nrr-godot-v1.0.0`, `nrr-unity-v1.0.0`, `nrr-unreal-v1.0.0`), built by `tools/package_plugins.ps1` into
 `work/dist/`: the Godot addon with its GDExtension library at `bin/windows/debug`, the Unity package with
 `nrr.dll` and generated `.meta` files at `Runtime/Plugins/x86_64`, the Unreal plugin with `nrr.dll` and
+
 `nrr.h` at `Binaries/Win64` and `ThirdParty/NRR/include`. Every package is self-contained - plugin source, the
 native binaries it needs to run, the **CPU** ONNX Runtime DLLs (~6.7 MB per download, ~17 MB unpacked), the released model
 under the SHA-256 the verify setups pin, an `INSTALL.md`, and the LICENSE - and each zip is re-extracted and
 asserted file-by-file before the script reports success. The CUDA provider and its ~2.6 GB runtime are
 deliberately not bundled; the engine setup scripts attach them for the GPU path. Windows x86_64 only, matching
 what has actually been built and run. The Hub card's `spatial` row now documents the non-square verification.
+
+**The releases are published, and creating them is a script** (`7cbb20bc`). `ae5fc7ad` built the zips and left
+the tags local, so the three releases did not exist: `GET /releases` returned `count: 0`. The tags are now
+pushed and all three releases are live with their assets attached and digest-checked -
+[nrr-godot-v1.0.0](https://github.com/SamurAI-Official/NRR/releases/tag/nrr-godot-v1.0.0),
+[nrr-unity-v1.0.0](https://github.com/SamurAI-Official/NRR/releases/tag/nrr-unity-v1.0.0),
+[nrr-unreal-v1.0.0](https://github.com/SamurAI-Official/NRR/releases/tag/nrr-unreal-v1.0.0).
+`tools/create_releases.py` (new) is the command that did it, because the step that was missing was not a
+build step but a repeatable one: it is idempotent (an existing release for a tag is reused rather than
+duplicated), deletes a same-named stale asset before uploading (GitHub 422s on the duplicate and the release
+would silently keep the older file), verifies the uploaded digest against the local file, and quotes that
+SHA-256 in the release note so the check needs neither this repository nor a token.
+
+**The 16:9 model is on the Hub, and the claim about it was wrong** (`7cbb20bc`). `rect/rect-model.onnx` and
+its report are published to [SamurAI-Official/NRR](https://huggingface.co/SamurAI-Official/NRR), and the model
+was re-downloaded from the Hub and re-run through `tools/verify_rect_upscale.py` to confirm what is actually
+served renders 16:9 (`RESULT: PASS`, `(1, 3, 180, 320)`). Publishing it is what exposed the error this
+section corrects above: the model **does not** beat bilinear, so `models/HUB_README.md` now says so in a
+section that names the three gates it fails rather than leaving a reader to assume the number is a result.
+Two further defects surfaced in the same push. The Hub rejected the card outright - `license_name: All Rights
+Reserved` fails the Hub's `/^[a-z0-9-.]+$/` metadata pattern - which is why the live card still advertised
+`license: mit` a release after the licence changed: **the All Rights Reserved licence had never actually
+reached the Hub.** It is now `license_name: all-rights-reserved` with the terms stated in the card body, and
+the live repo reports `license:other`. And `tools/push_model_to_hf.ps1`'s own docstring still described the
+licence as MIT.
 
 ### The device-side blend is wired and opt-in, and the attach it needs does not happen yet
 

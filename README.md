@@ -260,8 +260,11 @@ have verified GPU kernels (`nchw_pack`, `rgb8_unpack`) that the frame path never
       the output is exactly that graph's ratio on both axes (`1, 3, 180, 320` at 2x) - it passes for the
       released `upscale_msreal_scale.onnx`, for the Hub's 2.5x models (`path@ratio` notation), and for a model
       trained on a 160x90 capture (`G:\NRR-capture\rect-model.onnx`, 112,907 parameters, exported from 18
-      packed pairs; `evaluate_model.py` scores it on the packed val split at **SSIM 0.9085 against the 0.9003
-      bilinear baseline**, PSNR 28.70 against 28.78 dB). Along the way `evaluate_model.py` was fixed: its
+      packed pairs with `--export-unqualified`; `evaluate_model.py` scores it on the packed val split at
+      **SSIM 0.8998 against the 0.9003 bilinear baseline**, PSNR 28.77 against 28.78 dB - i.e. *below* its own
+      bilinear baseline, which is what its three failed gates in `rect-model.report.json` say. It is published
+      as the proof that a 160x90 grid renders, **not** as a quality result). Along the way `evaluate_model.py`
+      was fixed: its
       `build_feed` never filled the released model's `scale` input, so ONNX Runtime refused the feed with
       `Required inputs (['scale']) are missing` and **the released model could not be evaluated at all** -
       it now derives the token from the input's own width (`log2(width / 128)`, 128 -> 0.0, 256 -> 1.0,
@@ -671,6 +674,18 @@ The verification projects (`engine_plugins/*_verify/`) remain the evidence that 
 in its engine - the releases are the convenience packaging of the same source and the same
 verified binaries. Windows x86_64 only, matching what has actually been built and run; the other
 platform entries in `nrr.gdextension` are still unbuilt.
+
+Building them is two commands, and the second one is a script rather than a sequence of manual
+steps, because the packaging is only trustworthy if it is repeatable:
+
+    powershell -File tools/package_plugins.ps1          # zips + hashes into work/dist/
+    GITHUB_TOKEN=<token> python tools/create_releases.py   # creates the 3 releases, uploads, verifies
+
+`tools/create_releases.py` re-creates a release for a tag that already has one instead of
+duplicating it, deletes a same-named stale asset before uploading (GitHub would otherwise reject
+the upload and silently keep the older file), and prints each asset's SHA-256 in the release
+note - the check a consumer can run without this repository. `--dry-run` prints the plan and
+touches nothing.
 
 ## Continuous integration
 
